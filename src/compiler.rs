@@ -1,4 +1,5 @@
-use crate::analysis::format::report_resolution_errors;
+use crate::analysis::checker::TypeChecker;
+use crate::analysis::format::{report_resolution_errors, report_type_errors};
 use crate::analysis::resolver::Resolver;
 use crate::lexer::Lexer;
 use crate::parser::parse_program;
@@ -22,12 +23,20 @@ pub fn compile(input: &str, name: &str) -> Result<(), anyhow::Error> {
         Some(v) => v,
     };
     let resolver = Resolver::new();
-    let _ = match resolver.resolve_program(parsed) {
+    let prepopulated_types = resolver.get_pre_populated_types().clone();
+    let resolved = match resolver.resolve_program(parsed) {
         Err(e) => {
             let _ = report_resolution_errors(input, &[e], name);
             return Err(anyhow!("resolution error"));
         }
         Ok(r) => r,
     };
+
+    let mut type_checker = TypeChecker::new(prepopulated_types);
+    if let Err(e) = type_checker.check_program(resolved) {
+        let _ = report_type_errors(input, &[e], name);
+        return Err(anyhow!("type checking error"));
+    }
+
     Ok(())
 }

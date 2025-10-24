@@ -80,11 +80,17 @@ pub struct FieldDef {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum TypeDef {
+pub enum TypeDefKind {
     Named(String),
     Map(Box<TypeDef>, Box<TypeDef>),
     List(Box<TypeDef>),
     Tuple(Vec<TypeDef>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    pub kind: TypeDefKind,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,10 +135,16 @@ pub struct IfBranch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ForLoopInit {
+    VarInit(VarInit),
+    Assignment(Assignment),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForLoop {
-    pub init: Assignment,
-    pub condition: Expr,
-    pub increment: Assignment,
+    pub init: Option<ForLoopInit>,
+    pub condition: Option<Expr>,
+    pub increment: Option<Assignment>,
     pub body: Vec<Statement>,
     pub span: Span,
 }
@@ -336,7 +348,11 @@ where
     });
 
     type_def.define({
-        let named = ident.clone().map(TypeDef::Named);
+        let named = ident.clone().map_with(|name, e| TypeDef {
+            kind: TypeDefKind::Named(name),
+            span: e.span(),
+        });
+
         let map = just(TokenKind::Map)
             .ignore_then(
                 type_def
@@ -345,21 +361,33 @@ where
                     .then(type_def.clone())
                     .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
             )
-            .map(|(key_type, val_type)| TypeDef::Map(Box::new(key_type), Box::new(val_type)));
+            .map_with(|(key_type, val_type), e| TypeDef {
+                kind: TypeDefKind::Map(Box::new(key_type), Box::new(val_type)),
+                span: e.span(),
+            });
+
         let list = just(TokenKind::List)
             .ignore_then(
                 type_def
                     .clone()
                     .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
             )
-            .map(|t| TypeDef::List(Box::new(t)));
+            .map_with(|t, e| TypeDef {
+                kind: TypeDefKind::List(Box::new(t)),
+                span: e.span(),
+            });
+
         let tuple = type_def
             .clone()
             .separated_by(just(TokenKind::Comma))
             .allow_trailing()
             .collect::<Vec<_>>()
             .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
-            .map(TypeDef::Tuple);
+            .map_with(|ts, e| TypeDef {
+                kind: TypeDefKind::Tuple(ts),
+                span: e.span(),
+            });
+
         choice((named, map, list, tuple))
     });
 
@@ -441,6 +469,9 @@ where
             )
             .map(|(name, fields)| ExprKind::StructLit(name, fields));
 
+        let paren_expr = expr.clone()
+            .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen));
+
         let two_arg_builtin = |name, constructor: fn(Box<Expr>, Box<Expr>) -> ExprKind| {
             just(name).ignore_then(
                 expr.clone()
@@ -477,12 +508,11 @@ where
             }
         });
 
-        let primary_base = choice((
+        let atom = choice((
             val,
             list_lit,
             map_lit,
             struct_lit,
-            args().map(ExprKind::TupleLit),
             two_arg_builtin(TokenKind::Append, ExprKind::Append),
             two_arg_builtin(TokenKind::Prepend, ExprKind::Prepend),
             two_arg_builtin(TokenKind::PollForResps, ExprKind::PollForResps),
@@ -499,6 +529,11 @@ where
             rpc_call,
         ))
         .map_with(|kind, e| Expr::new(kind, e.span()));
+
+        let primary_base = choice((
+            paren_expr, // Try to parse (expr) first
+            atom,       // Then try all other atoms
+        ));
 
         #[derive(Clone)]
         enum PostfixOp {
@@ -607,6 +642,19 @@ where
         or_expr
     });
 
+    let var_init_core = just(TokenKind::Let)
+        .ignore_then(ident.clone())
+        .then_ignore(just(TokenKind::Colon))
+        .then(type_def.clone())
+        .then_ignore(just(TokenKind::Equal))
+        .then(expr.clone())
+        .map_with(|((name, type_def), value), e| VarInit {
+            name,
+            type_def,
+            value,
+            span: e.span(),
+        });
+
     statement.define({
         let block = || {
             statement
@@ -626,24 +674,10 @@ where
                 span: e.span(),
             });
 
-        let var_init_stmt = just(TokenKind::Let)
-            .ignore_then(ident.clone())
-            .then_ignore(just(TokenKind::Colon))
-            .then(type_def.clone())
-            .then_ignore(just(TokenKind::Equal))
-            .then(expr.clone())
+        let var_init_stmt = var_init_core
+            .clone()
             .then_ignore(just(TokenKind::Semicolon))
-            .map_with(|((name, type_def), value), e| {
-                Statement::new(
-                    StatementKind::VarInit(VarInit {
-                        name,
-                        type_def,
-                        value,
-                        span: e.span(),
-                    }),
-                    e.span(),
-                )
-            });
+            .map_with(|var_init, e| Statement::new(StatementKind::VarInit(var_init), e.span()));
 
         let if_branch = |kw| {
             just(kw)
@@ -673,14 +707,20 @@ where
                 )
             });
 
+        let for_loop_init = choice((
+            var_init_core.clone().map(ForLoopInit::VarInit), // <-- MODIFIED
+            assignment.clone().map(ForLoopInit::Assignment),
+        ));
+
         let for_loop = just(TokenKind::For)
             .ignore_then(
-                assignment
+                for_loop_init
                     .clone()
+                    .or_not()
                     .then_ignore(just(TokenKind::Semicolon))
-                    .then(expr.clone())
+                    .then(expr.clone().or_not())
                     .then_ignore(just(TokenKind::Semicolon))
-                    .then(assignment.clone())
+                    .then(assignment.clone().or_not())
                     .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
             )
             .then(block())

@@ -56,7 +56,7 @@ if_stmt ::= 'if' '(' expr ')' '{' statements '}'
 elseif_stmt ::= 'elseif' '(' expr ')' '{' statements '}'
 else_stmt ::= 'else' '{' statements '}'
 
-for_loop ::= 'for' '(' assignment ';' expr ';' assignment ')' '{' statements '}'
+for_loop ::= 'for' '(' ( var_init | assignment ) ';' expr ';' assignment ')' '{' statements '}'
 for_in_loop ::= 'for' '(' pattern 'in' expr ')' '{' statements '}'
 
 assignment ::= primary_expr '=' expr

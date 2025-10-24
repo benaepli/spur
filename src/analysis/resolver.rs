@@ -133,10 +133,16 @@ pub struct ResolvedIfBranch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedForLoopInit {
+    VarInit(ResolvedVarInit),
+    Assignment(ResolvedAssignment),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedForLoop {
-    pub init: ResolvedAssignment,
-    pub condition: ResolvedExpr,
-    pub increment: ResolvedAssignment,
+    pub init: Option<ResolvedForLoopInit>,
+    pub condition: Option<ResolvedExpr>,
+    pub increment: Option<ResolvedAssignment>,
     pub body: Vec<ResolvedStatement>,
     pub span: Span,
 }
@@ -219,15 +225,27 @@ type Scope<T> = HashMap<String, T>;
 
 pub struct Resolver {
     var_scopes: Vec<Scope<NameId>>,
-    func_scopes: Vec<Scope<NameId>>,
+    func_scope: Scope<NameId>,
     type_scopes: Vec<Scope<NameId>>,
     role_scope: Scope<NameId>, // Roles are global and not nested
     next_id: usize,
     func_to_role_map: HashMap<NameId, String>,
     current_role: Option<String>,
+
+    pre_populated_types: PrepopulatedTypes,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrepopulatedTypes {
+    pub int: NameId,
+    pub string: NameId,
+    pub bool: NameId,
+    pub unit: NameId,
+}
+
+
 impl Resolver {
+
     pub fn new() -> Self {
         let mut next_id = 0;
         let mut new_name_id = || {
@@ -238,19 +256,36 @@ impl Resolver {
 
         // Pre-populate the global scope with built-in types.
         let mut type_scope = HashMap::new();
-        type_scope.insert("int".to_string(), new_name_id());
-        type_scope.insert("string".to_string(), new_name_id());
-        type_scope.insert("bool".to_string(), new_name_id());
+
+        let int_type = new_name_id();
+        let string_type = new_name_id();
+        let bool_type = new_name_id();
+        let unit_type = new_name_id();
+
+        type_scope.insert("int".to_string(), int_type);
+        type_scope.insert("string".to_string(), string_type);
+        type_scope.insert("bool".to_string(), bool_type);
+        type_scope.insert("unit".to_string(), unit_type);
 
         Resolver {
             var_scopes: vec![HashMap::new()],
-            func_scopes: vec![HashMap::new()], // A single global scope for all functions
-            type_scopes: vec![type_scope],
+            func_scope: HashMap::new(),
+            type_scopes: vec![type_scope.clone()],
             role_scope: HashMap::new(),
             next_id,
             func_to_role_map: HashMap::new(),
             current_role: None,
+            pre_populated_types: PrepopulatedTypes{
+                int: int_type,
+                string: string_type,
+                bool: bool_type,
+                unit: unit_type,
+            },
         }
+    }
+
+    pub fn get_pre_populated_types(&self) -> &PrepopulatedTypes {
+        &self.pre_populated_types
     }
 
     fn new_name_id(&mut self) -> NameId {
@@ -290,7 +325,7 @@ impl Resolver {
     fn declare_func(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
         let id = self.new_name_id();
         // All functions are declared in the single global function scope
-        Self::declare_in_scope(self.func_scopes.last_mut().unwrap(), name, id, span)?;
+        Self::declare_in_scope(&mut self.func_scope, name, id, span)?;
         Ok(id)
     }
 
@@ -303,15 +338,19 @@ impl Resolver {
     fn declare_role(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
         let id = self.new_name_id();
         Self::declare_in_scope(&mut self.role_scope, name, id, span)?;
+        Self::declare_in_scope(self.type_scopes.last_mut().unwrap(), name, id, span)?;
         Ok(id)
     }
 
-    fn lookup_in_scopes<T: Copy>(
-        scopes: &[Scope<T>],
+    fn lookup_in_scopes<'a, T: Copy + 'a, I>(
+        scopes: I,
         name: &str,
         span: Span,
-    ) -> Result<T, ResolutionError> {
-        for scope in scopes.iter().rev() {
+    ) -> Result<T, ResolutionError>
+    where
+        I: IntoIterator<Item = &'a Scope<T>>,
+    {
+        for scope in scopes {
             if let Some(id) = scope.get(name) {
                 return Ok(*id);
             }
@@ -324,11 +363,19 @@ impl Resolver {
     }
 
     fn lookup_func(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        Self::lookup_in_scopes(&self.func_scopes, name, span)
+        Self::lookup_in_scopes(std::iter::once(&self.func_scope), name, span)
     }
 
     fn lookup_type(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        Self::lookup_in_scopes(&self.type_scopes, name, span)
+        match Self::lookup_in_scopes(&self.type_scopes, name, span) {
+            Ok(id) => Ok(id), // Found it as a type
+            Err(ResolutionError::NameNotFound(_, _)) => {
+                // Not found as a type, fall back to checking if it's a role name.
+                // This allows syntax like `let x: MyRole = ...` to work.
+                self.lookup_role(name, span)
+            }
+            Err(e) => Err(e), // Propagate any other error
+        }
     }
 
     fn lookup_role(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
@@ -353,8 +400,7 @@ impl Resolver {
         for def in &program.top_level_defs {
             if let TopLevelDef::Role(role_def) = def {
                 for func in &role_def.func_defs {
-                    let id = self.declare_func(&func.name, func.span)?;
-                    self.func_to_role_map.insert(id, role_def.name.clone());
+                    self.declare_func(&func.name, func.span)?;
                 }
             }
         }
@@ -533,21 +579,16 @@ impl Resolver {
     }
 
     fn resolve_type_def(&mut self, td: TypeDef) -> Result<ResolvedTypeDef, ResolutionError> {
-        match td {
-            TypeDef::Named(name) => Ok(ResolvedTypeDef::Named(self.lookup_type(
-                &name,
-                Span {
-                    context: (),
-                    start: 0,
-                    end: 0,
-                },
-            )?)), // Assuming a dummy span
-            TypeDef::Map(k, v) => Ok(ResolvedTypeDef::Map(
+        let span = td.span;
+
+        match td.kind {
+            TypeDefKind::Named(name) => Ok(ResolvedTypeDef::Named(self.lookup_type(&name, span)?)),
+            TypeDefKind::Map(k, v) => Ok(ResolvedTypeDef::Map(
                 Box::new(self.resolve_type_def(*k)?),
                 Box::new(self.resolve_type_def(*v)?),
             )),
-            TypeDef::List(t) => Ok(ResolvedTypeDef::List(Box::new(self.resolve_type_def(*t)?))),
-            TypeDef::Tuple(ts) => {
+            TypeDefKind::List(t) => Ok(ResolvedTypeDef::List(Box::new(self.resolve_type_def(*t)?))),
+            TypeDefKind::Tuple(ts) => {
                 let resolved_ts = ts
                     .into_iter()
                     .map(|t| self.resolve_type_def(t))
@@ -626,15 +667,37 @@ impl Resolver {
 
     fn resolve_for_loop(&mut self, loop_stmt: ForLoop) -> Result<ResolvedForLoop, ResolutionError> {
         self.enter_scope();
-        let init = self.resolve_assignment(loop_stmt.init)?;
-        let condition = self.resolve_expr(loop_stmt.condition)?;
-        let increment = self.resolve_assignment(loop_stmt.increment)?;
+
+        let init = loop_stmt
+            .init
+            .map(|init_kind| match init_kind {
+                ForLoopInit::VarInit(vi) => {
+                    self.resolve_var_init(vi).map(ResolvedForLoopInit::VarInit)
+                }
+                ForLoopInit::Assignment(a) => self
+                    .resolve_assignment(a)
+                    .map(ResolvedForLoopInit::Assignment),
+            })
+            .transpose()?;
+
+        let condition = loop_stmt
+            .condition
+            .map(|e| self.resolve_expr(e))
+            .transpose()?;
+
+        let increment = loop_stmt
+            .increment
+            .map(|a| self.resolve_assignment(a))
+            .transpose()?;
+
         let body = loop_stmt
             .body
             .into_iter()
             .map(|s| self.resolve_statement(s))
             .collect::<Result<_, _>>()?;
+
         self.exit_scope();
+
         Ok(ResolvedForLoop {
             init,
             condition,
