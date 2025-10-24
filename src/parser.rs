@@ -147,7 +147,7 @@ pub struct ForInLoop {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
-    pub pattern: Pattern,
+    pub target: Expr,
     pub value: Expr,
     pub span: Span,
 }
@@ -292,7 +292,7 @@ where
             ident.clone().map(PatternKind::Var),
             just(TokenKind::Underscore).to(PatternKind::Wildcard),
         ))
-        .map_with(|kind, e| Pattern::new(kind, e.span()));
+            .map_with(|kind, e| Pattern::new(kind, e.span()));
 
         let items = pattern
             .clone()
@@ -341,7 +341,7 @@ where
         choice((named, map, list, tuple))
     });
 
-    expr.define({
+    let primary = {
         let val = select! {
             TokenKind::Integer(i) => ExprKind::IntLit(i),
             TokenKind::String(s) => ExprKind::StringLit(s),
@@ -395,14 +395,15 @@ where
                     expr.clone()
                         .separated_by(just(TokenKind::Comma))
                         .allow_trailing()
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>(),
                 )
                 .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
                 .map(|(first, mut rest)| {
                     rest.insert(0, first);
                     rest
-                })
-        )).map(ExprKind::TupleLit);
+                }),
+        ))
+            .map(ExprKind::TupleLit);
 
         let two_arg_builtin = |name, constructor: fn(Box<Expr>, Box<Expr>) -> ExprKind| {
             just(name).ignore_then(
@@ -426,19 +427,19 @@ where
             just(TokenKind::RpcCall).to(false),
             just(TokenKind::RpcAsyncCall).to(true),
         ))
-        .then(
-            expr.clone()
-                .then_ignore(just(TokenKind::Comma))
-                .then(func_call.clone())
-                .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-        )
-        .map(|(is_async, (target, call))| {
-            if is_async {
-                ExprKind::RpcAsyncCall(Box::new(target), call)
-            } else {
-                ExprKind::RpcCall(Box::new(target), call)
-            }
-        });
+            .then(
+                expr.clone()
+                    .then_ignore(just(TokenKind::Comma))
+                    .then(func_call.clone())
+                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
+            )
+            .map(|(is_async, (target, call))| {
+                if is_async {
+                    ExprKind::RpcAsyncCall(Box::new(target), call)
+                } else {
+                    ExprKind::RpcCall(Box::new(target), call)
+                }
+            });
 
         let primary_base = choice((
             val,
@@ -458,9 +459,9 @@ where
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
             func_call.map(ExprKind::FuncCall),
             ident.clone().map(ExprKind::Var),
-            tuple_lit
+            tuple_lit,
         ))
-        .map_with(|kind, e| Expr::new(kind, e.span()));
+            .map_with(|kind, e| Expr::new(kind, e.span()));
 
         #[derive(Clone)]
         enum PostfixOp {
@@ -486,7 +487,7 @@ where
                 .map_with(|idx, e| PostfixOp::TupleAccess(idx, e.span())),
         ));
 
-        let primary = primary_base.foldl(postfix_op.repeated(), |lhs, op| match op {
+        primary_base.foldl(postfix_op.repeated(), |lhs, op| match op {
             PostfixOp::Index(idx) => {
                 let span = lhs.span.union(idx.span);
                 Expr::new(ExprKind::Index(Box::new(lhs), Box::new(idx)), span)
@@ -502,8 +503,10 @@ where
                 let span = lhs.span.union(op_span);
                 Expr::new(ExprKind::TupleAccess(Box::new(lhs), idx), span)
             }
-        });
+        })
+    };
 
+    expr.define({
         let unary = recursive(|unary| {
             choice((
                 just(TokenKind::Bang)
@@ -512,7 +515,7 @@ where
                 just(TokenKind::Minus)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Negate(Box::new(val)), e.span())),
-                primary,
+                primary.clone(),
             ))
         });
 
@@ -567,12 +570,12 @@ where
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
         };
 
-        let assignment = pattern
+        let assignment = primary
             .clone()
             .then_ignore(just(TokenKind::Equal))
             .then(expr.clone())
-            .map_with(|(pattern, value), e| Assignment {
-                pattern,
+            .map_with(|(target, value), e| Assignment {
+                target,
                 value,
                 span: e.span(),
             });

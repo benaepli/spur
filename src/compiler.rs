@@ -1,7 +1,9 @@
-use anyhow::anyhow;
-use crate::{lexer, parser};
+use crate::analysis::format::report_resolution_errors;
+use crate::analysis::resolver::Resolver;
 use crate::lexer::Lexer;
 use crate::parser::parse_program;
+use crate::{lexer, parser};
+use anyhow::anyhow;
 
 pub fn compile(input: &str, name: &str) -> Result<(), anyhow::Error> {
     let mut lexer = Lexer::new(input);
@@ -15,9 +17,17 @@ pub fn compile(input: &str, name: &str) -> Result<(), anyhow::Error> {
         parser::format::report_errors(input, parsed.errors(), name)?;
         return Err(anyhow!("parsing error"));
     }
-    let _ = match parsed.into_output() {
+    let parsed = match parsed.into_output() {
         None => return Err(anyhow!("no output generated")),
         Some(v) => v,
+    };
+    let resolver = Resolver::new();
+    let _ = match resolver.resolve_program(parsed) {
+        Err(e) => {
+            let _ = report_resolution_errors(input, &[e], name);
+            return Err(anyhow!("resolution error"));
+        }
+        Ok(r) => r,
     };
     Ok(())
 }
