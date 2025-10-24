@@ -1,5 +1,3 @@
-// resolver.rs
-
 use crate::parser::*;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -206,6 +204,8 @@ pub enum ResolvedExprKind {
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
+    FieldAccess(Box<ResolvedExpr>, String),
+    StructLit(NameId, Vec<(String, ResolvedExpr)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -787,6 +787,19 @@ impl Resolver {
             ),
             ExprKind::TupleAccess(e, i) => {
                 ResolvedExprKind::TupleAccess(Box::new(self.resolve_expr(*e)?), i)
+            }
+            ExprKind::FieldAccess(e, name) => {
+                ResolvedExprKind::FieldAccess(Box::new(self.resolve_expr(*e)?), name)
+            }
+            ExprKind::StructLit(name, fields) => {
+                let type_id = self.lookup_type(&name, span)?;
+                let resolved_fields = fields
+                    .into_iter()
+                    .map(|(field_name, field_expr)| {
+                        Ok((field_name, self.resolve_expr(field_expr)?))
+                    })
+                    .collect::<Result<Vec<_>, ResolutionError>>()?;
+                ResolvedExprKind::StructLit(type_id, resolved_fields)
             }
         };
         Ok(ResolvedExpr { kind, span })

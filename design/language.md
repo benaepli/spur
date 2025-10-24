@@ -9,7 +9,7 @@ top_level_def ::=
       role_def
     | type_def_stmt
 
-role_def ::= ID '{' var_inits func_defs '}'
+role_def ::= 'role' ID '{' var_inits func_defs '}'
 client_def ::= 'ClientInterface' '{' var_inits func_defs '}'
 
 func_defs ::= ( func_def )*
@@ -88,6 +88,7 @@ primary_base ::=
     | TRUE | FALSE
     | literals
     | func_call
+    | struct_literal
     | collection
     | rpc_call
     | list_ops
@@ -104,6 +105,7 @@ postfix_op ::=
       '[' expr ']'
     | '[' expr ':' expr ']'
     | '.' INT
+    | '.' ID
 
 literals ::= STRING | INT
 
@@ -116,6 +118,10 @@ tuple_lit ::=
 
 items ::= expr ( ',' expr )*
 list_lit ::= '[' items? ']'
+
+struct_literal ::= ID '{' field_inits? '}'
+field_inits ::= field_init ( ',' field_init )* ','?
+field_init ::= ID ':' expr
 
 list_ops ::= ( 'head' | 'tail' | 'len' ) '(' expr ')'
 

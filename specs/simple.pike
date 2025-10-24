@@ -1,5 +1,10 @@
-Head {
+type Value {
+    test: int;
+};
+
+role Head {
     let db: map<string, int> = {};
+    let e: Value = Value{test: 2};
 
     func Write(key: string, value: int) -> bool {
         db[key] = value;

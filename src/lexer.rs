@@ -1,11 +1,11 @@
 pub mod format;
 
+use crate::parser::Span;
 use phf_macros::phf_map;
 use std::fmt;
 use std::iter::Peekable;
 use std::str::Chars;
 use thiserror::Error;
-use crate::parser::Span;
 
 /// A token represents a single meaningful unit in the source code with its position.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +68,7 @@ pub enum TokenKind {
 
     // Keywords
     ClientInterface,
+    Role,
     Func,
     Let,
     Type,
@@ -133,6 +134,7 @@ impl fmt::Display for TokenKind {
             TokenKind::String(s) => write!(f, "\"{}\"", s),
             TokenKind::Integer(i) => write!(f, "{}", i),
             TokenKind::ClientInterface => write!(f, "ClientInterface"),
+            TokenKind::Role => write!(f, "role"),
             TokenKind::Func => write!(f, "func"),
             TokenKind::Let => write!(f, "let"),
             TokenKind::Type => write!(f, "type"),
@@ -170,6 +172,7 @@ impl fmt::Display for TokenKind {
 
 static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "ClientInterface" => TokenKind::ClientInterface,
+    "role" => TokenKind::Role,
     "func" => TokenKind::Func,
     "let" => TokenKind::Let,
     "type" => TokenKind::Type,
@@ -471,7 +474,16 @@ impl<'a> Iterator for Lexer<'a> {
         };
 
         let end = self.position;
-        Some(result.map(|kind| Token::new(kind, Span { context: (), start, end })))
+        Some(result.map(|kind| {
+            Token::new(
+                kind,
+                Span {
+                    context: (),
+                    start,
+                    end,
+                },
+            )
+        }))
     }
 }
 

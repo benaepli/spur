@@ -206,6 +206,7 @@ pub enum ExprKind {
     MapLit(Vec<(Expr, Expr)>),
     ListLit(Vec<Expr>),
     TupleLit(Vec<Expr>),
+    StructLit(String, Vec<(String, Expr)>),
 
     // Built-in operations
     Append(Box<Expr>, Box<Expr>),
@@ -227,6 +228,7 @@ pub enum ExprKind {
     Index(Box<Expr>, Box<Expr>),
     Slice(Box<Expr>, Box<Expr>, Box<Expr>),
     TupleAccess(Box<Expr>, usize),
+    FieldAccess(Box<Expr>, String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -256,6 +258,26 @@ pub enum BinOp {
     Multiply,
     Divide,
     Modulo,
+}
+
+impl std::fmt::Display for BinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BinOp::And => write!(f, "and"),
+            BinOp::Or => write!(f, "or"),
+            BinOp::Equal => write!(f, "=="),
+            BinOp::NotEqual => write!(f, "!="),
+            BinOp::Less => write!(f, "<"),
+            BinOp::LessEqual => write!(f, "<="),
+            BinOp::Greater => write!(f, ">"),
+            BinOp::GreaterEqual => write!(f, ">="),
+            BinOp::Add => write!(f, "+"),
+            BinOp::Subtract => write!(f, "-"),
+            BinOp::Multiply => write!(f, "*"),
+            BinOp::Divide => write!(f, "/"),
+            BinOp::Modulo => write!(f, "%"),
+        }
+    }
 }
 
 // Helper to build a parser for a left-associative binary operation
@@ -292,7 +314,7 @@ where
             ident.clone().map(PatternKind::Var),
             just(TokenKind::Underscore).to(PatternKind::Wildcard),
         ))
-            .map_with(|kind, e| Pattern::new(kind, e.span()));
+        .map_with(|kind, e| Pattern::new(kind, e.span()));
 
         let items = pattern
             .clone()
@@ -403,7 +425,21 @@ where
                     rest
                 }),
         ))
-            .map(ExprKind::TupleLit);
+        .map(ExprKind::TupleLit);
+
+        let struct_lit = ident
+            .clone()
+            .then(
+                ident
+                    .clone()
+                    .then_ignore(just(TokenKind::Colon))
+                    .then(expr.clone())
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<(String, Expr)>>()
+                    .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
+            )
+            .map(|(name, fields)| ExprKind::StructLit(name, fields));
 
         let two_arg_builtin = |name, constructor: fn(Box<Expr>, Box<Expr>) -> ExprKind| {
             just(name).ignore_then(
@@ -427,26 +463,26 @@ where
             just(TokenKind::RpcCall).to(false),
             just(TokenKind::RpcAsyncCall).to(true),
         ))
-            .then(
-                expr.clone()
-                    .then_ignore(just(TokenKind::Comma))
-                    .then(func_call.clone())
-                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-            )
-            .map(|(is_async, (target, call))| {
-                if is_async {
-                    ExprKind::RpcAsyncCall(Box::new(target), call)
-                } else {
-                    ExprKind::RpcCall(Box::new(target), call)
-                }
-            });
+        .then(
+            expr.clone()
+                .then_ignore(just(TokenKind::Comma))
+                .then(func_call.clone())
+                .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
+        )
+        .map(|(is_async, (target, call))| {
+            if is_async {
+                ExprKind::RpcAsyncCall(Box::new(target), call)
+            } else {
+                ExprKind::RpcCall(Box::new(target), call)
+            }
+        });
 
         let primary_base = choice((
             val,
             list_lit,
             map_lit,
+            struct_lit,
             args().map(ExprKind::TupleLit),
-            rpc_call,
             two_arg_builtin(TokenKind::Append, ExprKind::Append),
             two_arg_builtin(TokenKind::Prepend, ExprKind::Prepend),
             two_arg_builtin(TokenKind::PollForResps, ExprKind::PollForResps),
@@ -460,14 +496,16 @@ where
             func_call.map(ExprKind::FuncCall),
             ident.clone().map(ExprKind::Var),
             tuple_lit,
+            rpc_call,
         ))
-            .map_with(|kind, e| Expr::new(kind, e.span()));
+        .map_with(|kind, e| Expr::new(kind, e.span()));
 
         #[derive(Clone)]
         enum PostfixOp {
             Index(Expr),
             Slice(Expr, Expr),
             TupleAccess(usize, Span),
+            FieldAccess(String, Span),
         }
 
         let postfix_op = choice((
@@ -485,6 +523,10 @@ where
             just(TokenKind::Dot)
                 .ignore_then(select! { TokenKind::Integer(i) => i as usize })
                 .map_with(|idx, e| PostfixOp::TupleAccess(idx, e.span())),
+            // Field Access: .ID
+            just(TokenKind::Dot)
+                .ignore_then(ident.clone())
+                .map_with(|name, e| PostfixOp::FieldAccess(name, e.span())),
         ));
 
         primary_base.foldl(postfix_op.repeated(), |lhs, op| match op {
@@ -502,6 +544,10 @@ where
             PostfixOp::TupleAccess(idx, op_span) => {
                 let span = lhs.span.union(op_span);
                 Expr::new(ExprKind::TupleAccess(Box::new(lhs), idx), span)
+            }
+            PostfixOp::FieldAccess(name, op_span) => {
+                let span = lhs.span.union(op_span);
+                Expr::new(ExprKind::FieldAccess(Box::new(lhs), name), span)
             }
         })
     };
@@ -796,7 +842,8 @@ where
             .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
     };
 
-    let role_def = ident
+    let role_def = just(TokenKind::Role)
+        .ignore_then(ident)
         .then(role_contents())
         .map_with(|(name, (var_inits, func_defs)), e| {
             TopLevelDef::Role(RoleDef {
