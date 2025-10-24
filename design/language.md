@@ -59,7 +59,7 @@ else_stmt ::= 'else' '{' statements '}'
 for_loop ::= 'for' '(' assignment ';' expr ';' assignment ')' '{' statements '}'
 for_in_loop ::= 'for' '(' pattern 'in' expr ')' '{' statements '}'
 
-assignment ::= pattern '=' expr
+assignment ::= primary_expr '=' expr
 
 pattern ::=
       ID
@@ -105,9 +105,7 @@ postfix_op ::=
     | '[' expr ':' expr ']'
     | '.' INT
 
-literals ::= 'options' '(' options ')' | STRING | integer
-integer ::= '-'? INT
-options ::= ID (',' ID)*
+literals ::= STRING | INT
 
 collection ::= '{' kv_pairs? '}' | list_lit | tuple_lit
 kv_pairs ::= ( expr ':' expr ) ( ',' expr ':' expr )*

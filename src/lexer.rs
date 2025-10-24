@@ -5,14 +5,7 @@ use std::fmt;
 use std::iter::Peekable;
 use std::str::Chars;
 use thiserror::Error;
-
-
-/// A span represents a position range in the source code.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
+use crate::parser::Span;
 
 /// A token represents a single meaningful unit in the source code with its position.
 #[derive(Clone, Debug, PartialEq)]
@@ -478,7 +471,7 @@ impl<'a> Iterator for Lexer<'a> {
         };
 
         let end = self.position;
-        Some(result.map(|kind| Token::new(kind, Span { start, end })))
+        Some(result.map(|kind| Token::new(kind, Span { context: (), start, end })))
     }
 }
 
