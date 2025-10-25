@@ -527,7 +527,7 @@ impl TypeChecker {
         expected_type: &Type,
     ) -> Result<(), TypeError> {
         match &pattern.kind {
-            ResolvedPatternKind::Var(name_id) => {
+            ResolvedPatternKind::Var(name_id, _) => {
                 self.add_var(*name_id, expected_type.clone());
                 Ok(())
             }
@@ -578,7 +578,6 @@ impl TypeChecker {
             ResolvedExprKind::Var(_) => true,
             ResolvedExprKind::FieldAccess(_, _) => true,
             ResolvedExprKind::Index(_, _) => true,
-            ResolvedExprKind::TupleAccess(_, _) => true,
             _ => false,
         }
     }
@@ -819,7 +818,7 @@ impl TypeChecker {
                         return Err(TypeError::PollingOnInvalidType {
                             ty: col_ty,
                             span: collection.span,
-                        })
+                        });
                     }
                 }
                 Ok(Type::Int)
@@ -848,7 +847,7 @@ impl TypeChecker {
                         return Err(TypeError::PollingOnInvalidType {
                             ty: col_ty,
                             span: collection.span,
-                        })
+                        });
                     }
                 }
                 Ok(Type::Bool)
@@ -1157,7 +1156,6 @@ impl TypeChecker {
                 Ok(Type::Tuple(resolved_types))
             }
             ResolvedTypeDef::Optional(t) => {
-                // <-- ADD THIS
                 let base_type = self.resolve_type(t)?;
                 // "Collapse" nested optionals: T?? becomes T?
                 if matches!(base_type, Type::Optional(_)) {

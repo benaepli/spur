@@ -57,6 +57,7 @@ pub struct ResolvedFuncDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedFuncParam {
     pub name: NameId,
+    pub original_name: String,
     pub type_def: ResolvedTypeDef,
     pub span: Span,
 }
@@ -64,6 +65,7 @@ pub struct ResolvedFuncParam {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedVarInit {
     pub name: NameId,
+    pub original_name: String,
     pub type_def: ResolvedTypeDef,
     pub value: ResolvedExpr,
     pub span: Span,
@@ -72,6 +74,7 @@ pub struct ResolvedVarInit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedTypeDefStmt {
     pub name: NameId,
+    pub original_name: String,
     pub def: ResolvedTypeDefStmtKind,
     pub span: Span,
 }
@@ -171,7 +174,7 @@ pub struct ResolvedPattern {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedPatternKind {
-    Var(NameId),
+    Var(NameId, String),
     Wildcard,
     Unit,
     Tuple(Vec<ResolvedPattern>),
@@ -247,9 +250,7 @@ pub struct PrepopulatedTypes {
     pub unit: NameId,
 }
 
-
 impl Resolver {
-
     pub fn new() -> Self {
         let mut next_id = 0;
         let mut new_name_id = || {
@@ -279,7 +280,7 @@ impl Resolver {
             next_id,
             func_to_role_map: HashMap::new(),
             current_role: None,
-            pre_populated_types: PrepopulatedTypes{
+            pre_populated_types: PrepopulatedTypes {
                 int: int_type,
                 string: string_type,
                 bool: bool_type,
@@ -533,6 +534,7 @@ impl Resolver {
         let name_id = self.declare_var(&param.name, param.span)?;
         Ok(ResolvedFuncParam {
             name: name_id,
+            original_name: param.name,
             type_def,
             span: param.span,
         })
@@ -544,6 +546,7 @@ impl Resolver {
         let name_id = self.declare_var(&init.name, init.span)?;
         Ok(ResolvedVarInit {
             name: name_id,
+            original_name: init.name,
             type_def,
             value,
             span: init.span,
@@ -569,6 +572,7 @@ impl Resolver {
         };
         Ok(ResolvedTypeDefStmt {
             name: name_id,
+            original_name: stmt.name,
             def,
             span: stmt.span,
         })
@@ -598,10 +602,10 @@ impl Resolver {
                     .map(|t| self.resolve_type_def(t))
                     .collect::<Result<_, _>>()?;
                 Ok(ResolvedTypeDef::Tuple(resolved_ts))
-            },
+            }
             TypeDefKind::Optional(t) => Ok(ResolvedTypeDef::Optional(Box::new(
                 self.resolve_type_def(*t)?,
-            )))
+            ))),
         }
     }
 
@@ -749,7 +753,10 @@ impl Resolver {
     fn resolve_pattern(&mut self, pat: Pattern) -> Result<ResolvedPattern, ResolutionError> {
         let span = pat.span;
         let kind = match pat.kind {
-            PatternKind::Var(name) => ResolvedPatternKind::Var(self.declare_var(&name, span)?),
+            PatternKind::Var(name) => {
+                let id = self.declare_var(&name, span)?;
+                ResolvedPatternKind::Var(id, name)
+            }
             PatternKind::Wildcard => ResolvedPatternKind::Wildcard,
             PatternKind::Unit => ResolvedPatternKind::Unit,
             PatternKind::Tuple(pats) => {
@@ -862,9 +869,7 @@ impl Resolver {
             ExprKind::FieldAccess(e, name) => {
                 ResolvedExprKind::FieldAccess(Box::new(self.resolve_expr(*e)?), name)
             }
-            ExprKind::Unwrap(e) => { 
-                ResolvedExprKind::Unwrap(Box::new(self.resolve_expr(*e)?))
-            },
+            ExprKind::Unwrap(e) => ResolvedExprKind::Unwrap(Box::new(self.resolve_expr(*e)?)),
             ExprKind::StructLit(name, fields) => {
                 let type_id = self.lookup_type(&name, span)?;
                 let resolved_fields = fields
