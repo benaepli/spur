@@ -188,7 +188,7 @@ pub struct ResolvedExpr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedExprKind {
-    Var(NameId),
+    Var(NameId, String),
     IntLit(i64),
     StringLit(String),
     BoolLit(bool),
@@ -224,6 +224,7 @@ pub enum ResolvedExprKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedFuncCall {
     pub name: NameId,
+    pub original_name: String,
     pub args: Vec<ResolvedExpr>,
     pub span: Span,
 }
@@ -773,7 +774,7 @@ impl Resolver {
     fn resolve_expr(&mut self, expr: Expr) -> Result<ResolvedExpr, ResolutionError> {
         let span = expr.span;
         let kind = match expr.kind {
-            ExprKind::Var(name) => ResolvedExprKind::Var(self.lookup_var(&name, span)?),
+            ExprKind::Var(name) => ResolvedExprKind::Var(self.lookup_var(&name, span)?, name),
             ExprKind::IntLit(i) => ResolvedExprKind::IntLit(i),
             ExprKind::StringLit(s) => ResolvedExprKind::StringLit(s),
             ExprKind::BoolLit(b) => ResolvedExprKind::BoolLit(b),
@@ -893,6 +894,7 @@ impl Resolver {
             .collect::<Result<_, _>>()?;
         Ok(ResolvedFuncCall {
             name: name_id,
+            original_name: call.name,
             args,
             span: call.span,
         })

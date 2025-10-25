@@ -575,7 +575,7 @@ impl TypeChecker {
 
     fn is_valid_lvalue(&self, expr_kind: &ResolvedExprKind) -> bool {
         match expr_kind {
-            ResolvedExprKind::Var(_) => true,
+            ResolvedExprKind::Var(_, _) => true,
             ResolvedExprKind::FieldAccess(_, _) => true,
             ResolvedExprKind::Index(_, _) => true,
             _ => false,
@@ -584,7 +584,7 @@ impl TypeChecker {
 
     fn check_expr(&mut self, expr: &ResolvedExpr) -> Result<Type, TypeError> {
         match &expr.kind {
-            ResolvedExprKind::Var(name_id) => self.get_var_type(*name_id, expr.span),
+            ResolvedExprKind::Var(name_id, _) => self.get_var_type(*name_id, expr.span),
             ResolvedExprKind::IntLit(_) => Ok(Type::Int),
             ResolvedExprKind::StringLit(_) => Ok(Type::String),
             ResolvedExprKind::BoolLit(_) => Ok(Type::Bool),
