@@ -210,7 +210,7 @@ impl Compiler {
         let mut next_vertex = final_vertex;
         // Build the init chain backwards
         for init in inits.iter().rev() {
-            let var_name = init.original_name.clone();
+            let var_name = resolved_name(init.name, &init.original_name);
             next_vertex = self.compile_expr_to_value(&init.value, Lhs::Var(var_name), next_vertex);
         }
 
@@ -234,13 +234,17 @@ impl Compiler {
             final_vertex, // `break_target` (breaks go to end of function)
         );
 
-        let formals = func.params.into_iter().map(|p| p.original_name).collect();
+        let formals = func
+            .params
+            .into_iter()
+            .map(|p| resolved_name(p.name, &p.original_name))
+            .collect();
 
         let locals = self.scan_body(&func.body);
 
         FunctionInfo {
             entry,
-            name: func.original_name,
+            name: resolved_name(func.name, &func.original_name),
             formals,
             locals,
         }
