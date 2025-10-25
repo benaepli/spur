@@ -21,6 +21,7 @@ pub enum Type {
     Struct(NameId),
     Role(NameId),
     Optional(Box<Type>),
+    Future(Box<Type>),
 
     // Placeholder types.
     EmptyList,
@@ -48,6 +49,7 @@ impl std::fmt::Display for Type {
             Type::Struct(id) => write!(f, "struct(id:{})", id.0),
             Type::Role(id) => write!(f, "role(id:{})", id.0),
             Type::Optional(t) => write!(f, "{}?", t),
+            Type::Future(t) => write!(f, "future<{}>", t),
             Type::EmptyList => write!(f, "empty list"),
             Type::EmptyMap => write!(f, "empty map"),
             Type::Nil => write!(f, "nil"),
@@ -114,6 +116,8 @@ pub enum TypeError {
     MissingReturn(Span),
     #[error("Return statement found outside of a function")]
     ReturnOutsideFunction(Span),
+    #[error("Break statement found outside of a loop")]
+    BreakOutsideLoop(Span),
     #[error("Cannot iterate over type `{ty}`")]
     NotIterable { ty: Type, span: Span },
     #[error("Pattern does not match iterable type")]
@@ -142,6 +146,12 @@ pub enum TypeError {
     InvalidRoleOperation { ty: Type, span: Span },
     #[error("Cannot force-unwrap a non-optional type `{ty}`")]
     UnwrapOnNonOptional { ty: Type, span: Span },
+    #[error("await can only be used on a future, found `{ty}`")]
+    AwaitOnNonFuture { ty: Type, span: Span },
+    #[error("Polling operation requires a collection of futures or bools, found `{ty}`")]
+    PollingOnInvalidType { ty: Type, span: Span },
+    #[error("next_resp requires a map of futures, found `{ty}`")]
+    NextRespOnInvalidType { ty: Type, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -391,7 +401,7 @@ impl TypeChecker {
             }
             ResolvedStatementKind::Break => {
                 if self.loop_depth == 0 {
-                    // Could add a specific error for break outside loop
+                    return Err(TypeError::BreakOutsideLoop(stmt.span));
                 }
                 Ok(false)
             }
@@ -761,8 +771,7 @@ impl TypeChecker {
             ResolvedExprKind::StructLit(struct_id, fields) => {
                 self.check_struct_literal(*struct_id, fields, expr.span)
             }
-            ResolvedExprKind::RpcCall(target, call)
-            | ResolvedExprKind::RpcAsyncCall(target, call) => {
+            ResolvedExprKind::RpcCall(target, call) => {
                 let target_ty = self.check_expr(target)?;
                 if !matches!(target_ty, Type::Role(_)) {
                     return Err(TypeError::RpcCallTargetNotRole {
@@ -770,21 +779,100 @@ impl TypeChecker {
                         span: expr.span,
                     });
                 }
+                // Synchronous call, returns T
                 self.check_func_call(call)
             }
 
-            ResolvedExprKind::PollForResps(_, _) => {
-                // TODO: Type check async operations properly
-                // For now, return Unit
-                Ok(Type::Unit)
+            ResolvedExprKind::RpcAsyncCall(target, call) => {
+                let target_ty = self.check_expr(target)?;
+                if !matches!(target_ty, Type::Role(_)) {
+                    return Err(TypeError::RpcCallTargetNotRole {
+                        ty: target_ty,
+                        span: expr.span,
+                    });
+                }
+                // Asynchronous call, returns Future<T>
+                let return_type = self.check_func_call(call)?;
+                Ok(Type::Future(Box::new(return_type)))
             }
-            ResolvedExprKind::PollForAnyResp(_) => {
-                // TODO: Type check async operations properly
-                Ok(Type::Unit)
+
+            ResolvedExprKind::PollForResps(collection, _value) => {
+                let col_ty = self.check_expr(collection)?;
+                match &col_ty {
+                    Type::List(elem_ty) => {
+                        if !matches!(**elem_ty, Type::Future(_) | Type::Bool) {
+                            return Err(TypeError::PollingOnInvalidType {
+                                ty: col_ty,
+                                span: collection.span,
+                            });
+                        }
+                    }
+                    Type::Map(_, val_ty) => {
+                        if !matches!(**val_ty, Type::Future(_) | Type::Bool) {
+                            return Err(TypeError::PollingOnInvalidType {
+                                ty: col_ty,
+                                span: collection.span,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(TypeError::PollingOnInvalidType {
+                            ty: col_ty,
+                            span: collection.span,
+                        })
+                    }
+                }
+                Ok(Type::Int)
             }
-            ResolvedExprKind::NextResp(_) => {
-                // TODO: Type check async operations properly
-                Ok(Type::Unit)
+
+            ResolvedExprKind::PollForAnyResp(collection) => {
+                let col_ty = self.check_expr(collection)?;
+                match &col_ty {
+                    Type::List(elem_ty) => {
+                        if !matches!(**elem_ty, Type::Future(_) | Type::Bool) {
+                            return Err(TypeError::PollingOnInvalidType {
+                                ty: col_ty,
+                                span: collection.span,
+                            });
+                        }
+                    }
+                    Type::Map(_, val_ty) => {
+                        if !matches!(**val_ty, Type::Future(_) | Type::Bool) {
+                            return Err(TypeError::PollingOnInvalidType {
+                                ty: col_ty,
+                                span: collection.span,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(TypeError::PollingOnInvalidType {
+                            ty: col_ty,
+                            span: collection.span,
+                        })
+                    }
+                }
+                Ok(Type::Bool)
+            }
+
+            ResolvedExprKind::NextResp(collection) => {
+                let col_ty = self.check_expr(collection)?;
+                match col_ty {
+                    Type::Map(key_ty, val_ty) => {
+                        if let Type::Future(inner_ty) = *val_ty {
+                            // Returns the value inside the future
+                            Ok(*inner_ty)
+                        } else {
+                            Err(TypeError::NextRespOnInvalidType {
+                                ty: Type::Map(key_ty, val_ty),
+                                span: collection.span,
+                            })
+                        }
+                    }
+                    _ => Err(TypeError::NextRespOnInvalidType {
+                        ty: col_ty,
+                        span: collection.span,
+                    }),
+                }
             }
         }
     }
@@ -1110,6 +1198,11 @@ impl TypeChecker {
             if let Type::Optional(actual_inner) = actual {
                 return self.check_type_compatibility(expected_inner, actual_inner, span);
             }
+        }
+        // Check for future "widening" (e.g., if expected is Future<T> and actual is Future<T>)
+        // This is primarily for placeholder types like EmptyList/Map when used with futures.
+        if let (Type::Future(expected_inner), Type::Future(actual_inner)) = (expected, actual) {
+            return self.check_type_compatibility(expected_inner, actual_inner, span);
         }
 
         Err(TypeError::Mismatch {

@@ -32,12 +32,14 @@ field_def ::= ID ':' type_def
 
 type_alias ::= '=' type_def
 
-type_def ::=
+type_def ::= base_type ( '?' )?
+
+base_type ::=
       ID
     | 'map' '<' type_def ',' type_def '>'
     | 'list' '<' type_def '>'
     | '(' type_def_list? ')'
-
+    
 statements ::= statement*
 statement ::=
       cond_stmts
@@ -67,7 +69,9 @@ pattern ::=
     | '(' ')'
     | '(' pattern ( ',' pattern )* ')'
 
-expr ::= boolean_or_expr
+expr ::= coalescing_expr
+
+coalescing_expr ::= boolean_or_expr ( '??' boolean_or_expr )*
 
 boolean_or_expr ::= boolean_and_expr ( 'or' boolean_and_expr )*
 
@@ -85,7 +89,7 @@ primary_expr ::= primary_base postfix_op*
 
 primary_base ::= 
       ID
-    | TRUE | FALSE
+    | TRUE | FALSE | NIL
     | literals
     | func_call
     | struct_literal
@@ -101,11 +105,12 @@ primary_base ::=
     | 'exists' '(' expr ',' expr ')'
     | '(' expr ')'
 
-postfix_op ::= 
+postfix_op ::=
       '[' expr ']'
     | '[' expr ':' expr ']'
     | '.' INT
     | '.' ID
+    | '!'
 
 literals ::= STRING | INT
 

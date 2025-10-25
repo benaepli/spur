@@ -1,3 +1,5 @@
+pub mod cfg;
+
 use crate::analysis::checker::TypeChecker;
 use crate::analysis::format::{report_resolution_errors, report_type_errors};
 use crate::analysis::resolver::Resolver;

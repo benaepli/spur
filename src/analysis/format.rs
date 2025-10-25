@@ -220,6 +220,16 @@ pub fn report_type_errors(
                     "help: return statements can only appear inside functions".to_string(),
                 ]),
 
+            TypeError::BreakOutsideLoop(span) => Diagnostic::error()
+                .with_message("break statement outside of loop")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message("cannot break from here"),
+                ])
+                .with_notes(vec![
+                    "help: break statements can only appear inside loops".to_string(),
+                ]),
+
             TypeError::NotIterable { ty, span } => Diagnostic::error()
                 .with_message("cannot iterate over this type")
                 .with_labels(vec![
@@ -321,6 +331,36 @@ pub fn report_type_errors(
                 ])
                 .with_notes(vec![
                     format!("help: the force-unwrap operator `!` can only be used on optional types, but `{}` is not optional", ty),
+                ]),
+
+            TypeError::AwaitOnNonFuture { ty, span } => Diagnostic::error()
+                .with_message("cannot await non-future type")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected future type, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: await can only be used on future types, but `{}` is not a future", ty),
+                ]),
+
+            TypeError::PollingOnInvalidType { ty, span } => Diagnostic::error()
+                .with_message("invalid polling operation")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected collection of futures or bools, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: polling operations require a list or map of futures or bools, but `{}` does not match this requirement", ty),
+                ]),
+
+            TypeError::NextRespOnInvalidType { ty, span } => Diagnostic::error()
+                .with_message("invalid next_resp operation")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected map of futures, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: next_resp requires a map where values are futures, but `{}` does not match this requirement", ty),
                 ]),
         };
 
