@@ -3,12 +3,13 @@ pub mod cfg;
 use crate::analysis::checker::TypeChecker;
 use crate::analysis::format::{report_resolution_errors, report_type_errors};
 use crate::analysis::resolver::Resolver;
+use crate::compiler::cfg::Compiler as CfgCompiler;
 use crate::lexer::Lexer;
 use crate::parser::parse_program;
 use crate::{lexer, parser};
 use anyhow::anyhow;
 
-pub fn compile(input: &str, name: &str) -> Result<(), anyhow::Error> {
+pub fn compile(input: &str, name: &str) -> Result<cfg::Program, anyhow::Error> {
     let mut lexer = Lexer::new(input);
     let (lexed, errors) = lexer.collect_all();
     lexer::format::report_errors(input, &errors, name)?;
@@ -35,10 +36,14 @@ pub fn compile(input: &str, name: &str) -> Result<(), anyhow::Error> {
     };
 
     let mut type_checker = TypeChecker::new(prepopulated_types);
-    if let Err(e) = type_checker.check_program(resolved) {
+    if let Err(e) = type_checker.check_program(resolved.clone()) {
         let _ = report_type_errors(input, &[e], name);
         return Err(anyhow!("type checking error"));
     }
 
-    Ok(())
+    // Compile to CFG
+    let cfg_compiler = CfgCompiler::new();
+    let program = cfg_compiler.compile_program(resolved);
+
+    Ok(program)
 }

@@ -22,5 +22,17 @@ fn main() {
 
     let path = Path::new(&args.spec);
     let content = fs::read_to_string(path).expect("Unable to read file");
-    let _ = compiler::compile(&content, &args.spec);
+
+    match compiler::compile(&content, &args.spec) {
+        Ok(program) => {
+            let json = serde_json::to_string_pretty(&program)
+                .expect("Failed to serialize program");
+            fs::write(&args.output, json).expect("Failed to write output file");
+            println!("Successfully compiled to {}", args.output);
+        }
+        Err(e) => {
+            eprintln!("Compilation failed: {}", e);
+            std::process::exit(1);
+        }
+    }
 }

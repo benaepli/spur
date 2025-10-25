@@ -5,11 +5,12 @@ use crate::analysis::resolver::{
     ResolvedVarInit,
 };
 use crate::parser::BinOp;
+use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Expr {
     EVar(String),
     EFind(Box<Expr>, Box<Expr>),
@@ -49,14 +50,14 @@ pub enum Expr {
     ECoalesce(Box<Expr>, Box<Expr>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Lhs {
     Var(String),
     Access(Expr, Expr),
     Tuple(Vec<String>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Instr {
     Assign(Lhs, Expr),
     Async(Lhs, Expr, String, Vec<Expr>),
@@ -65,7 +66,7 @@ pub enum Instr {
 
 pub type Vertex = usize;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FunctionInfo {
     pub entry: Vertex,
     pub name: String,
@@ -73,7 +74,7 @@ pub struct FunctionInfo {
     pub locals: Vec<(String, Expr)>, // (name, default_value)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Label {
     Instr(Instr, Vertex /* next_vertex */),
     Pause(Vertex /* next_vertex */),
@@ -108,7 +109,7 @@ pub enum Value {
     VMap(Rc<RefCell<HashMap<Value, Value>>>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Program {
     // The CFG is just a list of all vertices.
     // The `Vertex` indices in `Label` and `FunctionInfo`
@@ -325,8 +326,7 @@ impl Compiler {
     }
 
     fn compile_for_loop(&mut self, loop_stmt: &ResolvedForLoop, next_vertex: Vertex) -> Vertex {
-        // The [Condition] check is the "head" of the loop.
-        let cond_vertex = self.cfg.len();
+        let cond_vertex = self.add_label(Label::Return(Expr::EUnit)); // Dummy label
 
         // Compile the [Increment] block.
         //    After it runs, it loops back to the [Condition].
@@ -347,6 +347,7 @@ impl Compiler {
             next_vertex,      // `break` goes to after the loop
         );
 
+        // Now we know `body_vertex`, so we can create the *real* condition label.
         let cond_expr = loop_stmt.condition.as_ref().map_or(
             Expr::EBool(true), // No condition == `true`
             |c| self.convert_simple_expr(c),
@@ -356,7 +357,8 @@ impl Compiler {
             body_vertex, // On true, go to body
             next_vertex, // On false, exit loop
         );
-        assert_eq!(self.add_label(cond_label), cond_vertex);
+
+        self.cfg[cond_vertex] = cond_label;
 
         // Compile the [Init] block.
         // It runs once, then goes to [Condition].
@@ -364,7 +366,7 @@ impl Compiler {
             Some(ResolvedForLoopInit::VarInit(vi)) => self.compile_expr_to_value(
                 &vi.value,
                 Lhs::Var(vi.original_name.clone()),
-                cond_vertex,
+                cond_vertex, // [FIX 4] This also correctly points to cond_vertex.
             ),
             Some(ResolvedForLoopInit::Assignment(assign)) => {
                 let lhs = self.convert_lhs(&assign.target);
@@ -461,25 +463,6 @@ impl Compiler {
                 self.add_label(label)
             }
         }
-    }
-
-    fn compile_arg_list(
-        &mut self,
-        args: &[ResolvedExpr],
-        next_vertex: Vertex,
-    ) -> (Vec<Expr>, Vertex) {
-        let mut next = next_vertex;
-        let mut arg_exprs = Vec::new();
-
-        // Compile args backwards, chaining them
-        for arg in args.iter().rev() {
-            let tmp = self.new_temp_var();
-            next = self.compile_expr_to_value(arg, Lhs::Var(tmp.clone()), next);
-            arg_exprs.push(Expr::EVar(tmp));
-        }
-
-        arg_exprs.reverse(); // Put them back in the correct order
-        (arg_exprs, next)
     }
 
     fn compile_func_call(
@@ -777,7 +760,7 @@ impl Compiler {
 
     fn convert_lhs(&mut self, expr: &ResolvedExpr) -> Lhs {
         match &expr.kind {
-            ResolvedExprKind::Var(id, name) => Lhs::Var(name.clone()),
+            ResolvedExprKind::Var(id, name) => Lhs::Var(resolved_name(*id, name)),
             // Desugar: `s[i] = ...` -> `LAccess(s, i)`
             ResolvedExprKind::Index(target, index) => Lhs::Access(
                 self.convert_simple_expr(target),

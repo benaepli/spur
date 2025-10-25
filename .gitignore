@@ -6,3 +6,5 @@
 *.bak
 *.swp
 .DS_Store
+
+output.json
