@@ -312,6 +312,16 @@ pub fn report_type_errors(
                 .with_notes(vec![
                     "help: role types can only be used for RPC calls".to_string(),
                 ]),
+
+            TypeError::UnwrapOnNonOptional { ty, span } => Diagnostic::error()
+                .with_message("cannot force-unwrap non-optional type")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("type `{}` is not optional", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: the force-unwrap operator `!` can only be used on optional types, but `{}` is not optional", ty),
+                ]),
         };
 
         term::emit_to_write_style(&mut writer_lock, &config, &files, &diagnostic)?;

@@ -95,6 +95,7 @@ pub enum ResolvedTypeDef {
     Map(Box<ResolvedTypeDef>, Box<ResolvedTypeDef>),
     List(Box<ResolvedTypeDef>),
     Tuple(Vec<ResolvedTypeDef>),
+    Optional(Box<ResolvedTypeDef>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +189,8 @@ pub enum ResolvedExprKind {
     IntLit(i64),
     StringLit(String),
     BoolLit(bool),
+    NilLit,
+
     BinOp(BinOp, Box<ResolvedExpr>, Box<ResolvedExpr>),
     Not(Box<ResolvedExpr>),
     Negate(Box<ResolvedExpr>),
@@ -211,6 +214,7 @@ pub enum ResolvedExprKind {
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
     FieldAccess(Box<ResolvedExpr>, String),
+    Unwrap(Box<ResolvedExpr>),
     StructLit(NameId, Vec<(String, ResolvedExpr)>),
 }
 
@@ -594,7 +598,10 @@ impl Resolver {
                     .map(|t| self.resolve_type_def(t))
                     .collect::<Result<_, _>>()?;
                 Ok(ResolvedTypeDef::Tuple(resolved_ts))
-            }
+            },
+            TypeDefKind::Optional(t) => Ok(ResolvedTypeDef::Optional(Box::new(
+                self.resolve_type_def(*t)?,
+            )))
         }
     }
 
@@ -763,6 +770,7 @@ impl Resolver {
             ExprKind::IntLit(i) => ResolvedExprKind::IntLit(i),
             ExprKind::StringLit(s) => ResolvedExprKind::StringLit(s),
             ExprKind::BoolLit(b) => ResolvedExprKind::BoolLit(b),
+            ExprKind::NilLit => ResolvedExprKind::NilLit,
             ExprKind::BinOp(op, l, r) => ResolvedExprKind::BinOp(
                 op,
                 Box::new(self.resolve_expr(*l)?),
@@ -854,6 +862,9 @@ impl Resolver {
             ExprKind::FieldAccess(e, name) => {
                 ResolvedExprKind::FieldAccess(Box::new(self.resolve_expr(*e)?), name)
             }
+            ExprKind::Unwrap(e) => { 
+                ResolvedExprKind::Unwrap(Box::new(self.resolve_expr(*e)?))
+            },
             ExprKind::StructLit(name, fields) => {
                 let type_id = self.lookup_type(&name, span)?;
                 let resolved_fields = fields

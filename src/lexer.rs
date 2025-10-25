@@ -51,6 +51,8 @@ pub enum TokenKind {
     Slash,
     Percent,
     Bang,
+    Question,
+    QuestionQuestion,
 
     Equal,
     EqualEqual,
@@ -100,6 +102,7 @@ pub enum TokenKind {
     RpcAsyncCall,
     True,
     False,
+    Nil,
 }
 
 impl fmt::Display for TokenKind {
@@ -122,6 +125,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Slash => write!(f, "/"),
             TokenKind::Percent => write!(f, "%"),
             TokenKind::Bang => write!(f, "!"),
+            TokenKind::Question => write!(f, "?"),
+            TokenKind::QuestionQuestion => write!(f, "??"),
             TokenKind::Equal => write!(f, "="),
             TokenKind::EqualEqual => write!(f, "=="),
             TokenKind::BangEqual => write!(f, "!="),
@@ -166,6 +171,7 @@ impl fmt::Display for TokenKind {
             TokenKind::RpcAsyncCall => write!(f, "rpc_async_call"),
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
+            TokenKind::Nil => write!(f, "nil"),
         }
     }
 }
@@ -204,6 +210,7 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "rpc_async_call" => TokenKind::RpcAsyncCall,
     "true" => TokenKind::True,
     "false" => TokenKind::False,
+    "nil" => TokenKind::Nil,
 };
 
 fn is_special_char(ch: char) -> bool {
@@ -224,6 +231,7 @@ fn is_special_char(ch: char) -> bool {
             | '/'
             | '%'
             | '!'
+            | '?'
             | '>'
             | '<'
             | '='
@@ -437,6 +445,14 @@ impl<'a> Iterator for Lexer<'a> {
                     Ok(TokenKind::BangEqual)
                 } else {
                     Ok(TokenKind::Bang)
+                }
+            }
+
+            '?' => {
+                if self.match_next('?') {
+                    Ok(TokenKind::QuestionQuestion)
+                } else {
+                    Ok(TokenKind::Question)
                 }
             }
 

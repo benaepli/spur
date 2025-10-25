@@ -20,10 +20,12 @@ pub enum Type {
     Tuple(Vec<Type>),
     Struct(NameId),
     Role(NameId),
+    Optional(Box<Type>),
 
     // Placeholder types.
     EmptyList,
     EmptyMap,
+    Nil,
 }
 
 impl std::fmt::Display for Type {
@@ -45,8 +47,10 @@ impl std::fmt::Display for Type {
             }
             Type::Struct(id) => write!(f, "struct(id:{})", id.0),
             Type::Role(id) => write!(f, "role(id:{})", id.0),
+            Type::Optional(t) => write!(f, "{}?", t),
             Type::EmptyList => write!(f, "empty list"),
             Type::EmptyMap => write!(f, "empty map"),
+            Type::Nil => write!(f, "nil"),
         }
     }
 }
@@ -136,6 +140,8 @@ pub enum TypeError {
     NotAList { ty: Type, span: Span },
     #[error("Cannot apply operation to role type `{ty}`")]
     InvalidRoleOperation { ty: Type, span: Span },
+    #[error("Cannot force-unwrap a non-optional type `{ty}`")]
+    UnwrapOnNonOptional { ty: Type, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -573,7 +579,10 @@ impl TypeChecker {
             ResolvedExprKind::IntLit(_) => Ok(Type::Int),
             ResolvedExprKind::StringLit(_) => Ok(Type::String),
             ResolvedExprKind::BoolLit(_) => Ok(Type::Bool),
-            ResolvedExprKind::BinOp(op, left, right) => self.check_binop(op.clone(), left, right),
+            ResolvedExprKind::NilLit => Ok(Type::Nil),
+            ResolvedExprKind::BinOp(op, left, right) => {
+                self.check_binop(op.clone(), left, right, expr.span)
+            }
             ResolvedExprKind::Not(e) => {
                 let ty = self.check_expr(e)?;
                 self.check_type_compatibility(&Type::Bool, &ty, expr.span)?;
@@ -603,9 +612,7 @@ impl TypeChecker {
                         self.check_type_compatibility(elem_ty.as_ref(), &item_type, expr.span)?;
                         Ok(Type::List(elem_ty))
                     }
-                    Type::EmptyList => {
-                        Ok(Type::List(Box::new(item_type)))
-                    }
+                    Type::EmptyList => Ok(Type::List(Box::new(item_type))),
                     _ => Err(TypeError::NotAList {
                         ty: list_type,
                         span: expr.span,
@@ -724,6 +731,13 @@ impl TypeChecker {
             }
             ResolvedExprKind::FieldAccess(struct_expr, field_name) => {
                 let struct_ty = self.check_expr(struct_expr)?;
+                if matches!(struct_ty, Type::Optional(_)) {
+                    return Err(TypeError::NotAStruct {
+                        ty: struct_ty,
+                        field_name: field_name.clone(),
+                        span: expr.span,
+                    });
+                }
                 if let Type::Struct(struct_id) = struct_ty {
                     self.get_field_type(struct_id, field_name, expr.span)
                 } else {
@@ -732,6 +746,16 @@ impl TypeChecker {
                         field_name: field_name.clone(),
                         span: expr.span,
                     })
+                }
+            }
+            ResolvedExprKind::Unwrap(e) => {
+                let inner_ty = self.check_expr(e)?;
+                match inner_ty {
+                    Type::Optional(t) => Ok(*t), // T? -> T
+                    _ => Err(TypeError::UnwrapOnNonOptional {
+                        ty: inner_ty,
+                        span: expr.span,
+                    }),
                 }
             }
             ResolvedExprKind::StructLit(struct_id, fields) => {
@@ -770,6 +794,7 @@ impl TypeChecker {
         op: BinOp,
         left: &ResolvedExpr,
         right: &ResolvedExpr,
+        span: Span,
     ) -> Result<Type, TypeError> {
         let left_ty = self.check_expr(left)?;
         let right_ty = self.check_expr(right)?;
@@ -781,6 +806,11 @@ impl TypeChecker {
                 Ok(Type::Int)
             }
             BinOp::Equal | BinOp::NotEqual => {
+                if (matches!(left_ty, Type::Optional(_)) && right_ty == Type::Nil)
+                    || (left_ty == Type::Nil && matches!(right_ty, Type::Optional(_)))
+                {
+                    return Ok(Type::Bool);
+                }
                 self.check_type_compatibility(&left_ty, &right_ty, right.span)?;
                 Ok(Type::Bool)
             }
@@ -793,6 +823,23 @@ impl TypeChecker {
                 self.check_type_compatibility(&Type::Bool, &left_ty, left.span)?;
                 self.check_type_compatibility(&Type::Bool, &right_ty, right.span)?;
                 Ok(Type::Bool)
+            }
+            BinOp::Coalesce => {
+                let left_ty = self.check_expr(left)?;
+                let right_ty = self.check_expr(right)?;
+
+                if let Type::Optional(inner_ty) = left_ty {
+                    self.check_type_compatibility(inner_ty.as_ref(), &right_ty, span)?;
+                    Ok(*inner_ty)
+                } else {
+                    Err(TypeError::InvalidBinOp {
+                        //
+                        op: BinOp::Coalesce,
+                        left: left_ty,
+                        right: right_ty,
+                        span,
+                    })
+                }
             }
         }
     }
@@ -849,11 +896,7 @@ impl TypeChecker {
         }
     }
 
-    fn check_list_literal(
-        &mut self,
-        items: &[ResolvedExpr],
-        _: Span,
-    ) -> Result<Type, TypeError> {
+    fn check_list_literal(&mut self, items: &[ResolvedExpr], _: Span) -> Result<Type, TypeError> {
         if items.is_empty() {
             return Ok(Type::EmptyList);
         }
@@ -1025,6 +1068,16 @@ impl TypeChecker {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Type::Tuple(resolved_types))
             }
+            ResolvedTypeDef::Optional(t) => {
+                // <-- ADD THIS
+                let base_type = self.resolve_type(t)?;
+                // "Collapse" nested optionals: T?? becomes T?
+                if matches!(base_type, Type::Optional(_)) {
+                    Ok(base_type)
+                } else {
+                    Ok(Type::Optional(Box::new(base_type)))
+                }
+            }
         }
     }
 
@@ -1034,23 +1087,36 @@ impl TypeChecker {
         actual: &Type,
         span: Span,
     ) -> Result<(), TypeError> {
-        if let (Type::List(_), Type::EmptyList) = (expected, actual) {
+        if expected == actual {
             return Ok(());
         }
 
+        // Check for "Empty" placeholders
+        if let (Type::List(_), Type::EmptyList) = (expected, actual) {
+            return Ok(());
+        }
         if let (Type::Map(_, _), Type::EmptyMap) = (expected, actual) {
             return Ok(());
         }
 
-        if expected != actual {
-            Err(TypeError::Mismatch {
-                expected: expected.clone(),
-                found: actual.clone(),
-                span,
-            })
-        } else {
-            Ok(())
+        // Check for optional "widening"
+        if let Type::Optional(expected_inner) = expected {
+            if *actual == Type::Nil {
+                return Ok(());
+            }
+            if **expected_inner == *actual {
+                return Ok(());
+            }
+            if let Type::Optional(actual_inner) = actual {
+                return self.check_type_compatibility(expected_inner, actual_inner, span);
+            }
         }
+
+        Err(TypeError::Mismatch {
+            expected: expected.clone(),
+            found: actual.clone(),
+            span,
+        })
     }
 
     fn enter_scope(&mut self) {

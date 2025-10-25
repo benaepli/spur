@@ -85,6 +85,7 @@ pub enum TypeDefKind {
     Map(Box<TypeDef>, Box<TypeDef>),
     List(Box<TypeDef>),
     Tuple(Vec<TypeDef>),
+    Optional(Box<TypeDef>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,6 +204,7 @@ pub enum ExprKind {
     IntLit(i64),
     StringLit(String),
     BoolLit(bool),
+    NilLit,
 
     // Binary operations
     BinOp(BinOp, Box<Expr>, Box<Expr>),
@@ -241,6 +243,7 @@ pub enum ExprKind {
     Slice(Box<Expr>, Box<Expr>, Box<Expr>),
     TupleAccess(Box<Expr>, usize),
     FieldAccess(Box<Expr>, String),
+    Unwrap(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -270,6 +273,7 @@ pub enum BinOp {
     Multiply,
     Divide,
     Modulo,
+    Coalesce,
 }
 
 impl std::fmt::Display for BinOp {
@@ -288,6 +292,7 @@ impl std::fmt::Display for BinOp {
             BinOp::Multiply => write!(f, "*"),
             BinOp::Divide => write!(f, "/"),
             BinOp::Modulo => write!(f, "%"),
+            BinOp::Coalesce => write!(f, "??"),
         }
     }
 }
@@ -388,7 +393,21 @@ where
                 span: e.span(),
             });
 
-        choice((named, map, list, tuple))
+        let base_type = choice((named, map, list, tuple));
+
+        base_type
+            .clone()
+            .then(just(TokenKind::Question).or_not())
+            .map_with(|(base, opt_q), e| {
+                if opt_q.is_some() {
+                    TypeDef {
+                        kind: TypeDefKind::Optional(Box::new(base)),
+                        span: e.span(),
+                    }
+                } else {
+                    base
+                }
+            })
     });
 
     let primary = {
@@ -397,6 +416,7 @@ where
             TokenKind::String(s) => ExprKind::StringLit(s),
             TokenKind::True => ExprKind::BoolLit(true),
             TokenKind::False => ExprKind::BoolLit(false),
+            TokenKind::Nil => ExprKind::NilLit,
         };
 
         let args = || {
@@ -469,7 +489,8 @@ where
             )
             .map(|(name, fields)| ExprKind::StructLit(name, fields));
 
-        let paren_expr = expr.clone()
+        let paren_expr = expr
+            .clone()
             .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen));
 
         let two_arg_builtin = |name, constructor: fn(Box<Expr>, Box<Expr>) -> ExprKind| {
@@ -541,6 +562,7 @@ where
             Slice(Expr, Expr),
             TupleAccess(usize, Span),
             FieldAccess(String, Span),
+            Unwrap(Span),
         }
 
         let postfix_op = choice((
@@ -562,6 +584,7 @@ where
             just(TokenKind::Dot)
                 .ignore_then(ident.clone())
                 .map_with(|name, e| PostfixOp::FieldAccess(name, e.span())),
+            just(TokenKind::Bang).map_with(|_, e| PostfixOp::Unwrap(e.span())),
         ));
 
         primary_base.foldl(postfix_op.repeated(), |lhs, op| match op {
@@ -583,6 +606,10 @@ where
             PostfixOp::FieldAccess(name, op_span) => {
                 let span = lhs.span.union(op_span);
                 Expr::new(ExprKind::FieldAccess(Box::new(lhs), name), span)
+            }
+            PostfixOp::Unwrap(op_span) => {
+                let span = lhs.span.union(op_span);
+                Expr::new(ExprKind::Unwrap(Box::new(lhs)), span)
             }
         })
     };
@@ -639,7 +666,12 @@ where
         let and_expr = build_binary_op(comparison, just(TokenKind::And).to(BinOp::And));
         let or_expr = build_binary_op(and_expr, just(TokenKind::Or).to(BinOp::Or));
 
-        or_expr
+        let coalescing_expr = build_binary_op(
+            or_expr,
+            just(TokenKind::QuestionQuestion).to(BinOp::Coalesce),
+        );
+
+        coalescing_expr
     });
 
     let var_init_core = just(TokenKind::Let)

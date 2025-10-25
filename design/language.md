@@ -130,3 +130,6 @@ rpc_call ::= ( 'rpc_call' | 'rpc_async_call' ) '(' expr ',' func_call ')'
 
 Notice that we allow any primary expression on the left hand side.
 We have to introduce a semantic analysis stage that checks if the left side is a valid assignment.
+
+## Typing
+
