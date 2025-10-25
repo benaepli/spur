@@ -379,6 +379,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
 
 [[package]]
+name = "spur"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chumsky",
+ "clap",
+ "codespan-reporting",
+ "phf",
+ "phf_macros",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "stacker"
 version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -435,21 +450,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "turnpike"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chumsky",
- "clap",
- "codespan-reporting",
- "phf",
- "phf_macros",
- "serde",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]

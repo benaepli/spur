@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::Path;
 use clap::Parser;
-use turnpike::compiler;
+use spur::compiler;
 
 #[derive(Parser)]
-#[command(name = "turnpike-frontend")]
-#[command(about = "A compiler for Turnpike.", long_about = None)]
+#[command(name = "spur-frontend")]
+#[command(about = "A compiler for spur.", long_about = None)]
 struct Args {
     /// Input specification file
     spec: String,
