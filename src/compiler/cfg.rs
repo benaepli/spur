@@ -275,7 +275,7 @@ impl Compiler {
                 // Compile the value, assigning to the new variable
                 self.compile_expr_to_value(
                     &init.value,
-                    Lhs::Var(init.original_name.clone()),
+                    Lhs::Var(resolved_name(init.name, &init.original_name)),
                     next_vertex,
                 )
             }
@@ -326,6 +326,7 @@ impl Compiler {
     }
 
     fn compile_for_loop(&mut self, loop_stmt: &ResolvedForLoop, next_vertex: Vertex) -> Vertex {
+        // The [Condition] check is the "head" of the loop.
         let cond_vertex = self.add_label(Label::Return(Expr::EUnit)); // Dummy label
 
         // Compile the [Increment] block.
@@ -347,7 +348,6 @@ impl Compiler {
             next_vertex,      // `break` goes to after the loop
         );
 
-        // Now we know `body_vertex`, so we can create the *real* condition label.
         let cond_expr = loop_stmt.condition.as_ref().map_or(
             Expr::EBool(true), // No condition == `true`
             |c| self.convert_simple_expr(c),
@@ -365,8 +365,8 @@ impl Compiler {
         let init_vertex = match &loop_stmt.init {
             Some(ResolvedForLoopInit::VarInit(vi)) => self.compile_expr_to_value(
                 &vi.value,
-                Lhs::Var(vi.original_name.clone()),
-                cond_vertex, // [FIX 4] This also correctly points to cond_vertex.
+                Lhs::Var(resolved_name(vi.name, &vi.original_name)),
+                cond_vertex,
             ),
             Some(ResolvedForLoopInit::Assignment(assign)) => {
                 let lhs = self.convert_lhs(&assign.target);
@@ -435,6 +435,70 @@ impl Compiler {
         ))
     }
 
+    // Helper to generate temp vars and EVar expressions for a list
+    fn compile_temp_list(&mut self, count: usize) -> (Vec<String>, Vec<Expr>) {
+        (0..count)
+            .map(|_| {
+                let tmp = self.new_temp_var();
+                (tmp.clone(), Expr::EVar(tmp))
+            })
+            .unzip()
+    }
+
+    // Helper to generate temp vars and EVar expressions for (key, value) pairs
+    fn compile_temp_pairs(
+        &mut self,
+        count: usize,
+    ) -> (Vec<String>, Vec<String>, Vec<(Expr, Expr)>) {
+        let mut key_tmps = Vec::with_capacity(count);
+        let mut val_tmps = Vec::with_capacity(count);
+        let mut simple_pairs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key_tmp = self.new_temp_var();
+            let val_tmp = self.new_temp_var();
+            simple_pairs.push((Expr::EVar(key_tmp.clone()), Expr::EVar(val_tmp.clone())));
+            key_tmps.push(key_tmp);
+            val_tmps.push(val_tmp);
+        }
+        (key_tmps, val_tmps, simple_pairs)
+    }
+
+    // Helper to recursively compile a list of expressions into a list of temp vars
+    fn compile_expr_list_recursive<'a, I>(
+        &mut self,
+        exprs: I,
+        tmps: Vec<String>,
+        next_vertex: Vertex,
+    ) -> Vertex
+    where
+        I: DoubleEndedIterator<Item = &'a ResolvedExpr>,
+    {
+        let mut next = next_vertex;
+        for (expr, tmp) in exprs.rev().zip(tmps.iter().rev()) {
+            next = self.compile_expr_to_value(expr, Lhs::Var(tmp.clone()), next);
+        }
+        next
+    }
+
+    fn convert_simple_binop(&mut self, op: &BinOp, left: Box<Expr>, right: Box<Expr>) -> Expr {
+        match op {
+            BinOp::Add => Expr::EPlus(left, right),
+            BinOp::Subtract => Expr::EMinus(left, right),
+            BinOp::Multiply => Expr::ETimes(left, right),
+            BinOp::Divide => Expr::EDiv(left, right),
+            BinOp::Modulo => Expr::EMod(left, right),
+            BinOp::And => Expr::EAnd(left, right),
+            BinOp::Or => Expr::EOr(left, right),
+            BinOp::Equal => Expr::EEqualsEquals(left, right),
+            BinOp::NotEqual => Expr::ENot(Box::new(Expr::EEqualsEquals(left, right))),
+            BinOp::Less => Expr::ELessThan(left, right),
+            BinOp::LessEqual => Expr::ELessThanEquals(left, right),
+            BinOp::Greater => Expr::EGreaterThan(left, right),
+            BinOp::GreaterEqual => Expr::EGreaterThanEquals(left, right),
+            BinOp::Coalesce => Expr::ECoalesce(left, right),
+        }
+    }
+
     /// Compiles any expression into CFG labels, storing the
     /// result in `target`.
     /// Returns the entry vertex for this sequence of instructions.
@@ -454,7 +518,258 @@ impl Compiler {
                 self.compile_rpc_async_call(target_expr, call, target, next_vertex)
             }
 
-            // --- Simple, non-side-effecting cases ---
+            // --- Compound expressions that may contain complex sub-expressions ---
+            ResolvedExprKind::BinOp(op, l, r) => {
+                let l_tmp = self.new_temp_var();
+                let r_tmp = self.new_temp_var();
+                let l_expr = Box::new(Expr::EVar(l_tmp.clone()));
+                let r_expr = Box::new(Expr::EVar(r_tmp.clone()));
+                let final_expr = self.convert_simple_binop(op, l_expr, r_expr);
+
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let r_vertex = self.compile_expr_to_value(r, Lhs::Var(r_tmp), assign_vertex);
+                let l_vertex = self.compile_expr_to_value(l, Lhs::Var(l_tmp), r_vertex);
+                l_vertex
+            }
+
+            ResolvedExprKind::Not(e) => {
+                let e_tmp = self.new_temp_var();
+                let final_expr = Expr::ENot(Box::new(Expr::EVar(e_tmp.clone())));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::Negate(e) => {
+                let e_tmp = self.new_temp_var();
+                let final_expr =
+                    Expr::EMinus(Box::new(Expr::EInt(0)), Box::new(Expr::EVar(e_tmp.clone())));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::MapLit(pairs) => {
+                let (key_tmps, val_tmps, simple_pairs) = self.compile_temp_pairs(pairs.len());
+                let final_expr = Expr::EMap(simple_pairs);
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+
+                let keys_entry_vertex = self.compile_expr_list_recursive(
+                    pairs.iter().map(|(k, v)| k),
+                    key_tmps,
+                    assign_vertex,
+                );
+
+                self.compile_expr_list_recursive(
+                    pairs.iter().map(|(k, v)| v),
+                    val_tmps,
+                    keys_entry_vertex,
+                )
+            }
+
+            ResolvedExprKind::ListLit(items) => {
+                let (tmps, simple_exprs) = self.compile_temp_list(items.len());
+                let final_expr = Expr::EList(simple_exprs);
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_list_recursive(items.iter(), tmps, assign_vertex)
+            }
+
+            ResolvedExprKind::TupleLit(items) => {
+                let (tmps, simple_exprs) = self.compile_temp_list(items.len());
+                let final_expr = Expr::ETuple(simple_exprs);
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_list_recursive(items.iter(), tmps, assign_vertex)
+            }
+
+            ResolvedExprKind::Append(l, i) => {
+                let l_tmp = self.new_temp_var();
+                let i_tmp = self.new_temp_var();
+                let final_expr = Expr::EListAppend(
+                    Box::new(Expr::EVar(l_tmp.clone())),
+                    Box::new(Expr::EVar(i_tmp.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let i_vertex = self.compile_expr_to_value(i, Lhs::Var(i_tmp), assign_vertex);
+                self.compile_expr_to_value(l, Lhs::Var(l_tmp), i_vertex)
+            }
+
+            ResolvedExprKind::Prepend(i, l) => {
+                let i_tmp = self.new_temp_var();
+                let l_tmp = self.new_temp_var();
+                let final_expr = Expr::EListPrepend(
+                    Box::new(Expr::EVar(i_tmp.clone())),
+                    Box::new(Expr::EVar(l_tmp.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let l_vertex = self.compile_expr_to_value(l, Lhs::Var(l_tmp), assign_vertex);
+                self.compile_expr_to_value(i, Lhs::Var(i_tmp), l_vertex)
+            }
+
+            ResolvedExprKind::Len(e) => {
+                let e_tmp = self.new_temp_var();
+                let final_expr = Expr::EListLen(Box::new(Expr::EVar(e_tmp.clone())));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::Min(l, r) => {
+                let l_tmp = self.new_temp_var();
+                let r_tmp = self.new_temp_var();
+                let final_expr = Expr::EMin(
+                    Box::new(Expr::EVar(l_tmp.clone())),
+                    Box::new(Expr::EVar(r_tmp.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let r_vertex = self.compile_expr_to_value(r, Lhs::Var(r_tmp), assign_vertex);
+                self.compile_expr_to_value(l, Lhs::Var(l_tmp), r_vertex)
+            }
+
+            ResolvedExprKind::Exists(map, key) => {
+                let map_tmp = self.new_temp_var();
+                let key_tmp = self.new_temp_var();
+                let final_expr = Expr::EKeyExists(
+                    Box::new(Expr::EVar(key_tmp.clone())),
+                    Box::new(Expr::EVar(map_tmp.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let key_vertex = self.compile_expr_to_value(key, Lhs::Var(key_tmp), assign_vertex);
+                self.compile_expr_to_value(map, Lhs::Var(map_tmp), key_vertex)
+            }
+
+            ResolvedExprKind::Head(l) => {
+                let l_tmp = self.new_temp_var();
+                let final_expr = Expr::EListAccess(Box::new(Expr::EVar(l_tmp.clone())), 0);
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(l, Lhs::Var(l_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::Tail(l) => {
+                let l_tmp = self.new_temp_var();
+                let list_expr = Expr::EVar(l_tmp.clone());
+                let final_expr = Expr::EListSubsequence(
+                    Box::new(list_expr.clone()),
+                    Box::new(Expr::EInt(1)),
+                    Box::new(Expr::EListLen(Box::new(list_expr))),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(l, Lhs::Var(l_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::Index(target_expr, index_expr) => {
+                let target_tmp = self.new_temp_var();
+                let index_tmp = self.new_temp_var();
+                let final_expr = Expr::EFind(
+                    Box::new(Expr::EVar(target_tmp.clone())),
+                    Box::new(Expr::EVar(index_tmp.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let index_vertex =
+                    self.compile_expr_to_value(index_expr, Lhs::Var(index_tmp), assign_vertex);
+                self.compile_expr_to_value(target_expr, Lhs::Var(target_tmp), index_vertex)
+            }
+
+            ResolvedExprKind::Slice(target_expr, start_expr, end_expr) => {
+                let target_tmp = self.new_temp_var();
+                let start_tmp = self.new_temp_var();
+                let end_tmp = self.new_temp_var();
+                let final_expr = Expr::EListSubsequence(
+                    Box::new(Expr::EVar(target_tmp.clone())),
+                    Box::new(Expr::EVar(start_tmp.clone())),
+                    Box::new(Expr::EVar(end_tmp.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let end_vertex =
+                    self.compile_expr_to_value(end_expr, Lhs::Var(end_tmp), assign_vertex);
+                let start_vertex =
+                    self.compile_expr_to_value(start_expr, Lhs::Var(start_tmp), end_vertex);
+                self.compile_expr_to_value(target_expr, Lhs::Var(target_tmp), start_vertex)
+            }
+
+            ResolvedExprKind::TupleAccess(tuple_expr, index) => {
+                let tuple_tmp = self.new_temp_var();
+                let final_expr =
+                    Expr::ETupleAccess(Box::new(Expr::EVar(tuple_tmp.clone())), *index);
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(tuple_expr, Lhs::Var(tuple_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::FieldAccess(target_expr, field) => {
+                let target_tmp = self.new_temp_var();
+                let final_expr = Expr::EFind(
+                    Box::new(Expr::EVar(target_tmp.clone())),
+                    Box::new(Expr::EString(field.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(target_expr, Lhs::Var(target_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::Unwrap(e) => {
+                let e_tmp = self.new_temp_var();
+                let final_expr = Expr::EUnwrap(Box::new(Expr::EVar(e_tmp.clone())));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::StructLit(_, fields) => {
+                let (field_names, val_exprs): (Vec<_>, Vec<_>) = fields.iter().cloned().unzip();
+                let (tmps, simple_exprs) = self.compile_temp_list(val_exprs.len());
+                let final_pairs = field_names
+                    .into_iter()
+                    .map(Expr::EString)
+                    .zip(simple_exprs)
+                    .collect();
+                let final_expr = Expr::EMap(final_pairs);
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_list_recursive(val_exprs.iter(), tmps, assign_vertex)
+            }
+
+            ResolvedExprKind::PollForResps(e1, e2) => {
+                let e1_tmp = self.new_temp_var();
+                let e2_tmp = self.new_temp_var();
+                let final_expr = Expr::EPollForResps(
+                    Box::new(Expr::EVar(e1_tmp.clone())),
+                    Box::new(Expr::EVar(e2_tmp.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let e2_vertex = self.compile_expr_to_value(e2, Lhs::Var(e2_tmp), assign_vertex);
+                self.compile_expr_to_value(e1, Lhs::Var(e1_tmp), e2_vertex)
+            }
+
+            ResolvedExprKind::PollForAnyResp(e) => {
+                let e_tmp = self.new_temp_var();
+                let final_expr = Expr::EPollForAnyResp(Box::new(Expr::EVar(e_tmp.clone())));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
+            }
+
+            ResolvedExprKind::NextResp(e) => {
+                let e_tmp = self.new_temp_var();
+                let final_expr = Expr::ENextResp(Box::new(Expr::EVar(e_tmp.clone())));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
+            }
+
+            // --- Truly simple, non-side-effecting cases ---
             _ => {
                 // Desugar the simple expression
                 let sim_expr = self.convert_simple_expr(expr);
@@ -644,22 +959,7 @@ impl Compiler {
             ResolvedExprKind::BinOp(op, l, r) => {
                 let left = Box::new(self.convert_simple_expr(l));
                 let right = Box::new(self.convert_simple_expr(r));
-                match op {
-                    BinOp::Add => Expr::EPlus(left, right),
-                    BinOp::Subtract => Expr::EMinus(left, right),
-                    BinOp::Multiply => Expr::ETimes(left, right),
-                    BinOp::Divide => Expr::EDiv(left, right),
-                    BinOp::Modulo => Expr::EMod(left, right),
-                    BinOp::And => Expr::EAnd(left, right),
-                    BinOp::Or => Expr::EOr(left, right),
-                    BinOp::Equal => Expr::EEqualsEquals(left, right),
-                    BinOp::NotEqual => Expr::ENot(Box::new(Expr::EEqualsEquals(left, right))),
-                    BinOp::Less => Expr::ELessThan(left, right),
-                    BinOp::LessEqual => Expr::ELessThanEquals(left, right),
-                    BinOp::Greater => Expr::EGreaterThan(left, right),
-                    BinOp::GreaterEqual => Expr::EGreaterThanEquals(left, right),
-                    BinOp::Coalesce => Expr::ECoalesce(left, right),
-                }
+                self.convert_simple_binop(op, left, right)
             }
             ResolvedExprKind::Not(e) => Expr::ENot(Box::new(self.convert_simple_expr(e))),
             ResolvedExprKind::Negate(e) => Expr::EMinus(
@@ -819,7 +1119,7 @@ impl Compiler {
                 // `let x = ...` adds a local
                 locals.push((
                     resolved_name(init.name, &init.original_name),
-                    self.convert_simple_expr(&init.value),
+                    Expr::ENil, // Use placeholder, actual init is handled by CFG
                 ));
             }
             ResolvedStatementKind::Conditional(cond) => {
@@ -836,7 +1136,7 @@ impl Compiler {
                 if let Some(ResolvedForLoopInit::VarInit(init)) = &fl.init {
                     locals.push((
                         resolved_name(init.name, &init.original_name),
-                        self.convert_simple_expr(&init.value),
+                        Expr::ENil, // Use placeholder
                     ));
                 }
                 self.scan_body_for_locals(&fl.body, locals);
