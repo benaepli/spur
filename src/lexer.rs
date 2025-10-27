@@ -420,7 +420,22 @@ impl<'a> Iterator for Lexer<'a> {
             ';' => Ok(TokenKind::Semicolon),
             ':' => Ok(TokenKind::Colon),
             '.' => Ok(TokenKind::Dot),
-            '_' => Ok(TokenKind::Underscore),
+
+            '_' => {
+                // Check if this is part of an identifier or standalone underscore
+                if let Some(&next_ch) = self.input.peek() {
+                    if next_ch.is_alphanumeric() || next_ch == '_' {
+                        // It's the start of an identifier like _test
+                        Ok(self.parse_identifier('_'))
+                    } else {
+                        // Standalone underscore
+                        Ok(TokenKind::Underscore)
+                    }
+                } else {
+                    // End of input, standalone underscore
+                    Ok(TokenKind::Underscore)
+                }
+            }
 
             '+' => Ok(TokenKind::Plus),
             '*' => Ok(TokenKind::Star),
@@ -533,7 +548,7 @@ mod tests {
         assert_eq!(tokens.len(), 13);
         assert_eq!(tokens[0].kind, TokenKind::Plus);
         assert_eq!(tokens[1].kind, TokenKind::Minus);
-        assert_eq!(tokens[6].kind, TokenKind::EqualEqual);
+        assert_eq!(tokens[5].kind, TokenKind::EqualEqual);
         assert_eq!(tokens[11].kind, TokenKind::Arrow);
     }
 

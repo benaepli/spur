@@ -561,13 +561,13 @@ impl Compiler {
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
                 let keys_entry_vertex = self.compile_expr_list_recursive(
-                    pairs.iter().map(|(k, v)| k),
+                    pairs.iter().map(|(k, _v)| k),
                     key_tmps,
                     assign_vertex,
                 );
 
                 self.compile_expr_list_recursive(
-                    pairs.iter().map(|(k, v)| v),
+                    pairs.iter().map(|(_k, v)| v),
                     val_tmps,
                     keys_entry_vertex,
                 )
