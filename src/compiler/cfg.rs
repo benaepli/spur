@@ -409,34 +409,45 @@ impl Compiler {
     fn compile_for_in_loop(
         &mut self,
         loop_stmt: &ResolvedForInLoop,
-        next_vertex: Vertex,
+        next_vertex: Vertex, 
     ) -> Vertex {
-        let for_vertex = self.cfg.len();
+        // The [ForLoopIn] label is the "head" of the loop.
+        // We add a dummy label to reserve its vertex index.
+        let for_vertex = self.add_label(Label::Return(Expr::EUnit)); // Dummy label
 
-        // Compile the body, which loops back to `for_vertex`.
+        // Compile the [Body] block.
+        // After it runs, it loops back to the [ForLoopIn] check.
+        // Any `Break` inside it goes to `next_vertex`.
         let body_vertex = self.compile_block(
             &loop_stmt.body,
-            for_vertex,  // Loop back to self
+            for_vertex,  // Loop back to the ForLoopIn label
             next_vertex, // Break target
         );
 
+        // Now we create the real [ForLoopIn] label.
         let lhs = self.convert_pattern(&loop_stmt.pattern);
-
+        // We iterate over a local copy to avoid modification-during-iteration issues.
         let iterable_copy_var = "_local_copy".to_string();
-        let label = Label::ForLoopIn(
+        let for_label = Label::ForLoopIn(
             lhs,
             Expr::EVar(iterable_copy_var.clone()),
-            body_vertex, // Go here on iteration
-            next_vertex, // Go here when done
+            body_vertex, // On iteration, go to body
+            next_vertex, // When done, exit loop
         );
-        // This assertion just ensures our vertex indices are correct.
-        assert_eq!(self.add_label(label), for_vertex);
 
+        // Replace the dummy label with the real one.
+        self.cfg[for_vertex] = for_label;
+
+        // Compile the [Iterable] expression.
+        // This `Copy` instruction runs once, then goes to the [ForLoopIn] label.
         let iterable_expr = self.convert_simple_expr(&loop_stmt.iterable);
-        self.add_label(Label::Instr(
+        let copy_vertex = self.add_label(Label::Instr(
             Instr::Copy(Lhs::Var(iterable_copy_var), iterable_expr),
-            for_vertex,
-        ))
+            for_vertex, // After copy, go to the loop head
+        ));
+
+        // The entry point to the whole statement is the `Copy` instruction.
+        copy_vertex
     }
 
     // Helper to generate temp vars and EVar expressions for a list
