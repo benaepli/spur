@@ -18,8 +18,8 @@ pub enum Type {
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
     Tuple(Vec<Type>),
-    Struct(NameId),
-    Role(NameId),
+    Struct(NameId, String),
+    Role(NameId, String),
     Optional(Box<Type>),
     Future(Box<Type>),
 
@@ -46,8 +46,8 @@ impl std::fmt::Display for Type {
                     .join(", ");
                 write!(f, "({})", inner)
             }
-            Type::Struct(id) => write!(f, "struct(id:{})", id.0),
-            Type::Role(id) => write!(f, "role(id:{})", id.0),
+            Type::Struct(_, name) => write!(f, "{}", name),
+            Type::Role(_, name) => write!(f, "{}", name),
             Type::Optional(t) => write!(f, "{}?", t),
             Type::Future(t) => write!(f, "future<{}>", t),
             Type::EmptyList => write!(f, "empty list"),
@@ -177,6 +177,8 @@ pub struct TypeChecker {
     func_signatures: HashMap<NameId, FunctionSignature>,
     /// Maps role `NameId` to role name
     role_defs: HashMap<NameId, String>,
+    /// Maps struct `NameId` to struct name
+    struct_names: HashMap<NameId, String>,
     /// The expected return type of the current function being checked.
     current_return_type: Option<Type>,
     /// Track if we're inside a loop (for break statements)
@@ -199,6 +201,7 @@ impl TypeChecker {
             type_defs: predefined,
             func_signatures: HashMap::new(),
             role_defs: HashMap::new(),
+            struct_names: HashMap::new(),
             current_return_type: None,
             loop_depth: 0,
         }
@@ -237,6 +240,8 @@ impl TypeChecker {
                         type_def.name,
                         TypeDefinition::UserDefined(type_def.def.clone()),
                     );
+                    // Store the struct name for later use
+                    self.struct_names.insert(type_def.name, type_def.original_name.clone());
                 }
                 ResolvedTopLevelDef::Role(role) => {
                     self.role_defs.insert(role.name, role.original_name.clone());
@@ -747,7 +752,7 @@ impl TypeChecker {
                         span: expr.span,
                     });
                 }
-                if let Type::Struct(struct_id) = struct_ty {
+                if let Type::Struct(struct_id, _) = struct_ty {
                     self.get_field_type(struct_id, field_name, expr.span)
                 } else {
                     Err(TypeError::NotAStruct {
@@ -772,7 +777,7 @@ impl TypeChecker {
             }
             ResolvedExprKind::RpcCall(target, call) => {
                 let target_ty = self.check_expr(target)?;
-                if !matches!(target_ty, Type::Role(_)) {
+                if !matches!(target_ty, Type::Role(..)) {
                     return Err(TypeError::RpcCallTargetNotRole {
                         ty: target_ty,
                         span: expr.span,
@@ -784,7 +789,7 @@ impl TypeChecker {
 
             ResolvedExprKind::RpcAsyncCall(target, call) => {
                 let target_ty = self.check_expr(target)?;
-                if !matches!(target_ty, Type::Role(_)) {
+                if !matches!(target_ty, Type::Role(..)) {
                     return Err(TypeError::RpcCallTargetNotRole {
                         ty: target_ty,
                         span: expr.span,
@@ -1034,16 +1039,22 @@ impl TypeChecker {
 
         let field_defs = match type_def {
             TypeDefinition::Builtin(_) => {
+                let struct_name = self.struct_names.get(&struct_id)
+                    .map(|s| s.clone())
+                    .unwrap_or_else(|| format!("struct_{}", struct_id.0));
                 return Err(TypeError::NotAStruct {
-                    ty: Type::Struct(struct_id),
+                    ty: Type::Struct(struct_id, struct_name),
                     field_name: "".to_string(),
                     span,
                 });
             }
             TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => fields,
             TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(_)) => {
+                let struct_name = self.struct_names.get(&struct_id)
+                    .map(|s| s.clone())
+                    .unwrap_or_else(|| format!("struct_{}", struct_id.0));
                 return Err(TypeError::NotAStruct {
-                    ty: Type::Struct(struct_id),
+                    ty: Type::Struct(struct_id, struct_name),
                     field_name: "".to_string(),
                     span,
                 });
@@ -1075,7 +1086,10 @@ impl TypeChecker {
             }
         }
 
-        Ok(Type::Struct(struct_id))
+        let struct_name = self.struct_names.get(&struct_id)
+            .map(|s| s.clone())
+            .unwrap_or_else(|| format!("struct_{}", struct_id.0));
+        Ok(Type::Struct(struct_id, struct_name))
     }
 
     fn get_field_type(
@@ -1091,16 +1105,22 @@ impl TypeChecker {
 
         let field_defs = match type_def {
             TypeDefinition::Builtin(_) => {
+                let struct_name = self.struct_names.get(&struct_id)
+                    .map(|s| s.clone())
+                    .unwrap_or_else(|| format!("struct_{}", struct_id.0));
                 return Err(TypeError::NotAStruct {
-                    ty: Type::Struct(struct_id),
+                    ty: Type::Struct(struct_id, struct_name),
                     field_name: field_name.to_string(),
                     span,
                 });
             }
             TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => fields,
             TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(_)) => {
+                let struct_name = self.struct_names.get(&struct_id)
+                    .map(|s| s.clone())
+                    .unwrap_or_else(|| format!("struct_{}", struct_id.0));
                 return Err(TypeError::NotAStruct {
-                    ty: Type::Struct(struct_id),
+                    ty: Type::Struct(struct_id, struct_name),
                     field_name: field_name.to_string(),
                     span,
                 });
@@ -1126,17 +1146,23 @@ impl TypeChecker {
                     match def {
                         TypeDefinition::Builtin(ty) => Ok(ty.clone()),
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(_)) => {
-                            Ok(Type::Struct(*name_id))
+                            let name = self.struct_names.get(name_id)
+                                .map(|s| s.clone())
+                                .unwrap_or_else(|| format!("struct_{}", name_id.0));
+                            Ok(Type::Struct(*name_id, name))
                         }
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
                             aliased_type,
                         )) => self.resolve_type(aliased_type),
                     }
-                } else if self.role_defs.contains_key(name_id) {
-                    Ok(Type::Role(*name_id))
+                } else if let Some(role_name) = self.role_defs.get(name_id) {
+                    Ok(Type::Role(*name_id, role_name.clone()))
                 } else {
-                    // Type not found
-                    Ok(Type::Struct(*name_id))
+                    // Type not found - create with a fallback name
+                    let name = self.struct_names.get(name_id)
+                        .map(|s| s.clone())
+                        .unwrap_or_else(|| format!("unknown_{}", name_id.0));
+                    Ok(Type::Struct(*name_id, name))
                 }
             }
             ResolvedTypeDef::Map(key, val) => {
