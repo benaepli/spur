@@ -14,7 +14,6 @@ pub enum Type {
     Int,
     String,
     Bool,
-    Unit,
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
     Tuple(Vec<Type>),
@@ -35,7 +34,6 @@ impl std::fmt::Display for Type {
             Type::Int => write!(f, "int"),
             Type::String => write!(f, "string"),
             Type::Bool => write!(f, "bool"),
-            Type::Unit => write!(f, "unit"),
             Type::List(t) => write!(f, "list<{}>", t),
             Type::Map(k, v) => write!(f, "map<{}, {}>", k, v),
             Type::Tuple(ts) => {
@@ -194,7 +192,10 @@ impl TypeChecker {
             TypeDefinition::Builtin(Type::String),
         );
         predefined.insert(prepopulated_types.bool, TypeDefinition::Builtin(Type::Bool));
-        predefined.insert(prepopulated_types.unit, TypeDefinition::Builtin(Type::Unit));
+        predefined.insert(
+            prepopulated_types.unit,
+            TypeDefinition::Builtin(Type::Tuple(vec![])),
+        );
 
         Self {
             scopes: vec![HashMap::new()], // Global scope
@@ -278,7 +279,7 @@ impl TypeChecker {
         let return_type = if let Some(ret_type_def) = &func.return_type {
             self.resolve_type(ret_type_def)?
         } else {
-            Type::Unit
+            Type::Tuple(vec![])
         };
 
         Ok(FunctionSignature {
@@ -345,7 +346,7 @@ impl TypeChecker {
         }
 
         // Check that non-unit functions have a return statement
-        if sig.return_type != Type::Unit && !has_return {
+        if sig.return_type != Type::Tuple(vec![]) && !has_return {
             return Err(TypeError::MissingReturn(func.span));
         }
 
@@ -538,16 +539,7 @@ impl TypeChecker {
                 Ok(())
             }
             ResolvedPatternKind::Wildcard => Ok(()),
-            ResolvedPatternKind::Unit => {
-                self.check_type_compatibility(&Type::Unit, expected_type, pattern.span)?;
-                Ok(())
-            }
             ResolvedPatternKind::Tuple(patterns) => {
-                if patterns.is_empty() {
-                    self.check_type_compatibility(&Type::Unit, expected_type, pattern.span)?;
-                    return Ok(());
-                }
-
                 if let Type::Tuple(types) = expected_type {
                     if patterns.len() != types.len() {
                         return Err(TypeError::PatternMismatch {
@@ -621,11 +613,7 @@ impl TypeChecker {
                     .iter()
                     .map(|item| self.check_expr(item))
                     .collect::<Result<Vec<_>, _>>()?;
-                if types.is_empty() {
-                    Ok(Type::Unit)
-                } else {
-                    Ok(Type::Tuple(types))
-                }
+                Ok(Type::Tuple(types))
             }
             ResolvedExprKind::Append(list_expr, item_expr) => {
                 let list_type = self.check_expr(list_expr)?;
@@ -1203,11 +1191,7 @@ impl TypeChecker {
                     .iter()
                     .map(|t| self.resolve_type(t))
                     .collect::<Result<Vec<_>, _>>()?;
-                if resolved_types.is_empty() {
-                    Ok(Type::Unit)
-                } else {
-                    Ok(Type::Tuple(resolved_types))
-                }
+                Ok(Type::Tuple(resolved_types))
             }
             ResolvedTypeDef::Optional(t) => {
                 let base_type = self.resolve_type(t)?;

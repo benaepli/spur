@@ -11,6 +11,10 @@ role Head {
     func Read(key: string) -> Value {
         return db[key];
     }
+
+    func Empty() {
+        return ();
+    }
 }
 
 ClientInterface {

@@ -1083,7 +1083,6 @@ impl Compiler {
         match &pat.kind {
             ResolvedPatternKind::Var(id, name) => Lhs::Var(resolved_name(*id, name)),
             ResolvedPatternKind::Wildcard => Lhs::Var(self.new_temp_var()),
-            ResolvedPatternKind::Unit => Lhs::Var(self.new_temp_var()),
             ResolvedPatternKind::Tuple(pats) => {
                 let names = pats
                     .iter()

@@ -176,7 +176,6 @@ pub struct ResolvedPattern {
 pub enum ResolvedPatternKind {
     Var(NameId, String),
     Wildcard,
-    Unit,
     Tuple(Vec<ResolvedPattern>),
 }
 
@@ -759,7 +758,7 @@ impl Resolver {
                 ResolvedPatternKind::Var(id, name)
             }
             PatternKind::Wildcard => ResolvedPatternKind::Wildcard,
-            PatternKind::Unit => ResolvedPatternKind::Unit,
+            PatternKind::Unit => ResolvedPatternKind::Tuple(vec![]),
             PatternKind::Tuple(pats) => {
                 let resolved_pats = pats
                     .into_iter()
