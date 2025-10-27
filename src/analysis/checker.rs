@@ -241,7 +241,8 @@ impl TypeChecker {
                         TypeDefinition::UserDefined(type_def.def.clone()),
                     );
                     // Store the struct name for later use
-                    self.struct_names.insert(type_def.name, type_def.original_name.clone());
+                    self.struct_names
+                        .insert(type_def.name, type_def.original_name.clone());
                 }
                 ResolvedTopLevelDef::Role(role) => {
                     self.role_defs.insert(role.name, role.original_name.clone());
@@ -542,6 +543,11 @@ impl TypeChecker {
                 Ok(())
             }
             ResolvedPatternKind::Tuple(patterns) => {
+                if patterns.is_empty() {
+                    self.check_type_compatibility(&Type::Unit, expected_type, pattern.span)?;
+                    return Ok(());
+                }
+
                 if let Type::Tuple(types) = expected_type {
                     if patterns.len() != types.len() {
                         return Err(TypeError::PatternMismatch {
@@ -615,7 +621,11 @@ impl TypeChecker {
                     .iter()
                     .map(|item| self.check_expr(item))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Type::Tuple(types))
+                if types.is_empty() {
+                    Ok(Type::Unit)
+                } else {
+                    Ok(Type::Tuple(types))
+                }
             }
             ResolvedExprKind::Append(list_expr, item_expr) => {
                 let list_type = self.check_expr(list_expr)?;
@@ -1039,7 +1049,9 @@ impl TypeChecker {
 
         let field_defs = match type_def {
             TypeDefinition::Builtin(_) => {
-                let struct_name = self.struct_names.get(&struct_id)
+                let struct_name = self
+                    .struct_names
+                    .get(&struct_id)
                     .map(|s| s.clone())
                     .unwrap_or_else(|| format!("struct_{}", struct_id.0));
                 return Err(TypeError::NotAStruct {
@@ -1050,7 +1062,9 @@ impl TypeChecker {
             }
             TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => fields,
             TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(_)) => {
-                let struct_name = self.struct_names.get(&struct_id)
+                let struct_name = self
+                    .struct_names
+                    .get(&struct_id)
                     .map(|s| s.clone())
                     .unwrap_or_else(|| format!("struct_{}", struct_id.0));
                 return Err(TypeError::NotAStruct {
@@ -1086,7 +1100,9 @@ impl TypeChecker {
             }
         }
 
-        let struct_name = self.struct_names.get(&struct_id)
+        let struct_name = self
+            .struct_names
+            .get(&struct_id)
             .map(|s| s.clone())
             .unwrap_or_else(|| format!("struct_{}", struct_id.0));
         Ok(Type::Struct(struct_id, struct_name))
@@ -1105,7 +1121,9 @@ impl TypeChecker {
 
         let field_defs = match type_def {
             TypeDefinition::Builtin(_) => {
-                let struct_name = self.struct_names.get(&struct_id)
+                let struct_name = self
+                    .struct_names
+                    .get(&struct_id)
                     .map(|s| s.clone())
                     .unwrap_or_else(|| format!("struct_{}", struct_id.0));
                 return Err(TypeError::NotAStruct {
@@ -1116,7 +1134,9 @@ impl TypeChecker {
             }
             TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => fields,
             TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(_)) => {
-                let struct_name = self.struct_names.get(&struct_id)
+                let struct_name = self
+                    .struct_names
+                    .get(&struct_id)
                     .map(|s| s.clone())
                     .unwrap_or_else(|| format!("struct_{}", struct_id.0));
                 return Err(TypeError::NotAStruct {
@@ -1146,7 +1166,9 @@ impl TypeChecker {
                     match def {
                         TypeDefinition::Builtin(ty) => Ok(ty.clone()),
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(_)) => {
-                            let name = self.struct_names.get(name_id)
+                            let name = self
+                                .struct_names
+                                .get(name_id)
                                 .map(|s| s.clone())
                                 .unwrap_or_else(|| format!("struct_{}", name_id.0));
                             Ok(Type::Struct(*name_id, name))
@@ -1159,7 +1181,9 @@ impl TypeChecker {
                     Ok(Type::Role(*name_id, role_name.clone()))
                 } else {
                     // Type not found - create with a fallback name
-                    let name = self.struct_names.get(name_id)
+                    let name = self
+                        .struct_names
+                        .get(name_id)
                         .map(|s| s.clone())
                         .unwrap_or_else(|| format!("unknown_{}", name_id.0));
                     Ok(Type::Struct(*name_id, name))
@@ -1179,7 +1203,11 @@ impl TypeChecker {
                     .iter()
                     .map(|t| self.resolve_type(t))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Type::Tuple(resolved_types))
+                if resolved_types.is_empty() {
+                    Ok(Type::Unit)
+                } else {
+                    Ok(Type::Tuple(resolved_types))
+                }
             }
             ResolvedTypeDef::Optional(t) => {
                 let base_type = self.resolve_type(t)?;
