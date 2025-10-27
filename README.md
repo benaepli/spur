@@ -55,3 +55,7 @@ control flow graph.
 # Compile the simple key-value store
 cargo run -- specs/simple.spur output.json
 ```
+
+## Resources
+
+- There is a [VSCode extension](https://marketplace.visualstudio.com/items?itemName=baepli.spur) for syntax highlighting. 
