@@ -3,7 +3,7 @@
 Spur is a domain-specific language for specifying distributed protocols.
 
 This repository provides a compiler frontend in Rust that is used in  [jennLang](https://github.com/jl3953/jennLang/)
-for concurrency (linearizability, etc.) refutation.
+for consistency (linearizability, etc.) refutation.
 
 ## Features
 

@@ -409,7 +409,7 @@ impl Compiler {
     fn compile_for_in_loop(
         &mut self,
         loop_stmt: &ResolvedForInLoop,
-        next_vertex: Vertex, 
+        next_vertex: Vertex,
     ) -> Vertex {
         // The [ForLoopIn] label is the "head" of the loop.
         // We add a dummy label to reserve its vertex index.
