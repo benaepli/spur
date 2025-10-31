@@ -343,6 +343,16 @@ pub fn report_type_errors(
                     format!("help: await can only be used on future types, but `{}` is not a future", ty),
                 ]),
 
+            TypeError::NotAPromise { ty, span } => Diagnostic::error()
+                .with_message("promise operation on non-promise type")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected promise type, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: this operation requires a promise type, but `{}` is not a promise", ty),
+                ]),
+
             TypeError::PollingOnInvalidType { ty, span } => Diagnostic::error()
                 .with_message("invalid polling operation")
                 .with_labels(vec![

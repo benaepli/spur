@@ -86,6 +86,7 @@ pub enum TypeDefKind {
     List(Box<TypeDef>),
     Tuple(Vec<TypeDef>),
     Optional(Box<TypeDef>),
+    Promise(Box<TypeDef>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -240,6 +241,10 @@ pub enum ExprKind {
 
     Await(Box<Expr>),
     Spawn(Box<Expr>),
+
+    CreatePromise,
+    CreateFuture(Box<Expr>),
+    ResolvePromise(Box<Expr>, Box<Expr>),
 
     // Postfix operations
     Index(Box<Expr>, Box<Expr>),
@@ -396,7 +401,18 @@ where
                 span: e.span(),
             });
 
-        let base_type = choice((named, map, list, tuple));
+        let promise = just(TokenKind::Promise)
+            .ignore_then(
+                type_def
+                    .clone()
+                    .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
+            )
+            .map_with(|t, e| TypeDef {
+                kind: TypeDefKind::Promise(Box::new(t)),
+                span: e.span(),
+            });
+
+        let base_type = choice((named, map, list, tuple, promise));
 
         base_type
             .clone()
@@ -514,6 +530,13 @@ where
                 .map(move |a| constructor(Box::new(a)))
         };
 
+        let zero_arg_builtin = |name, kind: ExprKind| {
+            just(name)
+                .ignore_then(just(TokenKind::LeftParen))
+                .ignore_then(just(TokenKind::RightParen))
+                .to(kind)
+        };
+
         let rpc_call = choice((
             just(TokenKind::RpcCall).to(false),
             just(TokenKind::RpcAsyncCall).to(true),
@@ -548,6 +571,9 @@ where
             one_arg_builtin(TokenKind::Head, ExprKind::Head),
             one_arg_builtin(TokenKind::Tail, ExprKind::Tail),
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
+            zero_arg_builtin(TokenKind::CreatePromise, ExprKind::CreatePromise),
+            one_arg_builtin(TokenKind::CreateFuture, ExprKind::CreateFuture),
+            two_arg_builtin(TokenKind::ResolvePromise, ExprKind::ResolvePromise),
             func_call.map(ExprKind::FuncCall),
             ident.clone().map(ExprKind::Var),
             tuple_lit,

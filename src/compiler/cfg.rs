@@ -49,6 +49,7 @@ pub enum Expr {
     ENil,
     EUnwrap(Box<Expr>),
     ECoalesce(Box<Expr>, Box<Expr>),
+    ECreatePromise,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -63,6 +64,7 @@ pub enum Instr {
     Assign(Lhs, Expr),
     Async(Lhs, Expr, String, Vec<Expr>),
     Copy(Lhs, Expr),
+    Resolve(Lhs, Expr),
 }
 
 pub type Vertex = usize;
@@ -853,7 +855,38 @@ impl Compiler {
                 self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
             }
 
+            ResolvedExprKind::ResolvePromise(p, v) => {
+                let p_tmp = self.new_temp_var();
+                let v_tmp = self.new_temp_var();
+
+                // Assign unit to the target (e.g., `_tmp = ()`)
+                let assign_unit_label =
+                    Label::Instr(Instr::Assign(target, Expr::EUnit), next_vertex);
+                let assign_unit_vertex = self.add_label(assign_unit_label);
+
+                // Resolve the promise (e.g., `resolve(_p_tmp, _v_tmp)`)
+                let resolve_label = Label::Instr(
+                    Instr::Resolve(Lhs::Var(p_tmp.clone()), Expr::EVar(v_tmp.clone())),
+                    assign_unit_vertex,
+                );
+                let resolve_vertex = self.add_label(resolve_label);
+
+                // Compile p and v
+                let v_vertex = self.compile_expr_to_value(v, Lhs::Var(v_tmp), resolve_vertex);
+                self.compile_expr_to_value(p, Lhs::Var(p_tmp), v_vertex)
+            }
+
             // --- Truly simple, non-side-effecting cases ---
+            ResolvedExprKind::CreateFuture(e) => {
+                // create_future(p) is just a copy of p.
+                self.compile_expr_to_value(e, target, next_vertex)
+            }
+
+            ResolvedExprKind::CreatePromise => {
+                let label = Label::Instr(Instr::Assign(target, Expr::ECreatePromise), next_vertex);
+                self.add_label(label)
+            }
+
             _ => {
                 // Desugar the simple expression
                 let sim_expr = self.convert_simple_expr(expr);
@@ -1098,6 +1131,7 @@ impl Compiler {
                     Box::new(Expr::EListLen(Box::new(list_expr))),
                 )
             }
+            ResolvedExprKind::CreateFuture(e) => self.convert_simple_expr(e),
             // Desugar: `s[i]` -> `EFind(s, i)`
             ResolvedExprKind::Index(target, index) => Expr::EFind(
                 Box::new(self.convert_simple_expr(target)),
@@ -1131,7 +1165,9 @@ impl Compiler {
             | ResolvedExprKind::RpcCall(_, _)
             | ResolvedExprKind::RpcAsyncCall(_, _)
             | ResolvedExprKind::Await(_)
-            | ResolvedExprKind::Spawn(_) => {
+            | ResolvedExprKind::Spawn(_)
+            | ResolvedExprKind::CreatePromise
+            | ResolvedExprKind::ResolvePromise(_, _) => {
                 panic!(
                     "Cannot have complex call inside a simple expression: {:?}",
                     expr

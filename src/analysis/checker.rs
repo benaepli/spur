@@ -21,10 +21,12 @@ pub enum Type {
     Role(NameId, String),
     Optional(Box<Type>),
     Future(Box<Type>),
+    Promise(Box<Type>),
 
     // Placeholder types.
     EmptyList,
     EmptyMap,
+    EmptyPromise,
     Nil,
 }
 
@@ -48,8 +50,10 @@ impl std::fmt::Display for Type {
             Type::Role(_, name) => write!(f, "{}", name),
             Type::Optional(t) => write!(f, "{}?", t),
             Type::Future(t) => write!(f, "future<{}>", t),
+            Type::Promise(t) => write!(f, "promise<{}>", t),
             Type::EmptyList => write!(f, "empty list"),
             Type::EmptyMap => write!(f, "empty map"),
+            Type::EmptyPromise => write!(f, "empty promise"),
             Type::Nil => write!(f, "nil"),
         }
     }
@@ -146,6 +150,8 @@ pub enum TypeError {
     UnwrapOnNonOptional { ty: Type, span: Span },
     #[error("await can only be used on a future, found `{ty}`")]
     AwaitOnNonFuture { ty: Type, span: Span },
+    #[error("Operation requires a promise, found `{ty}`")]
+    NotAPromise { ty: Type, span: Span },
     #[error("Polling operation requires a collection of futures or bools, found `{ty}`")]
     PollingOnInvalidType { ty: Type, span: Span },
     #[error("next_resp requires a map of futures, found `{ty}`")]
@@ -716,6 +722,42 @@ impl TypeChecker {
                     })
                 }
             }
+            ResolvedExprKind::CreatePromise => {
+                Ok(Type::EmptyPromise)
+            }
+            ResolvedExprKind::CreateFuture(promise_expr) => {
+                let promise_type = self.check_expr(promise_expr)?;
+                match promise_type {
+                    Type::Promise(inner_ty) => {
+                        Ok(Type::Future(inner_ty))
+                    }
+                    _ => Err(TypeError::NotAPromise {
+                        ty: promise_type,
+                        span: promise_expr.span,
+                    }),
+                }
+            }
+            ResolvedExprKind::ResolvePromise(promise_expr, value_expr) => {
+                let promise_type = self.check_expr(promise_expr)?;
+                let value_type = self.check_expr(value_expr)?;
+
+                match promise_type {
+                    Type::Promise(inner_ty) => {
+                        // resolve_promise(promise<T>, T)
+                        self.check_type_compatibility(
+                            inner_ty.as_ref(),
+                            &value_type,
+                            value_expr.span,
+                        )?;
+                        // resolve_promise returns unit
+                        Ok(Type::Tuple(vec![]))
+                    }
+                    _ => Err(TypeError::NotAPromise {
+                        ty: promise_type,
+                        span: promise_expr.span,
+                    }),
+                }
+            }
             ResolvedExprKind::Index(target, index) => self.check_index(target, index, expr.span),
             ResolvedExprKind::Slice(target, start, end) => {
                 let target_ty = self.check_expr(target)?;
@@ -1190,8 +1232,8 @@ impl TypeChecker {
                             Ok(Type::Struct(*name_id, name))
                         }
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
-                            aliased_type,
-                        )) => self.resolve_type(aliased_type),
+                                                        aliased_type,
+                                                    )) => self.resolve_type(aliased_type),
                     }
                 } else if let Some(role_name) = self.role_defs.get(name_id) {
                     Ok(Type::Role(*name_id, role_name.clone()))
@@ -1230,6 +1272,10 @@ impl TypeChecker {
                     Ok(Type::Optional(Box::new(base_type)))
                 }
             }
+            ResolvedTypeDef::Promise(t) => {
+                let base_type = self.resolve_type(t)?;
+                Ok(Type::Promise(Box::new(base_type)))
+            }
         }
     }
 
@@ -1248,6 +1294,9 @@ impl TypeChecker {
             return Ok(());
         }
         if let (Type::Map(_, _), Type::EmptyMap) = (expected, actual) {
+            return Ok(());
+        }
+        if let (Type::Promise(_), Type::EmptyPromise) = (expected, actual) {
             return Ok(());
         }
 

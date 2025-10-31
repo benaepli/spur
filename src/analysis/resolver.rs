@@ -99,6 +99,7 @@ pub enum ResolvedTypeDef {
     List(Box<ResolvedTypeDef>),
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
+    Promise(Box<ResolvedTypeDef>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +215,9 @@ pub enum ResolvedExprKind {
     RpcAsyncCall(Box<ResolvedExpr>, ResolvedFuncCall),
     Await(Box<ResolvedExpr>),
     Spawn(Box<ResolvedExpr>),
+    CreatePromise,
+    CreateFuture(Box<ResolvedExpr>),
+    ResolvePromise(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
@@ -608,6 +612,9 @@ impl Resolver {
             TypeDefKind::Optional(t) => Ok(ResolvedTypeDef::Optional(Box::new(
                 self.resolve_type_def(*t)?,
             ))),
+            TypeDefKind::Promise(t) => Ok(ResolvedTypeDef::Promise(Box::new(
+                self.resolve_type_def(*t)?,
+            ))),
         }
     }
 
@@ -861,6 +868,14 @@ impl Resolver {
             ),
             ExprKind::Await(e) => ResolvedExprKind::Await(Box::new(self.resolve_expr(*e)?)),
             ExprKind::Spawn(e) => ResolvedExprKind::Spawn(Box::new(self.resolve_expr(*e)?)),
+            ExprKind::CreatePromise => ResolvedExprKind::CreatePromise,
+            ExprKind::CreateFuture(e) => {
+                ResolvedExprKind::CreateFuture(Box::new(self.resolve_expr(*e)?))
+            }
+            ExprKind::ResolvePromise(p, v) => ResolvedExprKind::ResolvePromise(
+                Box::new(self.resolve_expr(*p)?),
+                Box::new(self.resolve_expr(*v)?),
+            ),
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)?),
                 Box::new(self.resolve_expr(*i)?),

@@ -105,6 +105,10 @@ pub enum TokenKind {
     Nil,
     Erase,
     Spawn,
+    CreatePromise,
+    CreateFuture,
+    ResolvePromise,
+    Promise,
 }
 
 impl fmt::Display for TokenKind {
@@ -176,6 +180,10 @@ impl fmt::Display for TokenKind {
             TokenKind::Nil => write!(f, "nil"),
             TokenKind::Erase => write!(f, "erase"),
             TokenKind::Spawn => write!(f, "spawn"),
+            TokenKind::CreatePromise => write!(f, "create_promise"),
+            TokenKind::CreateFuture => write!(f, "create_future"),
+            TokenKind::ResolvePromise => write!(f, "resolve_promise"),
+            TokenKind::Promise => write!(f, "promise"),
         }
     }
 }
@@ -217,6 +225,10 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "nil" => TokenKind::Nil,
     "erase" => TokenKind::Erase,
     "spawn" => TokenKind::Spawn,
+    "create_promise" => TokenKind::CreatePromise,
+    "create_future" => TokenKind::CreateFuture,
+    "resolve_promise" => TokenKind::ResolvePromise,
+    "promise" => TokenKind::Promise,
 };
 
 fn is_special_char(ch: char) -> bool {
