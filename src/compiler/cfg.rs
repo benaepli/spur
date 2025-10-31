@@ -127,6 +127,10 @@ pub struct Compiler {
     cfg: Vec<Label>,
     /// Counter for generating fresh temporary variable names.
     temp_counter: usize,
+
+    rpc_map: HashMap<String, FunctionInfo>,
+    client_ops_map: HashMap<String, FunctionInfo>,
+    compiling_for_role: bool,
 }
 
 fn resolved_name(name_id: NameId, original_name: &str) -> String {
@@ -138,12 +142,23 @@ impl Compiler {
         Compiler {
             cfg: Vec::new(),
             temp_counter: 0,
+
+            rpc_map: HashMap::new(),
+            client_ops_map: HashMap::new(),
+            compiling_for_role: false,
         }
     }
 
     /// Allocates a new, unique temporary variable name.
     fn new_temp_var(&mut self) -> String {
         let name = format!("_tmp{}", self.temp_counter);
+        self.temp_counter += 1;
+        name
+    }
+
+    /// Allocates a new, unique name for a synthesized spawn task.
+    fn new_spawn_func_name(&mut self) -> String {
+        let name = format!("_spawn_task_{}", self.temp_counter);
         self.temp_counter += 1;
         name
     }
@@ -157,13 +172,11 @@ impl Compiler {
 
     /// The main entry point.
     pub fn compile_program(mut self, program: ResolvedProgram) -> Program {
-        let mut rpc_map = HashMap::new();
-        let mut client_ops_map = HashMap::new();
-
         // Compile all top-level definitions
         for def in program.top_level_defs {
             match def {
                 ResolvedTopLevelDef::Role(role) => {
+                    self.compiling_for_role = true;
                     // Compile role's var_inits into a special init function
                     let init_fn = self.compile_init_func(
                         &role.var_inits,
@@ -172,12 +185,12 @@ impl Compiler {
                             resolved_name(role.name, &role.original_name)
                         ),
                     );
-                    rpc_map.insert(init_fn.name.clone(), init_fn);
+                    self.rpc_map.insert(init_fn.name.clone(), init_fn);
 
                     // Compile all other functions in the role
                     for func in role.func_defs {
                         let func_info = self.compile_func_def(func);
-                        rpc_map.insert(func_info.name.clone(), func_info);
+                        self.rpc_map.insert(func_info.name.clone(), func_info);
                     }
                 }
                 ResolvedTopLevelDef::Type(_) => {
@@ -186,21 +199,25 @@ impl Compiler {
             }
         }
 
+        self.compiling_for_role = false;
+
         // Compile client definition
         let client_init_fn = self.compile_init_func(
             &program.client_def.var_inits,
             "BASE_CLIENT_INIT".to_string(),
         );
-        client_ops_map.insert(client_init_fn.name.clone(), client_init_fn);
+        self.client_ops_map
+            .insert(client_init_fn.name.clone(), client_init_fn);
         for func in program.client_def.func_defs {
             let func_info = self.compile_func_def(func);
-            client_ops_map.insert(func_info.name.clone(), func_info);
+            self.client_ops_map
+                .insert(func_info.name.clone(), func_info);
         }
 
         Program {
             cfg: self.cfg,
-            rpc: rpc_map,
-            client_ops: client_ops_map,
+            rpc: self.rpc_map,
+            client_ops: self.client_ops_map,
         }
     }
 
@@ -315,16 +332,6 @@ impl Compiler {
             ResolvedStatementKind::ForInLoop(loop_stmt) => {
                 // `next_vertex` is the break target for a loop
                 self.compile_for_in_loop(loop_stmt, next_vertex)
-            }
-            ResolvedStatementKind::Await(expr) => {
-                let future_var = self.new_temp_var();
-                let await_label = Label::Await(
-                    Lhs::Var(future_var.clone()),
-                    Expr::EVar(future_var.clone()),
-                    next_vertex,
-                );
-                let await_vertex = self.add_label(await_label);
-                self.compile_expr_to_value(expr, Lhs::Var(future_var), await_vertex)
             }
             ResolvedStatementKind::Break => self.add_label(Label::Break(break_target)),
         }
@@ -532,6 +539,54 @@ impl Compiler {
             }
             ResolvedExprKind::RpcAsyncCall(target_expr, call) => {
                 self.compile_rpc_async_call(target_expr, call, target, next_vertex)
+            }
+            ResolvedExprKind::Await(e) => {
+                let future_var = self.new_temp_var();
+                // The Await label takes the `target` Lhs directly.
+                // This is where the result of the future will be stored.
+                let await_label = Label::Await(target, Expr::EVar(future_var.clone()), next_vertex);
+                let await_vertex = self.add_label(await_label);
+                // Compile the inner expression `e` to get the future,
+                // storing it in `future_var`.
+                self.compile_expr_to_value(e, Lhs::Var(future_var), await_vertex)
+            }
+
+            ResolvedExprKind::Spawn(e) => {
+                let func_name = self.new_spawn_func_name();
+
+                // Compile the spawned expression `e` as a new function body
+                let tmp_result = self.new_temp_var();
+                let body_final_vertex =
+                    self.add_label(Label::Return(Expr::EVar(tmp_result.clone())));
+                let body_entry_vertex =
+                    self.compile_expr_to_value(e, Lhs::Var(tmp_result), body_final_vertex);
+
+                // Create the FunctionInfo for this new function
+                let info = FunctionInfo {
+                    entry: body_entry_vertex,
+                    name: func_name.clone(),
+                    formals: vec![], // The new function takes no arguments
+                    locals: vec![],  // Locals are handled by the body's CFG
+                };
+
+                if self.compiling_for_role {
+                    self.rpc_map.insert(func_name.clone(), info);
+                } else {
+                    self.client_ops_map.insert(func_name.clone(), info);
+                }
+
+                let async_label = Label::Instr(
+                    Instr::Async(
+                        target,                         // Store future in the target Lhs
+                        Expr::EVar("self".to_string()), // Call "self"
+                        func_name,                      // Call our new hidden function
+                        vec![],                         // No arguments
+                    ),
+                    next_vertex,
+                );
+                let async_vertex = self.add_label(async_label);
+
+                self.add_label(Label::Pause(async_vertex))
             }
 
             // --- Compound expressions that may contain complex sub-expressions ---
@@ -1074,7 +1129,9 @@ impl Compiler {
             // --- Panic on complex expressions ---
             ResolvedExprKind::FuncCall(_)
             | ResolvedExprKind::RpcCall(_, _)
-            | ResolvedExprKind::RpcAsyncCall(_, _) => {
+            | ResolvedExprKind::RpcAsyncCall(_, _)
+            | ResolvedExprKind::Await(_)
+            | ResolvedExprKind::Spawn(_) => {
                 panic!(
                     "Cannot have complex call inside a simple expression: {:?}",
                     expr

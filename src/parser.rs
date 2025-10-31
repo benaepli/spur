@@ -115,7 +115,6 @@ pub enum StatementKind {
     Return(Expr),
     ForLoop(ForLoop),
     ForInLoop(ForInLoop),
-    Await(Expr),
     Print(Expr),
     Break,
 }
@@ -238,6 +237,9 @@ pub enum ExprKind {
     // RPC calls
     RpcCall(Box<Expr>, FuncCall),
     RpcAsyncCall(Box<Expr>, FuncCall),
+
+    Await(Box<Expr>),
+    Spawn(Box<Expr>),
 
     // Postfix operations
     Index(Box<Expr>, Box<Expr>),
@@ -625,6 +627,12 @@ where
                 just(TokenKind::Minus)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Negate(Box::new(val)), e.span())),
+                just(TokenKind::Await)
+                    .then(unary.clone())
+                    .map_with(|(_, val), e| Expr::new(ExprKind::Await(Box::new(val)), e.span())),
+                just(TokenKind::Spawn)
+                    .then(unary.clone())
+                    .map_with(|(_, val), e| Expr::new(ExprKind::Spawn(Box::new(val)), e.span())),
                 primary.clone(),
             ))
         });
@@ -809,7 +817,6 @@ where
                 .then_ignore(just(TokenKind::Semicolon))
                 .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span())),
             simple_stmt(TokenKind::Return, StatementKind::Return),
-            simple_stmt(TokenKind::Await, StatementKind::Await),
             for_loop,
             for_in_loop,
             just(TokenKind::Print)

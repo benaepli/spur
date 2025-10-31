@@ -397,11 +397,6 @@ impl TypeChecker {
                 self.check_for_in_loop(for_in_loop)?;
                 Ok(false)
             }
-            ResolvedStatementKind::Await(expr) => {
-                // TODO: Type checking for async operations
-                self.check_expr(expr)?;
-                Ok(false)
-            }
             ResolvedStatementKind::Print(expr) => {
                 self.check_expr(expr)?;
                 Ok(false)
@@ -705,7 +700,8 @@ impl TypeChecker {
                     })
                 }
             }
-            ResolvedExprKind::Erase(map_expr, key_expr) => {  // NEW
+            ResolvedExprKind::Erase(map_expr, key_expr) => {
+                // NEW
                 let map_ty = self.check_expr(map_expr)?;
                 let key_ty = self.check_expr(key_expr)?;
 
@@ -811,6 +807,23 @@ impl TypeChecker {
                 // Asynchronous call, returns Future<T>
                 let return_type = self.check_func_call(call)?;
                 Ok(Type::Future(Box::new(return_type)))
+            }
+
+            ResolvedExprKind::Await(e) => {
+                let future_ty = self.check_expr(e)?;
+                match future_ty {
+                    Type::Future(inner_ty) => Ok(*inner_ty), // await future<T> returns T
+                    _ => Err(TypeError::AwaitOnNonFuture {
+                        ty: future_ty,
+                        span: expr.span,
+                    }),
+                }
+            }
+
+            ResolvedExprKind::Spawn(e) => {
+                let inner_ty = self.check_expr(e)?;
+                // spawn T returns future<T>
+                Ok(Type::Future(Box::new(inner_ty)))
             }
 
             ResolvedExprKind::PollForResps(collection, _value) => {

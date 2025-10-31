@@ -104,6 +104,7 @@ pub enum TokenKind {
     False,
     Nil,
     Erase,
+    Spawn,
 }
 
 impl fmt::Display for TokenKind {
@@ -174,6 +175,7 @@ impl fmt::Display for TokenKind {
             TokenKind::False => write!(f, "false"),
             TokenKind::Nil => write!(f, "nil"),
             TokenKind::Erase => write!(f, "erase"),
+            TokenKind::Spawn => write!(f, "spawn"),
         }
     }
 }
@@ -214,6 +216,7 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "false" => TokenKind::False,
     "nil" => TokenKind::Nil,
     "erase" => TokenKind::Erase,
+    "spawn" => TokenKind::Spawn,
 };
 
 fn is_special_char(ch: char) -> bool {

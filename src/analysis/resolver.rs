@@ -116,7 +116,6 @@ pub enum ResolvedStatementKind {
     Return(ResolvedExpr),
     ForLoop(ResolvedForLoop),
     ForInLoop(ResolvedForInLoop),
-    Await(ResolvedExpr),
     Print(ResolvedExpr),
     Break,
 }
@@ -213,6 +212,8 @@ pub enum ResolvedExprKind {
     Len(Box<ResolvedExpr>),
     RpcCall(Box<ResolvedExpr>, ResolvedFuncCall),
     RpcAsyncCall(Box<ResolvedExpr>, ResolvedFuncCall),
+    Await(Box<ResolvedExpr>),
+    Spawn(Box<ResolvedExpr>),
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
@@ -630,7 +631,6 @@ impl Resolver {
             StatementKind::ForInLoop(fil) => {
                 ResolvedStatementKind::ForInLoop(self.resolve_for_in_loop(fil)?)
             }
-            StatementKind::Await(e) => ResolvedStatementKind::Await(self.resolve_expr(e)?),
             StatementKind::Print(e) => ResolvedStatementKind::Print(self.resolve_expr(e)?),
             StatementKind::Break => ResolvedStatementKind::Break,
         };
@@ -859,6 +859,8 @@ impl Resolver {
                 Box::new(self.resolve_expr(*target)?),
                 self.resolve_func_call(call)?,
             ),
+            ExprKind::Await(e) => ResolvedExprKind::Await(Box::new(self.resolve_expr(*e)?)),
+            ExprKind::Spawn(e) => ResolvedExprKind::Spawn(Box::new(self.resolve_expr(*e)?)),
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)?),
                 Box::new(self.resolve_expr(*i)?),
