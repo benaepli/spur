@@ -31,6 +31,7 @@ pub enum Expr {
     EGreaterThan(Box<Expr>, Box<Expr>),
     EGreaterThanEquals(Box<Expr>, Box<Expr>),
     EKeyExists(Box<Expr>, Box<Expr>),
+    EMapErase(Box<Expr>, Box<Expr>),
     EListLen(Box<Expr>),
     EListAccess(Box<Expr>, usize),
     EPlus(Box<Expr>, Box<Expr>),
@@ -660,6 +661,19 @@ impl Compiler {
                 self.compile_expr_to_value(map, Lhs::Var(map_tmp), key_vertex)
             }
 
+            ResolvedExprKind::Erase(map, key) => {
+                let map_tmp = self.new_temp_var();
+                let key_tmp = self.new_temp_var();
+                let final_expr = Expr::EMapErase(
+                    Box::new(Expr::EVar(key_tmp.clone())),
+                    Box::new(Expr::EVar(map_tmp.clone())),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let key_vertex = self.compile_expr_to_value(key, Lhs::Var(key_tmp), assign_vertex);
+                self.compile_expr_to_value(map, Lhs::Var(map_tmp), key_vertex)
+            }
+
             ResolvedExprKind::Head(l) => {
                 let l_tmp = self.new_temp_var();
                 let final_expr = Expr::EListAccess(Box::new(Expr::EVar(l_tmp.clone())), 0);
@@ -1009,6 +1023,10 @@ impl Compiler {
                 Box::new(self.convert_simple_expr(r)),
             ),
             ResolvedExprKind::Exists(map, key) => Expr::EKeyExists(
+                Box::new(self.convert_simple_expr(key)),
+                Box::new(self.convert_simple_expr(map)),
+            ),
+            ResolvedExprKind::Erase(map, key) => Expr::EMapErase(
                 Box::new(self.convert_simple_expr(key)),
                 Box::new(self.convert_simple_expr(map)),
             ),

@@ -705,6 +705,21 @@ impl TypeChecker {
                     })
                 }
             }
+            ResolvedExprKind::Erase(map_expr, key_expr) => {  // NEW
+                let map_ty = self.check_expr(map_expr)?;
+                let key_ty = self.check_expr(key_expr)?;
+
+                if let Type::Map(expected_key_ty, value_ty) = &map_ty {
+                    self.check_type_compatibility(expected_key_ty, &key_ty, expr.span)?;
+                    Ok(Type::Map(expected_key_ty.clone(), value_ty.clone()))
+                } else {
+                    Err(TypeError::InvalidUnaryOp {
+                        op: "erase",
+                        ty: map_ty,
+                        span: expr.span,
+                    })
+                }
+            }
             ResolvedExprKind::Index(target, index) => self.check_index(target, index, expr.span),
             ResolvedExprKind::Slice(target, start, end) => {
                 let target_ty = self.check_expr(target)?;

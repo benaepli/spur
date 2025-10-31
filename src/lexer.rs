@@ -103,6 +103,7 @@ pub enum TokenKind {
     True,
     False,
     Nil,
+    Erase,
 }
 
 impl fmt::Display for TokenKind {
@@ -172,6 +173,7 @@ impl fmt::Display for TokenKind {
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
             TokenKind::Nil => write!(f, "nil"),
+            TokenKind::Erase => write!(f, "erase"),
         }
     }
 }
@@ -211,6 +213,7 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "true" => TokenKind::True,
     "false" => TokenKind::False,
     "nil" => TokenKind::Nil,
+    "erase" => TokenKind::Erase,
 };
 
 fn is_special_char(ch: char) -> bool {
