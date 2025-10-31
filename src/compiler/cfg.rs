@@ -539,9 +539,6 @@ impl Compiler {
             ResolvedExprKind::RpcCall(target_expr, call) => {
                 self.compile_rpc_call(target_expr, call, target, next_vertex)
             }
-            ResolvedExprKind::RpcAsyncCall(target_expr, call) => {
-                self.compile_rpc_async_call(target_expr, call, target, next_vertex)
-            }
             ResolvedExprKind::Await(e) => {
                 let future_var = self.new_temp_var();
                 // The Await label takes the `target` Lhs directly.
@@ -897,18 +894,15 @@ impl Compiler {
         }
     }
 
-    fn compile_func_call(
+    fn compile_async_call_internal(
         &mut self,
+        node_expr: Expr, // The node to call the function on
         call: &ResolvedFuncCall,
-        target: Lhs,
+        target: Lhs, // The final destination for the *future*
         next_vertex: Vertex,
     ) -> Vertex {
         // Allocate all temporary variable names up front.
-        let async_ret_var = self.new_temp_var();
-        let async_future_var = self.new_temp_var();
-
-        // Create temp var names for each argument. `arg_exprs` will be
-        // a list of `EVar`s (e.g., `_tmp2`, `_tmp3`) that refer to these.
+        // Create temp var names for each argument.
         let (arg_temp_vars, arg_exprs): (Vec<String>, Vec<Expr>) = (0..call.args.len())
             .map(|_| {
                 let tmp = self.new_temp_var();
@@ -916,46 +910,39 @@ impl Compiler {
             })
             .unzip();
 
-        // Build the call chain backwards (Assign -> Await -> Async -> Pause).
-        // Step D (Last): `target = async_ret_var;`
-        let assign_label = Label::Instr(
-            Instr::Assign(target, Expr::EVar(async_ret_var.clone())),
-            next_vertex, // After assignment, go to the original next_vertex
-        );
-        let assign_vertex = self.add_label(assign_label);
-
-        // Step C: `async_ret_var = await async_future_var;`
-        let await_label = Label::Await(
-            Lhs::Var(async_ret_var),              // Store result in `async_ret_var`
-            Expr::EVar(async_future_var.clone()), // Await the future
-            assign_vertex,                        // Go to step D
-        );
-        let await_vertex = self.add_label(await_label);
-
-        // Step B: `async_future_var = async self.func(arg_exprs);`
-        // This performs the async call to the function on the same node.
+        // Build the call chain backwards (Async -> Pause).
         let async_label = Label::Instr(
             Instr::Async(
-                Lhs::Var(async_future_var),     // Store the new future here
-                Expr::EVar("self".to_string()), // Target node is "self"
+                target,
+                node_expr, // Use the provided node expression
                 resolved_name(call.name, &call.original_name),
                 arg_exprs,
             ),
-            await_vertex, // Go to step C
+            next_vertex,
         );
         let async_vertex = self.add_label(async_label);
 
-        // Step A: `pause;`
-        // This yields to the scheduler before the async call.
-        let pause_vertex = self.add_label(Label::Pause(async_vertex)); // Go to step B
+        let pause_vertex = self.add_label(Label::Pause(async_vertex));
 
-        // 3. Build the argument compilation chain backwards.
+        // Build the argument compilation chain backwards.
         let mut entry_vertex = pause_vertex;
         for (arg, tmp_var) in call.args.iter().rev().zip(arg_temp_vars.iter().rev()) {
             entry_vertex = self.compile_expr_to_value(arg, Lhs::Var(tmp_var.clone()), entry_vertex);
         }
 
+        // This is the entry point for the "call" part
         entry_vertex
+    }
+
+    fn compile_func_call(
+        &mut self,
+        call: &ResolvedFuncCall,
+        target: Lhs,
+        next_vertex: Vertex,
+    ) -> Vertex {
+        // A local call is just an async call on "self"
+        let node_expr = Expr::EVar("self".to_string());
+        self.compile_async_call_internal(node_expr, call, target, next_vertex)
     }
 
     fn compile_rpc_call(
@@ -965,103 +952,17 @@ impl Compiler {
         target: Lhs,
         next_vertex: Vertex,
     ) -> Vertex {
-        let async_ret_var = self.new_temp_var();
-        let async_future_var = self.new_temp_var();
+        //  Allocate a temp var to hold the target role
         let target_var = self.new_temp_var();
+        let node_expr = Expr::EVar(target_var.clone());
 
-        // Create temp var names for each argument.
-        let (arg_temp_vars, arg_exprs): (Vec<String>, Vec<Expr>) = (0..call.args.len())
-            .map(|_| {
-                let tmp = self.new_temp_var();
-                (tmp.clone(), Expr::EVar(tmp))
-            })
-            .unzip();
+        // Get the entry vertex for the internal call logic
+        let internal_call_vertex =
+            self.compile_async_call_internal(node_expr, call, target, next_vertex);
 
-        // 2. Build the call chain backwards (Assign -> Await -> Async -> Pause).
-
-        let assign_label = Label::Instr(
-            Instr::Assign(target, Expr::EVar(async_ret_var.clone())),
-            next_vertex,
-        );
-        let assign_vertex = self.add_label(assign_label);
-
-        let await_label = Label::Await(
-            Lhs::Var(async_ret_var),
-            Expr::EVar(async_future_var.clone()), // Await the future
-            assign_vertex,
-        );
-        let await_vertex = self.add_label(await_label);
-
-        let async_label = Label::Instr(
-            Instr::Async(
-                Lhs::Var(async_future_var), // Store the new future here
-                Expr::EVar(target_var.clone()),
-                resolved_name(call.name, &call.original_name),
-                arg_exprs,
-            ),
-            await_vertex,
-        );
-        let async_vertex = self.add_label(async_label);
-
-        let pause_vertex = self.add_label(Label::Pause(async_vertex));
-
-        // 3. Build the argument compilation chain backwards.
-        let mut arg_entry_vertex = pause_vertex;
-        for (arg, tmp_var) in call.args.iter().rev().zip(arg_temp_vars.iter().rev()) {
-            arg_entry_vertex =
-                self.compile_expr_to_value(arg, Lhs::Var(tmp_var.clone()), arg_entry_vertex);
-        }
-
-        // 4. Build the target expression compilation.
-        let target_entry_vertex =
-            self.compile_expr_to_value(target_expr, Lhs::Var(target_var), arg_entry_vertex);
-
-        target_entry_vertex
-    }
-
-    fn compile_rpc_async_call(
-        &mut self,
-        target_expr: &ResolvedExpr,
-        call: &ResolvedFuncCall,
-        target: Lhs, // The final destination for the *future*
-        next_vertex: Vertex,
-    ) -> Vertex {
-        // 1. Allocate all temporary variable names up front.
-        let target_var = self.new_temp_var(); // To store the result of `target_expr`
-
-        // Create temp var names for each argument.
-        let (arg_temp_vars, arg_exprs): (Vec<String>, Vec<Expr>) = (0..call.args.len())
-            .map(|_| {
-                let tmp = self.new_temp_var();
-                (tmp.clone(), Expr::EVar(tmp))
-            })
-            .unzip();
-
-        // 2. Build the call chain backwards (Async -> Pause).
-        let async_label = Label::Instr(
-            Instr::Async(
-                target,
-                Expr::EVar(target_var.clone()),
-                resolved_name(call.name, &call.original_name),
-                arg_exprs,
-            ),
-            next_vertex,
-        );
-        let async_vertex = self.add_label(async_label);
-
-        let pause_vertex = self.add_label(Label::Pause(async_vertex)); // Go to step B
-
-        // 3. Build the argument compilation chain backwards.
-        let mut arg_entry_vertex = pause_vertex;
-        for (arg, tmp_var) in call.args.iter().rev().zip(arg_temp_vars.iter().rev()) {
-            arg_entry_vertex =
-                self.compile_expr_to_value(arg, Lhs::Var(tmp_var.clone()), arg_entry_vertex);
-        }
-
-        // 4. Build the target expression compilation.
-        let target_entry_vertex =
-            self.compile_expr_to_value(target_expr, Lhs::Var(target_var), arg_entry_vertex);
-        target_entry_vertex
+        // Compile the target_expr, which runs *before* the internal call
+        // The result is stored in `target_var`, which `internal_call_vertex` will use.
+        self.compile_expr_to_value(target_expr, Lhs::Var(target_var), internal_call_vertex)
     }
 
     /// Converts a "simple" `ResolvedExpr` to a `cfg::Expr`.
@@ -1163,7 +1064,6 @@ impl Compiler {
             // --- Panic on complex expressions ---
             ResolvedExprKind::FuncCall(_)
             | ResolvedExprKind::RpcCall(_, _)
-            | ResolvedExprKind::RpcAsyncCall(_, _)
             | ResolvedExprKind::Await(_)
             | ResolvedExprKind::Spawn(_)
             | ResolvedExprKind::CreatePromise

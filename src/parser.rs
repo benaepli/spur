@@ -235,9 +235,7 @@ pub enum ExprKind {
     Tail(Box<Expr>),
     Len(Box<Expr>),
 
-    // RPC calls
     RpcCall(Box<Expr>, FuncCall),
-    RpcAsyncCall(Box<Expr>, FuncCall),
 
     Await(Box<Expr>),
     Spawn(Box<Expr>),
@@ -537,23 +535,16 @@ where
                 .to(kind)
         };
 
-        let rpc_call = choice((
-            just(TokenKind::RpcCall).to(false),
-            just(TokenKind::RpcAsyncCall).to(true),
-        ))
-        .then(
-            expr.clone()
-                .then_ignore(just(TokenKind::Comma))
-                .then(func_call.clone())
-                .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-        )
-        .map(|(is_async, (target, call))| {
-            if is_async {
-                ExprKind::RpcAsyncCall(Box::new(target), call)
-            } else {
+        let rpc_call = just(TokenKind::RpcCall)
+            .then(
+                expr.clone()
+                    .then_ignore(just(TokenKind::Comma))
+                    .then(func_call.clone())
+                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
+            )
+            .map(|(_, (target, call))| {
                 ExprKind::RpcCall(Box::new(target), call)
-            }
-        });
+            });
 
         let atom = choice((
             val,

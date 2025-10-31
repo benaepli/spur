@@ -606,7 +606,10 @@ impl TypeChecker {
                 self.check_type_compatibility(&Type::Int, &ty, expr.span)?;
                 Ok(Type::Int)
             }
-            ResolvedExprKind::FuncCall(call) => self.check_func_call(call),
+            ResolvedExprKind::FuncCall(call) => {
+                let return_type = self.check_func_call(call)?;
+                Ok(Type::Future(Box::new(return_type)))
+            }
             ResolvedExprKind::MapLit(pairs) => self.check_map_literal(pairs, expr.span),
             ResolvedExprKind::ListLit(items) => self.check_list_literal(items, expr.span),
             ResolvedExprKind::TupleLit(items) => {
@@ -722,15 +725,11 @@ impl TypeChecker {
                     })
                 }
             }
-            ResolvedExprKind::CreatePromise => {
-                Ok(Type::EmptyPromise)
-            }
+            ResolvedExprKind::CreatePromise => Ok(Type::EmptyPromise),
             ResolvedExprKind::CreateFuture(promise_expr) => {
                 let promise_type = self.check_expr(promise_expr)?;
                 match promise_type {
-                    Type::Promise(inner_ty) => {
-                        Ok(Type::Future(inner_ty))
-                    }
+                    Type::Promise(inner_ty) => Ok(Type::Future(inner_ty)),
                     _ => Err(TypeError::NotAPromise {
                         ty: promise_type,
                         span: promise_expr.span,
@@ -834,19 +833,7 @@ impl TypeChecker {
                         span: expr.span,
                     });
                 }
-                // Synchronous call, returns T
-                self.check_func_call(call)
-            }
-
-            ResolvedExprKind::RpcAsyncCall(target, call) => {
-                let target_ty = self.check_expr(target)?;
-                if !matches!(target_ty, Type::Role(..)) {
-                    return Err(TypeError::RpcCallTargetNotRole {
-                        ty: target_ty,
-                        span: expr.span,
-                    });
-                }
-                // Asynchronous call, returns Future<T>
+                // Asynchronous call, returns future<T>
                 let return_type = self.check_func_call(call)?;
                 Ok(Type::Future(Box::new(return_type)))
             }
@@ -1232,8 +1219,8 @@ impl TypeChecker {
                             Ok(Type::Struct(*name_id, name))
                         }
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
-                                                        aliased_type,
-                                                    )) => self.resolve_type(aliased_type),
+                            aliased_type,
+                        )) => self.resolve_type(aliased_type),
                     }
                 } else if let Some(role_name) = self.role_defs.get(name_id) {
                     Ok(Type::Role(*name_id, role_name.clone()))

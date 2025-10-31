@@ -40,6 +40,7 @@ base_type ::=
       ID
     | 'map' '<' type_def ',' type_def '>'
     | 'list' '<' type_def '>'
+    | 'promise' '<' type_def '>'
     | '(' type_def_list? ')'
     
 statements ::= statement*
@@ -51,7 +52,6 @@ statement ::=
     | 'return' expr ';'
     | for_loop
     | for_in_loop
-    | 'await' expr ';'
     | 'print' '(' expr ')' ';'
     | 'break' ';'
 
@@ -87,7 +87,7 @@ additive_expr ::= multiplicative_expr ( ( '+' | '-' ) multiplicative_expr )*
 
 multiplicative_expr ::= unary_expr ( ( '*' | '/' | '%' ) unary_expr )*
 
-unary_expr ::= ( '!' | '-' ) unary_expr | primary_expr
+unary_expr ::= ( '!' | '-' | 'await' | 'spawn' ) unary_expr | primary_expr
 
 primary_expr ::= primary_base postfix_op*
 
@@ -107,6 +107,10 @@ primary_base ::=
     | 'next_resp' '(' expr ')'
     | 'min' '(' expr ',' expr ')'
     | 'exists' '(' expr ',' expr ')'
+    | 'erase' '(' expr ',' expr ')'
+    | 'create_promise' '(' ')'
+    | 'create_future' '(' expr ')'
+    | 'resolve_promise' '(' expr ',' expr ')'
     | '(' expr ')'
 
 postfix_op ::=
