@@ -86,6 +86,7 @@ pub enum TypeDefKind {
     List(Box<TypeDef>),
     Tuple(Vec<TypeDef>),
     Optional(Box<TypeDef>),
+    Future(Box<TypeDef>),
     Promise(Box<TypeDef>),
     Lock,
 }
@@ -407,6 +408,17 @@ where
                 span: e.span(),
             });
 
+        let future = just(TokenKind::Future)
+            .ignore_then(
+                type_def
+                    .clone()
+                    .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
+            )
+            .map_with(|t, e| TypeDef {
+                kind: TypeDefKind::Future(Box::new(t)),
+                span: e.span(),
+            });
+
         let promise = just(TokenKind::Promise)
             .ignore_then(
                 type_def
@@ -418,7 +430,7 @@ where
                 span: e.span(),
             });
 
-        let base_type = choice((named, lock_type, map, list, tuple, promise));
+        let base_type = choice((named, lock_type, map, list, tuple, future, promise));
 
         base_type
             .clone()
@@ -774,7 +786,7 @@ where
             });
 
         let for_loop_init = choice((
-            var_init_core.clone().map(ForLoopInit::VarInit), // <-- MODIFIED
+            var_init_core.clone().map(ForLoopInit::VarInit),
             assignment.clone().map(ForLoopInit::Assignment),
         ));
 

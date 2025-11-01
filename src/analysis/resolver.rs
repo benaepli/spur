@@ -99,6 +99,7 @@ pub enum ResolvedTypeDef {
     List(Box<ResolvedTypeDef>),
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
+    Future(Box<ResolvedTypeDef>),
     Promise(Box<ResolvedTypeDef>),
     Lock,
 }
@@ -616,6 +617,9 @@ impl Resolver {
                 Ok(ResolvedTypeDef::Tuple(resolved_ts))
             }
             TypeDefKind::Optional(t) => Ok(ResolvedTypeDef::Optional(Box::new(
+                self.resolve_type_def(*t)?,
+            ))),
+            TypeDefKind::Future(t) => Ok(ResolvedTypeDef::Future(Box::new(
                 self.resolve_type_def(*t)?,
             ))),
             TypeDefKind::Promise(t) => Ok(ResolvedTypeDef::Promise(Box::new(

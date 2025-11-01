@@ -206,10 +206,7 @@ impl TypeChecker {
             prepopulated_types.unit,
             TypeDefinition::Builtin(Type::Tuple(vec![])),
         );
-        predefined.insert(
-            prepopulated_types.lock,
-            TypeDefinition::Builtin(Type::Lock),
-        );
+        predefined.insert(prepopulated_types.lock, TypeDefinition::Builtin(Type::Lock));
 
         Self {
             scopes: vec![HashMap::new()], // Global scope
@@ -1285,6 +1282,10 @@ impl TypeChecker {
                     Ok(Type::Optional(Box::new(base_type)))
                 }
             }
+            ResolvedTypeDef::Future(t) => {
+                let base_type = self.resolve_type(t)?;
+                Ok(Type::Future(Box::new(base_type)))
+            }
             ResolvedTypeDef::Promise(t) => {
                 let base_type = self.resolve_type(t)?;
                 Ok(Type::Promise(Box::new(base_type)))
@@ -1319,11 +1320,15 @@ impl TypeChecker {
             if *actual == Type::Nil {
                 return Ok(());
             }
-            if **expected_inner == *actual {
-                return Ok(());
-            }
             if let Type::Optional(actual_inner) = actual {
                 return self.check_type_compatibility(expected_inner, actual_inner, span);
+            }
+
+            if self
+                .check_type_compatibility(expected_inner, actual, span)
+                .is_ok()
+            {
+                return Ok(());
             }
         }
         // Check for future "widening" (e.g., if expected is Future<T> and actual is Future<T>)
