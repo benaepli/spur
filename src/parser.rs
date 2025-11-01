@@ -87,6 +87,7 @@ pub enum TypeDefKind {
     Tuple(Vec<TypeDef>),
     Optional(Box<TypeDef>),
     Promise(Box<TypeDef>),
+    Lock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +119,7 @@ pub enum StatementKind {
     ForInLoop(ForInLoop),
     Print(Expr),
     Break,
+    Lock(Expr, Vec<Statement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +245,7 @@ pub enum ExprKind {
     CreatePromise,
     CreateFuture(Box<Expr>),
     ResolvePromise(Box<Expr>, Box<Expr>),
+    CreateLock,
 
     // Postfix operations
     Index(Box<Expr>, Box<Expr>),
@@ -364,6 +367,11 @@ where
             span: e.span(),
         });
 
+        let lock_type = just(TokenKind::Lock).map_with(|_, e| TypeDef {
+            kind: TypeDefKind::Lock,
+            span: e.span(),
+        });
+
         let map = just(TokenKind::Map)
             .ignore_then(
                 type_def
@@ -410,7 +418,7 @@ where
                 span: e.span(),
             });
 
-        let base_type = choice((named, map, list, tuple, promise));
+        let base_type = choice((named, lock_type, map, list, tuple, promise));
 
         base_type
             .clone()
@@ -542,9 +550,7 @@ where
                     .then(func_call.clone())
                     .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
             )
-            .map(|(_, (target, call))| {
-                ExprKind::RpcCall(Box::new(target), call)
-            });
+            .map(|(_, (target, call))| ExprKind::RpcCall(Box::new(target), call));
 
         let atom = choice((
             val,
@@ -565,6 +571,7 @@ where
             zero_arg_builtin(TokenKind::CreatePromise, ExprKind::CreatePromise),
             one_arg_builtin(TokenKind::CreateFuture, ExprKind::CreateFuture),
             two_arg_builtin(TokenKind::ResolvePromise, ExprKind::ResolvePromise),
+            zero_arg_builtin(TokenKind::CreateLock, ExprKind::CreateLock),
             func_call.map(ExprKind::FuncCall),
             ident.clone().map(ExprKind::Var),
             tuple_lit,
@@ -824,6 +831,17 @@ where
                 .map_with(move |expr, e| Statement::new(constructor(expr), e.span()))
         };
 
+        let lock_stmt = just(TokenKind::Await)
+            .ignore_then(just(TokenKind::Lock))
+            .ignore_then(
+                expr.clone()
+                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
+            )
+            .then(block())
+            .map_with(|(lock_expr, body), e| {
+                Statement::new(StatementKind::Lock(lock_expr, body), e.span())
+            });
+
         choice((
             cond_stmts,
             var_init_stmt,
@@ -836,6 +854,7 @@ where
             simple_stmt(TokenKind::Return, StatementKind::Return),
             for_loop,
             for_in_loop,
+            lock_stmt,
             just(TokenKind::Print)
                 .ignore_then(
                     expr.clone()

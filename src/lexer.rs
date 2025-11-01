@@ -108,6 +108,8 @@ pub enum TokenKind {
     CreateFuture,
     ResolvePromise,
     Promise,
+    Lock,
+    CreateLock,
 }
 
 impl fmt::Display for TokenKind {
@@ -182,6 +184,8 @@ impl fmt::Display for TokenKind {
             TokenKind::CreateFuture => write!(f, "create_future"),
             TokenKind::ResolvePromise => write!(f, "resolve_promise"),
             TokenKind::Promise => write!(f, "promise"),
+            TokenKind::Lock => write!(f, "lock"),
+            TokenKind::CreateLock => write!(f, "create_lock"),
         }
     }
 }
@@ -226,6 +230,8 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "create_future" => TokenKind::CreateFuture,
     "resolve_promise" => TokenKind::ResolvePromise,
     "promise" => TokenKind::Promise,
+    "lock" => TokenKind::Lock,
+    "create_lock" => TokenKind::CreateLock,
 };
 
 fn is_special_char(ch: char) -> bool {

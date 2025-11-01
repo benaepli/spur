@@ -353,6 +353,16 @@ pub fn report_type_errors(
                     format!("help: this operation requires a promise type, but `{}` is not a promise", ty),
                 ]),
 
+            TypeError::NotALock { ty, span } => Diagnostic::error()
+                .with_message("cannot await lock on non-lock type")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected lock type, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: await lock can only be used on lock types, but `{}` is not a lock", ty),
+                ]),
+
             TypeError::PollingOnInvalidType { ty, span } => Diagnostic::error()
                 .with_message("invalid polling operation")
                 .with_labels(vec![

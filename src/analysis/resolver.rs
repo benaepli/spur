@@ -100,6 +100,7 @@ pub enum ResolvedTypeDef {
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
     Promise(Box<ResolvedTypeDef>),
+    Lock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +120,7 @@ pub enum ResolvedStatementKind {
     ForInLoop(ResolvedForInLoop),
     Print(ResolvedExpr),
     Break,
+    Lock(Box<ResolvedExpr>, Vec<ResolvedStatement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -217,6 +219,7 @@ pub enum ResolvedExprKind {
     CreatePromise,
     CreateFuture(Box<ResolvedExpr>),
     ResolvePromise(Box<ResolvedExpr>, Box<ResolvedExpr>),
+    CreateLock,
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
@@ -253,6 +256,7 @@ pub struct PrepopulatedTypes {
     pub string: NameId,
     pub bool: NameId,
     pub unit: NameId,
+    pub lock: NameId,
 }
 
 impl Resolver {
@@ -271,11 +275,13 @@ impl Resolver {
         let string_type = new_name_id();
         let bool_type = new_name_id();
         let unit_type = new_name_id();
+        let lock_type = new_name_id();
 
         type_scope.insert("int".to_string(), int_type);
         type_scope.insert("string".to_string(), string_type);
         type_scope.insert("bool".to_string(), bool_type);
         type_scope.insert("unit".to_string(), unit_type);
+        type_scope.insert("lock".to_string(), lock_type);
 
         Resolver {
             var_scopes: vec![HashMap::new()],
@@ -290,6 +296,7 @@ impl Resolver {
                 string: string_type,
                 bool: bool_type,
                 unit: unit_type,
+                lock: lock_type,
             },
         }
     }
@@ -614,6 +621,7 @@ impl Resolver {
             TypeDefKind::Promise(t) => Ok(ResolvedTypeDef::Promise(Box::new(
                 self.resolve_type_def(*t)?,
             ))),
+            TypeDefKind::Lock => Ok(ResolvedTypeDef::Lock),
         }
     }
 
@@ -639,6 +647,16 @@ impl Resolver {
             }
             StatementKind::Print(e) => ResolvedStatementKind::Print(self.resolve_expr(e)?),
             StatementKind::Break => ResolvedStatementKind::Break,
+            StatementKind::Lock(lock_expr, body) => {
+                self.enter_scope();
+                let resolved_lock_expr = self.resolve_expr(lock_expr)?;
+                let resolved_body = body
+                    .into_iter()
+                    .map(|s| self.resolve_statement(s))
+                    .collect::<Result<_, _>>()?;
+                self.exit_scope();
+                ResolvedStatementKind::Lock(Box::new(resolved_lock_expr), resolved_body)
+            }
         };
         Ok(ResolvedStatement { kind, span })
     }
@@ -871,6 +889,7 @@ impl Resolver {
                 Box::new(self.resolve_expr(*p)?),
                 Box::new(self.resolve_expr(*v)?),
             ),
+            ExprKind::CreateLock => ResolvedExprKind::CreateLock,
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)?),
                 Box::new(self.resolve_expr(*i)?),

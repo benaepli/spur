@@ -22,6 +22,7 @@ pub enum Type {
     Optional(Box<Type>),
     Future(Box<Type>),
     Promise(Box<Type>),
+    Lock,
 
     // Placeholder types.
     EmptyList,
@@ -51,6 +52,7 @@ impl std::fmt::Display for Type {
             Type::Optional(t) => write!(f, "{}?", t),
             Type::Future(t) => write!(f, "future<{}>", t),
             Type::Promise(t) => write!(f, "promise<{}>", t),
+            Type::Lock => write!(f, "lock"),
             Type::EmptyList => write!(f, "empty list"),
             Type::EmptyMap => write!(f, "empty map"),
             Type::EmptyPromise => write!(f, "empty promise"),
@@ -152,6 +154,8 @@ pub enum TypeError {
     AwaitOnNonFuture { ty: Type, span: Span },
     #[error("Operation requires a promise, found `{ty}`")]
     NotAPromise { ty: Type, span: Span },
+    #[error("await lock can only be used on a Lock, found `{ty}`")]
+    NotALock { ty: Type, span: Span },
     #[error("Polling operation requires a collection of futures or bools, found `{ty}`")]
     PollingOnInvalidType { ty: Type, span: Span },
     #[error("next_resp requires a map of futures, found `{ty}`")]
@@ -201,6 +205,10 @@ impl TypeChecker {
         predefined.insert(
             prepopulated_types.unit,
             TypeDefinition::Builtin(Type::Tuple(vec![])),
+        );
+        predefined.insert(
+            prepopulated_types.lock,
+            TypeDefinition::Builtin(Type::Lock),
         );
 
         Self {
@@ -412,6 +420,23 @@ impl TypeChecker {
                     return Err(TypeError::BreakOutsideLoop(stmt.span));
                 }
                 Ok(false)
+            }
+            ResolvedStatementKind::Lock(lock_expr, body) => {
+                let lock_ty = self.check_expr(lock_expr)?;
+                if lock_ty != Type::Lock {
+                    return Err(TypeError::NotALock {
+                        ty: lock_ty,
+                        span: lock_expr.span,
+                    });
+                }
+
+                let mut body_returns = false;
+                for stmt in body {
+                    if self.check_statement(stmt)? {
+                        body_returns = true;
+                    }
+                }
+                Ok(body_returns)
             }
         }
     }
@@ -757,6 +782,7 @@ impl TypeChecker {
                     }),
                 }
             }
+            ResolvedExprKind::CreateLock => Ok(Type::Lock),
             ResolvedExprKind::Index(target, index) => self.check_index(target, index, expr.span),
             ResolvedExprKind::Slice(target, start, end) => {
                 let target_ty = self.check_expr(target)?;
@@ -1263,6 +1289,7 @@ impl TypeChecker {
                 let base_type = self.resolve_type(t)?;
                 Ok(Type::Promise(Box::new(base_type)))
             }
+            ResolvedTypeDef::Lock => Ok(Type::Lock),
         }
     }
 

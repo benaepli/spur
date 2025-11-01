@@ -50,6 +50,7 @@ pub enum Expr {
     EUnwrap(Box<Expr>),
     ECoalesce(Box<Expr>, Box<Expr>),
     ECreatePromise,
+    ECreateLock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -96,6 +97,8 @@ pub enum Label {
     ),
     Print(Expr, Vertex /* next_vertex */),
     Break(Vertex /* break_target_vertex */),
+    Lock(Expr, Vertex /* next_vertex */),
+    Unlock(Expr, Vertex /* next_vertex */),
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +147,6 @@ impl Compiler {
         Compiler {
             cfg: Vec::new(),
             temp_counter: 0,
-
             rpc_map: HashMap::new(),
             client_ops_map: HashMap::new(),
             compiling_for_role: false,
@@ -224,8 +226,8 @@ impl Compiler {
     }
 
     fn compile_init_func(&mut self, inits: &[ResolvedVarInit], name: String) -> FunctionInfo {
-        // All init functions end with `Return(EUnit)`
-        let final_vertex = self.add_label(Label::Return(Expr::EUnit));
+        let return_var_name = self.new_temp_var();
+        let final_vertex = self.add_label(Label::Return(Expr::EVar(return_var_name.clone())));
 
         let mut next_vertex = final_vertex;
         // Build the init chain backwards
@@ -239,19 +241,21 @@ impl Compiler {
             entry,
             name,
             formals: vec![],
-            locals: vec![], // Inits are treated as "globals" for the node
+            locals: vec![(return_var_name, Expr::EUnit)], // Inits are "globals"
         }
     }
 
     fn compile_func_def(&mut self, func: ResolvedFuncDef) -> FunctionInfo {
-        // Add an implicit `Return(EUnit)` at the end of every function,
-        // just in case it doesn't have an explicit return.
-        let final_vertex = self.add_label(Label::Return(Expr::EUnit));
+        let return_var_name = self.new_temp_var();
+        let final_return_vertex =
+            self.add_label(Label::Return(Expr::EVar(return_var_name.clone())));
 
         let entry = self.compile_block(
             &func.body,
-            final_vertex,
-            final_vertex, // `break_target` (breaks go to end of function)
+            final_return_vertex,
+            final_return_vertex, // `break_target` (breaks go to end of function)
+            final_return_vertex, // `return_target`
+            &return_var_name,
         );
 
         let formals = func
@@ -260,7 +264,8 @@ impl Compiler {
             .map(|p| resolved_name(p.name, &p.original_name))
             .collect();
 
-        let locals = self.scan_body(&func.body);
+        let mut locals = self.scan_body(&func.body);
+        locals.push((return_var_name.clone(), Expr::EUnit)); // Default return val
 
         FunctionInfo {
             entry,
@@ -275,6 +280,8 @@ impl Compiler {
         body: &[ResolvedStatement],
         next_vertex: Vertex,
         break_target: Vertex,
+        return_target: Vertex,
+        return_var: &str,
     ) -> Vertex {
         let mut next = next_vertex;
         // Iterate in reverse to chain statements:
@@ -283,7 +290,7 @@ impl Compiler {
         // ...
         // Stmt0 -> Stmt1
         for stmt in body.iter().rev() {
-            next = self.compile_statement(stmt, next, break_target);
+            next = self.compile_statement(stmt, next, break_target, return_target, return_var);
         }
         next
     }
@@ -293,6 +300,8 @@ impl Compiler {
         stmt: &ResolvedStatement,
         next_vertex: Vertex,
         break_target: Vertex,
+        return_target: Vertex,
+        return_var: &str,
     ) -> Vertex {
         match &stmt.kind {
             ResolvedStatementKind::VarInit(init) => {
@@ -314,10 +323,13 @@ impl Compiler {
                 self.compile_expr_to_value(expr, Lhs::Var(dummy_var), next_vertex)
             }
             ResolvedStatementKind::Return(expr) => {
-                let ret_var = self.new_temp_var();
-                let return_label = Label::Return(Expr::EVar(ret_var.clone()));
-                let return_vertex = self.add_label(return_label);
-                self.compile_expr_to_value(expr, Lhs::Var(ret_var), return_vertex)
+                // Compile the expression, store result in the dedicated return_var,
+                // and then jump to the function's final return_target.
+                self.compile_expr_to_value(
+                    expr,
+                    Lhs::Var(return_var.to_string()),
+                    return_target,
+                )
             }
             ResolvedStatementKind::Print(expr) => {
                 let print_var = self.new_temp_var();
@@ -326,20 +338,34 @@ impl Compiler {
                 self.compile_expr_to_value(expr, Lhs::Var(print_var), print_vertex)
             }
             ResolvedStatementKind::ForLoop(loop_stmt) => {
-                self.compile_for_loop(loop_stmt, next_vertex)
+                self.compile_for_loop(loop_stmt, next_vertex, return_target, return_var)
             }
             ResolvedStatementKind::Conditional(cond) => {
-                self.compile_conditional(cond, next_vertex, break_target)
+                self.compile_conditional(cond, next_vertex, break_target, return_target, return_var)
             }
             ResolvedStatementKind::ForInLoop(loop_stmt) => {
                 // `next_vertex` is the break target for a loop
-                self.compile_for_in_loop(loop_stmt, next_vertex)
+                self.compile_for_in_loop(loop_stmt, next_vertex, return_target, return_var)
             }
             ResolvedStatementKind::Break => self.add_label(Label::Break(break_target)),
+            ResolvedStatementKind::Lock(lock_expr, body) => self.compile_lock_statement(
+                lock_expr,
+                body,
+                next_vertex,
+                break_target,
+                return_target,
+                return_var,
+            ),
         }
     }
 
-    fn compile_for_loop(&mut self, loop_stmt: &ResolvedForLoop, next_vertex: Vertex) -> Vertex {
+    fn compile_for_loop(
+        &mut self,
+        loop_stmt: &ResolvedForLoop,
+        next_vertex: Vertex,
+        return_target: Vertex,
+        return_var: &str,
+    ) -> Vertex {
         // The [Condition] check is the "head" of the loop.
         let cond_vertex = self.add_label(Label::Return(Expr::EUnit)); // Dummy label
 
@@ -360,6 +386,8 @@ impl Compiler {
             &loop_stmt.body,
             increment_vertex, // After body, go to increment
             next_vertex,      // `break` goes to after the loop
+            return_target,
+            return_var,
         );
 
         let cond_expr = loop_stmt.condition.as_ref().map_or(
@@ -397,20 +425,40 @@ impl Compiler {
         cond: &ResolvedCondStmts,
         next_vertex: Vertex,
         break_target: Vertex,
+        return_target: Vertex,
+        return_var: &str,
     ) -> Vertex {
         let else_vertex = cond.else_branch.as_ref().map_or(next_vertex, |body| {
-            self.compile_block(body, next_vertex, break_target)
+            self.compile_block(
+                body,
+                next_vertex,
+                break_target,
+                return_target,
+                return_var,
+            )
         });
 
         let mut next_cond_vertex = else_vertex;
         for branch in cond.elseif_branches.iter().rev() {
-            let body_vertex = self.compile_block(&branch.body, next_vertex, break_target);
+            let body_vertex = self.compile_block(
+                &branch.body,
+                next_vertex,
+                break_target,
+                return_target,
+                return_var,
+            );
             let cond_expr = self.convert_simple_expr(&branch.condition);
             next_cond_vertex =
                 self.add_label(Label::Cond(cond_expr, body_vertex, next_cond_vertex));
         }
 
-        let if_body_vertex = self.compile_block(&cond.if_branch.body, next_vertex, break_target);
+        let if_body_vertex = self.compile_block(
+            &cond.if_branch.body,
+            next_vertex,
+            break_target,
+            return_target,
+            return_var,
+        );
         let if_cond_expr = self.convert_simple_expr(&cond.if_branch.condition);
 
         self.add_label(Label::Cond(if_cond_expr, if_body_vertex, next_cond_vertex))
@@ -420,6 +468,8 @@ impl Compiler {
         &mut self,
         loop_stmt: &ResolvedForInLoop,
         next_vertex: Vertex,
+        return_target: Vertex,
+        return_var: &str,
     ) -> Vertex {
         // The [ForLoopIn] label is the "head" of the loop.
         // We add a dummy label to reserve its vertex index.
@@ -432,6 +482,8 @@ impl Compiler {
             &loop_stmt.body,
             for_vertex,  // Loop back to the ForLoopIn label
             next_vertex, // Break target
+            return_target,
+            return_var,
         );
 
         // Now we create the real [ForLoopIn] label.
@@ -458,6 +510,44 @@ impl Compiler {
 
         // The entry point to the whole statement is the `Copy` instruction.
         copy_vertex
+    }
+
+    fn compile_lock_statement(
+        &mut self,
+        lock_expr: &ResolvedExpr,
+        body: &[ResolvedStatement],
+        next_vertex: Vertex,
+        break_target: Vertex,
+        return_target: Vertex,
+        return_var: &str,
+    ) -> Vertex {
+        let lock_var = self.new_temp_var();
+        let lock_var_expr = Expr::EVar(lock_var.clone());
+
+        let unlock_then_break_vertex =
+            self.add_label(Label::Unlock(lock_var_expr.clone(), break_target));
+
+        let unlock_then_return_vertex =
+            self.add_label(Label::Unlock(lock_var_expr.clone(), return_target));
+
+        let unlock_then_continue_vertex =
+            self.add_label(Label::Unlock(lock_var_expr.clone(), next_vertex));
+
+        let body_vertex = self.compile_block(
+            body,
+            unlock_then_continue_vertex, // next_vertex for the block
+            unlock_then_break_vertex,    // break_target for the block
+            unlock_then_return_vertex,   // return_target for the block
+            return_var,
+        );
+
+        // Create the Lock label, which runs before the body
+        let lock_vertex = self.add_label(Label::Lock(lock_var_expr, body_vertex));
+
+        let entry_vertex =
+            self.compile_expr_to_value(lock_expr, Lhs::Var(lock_var), lock_vertex);
+
+        entry_vertex
     }
 
     // Helper to generate temp vars and EVar expressions for a list
@@ -884,6 +974,11 @@ impl Compiler {
                 self.add_label(label)
             }
 
+            ResolvedExprKind::CreateLock => {
+                let label = Label::Instr(Instr::Assign(target, Expr::ECreateLock), next_vertex);
+                self.add_label(label)
+            }
+
             _ => {
                 // Desugar the simple expression
                 let sim_expr = self.convert_simple_expr(expr);
@@ -1060,6 +1155,8 @@ impl Compiler {
                     .map(|(name, val)| (Expr::EString(name.clone()), self.convert_simple_expr(val)))
                     .collect(),
             ),
+
+            ResolvedExprKind::CreateLock => Expr::ECreateLock,
 
             // --- Panic on complex expressions ---
             ResolvedExprKind::FuncCall(_)
