@@ -241,7 +241,6 @@ pub enum ExprKind {
     RpcCall(Box<Expr>, FuncCall),
 
     Await(Box<Expr>),
-    Spawn(Box<Expr>),
 
     CreatePromise,
     CreateFuture(Box<Expr>),
@@ -666,9 +665,6 @@ where
                 just(TokenKind::Await)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Await(Box::new(val)), e.span())),
-                just(TokenKind::Spawn)
-                    .then(unary.clone())
-                    .map_with(|(_, val), e| Expr::new(ExprKind::Spawn(Box::new(val)), e.span())),
                 primary.clone(),
             ))
         });

@@ -216,7 +216,6 @@ pub enum ResolvedExprKind {
     Len(Box<ResolvedExpr>),
     RpcCall(Box<ResolvedExpr>, ResolvedFuncCall),
     Await(Box<ResolvedExpr>),
-    Spawn(Box<ResolvedExpr>),
     CreatePromise,
     CreateFuture(Box<ResolvedExpr>),
     ResolvePromise(Box<ResolvedExpr>, Box<ResolvedExpr>),
@@ -884,7 +883,6 @@ impl Resolver {
                 self.resolve_func_call(call)?,
             ),
             ExprKind::Await(e) => ResolvedExprKind::Await(Box::new(self.resolve_expr(*e)?)),
-            ExprKind::Spawn(e) => ResolvedExprKind::Spawn(Box::new(self.resolve_expr(*e)?)),
             ExprKind::CreatePromise => ResolvedExprKind::CreatePromise,
             ExprKind::CreateFuture(e) => {
                 ResolvedExprKind::CreateFuture(Box::new(self.resolve_expr(*e)?))

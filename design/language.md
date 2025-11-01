@@ -87,7 +87,7 @@ additive_expr ::= multiplicative_expr ( ( '+' | '-' ) multiplicative_expr )*
 
 multiplicative_expr ::= unary_expr ( ( '*' | '/' | '%' ) unary_expr )*
 
-unary_expr ::= ( '!' | '-' | 'await' | 'spawn' ) unary_expr | primary_expr
+unary_expr ::= ( '!' | '-' | 'await' ) unary_expr | primary_expr
 
 primary_expr ::= primary_base postfix_op*
 

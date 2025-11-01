@@ -160,13 +160,6 @@ impl Compiler {
         name
     }
 
-    /// Allocates a new, unique name for a synthesized spawn task.
-    fn new_spawn_func_name(&mut self) -> String {
-        let name = format!("_spawn_task_{}", self.temp_counter);
-        self.temp_counter += 1;
-        name
-    }
-
     /// Adds a new label to the CFG and returns its Vertex index.
     fn add_label(&mut self, label: Label) -> Vertex {
         let vertex = self.cfg.len();
@@ -638,44 +631,6 @@ impl Compiler {
                 // Compile the inner expression `e` to get the future,
                 // storing it in `future_var`.
                 self.compile_expr_to_value(e, Lhs::Var(future_var), await_vertex)
-            }
-
-            ResolvedExprKind::Spawn(e) => {
-                let func_name = self.new_spawn_func_name();
-
-                // Compile the spawned expression `e` as a new function body
-                let tmp_result = self.new_temp_var();
-                let body_final_vertex =
-                    self.add_label(Label::Return(Expr::EVar(tmp_result.clone())));
-                let body_entry_vertex =
-                    self.compile_expr_to_value(e, Lhs::Var(tmp_result), body_final_vertex);
-
-                // Create the FunctionInfo for this new function
-                let info = FunctionInfo {
-                    entry: body_entry_vertex,
-                    name: func_name.clone(),
-                    formals: vec![], // The new function takes no arguments
-                    locals: vec![],  // Locals are handled by the body's CFG
-                };
-
-                if self.compiling_for_role {
-                    self.rpc_map.insert(func_name.clone(), info);
-                } else {
-                    self.client_ops_map.insert(func_name.clone(), info);
-                }
-
-                let async_label = Label::Instr(
-                    Instr::Async(
-                        target,                         // Store future in the target Lhs
-                        Expr::EVar("self".to_string()), // Call "self"
-                        func_name,                      // Call our new hidden function
-                        vec![],                         // No arguments
-                    ),
-                    next_vertex,
-                );
-                let async_vertex = self.add_label(async_label);
-
-                self.add_label(Label::Pause(async_vertex))
             }
 
             // --- Compound expressions that may contain complex sub-expressions ---
@@ -1162,7 +1117,6 @@ impl Compiler {
             ResolvedExprKind::FuncCall(_)
             | ResolvedExprKind::RpcCall(_, _)
             | ResolvedExprKind::Await(_)
-            | ResolvedExprKind::Spawn(_)
             | ResolvedExprKind::CreatePromise
             | ResolvedExprKind::ResolvePromise(_, _) => {
                 panic!(
