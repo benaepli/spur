@@ -124,26 +124,17 @@ struct FunctionSignature {
 
 #[derive(Debug, Clone)]
 enum TypeDefinition {
-    /// A built-in type (int, string, bool, unit)
     Builtin(Type),
-    /// A user-defined type (struct or alias)
     UserDefined(ResolvedTypeDefStmtKind),
 }
 
 pub struct TypeChecker {
-    /// A stack of scopes, mapping a variable's `NameId` to its `Type`.
     scopes: Vec<HashMap<NameId, Type>>,
-    /// Maps a type's `NameId` to its definition. Includes both built-in and user-defined types.
     type_defs: HashMap<NameId, TypeDefinition>,
-    /// Maps a function's `NameId` to its signature. Populated in the first pass.
     func_signatures: HashMap<NameId, FunctionSignature>,
-    /// Maps role `NameId` to role name
     role_defs: HashMap<NameId, String>,
-    /// Maps struct `NameId` to struct name
     struct_names: HashMap<NameId, String>,
-    /// The expected return type of the current function being checked.
     current_return_type: Option<Type>,
-    /// Track if we're inside a loop (for break statements)
     loop_depth: usize,
 }
 
@@ -173,12 +164,9 @@ impl TypeChecker {
         }
     }
 
-    /// Main entry point for type checking
     pub fn check_program(&mut self, program: ResolvedProgram) -> Result<TypedProgram, TypeError> {
-        // First pass: collect all type definitions and function signatures
         self.collect_definitions(&program)?;
 
-        // Second pass: type check all function bodies
         let mut typed_top_levels = Vec::new();
         for top_level_def in program.top_level_defs {
             match top_level_def {
@@ -186,13 +174,10 @@ impl TypeChecker {
                     let typed_role = self.check_role_def(role)?;
                     typed_top_levels.push(TypedTopLevelDef::Role(typed_role));
                 }
-                ResolvedTopLevelDef::Type(_) => {
-                    // Already processed in first pass, not included in TypedProgram
-                }
+                ResolvedTopLevelDef::Type(_) => {}
             }
         }
 
-        // Check client definition
         let typed_client = self.check_client_def(program.client_def)?;
 
         Ok(TypedProgram {
@@ -201,9 +186,7 @@ impl TypeChecker {
         })
     }
 
-    /// First pass: collect all type and function definitions
     fn collect_definitions(&mut self, program: &ResolvedProgram) -> Result<(), TypeError> {
-        // Collect type definitions
         for top_level_def in &program.top_level_defs {
             match top_level_def {
                 ResolvedTopLevelDef::Type(type_def) => {
@@ -211,14 +194,12 @@ impl TypeChecker {
                         type_def.name,
                         TypeDefinition::UserDefined(type_def.def.clone()),
                     );
-                    // Store the struct name for later use
                     self.struct_names
                         .insert(type_def.name, type_def.original_name.clone());
                 }
                 ResolvedTopLevelDef::Role(role) => {
                     self.role_defs.insert(role.name, role.original_name.clone());
 
-                    // Collect function signatures from this role
                     for func in &role.func_defs {
                         let sig = self.build_function_signature(func)?;
                         self.func_signatures.insert(func.name, sig);
@@ -227,7 +208,6 @@ impl TypeChecker {
             }
         }
 
-        // Collect client function signatures
         for func in &program.client_def.func_defs {
             let sig = self.build_function_signature(func)?;
             self.func_signatures.insert(func.name, sig);
@@ -261,13 +241,11 @@ impl TypeChecker {
     fn check_role_def(&mut self, role: ResolvedRoleDef) -> Result<TypedRoleDef, TypeError> {
         self.enter_scope();
 
-        // Check role variable initializations
         let mut typed_var_inits = Vec::new();
         for var_init in role.var_inits {
             typed_var_inits.push(self.check_var_init(var_init)?);
         }
 
-        // Check all functions in this role
         let mut typed_func_defs = Vec::new();
         for func in role.func_defs {
             typed_func_defs.push(self.check_func_def(func)?);
@@ -286,13 +264,11 @@ impl TypeChecker {
     fn check_client_def(&mut self, client: ResolvedClientDef) -> Result<TypedClientDef, TypeError> {
         self.enter_scope();
 
-        // Check client variable initializations
         let mut typed_var_inits = Vec::new();
         for var_init in client.var_inits {
             typed_var_inits.push(self.check_var_init(var_init)?);
         }
 
-        // Check all functions in the client
         let mut typed_func_defs = Vec::new();
         for func in client.func_defs {
             typed_func_defs.push(self.check_func_def(func)?);
@@ -316,7 +292,6 @@ impl TypeChecker {
         self.enter_scope();
         self.current_return_type = Some(sig.return_type.clone());
 
-        // Add parameters to scope
         let mut typed_params = Vec::new();
         for (param, param_type) in func.params.into_iter().zip(sig.params.iter()) {
             self.add_var(param.name, param_type.clone());
@@ -328,7 +303,6 @@ impl TypeChecker {
             });
         }
 
-        // Check function body
         let mut typed_body = Vec::new();
         let mut has_return = false;
         for stmt in func.body {
@@ -339,7 +313,6 @@ impl TypeChecker {
             }
         }
 
-        // Check that non-unit functions have a return statement
         if sig.return_type != Type::Tuple(vec![]) && !has_return {
             return Err(TypeError::MissingReturn(func.span));
         }
@@ -360,18 +333,17 @@ impl TypeChecker {
         let expected_type = self.resolve_type(&var_init.type_def)?;
         let typed_value = self.check_expr(var_init.value)?;
 
-        self.check_type_compatibility(&expected_type, &typed_value.ty, var_init.span)?;
+        let coerced_value = self.check_and_coerce(&expected_type, typed_value, var_init.span)?;
         self.add_var(var_init.name, expected_type.clone());
         Ok(TypedVarInit {
             name: var_init.name,
             original_name: var_init.original_name,
             type_def: expected_type,
-            value: typed_value,
+            value: coerced_value,
             span: var_init.span,
         })
     }
 
-    /// Check a statement. Returns (TypedStatement, true) if the statement definitely returns.
     fn check_statement(
         &mut self,
         stmt: ResolvedStatement,
@@ -412,13 +384,14 @@ impl TypeChecker {
             }
             ResolvedStatementKind::Return(expr) => {
                 let typed_expr = self.check_expr(expr)?;
+                let coerced_expr;
                 if let Some(expected_return_type) = &self.current_return_type {
-                    self.check_type_compatibility(expected_return_type, &typed_expr.ty, span)?;
+                    coerced_expr = self.check_and_coerce(expected_return_type, typed_expr, span)?;
                 } else {
                     return Err(TypeError::ReturnOutsideFunction(span));
                 }
                 let typed_stmt = TypedStatement {
-                    kind: TypedStatementKind::Return(typed_expr),
+                    kind: TypedStatementKind::Return(coerced_expr),
                     span,
                 };
                 Ok((typed_stmt, true))
@@ -498,7 +471,6 @@ impl TypeChecker {
         &mut self,
         cond: ResolvedCondStmts,
     ) -> Result<(TypedCondStmts, bool), TypeError> {
-        // Check if condition
         let typed_if_cond = self.check_expr(cond.if_branch.condition)?;
         self.check_type_compatibility(&Type::Bool, &typed_if_cond.ty, cond.if_branch.span)?;
         let (typed_if_body, if_returns) = self.check_block(cond.if_branch.body)?;
@@ -508,7 +480,6 @@ impl TypeChecker {
             span: cond.if_branch.span,
         };
 
-        // Check elseif branches
         let mut all_branches_return = if_returns;
         let mut typed_elseif_branches = Vec::new();
         for elseif in cond.elseif_branches {
@@ -524,7 +495,6 @@ impl TypeChecker {
             all_branches_return = all_branches_return && elseif_returns;
         }
 
-        // Check else branch
         let typed_else_branch;
         if let Some(else_body) = cond.else_branch {
             let (typed_body, else_returns) = self.check_block(else_body)?;
@@ -532,7 +502,6 @@ impl TypeChecker {
             all_branches_return = all_branches_return && else_returns;
         } else {
             typed_else_branch = None;
-            // No else branch means not all paths return
             all_branches_return = false;
         }
 
@@ -551,7 +520,6 @@ impl TypeChecker {
         self.enter_scope();
         self.loop_depth += 1;
 
-        // Check initialization
         let typed_init = if let Some(init) = for_loop.init {
             match init {
                 crate::analysis::resolver::ResolvedForLoopInit::VarInit(vi) => {
@@ -565,7 +533,6 @@ impl TypeChecker {
             None
         };
 
-        // Check condition
         let typed_condition = if let Some(condition) = for_loop.condition {
             let typed_cond = self.check_expr(condition)?;
             self.check_type_compatibility(&Type::Bool, &typed_cond.ty, for_loop.span)?;
@@ -574,14 +541,12 @@ impl TypeChecker {
             None
         };
 
-        // Check increment
         let typed_increment = if let Some(increment) = for_loop.increment {
             Some(self.check_assignment(increment)?)
         } else {
             None
         };
 
-        // Check body
         let mut typed_body = Vec::new();
         for stmt in for_loop.body {
             let (typed_stmt, _) = self.check_statement(stmt)?;
@@ -603,10 +568,8 @@ impl TypeChecker {
         &mut self,
         for_in_loop: ResolvedForInLoop,
     ) -> Result<TypedForInLoop, TypeError> {
-        // Check the iterable expression
         let typed_iterable = self.check_expr(for_in_loop.iterable)?;
 
-        // Determine the element type based on the iterable
         let element_type = match &typed_iterable.ty {
             Type::List(elem_ty) => (**elem_ty).clone(),
             Type::Map(key_ty, val_ty) => Type::Tuple(vec![(**key_ty).clone(), (**val_ty).clone()]),
@@ -621,10 +584,8 @@ impl TypeChecker {
         self.enter_scope();
         self.loop_depth += 1;
 
-        // Check and bind pattern
         let typed_pattern = self.check_pattern(for_in_loop.pattern, &element_type)?;
 
-        // Check body
         let mut typed_body = Vec::new();
         for stmt in for_in_loop.body {
             let (typed_stmt, _) = self.check_statement(stmt)?;
@@ -693,7 +654,6 @@ impl TypeChecker {
         &mut self,
         assign: ResolvedAssignment,
     ) -> Result<TypedAssignment, TypeError> {
-        // Check if target is a valid lvalue
         if !self.is_valid_lvalue(&assign.target.kind) {
             return Err(TypeError::InvalidAssignmentTarget(assign.span));
         }
@@ -701,10 +661,10 @@ impl TypeChecker {
         let typed_target = self.check_expr(assign.target)?;
         let typed_value = self.check_expr(assign.value)?;
 
-        self.check_type_compatibility(&typed_target.ty, &typed_value.ty, assign.span)?;
+        let coerced_value = self.check_and_coerce(&typed_target.ty, typed_value, assign.span)?;
         Ok(TypedAssignment {
             target: typed_target,
-            value: typed_value,
+            value: coerced_value,
             span: assign.span,
         })
     }
@@ -797,12 +757,12 @@ impl TypeChecker {
                 let typed_list = self.check_expr(*list_expr)?;
                 let typed_item = self.check_expr(*item_expr)?;
 
-                let list_ty = match typed_list.ty.clone() {
+                let (list_ty, coerced_item) = match typed_list.ty.clone() {
                     Type::List(elem_ty) => {
-                        self.check_type_compatibility(elem_ty.as_ref(), &typed_item.ty, span)?;
-                        Type::List(elem_ty)
+                        let coerced = self.check_and_coerce(elem_ty.as_ref(), typed_item, span)?;
+                        (Type::List(elem_ty), coerced)
                     }
-                    Type::EmptyList => Type::List(Box::new(typed_item.ty.clone())),
+                    Type::EmptyList => (Type::List(Box::new(typed_item.ty.clone())), typed_item),
                     _ => {
                         return Err(TypeError::NotAList {
                             ty: typed_list.ty,
@@ -812,7 +772,7 @@ impl TypeChecker {
                 };
 
                 Ok(TypedExpr {
-                    kind: TypedExprKind::Append(Box::new(typed_list), Box::new(typed_item)),
+                    kind: TypedExprKind::Append(Box::new(typed_list), Box::new(coerced_item)),
                     ty: list_ty,
                     span,
                 })
@@ -821,12 +781,12 @@ impl TypeChecker {
                 let typed_item = self.check_expr(*item_expr)?;
                 let typed_list = self.check_expr(*list_expr)?;
 
-                let list_ty = match typed_list.ty.clone() {
+                let (list_ty, coerced_item) = match typed_list.ty.clone() {
                     Type::List(elem_ty) => {
-                        self.check_type_compatibility(elem_ty.as_ref(), &typed_item.ty, span)?;
-                        Type::List(elem_ty)
+                        let coerced = self.check_and_coerce(elem_ty.as_ref(), typed_item, span)?;
+                        (Type::List(elem_ty), coerced)
                     }
-                    Type::EmptyList => Type::List(Box::new(typed_item.ty.clone())),
+                    Type::EmptyList => (Type::List(Box::new(typed_item.ty.clone())), typed_item),
                     _ => {
                         return Err(TypeError::NotAList {
                             ty: typed_list.ty,
@@ -836,7 +796,7 @@ impl TypeChecker {
                 };
 
                 Ok(TypedExpr {
-                    kind: TypedExprKind::Prepend(Box::new(typed_item), Box::new(typed_list)),
+                    kind: TypedExprKind::Prepend(Box::new(coerced_item), Box::new(typed_list)),
                     ty: list_ty,
                     span,
                 })
@@ -961,17 +921,19 @@ impl TypeChecker {
                 let typed_promise = self.check_expr(*promise_expr)?;
                 let typed_value = self.check_expr(*value_expr)?;
 
+                let value_span = typed_value.span.clone();
+
                 match typed_promise.ty.clone() {
                     Type::Promise(inner_ty) => {
-                        self.check_type_compatibility(
+                        let coerced_value = self.check_and_coerce(
                             inner_ty.as_ref(),
-                            &typed_value.ty,
-                            typed_value.span,
+                            typed_value,
+                            value_span,
                         )?;
                         Ok(TypedExpr {
                             kind: TypedExprKind::ResolvePromise(
                                 Box::new(typed_promise),
-                                Box::new(typed_value),
+                                Box::new(coerced_value),
                             ),
                             ty: Type::Tuple(vec![]), // unit
                             span,
@@ -1065,13 +1027,11 @@ impl TypeChecker {
                 let inner_ty = typed_e.ty.clone();
 
                 match inner_ty {
-                    // Case 1: Unwrapping optional T? -> T
                     Type::Optional(t) => Ok(TypedExpr {
                         kind: TypedExprKind::UnwrapOptional(Box::new(typed_e)),
                         ty: *t,
                         span,
                     }),
-                    // Case 2: Awaiting future<T> -> T
                     Type::Future(t) => Ok(TypedExpr {
                         kind: TypedExprKind::Await(Box::new(typed_e)),
                         ty: *t,
@@ -1267,9 +1227,14 @@ impl TypeChecker {
             }
             BinOp::Coalesce => {
                 if let Type::Optional(inner_ty) = left_ty.clone() {
-                    self.check_type_compatibility(inner_ty.as_ref(), &right_ty, span)?;
+                    let coerced_right =
+                        self.check_and_coerce(inner_ty.as_ref(), typed_right, span)?;
                     Ok(TypedExpr {
-                        kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
+                        kind: TypedExprKind::BinOp(
+                            op,
+                            Box::new(typed_left),
+                            Box::new(coerced_right),
+                        ),
                         ty: *inner_ty,
                         span,
                     })
@@ -1303,8 +1268,9 @@ impl TypeChecker {
         let mut typed_args = Vec::new();
         for (arg, param_ty) in call.args.into_iter().zip(sig.params.iter()) {
             let typed_arg = self.check_expr(arg)?;
-            self.check_type_compatibility(param_ty, &typed_arg.ty, typed_arg.span)?;
-            typed_args.push(typed_arg);
+            let arg_span = typed_arg.span.clone();
+            let coerced_arg = self.check_and_coerce(param_ty, typed_arg, arg_span)?;
+            typed_args.push(coerced_arg);
         }
 
         Ok(TypedFuncCall {
@@ -1380,8 +1346,9 @@ impl TypeChecker {
 
         for item in items {
             let typed_item = self.check_expr(item)?;
-            self.check_type_compatibility(&first_ty, &typed_item.ty, typed_item.span)?;
-            typed_items.push(typed_item);
+            let item_span = typed_item.span.clone();
+            let coerced_item = self.check_and_coerce(&first_ty, typed_item, item_span)?;
+            typed_items.push(coerced_item);
         }
 
         Ok(TypedExpr {
@@ -1415,10 +1382,12 @@ impl TypeChecker {
         for (key, val) in pairs {
             let typed_key = self.check_expr(key)?;
             let typed_val = self.check_expr(val)?;
+            let key_span = typed_key.span.clone();
+            let val_span = typed_val.span.clone();
 
-            self.check_type_compatibility(&key_ty, &typed_key.ty, typed_key.span)?;
-            self.check_type_compatibility(&val_ty, &typed_val.ty, typed_val.span)?;
-            typed_pairs.push((typed_key, typed_val));
+            let coerced_key = self.check_and_coerce(&key_ty, typed_key, key_span)?;
+            let coerced_val = self.check_and_coerce(&val_ty, typed_val, val_span)?;
+            typed_pairs.push((coerced_key, coerced_val));
         }
 
         Ok(TypedExpr {
@@ -1468,7 +1437,6 @@ impl TypeChecker {
         };
 
         let mut typed_fields = Vec::new();
-        // Check all provided fields exist and have correct types
         for (field_name, field_expr) in fields {
             let field_def = field_defs
                 .iter()
@@ -1480,15 +1448,12 @@ impl TypeChecker {
 
             let expected_ty = self.resolve_type(&field_def.type_def)?;
             let typed_field_expr = self.check_expr(field_expr)?;
-            self.check_type_compatibility(
-                &expected_ty,
-                &typed_field_expr.ty,
-                typed_field_expr.span,
-            )?;
-            typed_fields.push((field_name, typed_field_expr));
+            let field_span = typed_field_expr.span.clone();
+            let coerced_expr =
+                self.check_and_coerce(&expected_ty, typed_field_expr, field_span)?;
+            typed_fields.push((field_name, coerced_expr));
         }
 
-        // Check all required fields are provided
         for field_def in &field_defs {
             if !typed_fields.iter().any(|(name, _)| name == &field_def.name) {
                 return Err(TypeError::MissingStructField {
@@ -1564,7 +1529,6 @@ impl TypeChecker {
     fn resolve_type(&self, type_def: &ResolvedTypeDef) -> Result<Type, TypeError> {
         match type_def {
             ResolvedTypeDef::Named(name_id) => {
-                // Check if it's in type_defs (built-in or user-defined)
                 if let Some(def) = self.type_defs.get(name_id) {
                     match def {
                         TypeDefinition::Builtin(ty) => Ok(ty.clone()),
@@ -1583,7 +1547,6 @@ impl TypeChecker {
                 } else if let Some(role_name) = self.role_defs.get(name_id) {
                     Ok(Type::Role(*name_id, role_name.clone()))
                 } else {
-                    // Type not found - create with a fallback name
                     let name = self
                         .struct_names
                         .get(name_id)
@@ -1610,7 +1573,6 @@ impl TypeChecker {
             }
             ResolvedTypeDef::Optional(t) => {
                 let base_type = self.resolve_type(t)?;
-                // "Collapse" nested optionals: T?? becomes T?
                 if matches!(base_type, Type::Optional(_)) {
                     Ok(base_type)
                 } else {
@@ -1639,7 +1601,6 @@ impl TypeChecker {
             return Ok(());
         }
 
-        // Check for "Empty" placeholders
         if let (Type::List(_), Type::EmptyList) = (expected, actual) {
             return Ok(());
         }
@@ -1650,7 +1611,6 @@ impl TypeChecker {
             return Ok(());
         }
 
-        // Check for optional "widening"
         if let Type::Optional(expected_inner) = expected {
             if *actual == Type::Nil {
                 return Ok(());
@@ -1666,10 +1626,69 @@ impl TypeChecker {
                 return Ok(());
             }
         }
-        // Check for future "widening" (e.g., if expected is Future<T> and actual is Future<T>)
-        // This is primarily for placeholder types like EmptyList/Map when used with futures.
         if let (Type::Future(expected_inner), Type::Future(actual_inner)) = (expected, actual) {
             return self.check_type_compatibility(expected_inner, actual_inner, span);
+        }
+
+        Err(TypeError::Mismatch {
+            expected: expected.clone(),
+            found: actual.clone(),
+            span,
+        })
+    }
+
+    fn check_and_coerce(
+        &self,
+        expected: &Type,
+        mut actual_expr: TypedExpr,
+        span: Span,
+    ) -> Result<TypedExpr, TypeError> {
+        let actual = &actual_expr.ty;
+
+        if expected == actual {
+            return Ok(actual_expr);
+        }
+
+        if let (Type::List(e), Type::EmptyList) = (expected, actual) {
+            actual_expr.ty = Type::List(e.clone());
+            return Ok(actual_expr);
+        }
+        if let (Type::Map(k, v), Type::EmptyMap) = (expected, actual) {
+            actual_expr.ty = Type::Map(k.clone(), v.clone());
+            return Ok(actual_expr);
+        }
+        if let (Type::Promise(p), Type::EmptyPromise) = (expected, actual) {
+            actual_expr.ty = Type::Promise(p.clone());
+            return Ok(actual_expr);
+        }
+
+        if let Type::Optional(expected_inner) = expected {
+            if *actual == Type::Nil {
+                return Ok(actual_expr);
+            }
+
+            if let Type::Optional(actual_inner) = actual {
+                return self
+                    .check_type_compatibility(expected_inner, actual_inner, span)
+                    .map(|_| actual_expr);
+            }
+
+            if self
+                .check_type_compatibility(expected_inner, actual, span)
+                .is_ok()
+            {
+                return Ok(TypedExpr {
+                    kind: TypedExprKind::WrapInOptional(Box::new(actual_expr)),
+                    ty: expected.clone(),
+                    span,
+                });
+            }
+        }
+
+        if let (Type::Future(expected_inner), Type::Future(actual_inner)) = (expected, actual) {
+            return self
+                .check_type_compatibility(expected_inner, actual_inner, span)
+                .map(|_| actual_expr);
         }
 
         Err(TypeError::Mismatch {

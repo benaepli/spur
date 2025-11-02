@@ -51,6 +51,7 @@ pub enum Expr {
     ECoalesce(Box<Expr>, Box<Expr>),
     ECreatePromise,
     ECreateLock,
+    ESome(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -849,6 +850,14 @@ impl Compiler {
                 self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
             }
 
+            TypedExprKind::WrapInOptional(e) => {
+                let e_tmp = self.new_temp_var();
+                let final_expr = Expr::ESome(Box::new(Expr::EVar(e_tmp.clone())));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(e, Lhs::Var(e_tmp), assign_vertex)
+            }
+
             TypedExprKind::StructLit(_, fields) => {
                 let (field_names, val_exprs): (Vec<_>, Vec<_>) = fields.iter().cloned().unzip();
                 let (tmps, simple_exprs) = self.compile_temp_list(val_exprs.len());
@@ -1097,6 +1106,10 @@ impl Compiler {
             ),
             TypedExprKind::UnwrapOptional(e) => {
                 Expr::EUnwrap(Box::new(self.convert_simple_expr(e)))
+            }
+
+            TypedExprKind::WrapInOptional(e) => {
+                Expr::ESome(Box::new(self.convert_simple_expr(e)))
             }
             // Desugar: `MyStruct { ... }` -> `EMap { ... }`
             TypedExprKind::StructLit(_, fields) => Expr::EMap(
