@@ -1,7 +1,7 @@
-use std::fs;
-use std::path::Path;
 use clap::Parser;
 use spur::compiler;
+use std::fs;
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "spur-frontend")]
@@ -21,13 +21,36 @@ fn main() {
     );
 
     let path = Path::new(&args.spec);
-    let content = fs::read_to_string(path).expect("Unable to read file");
+
+    if !path.exists() {
+        eprintln!("Error: Input file '{}' does not exist", args.spec);
+        std::process::exit(1);
+    }
+
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Error: Failed to read input file '{}': {}", args.spec, e);
+            std::process::exit(1);
+        }
+    };
 
     match compiler::compile(&content, &args.spec) {
         Ok(program) => {
-            let json = serde_json::to_string_pretty(&program)
-                .expect("Failed to serialize program");
-            fs::write(&args.output, json).expect("Failed to write output file");
+            let json = serde_json::to_string_pretty(&program).expect("Failed to serialize program");
+
+            if let Err(e) = fs::write(&args.output, json) {
+                eprintln!(
+                    "Error: Failed to write output file '{}': {}",
+                    args.output, e
+                );
+                eprintln!("Possible causes:");
+                eprintln!("  - Directory does not exist");
+                eprintln!("  - Insufficient permissions");
+                eprintln!("  - Disk full or read-only filesystem");
+                std::process::exit(1);
+            }
+
             println!("Successfully compiled to {}", args.output);
         }
         Err(e) => {

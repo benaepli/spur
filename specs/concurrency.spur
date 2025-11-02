@@ -26,10 +26,10 @@ role Head {
 
 ClientInterface {
     func write(node: Head, key: string, value: Value) {
-        await rpc_call(node, AsyncWrite(key, value));
+        rpc_call(node, AsyncWrite(key, value))!;
     }
 
     func read(node: Head, key: string) -> Value {
-        return await rpc_call(node, AsyncRead(key));
+        return rpc_call(node, AsyncRead(key))!;
     }
 }
