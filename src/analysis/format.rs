@@ -312,7 +312,7 @@ pub fn report_type_errors(
                 .with_notes(vec![
                     format!("help: this operation requires a list type, but `{}` is not a list", ty),
                 ]),
-            
+
             TypeError::InvalidRoleOperation { ty, span } => Diagnostic::error()
                 .with_message("invalid operation on role type")
                 .with_labels(vec![
@@ -323,14 +323,14 @@ pub fn report_type_errors(
                     "help: role types can only be used for RPC calls".to_string(),
                 ]),
 
-            TypeError::UnwrapOnNonOptional { ty, span } => Diagnostic::error()
+            TypeError::UnwrapOnNonOptionalOrFuture { ty, span } => Diagnostic::error()
                 .with_message("cannot force-unwrap non-optional type")
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
                         .with_message(format!("type `{}` is not optional", ty)),
                 ])
                 .with_notes(vec![
-                    format!("help: the force-unwrap operator `!` can only be used on optional types, but `{}` is not optional", ty),
+                    format!("help: the force-unwrap operator `!` can only be used on optional or future types, but `{}` is not optional or future", ty),
                 ]),
 
             TypeError::AwaitOnNonFuture { ty, span } => Diagnostic::error()

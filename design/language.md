@@ -146,5 +146,41 @@ We have to introduce a semantic analysis stage that checks if the left side is a
 
 ## Typing
 
-Spur is strongly typed.
+Spur is a strongly and statically typed language.
 
+The type system is composed of:
+
+- Primitives: `int`, `string`, `bool`
+- Tuples and the unit type: `()`, `(T)`, `(T, U)`, etc.
+- Collections: `list<T>`, `map<K, V>`
+- Concurrency: `future<T>`, `promise<T>`, and `lock`
+- Optional types: `T?`, which can be either `nil` or a value of type `T`
+
+## Reference and Value Semantics
+
+Primitives and tuples are passed by value.
+All other types are passed by reference.
+
+## Concurrency
+
+Spur is async-first. Calling a function does not block execution and immediately returns a `future<T>`.
+To get the actual return value, you must await the future, which will pause the current task until the future is
+resolved. 
+
+This can result in some issues around synchronizing asynchronous code, since a series of function calls
+are not guaranteed to be executed atomically. To address this, we provide a `lock` type.
+
+### RPCs
+This asynchronous model extends seamlessly to remote procedure calls (RPCs). The syntax is nearly identical,
+but it requires a target role instance:
+```
+let f: string = rpc_call(other_role, some_func(1, 2))!;
+```
+
+## Additional Operators
+
+### Unwrap
+
+The unwrap `!` operator is syntactic sugar for the two most common "unwrapping" operations:
+1. Await a future: `f!` is equivalent to `await f` for `f: future<T>`
+2. Unwrap an optional: `o!` is a force unwrap, which panics if the optional is `nil` 

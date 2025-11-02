@@ -14,18 +14,14 @@ role Head {
 
     func WritePlusOne(key: string, value: int) -> bool {
         await lock(l) {
-            await write1(key, value);
-            await write2(key);
+            write1(key, value)!;
+            write2(key)!;
         }
         return true;
     }
 
     func Read(key: string) -> Value {
         return db[key];
-    }
-
-    func Empty() {
-        return ();
     }
 }
 

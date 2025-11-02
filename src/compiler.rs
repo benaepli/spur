@@ -36,14 +36,17 @@ pub fn compile(input: &str, name: &str) -> Result<cfg::Program, anyhow::Error> {
     };
 
     let mut type_checker = TypeChecker::new(prepopulated_types);
-    if let Err(e) = type_checker.check_program(resolved.clone()) {
-        let _ = report_type_errors(input, &[e], name);
-        return Err(anyhow!("type checking error"));
-    }
+    let typed = match type_checker.check_program(resolved.clone()) {
+        Err(e) => {
+            let _ = report_type_errors(input, &[e], name);
+            return Err(anyhow!("type checking error"));
+        }
+        Ok(r) => r,
+    };
 
     // Compile to CFG
     let cfg_compiler = CfgCompiler::new();
-    let program = cfg_compiler.compile_program(resolved);
+    let program = cfg_compiler.compile_program(typed);
 
     Ok(program)
 }
