@@ -1,9 +1,8 @@
 use crate::analysis::resolver::NameId;
 use crate::analysis::types::{
-    TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop,
-    TypedForLoop, TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedPattern,
-    TypedPatternKind, TypedProgram, TypedStatement, TypedStatementKind,
-    TypedTopLevelDef, TypedVarInit,
+    TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit,
+    TypedFuncCall, TypedFuncDef, TypedPattern, TypedPatternKind, TypedProgram, TypedStatement,
+    TypedStatementKind, TypedTopLevelDef, TypedVarInit,
 };
 use crate::parser::BinOp;
 use serde::Serialize;
@@ -227,7 +226,11 @@ impl Compiler {
             next_vertex = self.compile_expr_to_value(&init.value, Lhs::Var(var_name), next_vertex);
         }
 
-        let entry = next_vertex;
+        let entry = self.add_label(Label::Instr(
+            Instr::Assign(Lhs::Var(return_var_name.clone()), Expr::EUnit),
+            next_vertex,
+        ));
+
         FunctionInfo {
             entry,
             name,
@@ -241,7 +244,7 @@ impl Compiler {
         let final_return_vertex =
             self.add_label(Label::Return(Expr::EVar(return_var_name.clone())));
 
-        let entry = self.compile_block(
+        let body_entry = self.compile_block(
             &func.body,
             final_return_vertex,
             final_return_vertex, // `break_target` (breaks go to end of function)
@@ -257,6 +260,11 @@ impl Compiler {
 
         let mut locals = self.scan_body(&func.body);
         locals.push((return_var_name.clone(), Expr::EUnit)); // Default return val
+
+        let entry = self.add_label(Label::Instr(
+            Instr::Assign(Lhs::Var(return_var_name.clone()), Expr::EUnit),
+            body_entry,
+        ));
 
         FunctionInfo {
             entry,
