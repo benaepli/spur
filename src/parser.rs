@@ -38,6 +38,7 @@ pub struct ClientDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDef {
     pub name: String,
+    pub is_sync: bool,
     pub params: Vec<FuncParam>,
     pub return_type: Option<TypeDef>,
     pub body: Vec<Statement>,
@@ -913,8 +914,10 @@ where
         .allow_trailing()
         .collect::<Vec<_>>();
 
-    let func_def = just(TokenKind::Func)
-        .ignore_then(ident.clone())
+    let func_def = just(TokenKind::Sync)
+        .or_not()
+        .then_ignore(just(TokenKind::Func))
+        .then(ident.clone())
         .then(func_params.delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)))
         .then(
             just(TokenKind::Arrow)
@@ -928,13 +931,16 @@ where
                 .collect()
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
         )
-        .map_with(|(((name, params), return_type), body), e| FuncDef {
-            name,
-            params,
-            return_type,
-            body,
-            span: e.span(),
-        });
+        .map_with(
+            |((((is_sync_opt, name), params), return_type), body), e| FuncDef {
+                name,
+                is_sync: is_sync_opt.is_some(),
+                params,
+                return_type,
+                body,
+                span: e.span(),
+            },
+        );
 
     let field_def = ident
         .clone()

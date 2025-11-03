@@ -48,6 +48,7 @@ pub struct ResolvedClientDef {
 pub struct ResolvedFuncDef {
     pub name: NameId,
     pub original_name: String,
+    pub is_sync: bool,
     pub params: Vec<ResolvedFuncParam>,
     pub return_type: Option<ResolvedTypeDef>,
     pub body: Vec<ResolvedStatement>,
@@ -532,6 +533,7 @@ impl Resolver {
         Ok(ResolvedFuncDef {
             name: name_id,
             original_name: func.name,
+            is_sync: func.is_sync,
             params,
             return_type,
             body,

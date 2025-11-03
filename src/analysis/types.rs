@@ -238,6 +238,7 @@ pub struct TypedClientDef {
 pub struct TypedFuncDef {
     pub name: NameId,
     pub original_name: String,
+    pub is_sync: bool,
     pub params: Vec<TypedFuncParam>,
     pub return_type: Type,
     pub body: Vec<TypedStatement>,

@@ -2,21 +2,18 @@ type Value = int;
 
 role Head {
     var db: map<string, Value> = {"hi": 0};
-    var l: lock = create_lock();
 
-    func write1(key: string, value: Value) {
+    sync func write1(key: string, value: Value) {
         db[key] = value;
     }
 
-    func write2(key: string)  {
+    sync func write2(key: string)  {
         db[key] = db[key] + 1;
     }
 
     func WritePlusOne(key: string, value: int) -> bool {
-        await lock(l) {
-            @write1(key, value);
-            @write2(key);
-        }
+        write1(key, value);
+        write2(key);
         return true;
     }
 

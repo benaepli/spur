@@ -67,6 +67,7 @@ pub enum Instr {
     Async(Lhs, Expr, String, Vec<Expr>),
     Copy(Lhs, Expr),
     Resolve(Lhs, Expr),
+    SyncCall(Lhs, String, Vec<Expr>),
 }
 
 pub type Vertex = usize;
@@ -77,6 +78,7 @@ pub struct FunctionInfo {
     pub name: String,
     pub formals: Vec<String>,
     pub locals: Vec<(String, Expr)>, // (name, default_value)
+    pub is_sync: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -138,6 +140,8 @@ pub struct Compiler {
     rpc_map: HashMap<String, FunctionInfo>,
     client_ops_map: HashMap<String, FunctionInfo>,
     compiling_for_role: bool,
+
+    func_sync_map: HashMap<NameId, bool>,
 }
 
 fn resolved_name(name_id: NameId, original_name: &str) -> String {
@@ -152,6 +156,7 @@ impl Compiler {
             rpc_map: HashMap::new(),
             client_ops_map: HashMap::new(),
             compiling_for_role: false,
+            func_sync_map: HashMap::new(),
         }
     }
 
@@ -171,6 +176,20 @@ impl Compiler {
 
     /// The main entry point.
     pub fn compile_program(mut self, program: TypedProgram) -> Program {
+        // Build func_sync_map
+        for def in &program.top_level_defs {
+            match def {
+                TypedTopLevelDef::Role(role) => {
+                    for func in &role.func_defs {
+                        self.func_sync_map.insert(func.name, func.is_sync);
+                    }
+                }
+            }
+        }
+        for func in &program.client_def.func_defs {
+            self.func_sync_map.insert(func.name, func.is_sync);
+        }
+
         // Compile all top-level definitions
         for def in program.top_level_defs {
             match def {
@@ -238,6 +257,7 @@ impl Compiler {
             name,
             formals: vec![],
             locals: vec![(return_var_name, Expr::EUnit)], // Inits are "globals"
+            is_sync: false,
         }
     }
 
@@ -273,6 +293,7 @@ impl Compiler {
             name: resolved_name(func.name, &func.original_name),
             formals,
             locals,
+            is_sync: func.is_sync,
         }
     }
 
@@ -1012,9 +1033,34 @@ impl Compiler {
         target: Lhs,
         next_vertex: Vertex,
     ) -> Vertex {
-        // A local call is just an async call on "self"
-        let node_expr = Expr::EVar("self".to_string());
-        self.compile_async_call_internal(node_expr, call, target, next_vertex)
+        let is_sync = self.func_sync_map.get(&call.name).cloned().unwrap_or(false);
+
+        if is_sync {
+            // Allocate temp vars for all arguments
+            let (arg_tmps, arg_exprs): (Vec<String>, Vec<Expr>) = (0..call.args.len())
+                .map(|_| {
+                    let tmp = self.new_temp_var();
+                    (tmp.clone(), Expr::EVar(tmp))
+                })
+                .unzip();
+
+            // Create the SyncCall instruction.
+            let sync_call_label = Label::Instr(
+                Instr::SyncCall(
+                    target, // The final Lhs for the return value
+                    resolved_name(call.name, &call.original_name),
+                    arg_exprs,
+                ),
+                next_vertex,
+            );
+            let sync_call_vertex = self.add_label(sync_call_label);
+
+            // Compile all argument expressions, chaining them backwards.
+            self.compile_expr_list_recursive(call.args.iter(), arg_tmps, sync_call_vertex)
+        } else {
+            let node_expr = Expr::EVar("self".to_string());
+            self.compile_async_call_internal(node_expr, call, target, next_vertex)
+        }
     }
 
     fn compile_rpc_call(

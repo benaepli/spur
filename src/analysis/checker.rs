@@ -116,12 +116,23 @@ pub enum TypeError {
     PollingOnInvalidType { ty: Type, span: Span },
     #[error("next_resp requires a map of futures, found `{ty}`")]
     NextRespOnInvalidType { ty: Type, span: Span },
+    #[error("await cannot be used inside a `sync` function")]
+    AwaitInSyncFunc { span: Span },
+    #[error("spin_await cannot be used inside a `sync` function")]
+    SpinAwaitInSyncFunc { span: Span },
+    #[error("`sync` function cannot call async function `{func_name}`")]
+    SyncCallToAsync { func_name: String, span: Span },
+    #[error("RPC calls cannot be made from inside a `sync` function")]
+    RpcCallInSyncFunc { span: Span },
+    #[error("RPC call targets a `sync` function `{func_name}`, but RPC calls must be async")]
+    RpcCallToSyncFunc { func_name: String, span: Span },
 }
 
 #[derive(Debug, Clone)]
 struct FunctionSignature {
     params: Vec<Type>,
     return_type: Type,
+    is_sync: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +148,7 @@ pub struct TypeChecker {
     role_defs: HashMap<NameId, String>,
     struct_names: HashMap<NameId, String>,
     current_return_type: Option<Type>,
+    current_func_is_sync: bool,
     loop_depth: usize,
 }
 
@@ -162,6 +174,7 @@ impl TypeChecker {
             role_defs: HashMap::new(),
             struct_names: HashMap::new(),
             current_return_type: None,
+            current_func_is_sync: false,
             loop_depth: 0,
         }
     }
@@ -237,6 +250,7 @@ impl TypeChecker {
         Ok(FunctionSignature {
             params,
             return_type,
+            is_sync: func.is_sync,
         })
     }
 
@@ -293,6 +307,7 @@ impl TypeChecker {
 
         self.enter_scope();
         self.current_return_type = Some(sig.return_type.clone());
+        self.current_func_is_sync = sig.is_sync;
 
         let mut typed_params = Vec::new();
         for (param, param_type) in func.params.into_iter().zip(sig.params.iter()) {
@@ -320,10 +335,12 @@ impl TypeChecker {
         }
 
         self.current_return_type = None;
+        self.current_func_is_sync = false;
         self.exit_scope();
         Ok(TypedFuncDef {
             name: func.name,
             original_name: func.original_name,
+            is_sync: sig.is_sync,
             params: typed_params,
             return_type: sig.return_type,
             body: typed_body,
@@ -731,8 +748,26 @@ impl TypeChecker {
                 })
             }
             ResolvedExprKind::FuncCall(call) => {
-                let typed_call = self.check_func_call(call)?;
-                let return_ty = Type::Future(Box::new(typed_call.return_type.clone()));
+                let sig = self
+                    .func_signatures
+                    .get(&call.name)
+                    .ok_or_else(|| TypeError::UndefinedType(call.span))?
+                    .clone();
+
+                if self.current_func_is_sync && !sig.is_sync {
+                    return Err(TypeError::SyncCallToAsync {
+                        func_name: call.original_name.clone(),
+                        span,
+                    });
+                }
+
+                let typed_call = self.check_func_call(call, &sig)?;
+                let return_ty = if sig.is_sync {
+                    sig.return_type
+                } else {
+                    Type::Future(Box::new(sig.return_type.clone()))
+                };
+
                 Ok(TypedExpr {
                     kind: TypedExprKind::FuncCall(typed_call),
                     ty: return_ty,
@@ -1038,6 +1073,10 @@ impl TypeChecker {
                 self.check_struct_literal(struct_id, fields, span)
             }
             ResolvedExprKind::RpcCall(target, call) => {
+                if self.current_func_is_sync {
+                    return Err(TypeError::RpcCallInSyncFunc { span });
+                }
+
                 let typed_target = self.check_expr(*target)?;
                 if !matches!(typed_target.ty, Type::Role(..)) {
                     return Err(TypeError::RpcCallTargetNotRole {
@@ -1045,7 +1084,21 @@ impl TypeChecker {
                         span,
                     });
                 }
-                let typed_call = self.check_func_call(call)?;
+
+                let sig = self
+                    .func_signatures
+                    .get(&call.name)
+                    .ok_or_else(|| TypeError::UndefinedType(call.span))?
+                    .clone();
+
+                if sig.is_sync {
+                    return Err(TypeError::RpcCallToSyncFunc {
+                        func_name: call.original_name.clone(),
+                        span,
+                    });
+                }
+
+                let typed_call = self.check_func_call(call, &sig)?;
                 let return_ty = Type::Future(Box::new(typed_call.return_type.clone()));
                 Ok(TypedExpr {
                     kind: TypedExprKind::RpcCall(Box::new(typed_target), typed_call),
@@ -1054,6 +1107,9 @@ impl TypeChecker {
                 })
             }
             ResolvedExprKind::Await(e) => {
+                if self.current_func_is_sync {
+                    return Err(TypeError::AwaitInSyncFunc { span });
+                }
                 let typed_future = self.check_expr(*e)?;
                 match typed_future.ty.clone() {
                     Type::Future(inner_ty) => Ok(TypedExpr {
@@ -1068,6 +1124,9 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::SpinAwait(e) => {
+                if self.current_func_is_sync {
+                    return Err(TypeError::SpinAwaitInSyncFunc { span });
+                }
                 let typed_bool = self.check_expr(*e)?;
                 match typed_bool.ty.clone() {
                     Type::Bool => Ok(TypedExpr {
@@ -1258,13 +1317,11 @@ impl TypeChecker {
         }
     }
 
-    fn check_func_call(&mut self, call: ResolvedFuncCall) -> Result<TypedFuncCall, TypeError> {
-        let sig = self
-            .func_signatures
-            .get(&call.name)
-            .ok_or_else(|| TypeError::UndefinedType(call.span))?
-            .clone();
-
+    fn check_func_call(
+        &mut self,
+        call: ResolvedFuncCall,
+        sig: &FunctionSignature,
+    ) -> Result<TypedFuncCall, TypeError> {
         if call.args.len() != sig.params.len() {
             return Err(TypeError::WrongNumberOfArgs {
                 expected: sig.params.len(),
@@ -1285,7 +1342,7 @@ impl TypeChecker {
             name: call.name,
             original_name: call.original_name,
             args: typed_args,
-            return_type: sig.return_type,
+            return_type: sig.return_type.clone(),
             span: call.span,
         })
     }
