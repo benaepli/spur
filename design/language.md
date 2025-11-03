@@ -53,7 +53,6 @@ cond_stmts
 | 'return' expr ';'
 | for_loop
 | for_in_loop
-| 'print' '(' expr ')' ';'
 | 'break' ';'
 
 cond_stmts ::= if_stmt ( elseif_stmt )* ( else_stmt )?
@@ -215,3 +214,10 @@ The @ operator is a prefix shorthand for the await keyword.
 
 The unwrap `!` operator is used for unwrapping an optional. 
 In other words, `o!` either retrieves the value or panics if the optional is `nil`.
+
+## Built-in Functions
+We also have a variety of built-in functions.
+Right now, this includes:
+- `println: string -> ()`
+- `int_to_string: int -> string`
+- `bool_to_string: bool -> string`
