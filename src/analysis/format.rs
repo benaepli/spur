@@ -323,14 +323,15 @@ pub fn report_type_errors(
                     "help: role types can only be used for RPC calls".to_string(),
                 ]),
 
-            TypeError::UnwrapOnNonOptionalOrFuture { ty, span } => Diagnostic::error()
+            TypeError::UnwrapOnNonOptional { ty, span } => Diagnostic::error()
                 .with_message("cannot force-unwrap non-optional type")
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
                         .with_message(format!("type `{}` is not optional", ty)),
                 ])
                 .with_notes(vec![
-                    format!("help: the force-unwrap operator `!` can only be used on optional or future types, but `{}` is not optional or future", ty),
+                    format!("help: the force-unwrap operator `!` can only be used on optional types, but `{}` is not optional", ty),
+                    "note: to await a future, use the `await` keyword or `@` shorthand".to_string(),
                 ]),
 
             TypeError::AwaitOnNonFuture { ty, span } => Diagnostic::error()
@@ -341,6 +342,16 @@ pub fn report_type_errors(
                 ])
                 .with_notes(vec![
                     format!("help: await can only be used on future types, but `{}` is not a future", ty),
+                ]),
+
+            TypeError::SpinAwaitOnNonBool { ty, span } => Diagnostic::error()
+                .with_message("cannot spin_await on non-bool type")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected bool type, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: spin_await can only be used on bool types, but `{}` is not a bool", ty),
                 ]),
 
             TypeError::NotAPromise { ty, span } => Diagnostic::error()

@@ -1,8 +1,8 @@
 type Value = int;
 
 role Head {
-    let db: map<string, Value> = {"hi": 0};
-    let l: lock = create_lock();
+    var db: map<string, Value> = {"hi": 0};
+    var l: lock = create_lock();
 
     func write1(key: string, value: Value) {
         db[key] = value;
@@ -14,8 +14,8 @@ role Head {
 
     func WritePlusOne(key: string, value: int) -> bool {
         await lock(l) {
-            write1(key, value)!;
-            write2(key)!;
+            @write1(key, value);
+            @write2(key);
         }
         return true;
     }
@@ -27,10 +27,10 @@ role Head {
 
 ClientInterface {
     func write(node: Head, key: string, value: Value) {
-        rpc_call(node, WritePlusOne(key, value))!;
+        @rpc_call(node, WritePlusOne(key, value))!;
     }
 
     func read(node: Head, key: string) -> Value {
-        return rpc_call(node, Read(key))!;
+        return @rpc_call(node, Read(key))!;
     }
 }

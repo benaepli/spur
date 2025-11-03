@@ -84,6 +84,7 @@ pub enum Label {
     Instr(Instr, Vertex /* next_vertex */),
     Pause(Vertex /* next_vertex */),
     Await(Lhs, Expr, Vertex /* next_vertex */),
+    SpinAwait(Expr, Vertex /* next_vertex */),
     Return(Expr),
     Cond(
         Expr,
@@ -628,6 +629,23 @@ impl Compiler {
                 // storing it in `future_var`.
                 self.compile_expr_to_value(e, Lhs::Var(future_var), await_vertex)
             }
+            TypedExprKind::SpinAwait(e) => {
+                let bool_var = self.new_temp_var();
+
+                // 1. Assign unit to the target, which runs *after* the spinawait.
+                let assign_unit_vertex = self.add_label(Label::Instr(
+                    Instr::Assign(target, Expr::EUnit),
+                    next_vertex,
+                ));
+
+                // 2. The SpinAwait label. It just blocks, then goes to assign unit.
+                let spin_label = Label::SpinAwait(Expr::EVar(bool_var.clone()), assign_unit_vertex);
+                let spin_vertex = self.add_label(spin_label);
+
+                // 3. Compile the inner expression `e` to get the boolean,
+                //    storing it in `bool_var`.
+                self.compile_expr_to_value(e, Lhs::Var(bool_var), spin_vertex)
+            }
 
             // --- Compound expressions that may contain complex sub-expressions ---
             TypedExprKind::BinOp(op, l, r) => {
@@ -1108,9 +1126,7 @@ impl Compiler {
                 Expr::EUnwrap(Box::new(self.convert_simple_expr(e)))
             }
 
-            TypedExprKind::WrapInOptional(e) => {
-                Expr::ESome(Box::new(self.convert_simple_expr(e)))
-            }
+            TypedExprKind::WrapInOptional(e) => Expr::ESome(Box::new(self.convert_simple_expr(e))),
             // Desugar: `MyStruct { ... }` -> `EMap { ... }`
             TypedExprKind::StructLit(_, fields) => Expr::EMap(
                 fields
@@ -1125,6 +1141,7 @@ impl Compiler {
             TypedExprKind::FuncCall(_)
             | TypedExprKind::RpcCall(_, _)
             | TypedExprKind::Await(_)
+            | TypedExprKind::SpinAwait(_)
             | TypedExprKind::CreatePromise
             | TypedExprKind::ResolvePromise(_, _) => {
                 panic!(

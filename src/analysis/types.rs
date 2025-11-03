@@ -93,6 +93,7 @@ pub enum TypedExprKind {
 
     UnwrapOptional(Box<TypedExpr>), // T? -> T
     Await(Box<TypedExpr>),          // future<T> -> T
+    SpinAwait(Box<TypedExpr>),      // bool -> unit
 
     CreatePromise,
     CreateFuture(Box<TypedExpr>),

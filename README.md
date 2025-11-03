@@ -32,7 +32,7 @@ role Node {
 
 ClientInterface {
   func write(node: Node, key: string, value: Command) {
-      rpc_call(node, Write(key, value));
+      rpc_call(node, Write(key, value))!;
   }
 }
 ```

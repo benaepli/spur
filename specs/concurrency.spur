@@ -1,7 +1,7 @@
 type Value = int;
 
 role Head {
-    let db: map<string, Value> = {};
+    var db: map<string, Value> = {};
 
     func headWrite(key: string, value: int) {
         db[key] = value;
@@ -17,8 +17,8 @@ role Head {
     }
 
     func AsyncRead(key: string) -> Value {
-        let p: promise<Value> = create_promise();
-        let f: future<Value> = create_future(p);
+        var p: promise<Value> = create_promise();
+        var f: future<Value> = create_future(p);
         headRead(p, key);
         return await f;
     }
@@ -26,10 +26,10 @@ role Head {
 
 ClientInterface {
     func write(node: Head, key: string, value: Value) {
-        rpc_call(node, AsyncWrite(key, value))!;
+        @rpc_call(node, AsyncWrite(key, value));
     }
 
     func read(node: Head, key: string) -> Value {
-        return rpc_call(node, AsyncRead(key))!;
+        return @rpc_call(node, AsyncRead(key));
     }
 }

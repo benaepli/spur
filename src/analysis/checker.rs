@@ -102,10 +102,12 @@ pub enum TypeError {
     NotAList { ty: Type, span: Span },
     #[error("Cannot apply operation to role type `{ty}`")]
     InvalidRoleOperation { ty: Type, span: Span },
-    #[error("Operator `!` can only be used on an optional or a future, found `{ty}`")]
-    UnwrapOnNonOptionalOrFuture { ty: Type, span: Span },
+    #[error("Operator `!` can only be used on an optional, found `{ty}`")]
+    UnwrapOnNonOptional { ty: Type, span: Span },
     #[error("await can only be used on a future, found `{ty}`")]
     AwaitOnNonFuture { ty: Type, span: Span },
+    #[error("spin_await can only be used on a bool, found `{ty}`")]
+    SpinAwaitOnNonBool { ty: Type, span: Span },
     #[error("Operation requires a promise, found `{ty}`")]
     NotAPromise { ty: Type, span: Span },
     #[error("await lock can only be used on a Lock, found `{ty}`")]
@@ -925,11 +927,8 @@ impl TypeChecker {
 
                 match typed_promise.ty.clone() {
                     Type::Promise(inner_ty) => {
-                        let coerced_value = self.check_and_coerce(
-                            inner_ty.as_ref(),
-                            typed_value,
-                            value_span,
-                        )?;
+                        let coerced_value =
+                            self.check_and_coerce(inner_ty.as_ref(), typed_value, value_span)?;
                         Ok(TypedExpr {
                             kind: TypedExprKind::ResolvePromise(
                                 Box::new(typed_promise),
@@ -1032,12 +1031,7 @@ impl TypeChecker {
                         ty: *t,
                         span,
                     }),
-                    Type::Future(t) => Ok(TypedExpr {
-                        kind: TypedExprKind::Await(Box::new(typed_e)),
-                        ty: *t,
-                        span,
-                    }),
-                    _ => Err(TypeError::UnwrapOnNonOptionalOrFuture { ty: inner_ty, span }),
+                    _ => Err(TypeError::UnwrapOnNonOptional { ty: inner_ty, span }),
                 }
             }
             ResolvedExprKind::StructLit(struct_id, fields) => {
@@ -1070,6 +1064,20 @@ impl TypeChecker {
                     _ => Err(TypeError::AwaitOnNonFuture {
                         ty: typed_future.ty,
                         span,
+                    }),
+                }
+            }
+            ResolvedExprKind::SpinAwait(e) => {
+                let typed_bool = self.check_expr(*e)?;
+                match typed_bool.ty.clone() {
+                    Type::Bool => Ok(TypedExpr {
+                        kind: TypedExprKind::SpinAwait(Box::new(typed_bool)),
+                        ty: Type::Tuple(vec![]), // Evaluates to unit
+                        span,
+                    }),
+                    _ => Err(TypeError::SpinAwaitOnNonBool {
+                        ty: typed_bool.ty,
+                        span: typed_bool.span,
                     }),
                 }
             }
@@ -1449,8 +1457,7 @@ impl TypeChecker {
             let expected_ty = self.resolve_type(&field_def.type_def)?;
             let typed_field_expr = self.check_expr(field_expr)?;
             let field_span = typed_field_expr.span.clone();
-            let coerced_expr =
-                self.check_and_coerce(&expected_ty, typed_field_expr, field_span)?;
+            let coerced_expr = self.check_and_coerce(&expected_ty, typed_field_expr, field_span)?;
             typed_fields.push((field_name, coerced_expr));
         }
 

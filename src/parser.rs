@@ -241,6 +241,7 @@ pub enum ExprKind {
     RpcCall(Box<Expr>, FuncCall),
 
     Await(Box<Expr>),
+    SpinAwait(Box<Expr>),
 
     CreatePromise,
     CreateFuture(Box<Expr>),
@@ -656,6 +657,9 @@ where
     expr.define({
         let unary = recursive(|unary| {
             choice((
+                just(TokenKind::At)
+                    .then(unary.clone())
+                    .map_with(|(_, val), e| Expr::new(ExprKind::Await(Box::new(val)), e.span())),
                 just(TokenKind::Bang)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Not(Box::new(val)), e.span())),
@@ -665,6 +669,11 @@ where
                 just(TokenKind::Await)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Await(Box::new(val)), e.span())),
+                just(TokenKind::SpinAwait)
+                    .then(unary.clone())
+                    .map_with(|(_, val), e| {
+                        Expr::new(ExprKind::SpinAwait(Box::new(val)), e.span())
+                    }),
                 primary.clone(),
             ))
         });
@@ -716,7 +725,7 @@ where
         coalescing_expr
     });
 
-    let var_init_core = just(TokenKind::Let)
+    let var_init_core = just(TokenKind::Var)
         .ignore_then(ident.clone())
         .then_ignore(just(TokenKind::Colon))
         .then(type_def.clone())
@@ -876,7 +885,7 @@ where
         ))
     });
 
-    let var_init = just(TokenKind::Let)
+    let var_init = just(TokenKind::Var)
         .ignore_then(ident.clone())
         .then_ignore(just(TokenKind::Colon))
         .then(type_def.clone())

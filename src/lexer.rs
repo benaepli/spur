@@ -43,6 +43,7 @@ pub enum TokenKind {
     Colon,
     Dot,
     Underscore,
+    At,
 
     // Operators
     Plus,
@@ -72,11 +73,12 @@ pub enum TokenKind {
     ClientInterface,
     Role,
     Func,
-    Let,
+    Var,
     Type,
     Return,
     For,
     Await,
+    SpinAwait,
     Print,
     Break,
     If,
@@ -126,6 +128,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Colon => write!(f, ":"),
             TokenKind::Dot => write!(f, "."),
             TokenKind::Underscore => write!(f, "_"),
+            TokenKind::At => write!(f, "@"),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
             TokenKind::Star => write!(f, "*"),
@@ -148,11 +151,12 @@ impl fmt::Display for TokenKind {
             TokenKind::ClientInterface => write!(f, "ClientInterface"),
             TokenKind::Role => write!(f, "role"),
             TokenKind::Func => write!(f, "func"),
-            TokenKind::Let => write!(f, "let"),
+            TokenKind::Var => write!(f, "var"),
             TokenKind::Type => write!(f, "type"),
             TokenKind::Return => write!(f, "return"),
             TokenKind::For => write!(f, "for"),
             TokenKind::Await => write!(f, "await"),
+            TokenKind::SpinAwait => write!(f, "spin_await"),
             TokenKind::Print => write!(f, "print"),
             TokenKind::Break => write!(f, "break"),
             TokenKind::If => write!(f, "if"),
@@ -194,11 +198,12 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "ClientInterface" => TokenKind::ClientInterface,
     "role" => TokenKind::Role,
     "func" => TokenKind::Func,
-    "let" => TokenKind::Let,
+    "var" => TokenKind::Var,
     "type" => TokenKind::Type,
     "return" => TokenKind::Return,
     "for" => TokenKind::For,
     "await" => TokenKind::Await,
+    "spin_await" => TokenKind::SpinAwait,
     "print" => TokenKind::Print,
     "break" => TokenKind::Break,
     "if" => TokenKind::If,
@@ -257,6 +262,7 @@ fn is_special_char(ch: char) -> bool {
             | '<'
             | '='
             | '"'
+            | '@'
     )
 }
 
@@ -441,6 +447,7 @@ impl<'a> Iterator for Lexer<'a> {
             ';' => Ok(TokenKind::Semicolon),
             ':' => Ok(TokenKind::Colon),
             '.' => Ok(TokenKind::Dot),
+            '@' => Ok(TokenKind::At),
 
             '_' => {
                 // Check if this is part of an identifier or standalone underscore
@@ -545,14 +552,14 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let input = "func let if else for return";
+        let input = "func var if else for return";
         let mut lexer = Lexer::new(input);
         let (tokens, errors) = lexer.collect_all();
 
         assert!(errors.is_empty());
         assert_eq!(tokens.len(), 6);
         assert_eq!(tokens[0].kind, TokenKind::Func);
-        assert_eq!(tokens[1].kind, TokenKind::Let);
+        assert_eq!(tokens[1].kind, TokenKind::Var);
         assert_eq!(tokens[2].kind, TokenKind::If);
         assert_eq!(tokens[3].kind, TokenKind::Else);
         assert_eq!(tokens[4].kind, TokenKind::For);
@@ -600,13 +607,13 @@ mod tests {
 
     #[test]
     fn test_comments() {
-        let input = "func // this is a comment\nlet";
+        let input = "func // this is a comment\nvar";
         let mut lexer = Lexer::new(input);
         let (tokens, errors) = lexer.collect_all();
 
         assert!(errors.is_empty());
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].kind, TokenKind::Func);
-        assert_eq!(tokens[1].kind, TokenKind::Let);
+        assert_eq!(tokens[1].kind, TokenKind::Var);
     }
 }
