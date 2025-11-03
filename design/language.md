@@ -94,7 +94,7 @@ primary_expr ::= primary_base postfix_op*
 
 primary_base ::= 
 ID
-| TRUE | FALSE | NIL
+| 'true' | 'false' | 'nil'
 | literals
 | func_call
 | struct_literal

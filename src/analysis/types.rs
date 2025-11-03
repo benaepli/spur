@@ -1,4 +1,4 @@
-use crate::analysis::resolver::NameId;
+use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::parser::{BinOp, Span};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +89,7 @@ pub enum TypedExprKind {
     Tail(Box<TypedExpr>),
     Len(Box<TypedExpr>),
 
-    RpcCall(Box<TypedExpr>, TypedFuncCall),
+    RpcCall(Box<TypedExpr>, TypedUserFuncCall),
 
     UnwrapOptional(Box<TypedExpr>), // T? -> T
     Await(Box<TypedExpr>),          // future<T> -> T
@@ -111,7 +111,13 @@ pub enum TypedExprKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypedFuncCall {
+pub enum TypedFuncCall {
+    User(TypedUserFuncCall),
+    Builtin(BuiltinFn, Vec<TypedExpr>, Type), // (builtin, args, return_type)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedUserFuncCall {
     pub name: NameId,
     pub original_name: String,
     pub args: Vec<TypedExpr>,
@@ -134,7 +140,6 @@ pub enum TypedStatementKind {
     Return(TypedExpr),
     ForLoop(TypedForLoop),
     ForInLoop(TypedForInLoop),
-    Print(TypedExpr),
     Break,
     Lock(Box<TypedExpr>, Vec<TypedStatement>),
 }

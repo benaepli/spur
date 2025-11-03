@@ -1,15 +1,15 @@
 use crate::analysis::resolver::{
-    NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedClientDef, ResolvedCondStmts,
+    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedClientDef, ResolvedCondStmts,
     ResolvedExpr, ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall,
     ResolvedFuncDef, ResolvedPattern, ResolvedPatternKind, ResolvedProgram, ResolvedRoleDef,
     ResolvedStatement, ResolvedStatementKind, ResolvedTopLevelDef, ResolvedTypeDef,
-    ResolvedTypeDefStmtKind, ResolvedVarInit,
+    ResolvedTypeDefStmtKind, ResolvedUserFuncCall, ResolvedVarInit,
 };
 use crate::analysis::types::{
     Type, TypedAssignment, TypedClientDef, TypedCondStmts, TypedExpr, TypedExprKind,
     TypedForInLoop, TypedForLoop, TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam,
     TypedIfBranch, TypedPattern, TypedPatternKind, TypedProgram, TypedRoleDef, TypedStatement,
-    TypedStatementKind, TypedTopLevelDef, TypedVarInit,
+    TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
 };
 use crate::parser::{BinOp, Span};
 use std::collections::HashMap;
@@ -145,6 +145,7 @@ pub struct TypeChecker {
     scopes: Vec<HashMap<NameId, Type>>,
     type_defs: HashMap<NameId, TypeDefinition>,
     func_signatures: HashMap<NameId, FunctionSignature>,
+    builtin_signatures: HashMap<BuiltinFn, FunctionSignature>,
     role_defs: HashMap<NameId, String>,
     struct_names: HashMap<NameId, String>,
     current_return_type: Option<Type>,
@@ -161,16 +162,28 @@ impl TypeChecker {
             TypeDefinition::Builtin(Type::String),
         );
         predefined.insert(prepopulated_types.bool, TypeDefinition::Builtin(Type::Bool));
+        let unit_type = Type::Tuple(vec![]);
         predefined.insert(
             prepopulated_types.unit,
-            TypeDefinition::Builtin(Type::Tuple(vec![])),
+            TypeDefinition::Builtin(unit_type.clone()),
         );
         predefined.insert(prepopulated_types.lock, TypeDefinition::Builtin(Type::Lock));
+
+        let mut builtin_signatures = HashMap::new();
+        builtin_signatures.insert(
+            BuiltinFn::Println,
+            FunctionSignature {
+                params: vec![Type::String],
+                return_type: unit_type,
+                is_sync: true, // All builtins are sync
+            },
+        );
 
         Self {
             scopes: vec![HashMap::new()], // Global scope
             type_defs: predefined,
             func_signatures: HashMap::new(),
+            builtin_signatures,
             role_defs: HashMap::new(),
             struct_names: HashMap::new(),
             current_return_type: None,
@@ -427,14 +440,6 @@ impl TypeChecker {
                 let typed_loop = self.check_for_in_loop(for_in_loop)?;
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::ForInLoop(typed_loop),
-                    span,
-                };
-                Ok((typed_stmt, false))
-            }
-            ResolvedStatementKind::Print(expr) => {
-                let typed_expr = self.check_expr(expr)?;
-                let typed_stmt = TypedStatement {
-                    kind: TypedStatementKind::Print(typed_expr),
                     span,
                 };
                 Ok((typed_stmt, false))
@@ -697,7 +702,7 @@ impl TypeChecker {
         }
     }
 
-    fn check_expr(&mut self, expr: ResolvedExpr) -> Result<TypedExpr, TypeError> {
+    fn check_expr(&self, expr: ResolvedExpr) -> Result<TypedExpr, TypeError> {
         let span = expr.span;
         match expr.kind {
             ResolvedExprKind::Var(name_id, name) => {
@@ -748,32 +753,40 @@ impl TypeChecker {
                 })
             }
             ResolvedExprKind::FuncCall(call) => {
-                let sig = self
-                    .func_signatures
-                    .get(&call.name)
-                    .ok_or_else(|| TypeError::UndefinedType(call.span))?
-                    .clone();
+                match call {
+                    ResolvedFuncCall::User(user_call) => {
+                        let sig = self
+                            .func_signatures
+                            .get(&user_call.name)
+                            .ok_or_else(|| TypeError::UndefinedType(user_call.span))?
+                            .clone();
 
-                if self.current_func_is_sync && !sig.is_sync {
-                    return Err(TypeError::SyncCallToAsync {
-                        func_name: call.original_name.clone(),
-                        span,
-                    });
+                        if self.current_func_is_sync && !sig.is_sync {
+                            return Err(TypeError::SyncCallToAsync {
+                                func_name: user_call.original_name.clone(),
+                                span,
+                            });
+                        }
+
+                        let typed_call = self.check_user_func_call(user_call, &sig)?;
+                        let return_ty = if sig.is_sync {
+                            sig.return_type
+                        } else {
+                            Type::Future(Box::new(sig.return_type.clone()))
+                        };
+
+                        Ok(TypedExpr {
+                            kind: TypedExprKind::FuncCall(TypedFuncCall::User(typed_call)),
+                            ty: return_ty,
+                            span,
+                        })
+                    }
+                    ResolvedFuncCall::Builtin(builtin, args, span) => {
+                        self.check_builtin_call(builtin, args, span)
+                    }
                 }
-
-                let typed_call = self.check_func_call(call, &sig)?;
-                let return_ty = if sig.is_sync {
-                    sig.return_type
-                } else {
-                    Type::Future(Box::new(sig.return_type.clone()))
-                };
-
-                Ok(TypedExpr {
-                    kind: TypedExprKind::FuncCall(typed_call),
-                    ty: return_ty,
-                    span,
-                })
             }
+
             ResolvedExprKind::MapLit(pairs) => self.check_map_literal(pairs, span),
             ResolvedExprKind::ListLit(items) => self.check_list_literal(items, span),
             ResolvedExprKind::TupleLit(items) => {
@@ -1098,7 +1111,7 @@ impl TypeChecker {
                     });
                 }
 
-                let typed_call = self.check_func_call(call, &sig)?;
+                let typed_call = self.check_user_func_call(call, &sig)?;
                 let return_ty = Type::Future(Box::new(typed_call.return_type.clone()));
                 Ok(TypedExpr {
                     kind: TypedExprKind::RpcCall(Box::new(typed_target), typed_call),
@@ -1235,7 +1248,7 @@ impl TypeChecker {
     }
 
     fn check_binop(
-        &mut self,
+        &self,
         op: BinOp,
         left: ResolvedExpr,
         right: ResolvedExpr,
@@ -1317,28 +1330,62 @@ impl TypeChecker {
         }
     }
 
-    fn check_func_call(
-        &mut self,
-        call: ResolvedFuncCall,
-        sig: &FunctionSignature,
-    ) -> Result<TypedFuncCall, TypeError> {
-        if call.args.len() != sig.params.len() {
+    fn check_call_args(
+        &self,
+        expected_params: &Vec<Type>,
+        args: Vec<ResolvedExpr>,
+        call_span: Span,
+    ) -> Result<Vec<TypedExpr>, TypeError> {
+        if args.len() != expected_params.len() {
             return Err(TypeError::WrongNumberOfArgs {
-                expected: sig.params.len(),
-                got: call.args.len(),
-                span: call.span,
+                expected: expected_params.len(),
+                got: args.len(),
+                span: call_span,
             });
         }
 
         let mut typed_args = Vec::new();
-        for (arg, param_ty) in call.args.into_iter().zip(sig.params.iter()) {
+        for (arg, param_ty) in args.into_iter().zip(expected_params.iter()) {
             let typed_arg = self.check_expr(arg)?;
             let arg_span = typed_arg.span.clone();
             let coerced_arg = self.check_and_coerce(param_ty, typed_arg, arg_span)?;
             typed_args.push(coerced_arg);
         }
+        Ok(typed_args)
+    }
 
-        Ok(TypedFuncCall {
+    fn check_builtin_call(
+        &self,
+        builtin: BuiltinFn,
+        args: Vec<ResolvedExpr>,
+        span: Span,
+    ) -> Result<TypedExpr, TypeError> {
+        let sig = self
+            .builtin_signatures
+            .get(&builtin)
+            .expect("Missing signature for builtin");
+
+        let typed_args = self.check_call_args(&sig.params, args, span)?;
+
+        Ok(TypedExpr {
+            kind: TypedExprKind::FuncCall(TypedFuncCall::Builtin(
+                builtin,
+                typed_args,
+                sig.return_type.clone(),
+            )),
+            ty: sig.return_type.clone(),
+            span,
+        })
+    }
+
+    fn check_user_func_call(
+        &self,
+        call: ResolvedUserFuncCall,
+        sig: &FunctionSignature,
+    ) -> Result<TypedUserFuncCall, TypeError> {
+        let typed_args = self.check_call_args(&sig.params, call.args, call.span)?;
+
+        Ok(TypedUserFuncCall {
             name: call.name,
             original_name: call.original_name,
             args: typed_args,
@@ -1348,7 +1395,7 @@ impl TypeChecker {
     }
 
     fn check_index(
-        &mut self,
+        &self,
         target: ResolvedExpr,
         index: ResolvedExpr,
         span: Span,
@@ -1392,7 +1439,7 @@ impl TypeChecker {
     }
 
     fn check_list_literal(
-        &mut self,
+        &self,
         mut items: Vec<ResolvedExpr>,
         span: Span,
     ) -> Result<TypedExpr, TypeError> {
@@ -1424,7 +1471,7 @@ impl TypeChecker {
     }
 
     fn check_map_literal(
-        &mut self,
+        &self,
         mut pairs: Vec<(ResolvedExpr, ResolvedExpr)>,
         span: Span,
     ) -> Result<TypedExpr, TypeError> {
@@ -1462,7 +1509,7 @@ impl TypeChecker {
         })
     }
     fn check_struct_literal(
-        &mut self,
+        &self,
         struct_id: NameId,
         fields: Vec<(String, ResolvedExpr)>,
         span: Span,

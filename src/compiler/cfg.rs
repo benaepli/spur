@@ -1,9 +1,5 @@
-use crate::analysis::resolver::NameId;
-use crate::analysis::types::{
-    TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit,
-    TypedFuncCall, TypedFuncDef, TypedPattern, TypedPatternKind, TypedProgram, TypedStatement,
-    TypedStatementKind, TypedTopLevelDef, TypedVarInit,
-};
+use crate::analysis::resolver::{BuiltinFn, NameId};
+use crate::analysis::types::{TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedPattern, TypedPatternKind, TypedProgram, TypedStatement, TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit};
 use crate::parser::BinOp;
 use serde::Serialize;
 use std::cell::RefCell;
@@ -348,12 +344,6 @@ impl Compiler {
                 // Compile the expression, store result in the dedicated return_var,
                 // and then jump to the function's final return_target.
                 self.compile_expr_to_value(expr, Lhs::Var(return_var.to_string()), return_target)
-            }
-            TypedStatementKind::Print(expr) => {
-                let print_var = self.new_temp_var();
-                let print_label = Label::Print(Expr::EVar(print_var.clone()), next_vertex);
-                let print_vertex = self.add_label(print_label);
-                self.compile_expr_to_value(expr, Lhs::Var(print_var), print_vertex)
             }
             TypedStatementKind::ForLoop(loop_stmt) => {
                 self.compile_for_loop(loop_stmt, next_vertex, return_target, return_var)
@@ -990,7 +980,7 @@ impl Compiler {
     fn compile_async_call_internal(
         &mut self,
         node_expr: Expr, // The node to call the function on
-        call: &TypedFuncCall,
+        call: &TypedUserFuncCall,
         target: Lhs, // The final destination for the *future*
         next_vertex: Vertex,
     ) -> Vertex {
@@ -1029,44 +1019,84 @@ impl Compiler {
 
     fn compile_func_call(
         &mut self,
-        call: &TypedFuncCall,
+        call: &TypedFuncCall, // This is now the enum
         target: Lhs,
         next_vertex: Vertex,
     ) -> Vertex {
-        let is_sync = self.func_sync_map.get(&call.name).cloned().unwrap_or(false);
+        match call {
+            TypedFuncCall::User(user_call) => {
+                let is_sync = self
+                    .func_sync_map
+                    .get(&user_call.name)
+                    .cloned()
+                    .unwrap_or(false);
 
-        if is_sync {
-            // Allocate temp vars for all arguments
-            let (arg_tmps, arg_exprs): (Vec<String>, Vec<Expr>) = (0..call.args.len())
-                .map(|_| {
-                    let tmp = self.new_temp_var();
-                    (tmp.clone(), Expr::EVar(tmp))
-                })
-                .unzip();
+                if is_sync {
+                    // Allocate temp vars for all arguments
+                    let (arg_tmps, arg_exprs): (Vec<String>, Vec<Expr>) = (0..user_call.args.len())
+                        .map(|_| {
+                            let tmp = self.new_temp_var();
+                            (tmp.clone(), Expr::EVar(tmp))
+                        })
+                        .unzip();
 
-            // Create the SyncCall instruction.
-            let sync_call_label = Label::Instr(
-                Instr::SyncCall(
-                    target, // The final Lhs for the return value
-                    resolved_name(call.name, &call.original_name),
-                    arg_exprs,
-                ),
-                next_vertex,
-            );
-            let sync_call_vertex = self.add_label(sync_call_label);
+                    // Create the SyncCall instruction.
+                    let sync_call_label = Label::Instr(
+                        Instr::SyncCall(
+                            target, // The final Lhs for the return value
+                            resolved_name(user_call.name, &user_call.original_name),
+                            arg_exprs,
+                        ),
+                        next_vertex,
+                    );
+                    let sync_call_vertex = self.add_label(sync_call_label);
 
-            // Compile all argument expressions, chaining them backwards.
-            self.compile_expr_list_recursive(call.args.iter(), arg_tmps, sync_call_vertex)
-        } else {
-            let node_expr = Expr::EVar("self".to_string());
-            self.compile_async_call_internal(node_expr, call, target, next_vertex)
+                    // Compile all argument expressions, chaining them backwards.
+                    self.compile_expr_list_recursive(
+                        user_call.args.iter(),
+                        arg_tmps,
+                        sync_call_vertex,
+                    )
+                } else {
+                    let node_expr = Expr::EVar("self".to_string());
+                    self.compile_async_call_internal(node_expr, user_call, target, next_vertex)
+                }
+            }
+            TypedFuncCall::Builtin(builtin, args, _return_ty) => {
+                // --- This is the new logic for built-ins ---
+                self.compile_builtin_call(*builtin, args, target, next_vertex)
+            }
+        }
+    }
+
+    fn compile_builtin_call(
+        &mut self,
+        builtin: BuiltinFn,
+        args: &Vec<TypedExpr>,
+        target: Lhs,
+        next_vertex: Vertex,
+    ) -> Vertex {
+        match builtin {
+            BuiltinFn::Println => {
+                let assign_vertex = self.add_label(Label::Instr(
+                    Instr::Assign(target, Expr::EUnit),
+                    next_vertex,
+                ));
+
+                let arg_var = self.new_temp_var();
+                let print_label = Label::Print(Expr::EVar(arg_var.clone()), assign_vertex);
+                let print_vertex = self.add_label(print_label);
+
+                let arg_expr = args.get(0).expect("Println should have 1 arg");
+                self.compile_expr_to_value(arg_expr, Lhs::Var(arg_var), print_vertex)
+            }
         }
     }
 
     fn compile_rpc_call(
         &mut self,
         target_expr: &TypedExpr,
-        call: &TypedFuncCall,
+        call: &TypedUserFuncCall,
         target: Lhs,
         next_vertex: Vertex,
     ) -> Vertex {

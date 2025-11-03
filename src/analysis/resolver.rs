@@ -1,10 +1,27 @@
 use crate::parser::*;
 use std::collections::HashMap;
+use std::str::FromStr;
 use thiserror::Error;
 
 // A unique identifier for every named entity (variable, function, type, role).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NameId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinFn {
+    Println,
+}
+
+impl FromStr for BuiltinFn {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "println" => Ok(BuiltinFn::Println),
+            _ => Err(()),
+        }
+    }
+}
 
 #[derive(Error, Debug, PartialEq, Clone)]
 pub enum ResolutionError {
@@ -120,7 +137,6 @@ pub enum ResolvedStatementKind {
     Return(ResolvedExpr),
     ForLoop(ResolvedForLoop),
     ForInLoop(ResolvedForInLoop),
-    Print(ResolvedExpr),
     Break,
     Lock(Box<ResolvedExpr>, Vec<ResolvedStatement>),
 }
@@ -215,7 +231,7 @@ pub enum ResolvedExprKind {
     Head(Box<ResolvedExpr>),
     Tail(Box<ResolvedExpr>),
     Len(Box<ResolvedExpr>),
-    RpcCall(Box<ResolvedExpr>, ResolvedFuncCall),
+    RpcCall(Box<ResolvedExpr>, ResolvedUserFuncCall),
     Await(Box<ResolvedExpr>),
     SpinAwait(Box<ResolvedExpr>),
     CreatePromise,
@@ -231,7 +247,13 @@ pub enum ResolvedExprKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedFuncCall {
+pub enum ResolvedFuncCall {
+    User(ResolvedUserFuncCall),
+    Builtin(BuiltinFn, Vec<ResolvedExpr>, Span),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedUserFuncCall {
     pub name: NameId,
     pub original_name: String,
     pub args: Vec<ResolvedExpr>,
@@ -651,7 +673,6 @@ impl Resolver {
             StatementKind::ForInLoop(fil) => {
                 ResolvedStatementKind::ForInLoop(self.resolve_for_in_loop(fil)?)
             }
-            StatementKind::Print(e) => ResolvedStatementKind::Print(self.resolve_expr(e)?),
             StatementKind::Break => ResolvedStatementKind::Break,
             StatementKind::Lock(lock_expr, body) => {
                 self.enter_scope();
@@ -817,17 +838,33 @@ impl Resolver {
             ExprKind::Not(e) => ResolvedExprKind::Not(Box::new(self.resolve_expr(*e)?)),
             ExprKind::Negate(e) => ResolvedExprKind::Negate(Box::new(self.resolve_expr(*e)?)),
             ExprKind::FuncCall(fc) => {
-                let func_name = fc.name.clone();
-                let resolved_call = self.resolve_func_call(fc)?;
+                if let Ok(builtin) = fc.name.parse::<BuiltinFn>() {
+                    let resolved_args = fc
+                        .args
+                        .into_iter()
+                        .map(|arg| self.resolve_expr(arg))
+                        .collect::<Result<_, _>>()?;
+                    ResolvedExprKind::FuncCall(ResolvedFuncCall::Builtin(
+                        builtin,
+                        resolved_args,
+                        fc.span,
+                    ))
+                } else {
+                    let func_name = fc.name.clone();
+                    let resolved_call = self.resolve_user_func_call(fc)?;
 
-                if let Some(current_role_name) = &self.current_role {
-                    if let Some(target_func_role) = self.func_to_role_map.get(&resolved_call.name) {
-                        if current_role_name != target_func_role {
-                            return Err(ResolutionError::InvalidCrossRoleCall(func_name, span));
+                    // Check for invalid cross-role calls
+                    if let Some(current_role_name) = &self.current_role {
+                        if let Some(target_func_role) =
+                            self.func_to_role_map.get(&resolved_call.name)
+                        {
+                            if current_role_name != target_func_role {
+                                return Err(ResolutionError::InvalidCrossRoleCall(func_name, span));
+                            }
                         }
                     }
+                    ResolvedExprKind::FuncCall(ResolvedFuncCall::User(resolved_call))
                 }
-                ResolvedExprKind::FuncCall(resolved_call)
             }
             ExprKind::MapLit(pairs) => {
                 let resolved_pairs = pairs
@@ -883,7 +920,7 @@ impl Resolver {
             ExprKind::Len(e) => ResolvedExprKind::Len(Box::new(self.resolve_expr(*e)?)),
             ExprKind::RpcCall(target, call) => ResolvedExprKind::RpcCall(
                 Box::new(self.resolve_expr(*target)?),
-                self.resolve_func_call(call)?,
+                self.resolve_user_func_call(call)?,
             ),
             ExprKind::Await(e) => ResolvedExprKind::Await(Box::new(self.resolve_expr(*e)?)),
             ExprKind::SpinAwait(e) => ResolvedExprKind::SpinAwait(Box::new(self.resolve_expr(*e)?)),
@@ -926,14 +963,17 @@ impl Resolver {
         Ok(ResolvedExpr { kind, span })
     }
 
-    fn resolve_func_call(&mut self, call: FuncCall) -> Result<ResolvedFuncCall, ResolutionError> {
+    fn resolve_user_func_call(
+        &mut self,
+        call: FuncCall,
+    ) -> Result<ResolvedUserFuncCall, ResolutionError> {
         let name_id = self.lookup_func(&call.name, call.span)?;
         let args = call
             .args
             .into_iter()
             .map(|arg| self.resolve_expr(arg))
             .collect::<Result<_, _>>()?;
-        Ok(ResolvedFuncCall {
+        Ok(ResolvedUserFuncCall {
             name: name_id,
             original_name: call.name,
             args,

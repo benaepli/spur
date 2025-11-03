@@ -119,7 +119,6 @@ pub enum StatementKind {
     Return(Expr),
     ForLoop(ForLoop),
     ForInLoop(ForInLoop),
-    Print(Expr),
     Break,
     Lock(Expr, Vec<Statement>),
 }
@@ -873,13 +872,6 @@ where
             for_loop,
             for_in_loop,
             lock_stmt,
-            just(TokenKind::Print)
-                .ignore_then(
-                    expr.clone()
-                        .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-                )
-                .then_ignore(just(TokenKind::Semicolon))
-                .map_with(|e, s| Statement::new(StatementKind::Print(e), s.span())),
             just(TokenKind::Break)
                 .then_ignore(just(TokenKind::Semicolon))
                 .map_with(|_, e| Statement::new(StatementKind::Break, e.span())),
