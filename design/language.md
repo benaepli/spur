@@ -220,4 +220,3 @@ We also have a variety of built-in functions.
 Right now, this includes:
 - `println: string -> ()`
 - `int_to_string: int -> string`
-- `bool_to_string: bool -> string`

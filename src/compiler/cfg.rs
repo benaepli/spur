@@ -52,6 +52,7 @@ pub enum Expr {
     ECreatePromise,
     ECreateLock,
     ESome(Box<Expr>),
+    EIntToString(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -1097,7 +1098,7 @@ impl Compiler {
     fn compile_func_call(
         &mut self,
         locals: &mut Vec<(String, Expr)>,
-        call: &TypedFuncCall, // This is now the enum
+        call: &TypedFuncCall,
         target: Lhs,
         next_vertex: Vertex,
     ) -> Vertex {
@@ -1175,6 +1176,17 @@ impl Compiler {
 
                 let arg_expr = args.get(0).expect("Println should have 1 arg");
                 self.compile_expr_to_value(locals, arg_expr, Lhs::Var(arg_var), print_vertex)
+            }
+            BuiltinFn::IntToString => {
+                let arg_var = self.new_temp_var(locals);
+                let final_expr = Expr::EIntToString(Box::new(Expr::EVar(arg_var.clone())));
+                let assign_vertex = self.add_label(Label::Instr(
+                    Instr::Assign(target, final_expr),
+                    next_vertex,
+                ));
+
+                let arg_expr = args.get(0).expect("IntToString should have 1 arg");
+                self.compile_expr_to_value(locals, arg_expr, Lhs::Var(arg_var), assign_vertex)
             }
         }
     }

@@ -10,6 +10,7 @@ pub struct NameId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinFn {
     Println,
+    IntToString,
 }
 
 impl FromStr for BuiltinFn {
@@ -18,6 +19,7 @@ impl FromStr for BuiltinFn {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "println" => Ok(BuiltinFn::Println),
+            "int_to_string" => Ok(BuiltinFn::IntToString),
             _ => Err(()),
         }
     }

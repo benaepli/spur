@@ -174,8 +174,16 @@ impl TypeChecker {
             BuiltinFn::Println,
             FunctionSignature {
                 params: vec![Type::String],
-                return_type: unit_type,
+                return_type: unit_type.clone(),
                 is_sync: true, // All builtins are sync
+            },
+        );
+        builtin_signatures.insert(
+            BuiltinFn::IntToString,
+            FunctionSignature {
+                params: vec![Type::Int],
+                return_type: Type::String,
+                is_sync: true,
             },
         );
 
