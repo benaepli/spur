@@ -760,40 +760,38 @@ impl TypeChecker {
                     span,
                 })
             }
-            ResolvedExprKind::FuncCall(call) => {
-                match call {
-                    ResolvedFuncCall::User(user_call) => {
-                        let sig = self
-                            .func_signatures
-                            .get(&user_call.name)
-                            .ok_or_else(|| TypeError::UndefinedType(user_call.span))?
-                            .clone();
+            ResolvedExprKind::FuncCall(call) => match call {
+                ResolvedFuncCall::User(user_call) => {
+                    let sig = self
+                        .func_signatures
+                        .get(&user_call.name)
+                        .ok_or_else(|| TypeError::UndefinedType(user_call.span))?
+                        .clone();
 
-                        if self.current_func_is_sync && !sig.is_sync {
-                            return Err(TypeError::SyncCallToAsync {
-                                func_name: user_call.original_name.clone(),
-                                span,
-                            });
-                        }
-
-                        let typed_call = self.check_user_func_call(user_call, &sig)?;
-                        let return_ty = if sig.is_sync {
-                            sig.return_type
-                        } else {
-                            Type::Future(Box::new(sig.return_type.clone()))
-                        };
-
-                        Ok(TypedExpr {
-                            kind: TypedExprKind::FuncCall(TypedFuncCall::User(typed_call)),
-                            ty: return_ty,
+                    if self.current_func_is_sync && !sig.is_sync {
+                        return Err(TypeError::SyncCallToAsync {
+                            func_name: user_call.original_name.clone(),
                             span,
-                        })
+                        });
                     }
-                    ResolvedFuncCall::Builtin(builtin, args, span) => {
-                        self.check_builtin_call(builtin, args, span)
-                    }
+
+                    let typed_call = self.check_user_func_call(user_call, &sig)?;
+                    let return_ty = if sig.is_sync {
+                        sig.return_type
+                    } else {
+                        Type::Future(Box::new(sig.return_type.clone()))
+                    };
+
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::FuncCall(TypedFuncCall::User(typed_call)),
+                        ty: return_ty,
+                        span,
+                    })
                 }
-            }
+                ResolvedFuncCall::Builtin(builtin, args, span) => {
+                    self.check_builtin_call(builtin, args, span)
+                }
+            },
 
             ResolvedExprKind::MapLit(pairs) => self.check_map_literal(pairs, span),
             ResolvedExprKind::ListLit(items) => self.check_list_literal(items, span),
@@ -1279,18 +1277,11 @@ impl TypeChecker {
                 })
             }
             BinOp::Equal | BinOp::NotEqual => {
-                if (matches!(left_ty, Type::Optional(_)) && right_ty == Type::Nil)
-                    || (left_ty == Type::Nil && matches!(right_ty, Type::Optional(_)))
-                {
-                    return Ok(TypedExpr {
-                        kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
-                        ty: Type::Bool,
-                        span,
-                    });
-                }
-                self.check_type_compatibility(&left_ty, &right_ty, typed_right.span)?;
+                let (coerced_left, coerced_right) =
+                    self.check_and_coerce_symmetric(typed_left, typed_right, op.clone(), span)?;
+
                 Ok(TypedExpr {
-                    kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
+                    kind: TypedExprKind::BinOp(op, Box::new(coerced_left), Box::new(coerced_right)),
                     ty: Type::Bool,
                     span,
                 })
@@ -1333,6 +1324,33 @@ impl TypeChecker {
                         right: right_ty,
                         span,
                     })
+                }
+            }
+        }
+    }
+
+    fn check_and_coerce_symmetric(
+        &self,
+        typed_left: TypedExpr,
+        typed_right: TypedExpr,
+        op: BinOp,
+        span: Span,
+    ) -> Result<(TypedExpr, TypedExpr), TypeError> {
+        let left_ty = typed_left.ty.clone();
+        let right_ty = typed_right.ty.clone();
+
+        match self.check_and_coerce(&left_ty, typed_right.clone(), typed_right.span.clone()) {
+            Ok(coerced_right) => Ok((typed_left, coerced_right)),
+            Err(_) => {
+                let left_span = typed_left.span.clone();
+                match self.check_and_coerce(&right_ty, typed_left, left_span) {
+                    Ok(coerced_left) => Ok((coerced_left, typed_right)),
+                    Err(_) => Err(TypeError::InvalidBinOp {
+                        op,
+                        left: left_ty,
+                        right: right_ty,
+                        span,
+                    }),
                 }
             }
         }
@@ -1783,6 +1801,7 @@ impl TypeChecker {
 
         if let Type::Optional(expected_inner) = expected {
             if *actual == Type::Nil {
+                actual_expr.ty = expected.clone();
                 return Ok(actual_expr);
             }
 
