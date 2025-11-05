@@ -373,7 +373,8 @@ impl TypeChecker {
         let expected_type = self.resolve_type(&var_init.type_def)?;
         let typed_value = self.check_expr(var_init.value)?;
 
-        let coerced_value = self.check_and_coerce(&expected_type, typed_value, var_init.span)?;
+        let coerced_value =
+            self.check_and_coerce(&expected_type, typed_value, var_init.span, true)?;
         self.add_var(var_init.name, expected_type.clone());
         Ok(TypedVarInit {
             name: var_init.name,
@@ -426,7 +427,8 @@ impl TypeChecker {
                 let typed_expr = self.check_expr(expr)?;
                 let coerced_expr;
                 if let Some(expected_return_type) = &self.current_return_type {
-                    coerced_expr = self.check_and_coerce(expected_return_type, typed_expr, span)?;
+                    coerced_expr =
+                        self.check_and_coerce(expected_return_type, typed_expr, span, true)?;
                 } else {
                     return Err(TypeError::ReturnOutsideFunction(span));
                 }
@@ -693,7 +695,8 @@ impl TypeChecker {
         let typed_target = self.check_expr(assign.target)?;
         let typed_value = self.check_expr(assign.value)?;
 
-        let coerced_value = self.check_and_coerce(&typed_target.ty, typed_value, assign.span)?;
+        let coerced_value =
+            self.check_and_coerce(&typed_target.ty, typed_value, assign.span, true)?;
         Ok(TypedAssignment {
             target: typed_target,
             value: coerced_value,
@@ -815,7 +818,8 @@ impl TypeChecker {
 
                 let (list_ty, coerced_item) = match typed_list.ty.clone() {
                     Type::List(elem_ty) => {
-                        let coerced = self.check_and_coerce(elem_ty.as_ref(), typed_item, span)?;
+                        let coerced =
+                            self.check_and_coerce(elem_ty.as_ref(), typed_item, span, true)?;
                         (Type::List(elem_ty), coerced)
                     }
                     Type::EmptyList => (Type::List(Box::new(typed_item.ty.clone())), typed_item),
@@ -839,7 +843,8 @@ impl TypeChecker {
 
                 let (list_ty, coerced_item) = match typed_list.ty.clone() {
                     Type::List(elem_ty) => {
-                        let coerced = self.check_and_coerce(elem_ty.as_ref(), typed_item, span)?;
+                        let coerced =
+                            self.check_and_coerce(elem_ty.as_ref(), typed_item, span, true)?;
                         (Type::List(elem_ty), coerced)
                     }
                     Type::EmptyList => (Type::List(Box::new(typed_item.ty.clone())), typed_item),
@@ -981,8 +986,12 @@ impl TypeChecker {
 
                 match typed_promise.ty.clone() {
                     Type::Promise(inner_ty) => {
-                        let coerced_value =
-                            self.check_and_coerce(inner_ty.as_ref(), typed_value, value_span)?;
+                        let coerced_value = self.check_and_coerce(
+                            inner_ty.as_ref(),
+                            typed_value,
+                            value_span,
+                            true,
+                        )?;
                         Ok(TypedExpr {
                             kind: TypedExprKind::ResolvePromise(
                                 Box::new(typed_promise),
@@ -1277,8 +1286,13 @@ impl TypeChecker {
                 })
             }
             BinOp::Equal | BinOp::NotEqual => {
-                let (coerced_left, coerced_right) =
-                    self.check_and_coerce_symmetric(typed_left, typed_right, op.clone(), span)?;
+                let (coerced_left, coerced_right) = self.check_and_coerce_symmetric(
+                    typed_left,
+                    typed_right,
+                    op.clone(),
+                    span,
+                    false,
+                )?;
 
                 Ok(TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(coerced_left), Box::new(coerced_right)),
@@ -1307,7 +1321,7 @@ impl TypeChecker {
             BinOp::Coalesce => {
                 if let Type::Optional(inner_ty) = left_ty.clone() {
                     let coerced_right =
-                        self.check_and_coerce(inner_ty.as_ref(), typed_right, span)?;
+                        self.check_and_coerce(inner_ty.as_ref(), typed_right, span, true)?;
                     Ok(TypedExpr {
                         kind: TypedExprKind::BinOp(
                             op,
@@ -1335,15 +1349,21 @@ impl TypeChecker {
         typed_right: TypedExpr,
         op: BinOp,
         span: Span,
+        wrap_optional: bool,
     ) -> Result<(TypedExpr, TypedExpr), TypeError> {
         let left_ty = typed_left.ty.clone();
         let right_ty = typed_right.ty.clone();
 
-        match self.check_and_coerce(&left_ty, typed_right.clone(), typed_right.span.clone()) {
+        match self.check_and_coerce(
+            &left_ty,
+            typed_right.clone(),
+            typed_right.span.clone(),
+            wrap_optional,
+        ) {
             Ok(coerced_right) => Ok((typed_left, coerced_right)),
             Err(_) => {
                 let left_span = typed_left.span.clone();
-                match self.check_and_coerce(&right_ty, typed_left, left_span) {
+                match self.check_and_coerce(&right_ty, typed_left, left_span, wrap_optional) {
                     Ok(coerced_left) => Ok((coerced_left, typed_right)),
                     Err(_) => Err(TypeError::InvalidBinOp {
                         op,
@@ -1374,7 +1394,7 @@ impl TypeChecker {
         for (arg, param_ty) in args.into_iter().zip(expected_params.iter()) {
             let typed_arg = self.check_expr(arg)?;
             let arg_span = typed_arg.span.clone();
-            let coerced_arg = self.check_and_coerce(param_ty, typed_arg, arg_span)?;
+            let coerced_arg = self.check_and_coerce(param_ty, typed_arg, arg_span, true)?;
             typed_args.push(coerced_arg);
         }
         Ok(typed_args)
@@ -1485,7 +1505,7 @@ impl TypeChecker {
         for item in items {
             let typed_item = self.check_expr(item)?;
             let item_span = typed_item.span.clone();
-            let coerced_item = self.check_and_coerce(&first_ty, typed_item, item_span)?;
+            let coerced_item = self.check_and_coerce(&first_ty, typed_item, item_span, true)?;
             typed_items.push(coerced_item);
         }
 
@@ -1523,8 +1543,8 @@ impl TypeChecker {
             let key_span = typed_key.span.clone();
             let val_span = typed_val.span.clone();
 
-            let coerced_key = self.check_and_coerce(&key_ty, typed_key, key_span)?;
-            let coerced_val = self.check_and_coerce(&val_ty, typed_val, val_span)?;
+            let coerced_key = self.check_and_coerce(&key_ty, typed_key, key_span, true)?;
+            let coerced_val = self.check_and_coerce(&val_ty, typed_val, val_span, true)?;
             typed_pairs.push((coerced_key, coerced_val));
         }
 
@@ -1587,7 +1607,8 @@ impl TypeChecker {
             let expected_ty = self.resolve_type(&field_def.type_def)?;
             let typed_field_expr = self.check_expr(field_expr)?;
             let field_span = typed_field_expr.span.clone();
-            let coerced_expr = self.check_and_coerce(&expected_ty, typed_field_expr, field_span)?;
+            let coerced_expr =
+                self.check_and_coerce(&expected_ty, typed_field_expr, field_span, true)?;
             typed_fields.push((field_name, coerced_expr));
         }
 
@@ -1779,6 +1800,7 @@ impl TypeChecker {
         expected: &Type,
         mut actual_expr: TypedExpr,
         span: Span,
+        wrap_optional: bool,
     ) -> Result<TypedExpr, TypeError> {
         let actual = &actual_expr.ty;
 
@@ -1811,9 +1833,10 @@ impl TypeChecker {
                     .map(|_| actual_expr);
             }
 
-            if self
-                .check_type_compatibility(expected_inner, actual, span)
-                .is_ok()
+            if wrap_optional
+                && self
+                    .check_type_compatibility(expected_inner, actual, span)
+                    .is_ok()
             {
                 return Ok(TypedExpr {
                     kind: TypedExprKind::WrapInOptional(Box::new(actual_expr)),
