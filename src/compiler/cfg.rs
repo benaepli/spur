@@ -1058,7 +1058,7 @@ impl Compiler {
         locals: &mut Vec<(String, Expr)>,
         node_expr: Expr, // The node to call the function on
         call: &TypedUserFuncCall,
-        target: Lhs, // The final destination for the *future*
+        target: Lhs, // The final destination for the future
         next_vertex: Vertex,
     ) -> Vertex {
         // Allocate all temporary variable names up front.
@@ -1070,7 +1070,7 @@ impl Compiler {
             })
             .unzip();
 
-        // Build the call chain backwards (Async -> Pause).
+        // Build the call chain backwards (Async -> next_vertex).
         let async_label = Label::Instr(
             Instr::Async(
                 target,
@@ -1082,10 +1082,9 @@ impl Compiler {
         );
         let async_vertex = self.add_label(async_label);
 
-        let pause_vertex = self.add_label(Label::Pause(async_vertex));
+        let mut entry_vertex = async_vertex;
 
         // Build the argument compilation chain backwards.
-        let mut entry_vertex = pause_vertex;
         for (arg, tmp_var) in call.args.iter().rev().zip(arg_temp_vars.iter().rev()) {
             entry_vertex =
                 self.compile_expr_to_value(locals, arg, Lhs::Var(tmp_var.clone()), entry_vertex);
