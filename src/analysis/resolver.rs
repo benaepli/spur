@@ -31,8 +31,6 @@ pub enum ResolutionError {
     NameNotFound(String, Span),
     #[error("Name `{0}` is already defined in this scope")]
     DuplicateName(String, Span),
-    #[error("Direct call to function `{0}` is not allowed from another role")]
-    InvalidCrossRoleCall(String, Span),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,7 +231,7 @@ pub enum ResolvedExprKind {
     Head(Box<ResolvedExpr>),
     Tail(Box<ResolvedExpr>),
     Len(Box<ResolvedExpr>),
-    RpcCall(Box<ResolvedExpr>, ResolvedUserFuncCall),
+    RpcCall(Box<ResolvedExpr>, ResolvedRpcCall),
     Await(Box<ResolvedExpr>),
     SpinAwait(Box<ResolvedExpr>),
     CreatePromise,
@@ -262,16 +260,25 @@ pub struct ResolvedUserFuncCall {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedRpcCall {
+    pub original_name: String,
+    pub args: Vec<ResolvedExpr>,
+    pub span: Span,
+}
+
 type Scope<T> = HashMap<String, T>;
 
 pub struct Resolver {
     var_scopes: Vec<Scope<NameId>>,
-    func_scope: Scope<NameId>,
     type_scopes: Vec<Scope<NameId>>,
     role_scope: Scope<NameId>, // Roles are global and not nested
+
+    role_func_scopes: HashMap<NameId, Scope<NameId>>,
+    client_func_scope: Scope<NameId>,
+
     next_id: usize,
-    func_to_role_map: HashMap<NameId, String>,
-    current_role: Option<String>,
+    current_role: Option<NameId>,
 
     pre_populated_types: PrepopulatedTypes,
 }
@@ -311,11 +318,11 @@ impl Resolver {
 
         Resolver {
             var_scopes: vec![HashMap::new()],
-            func_scope: HashMap::new(),
             type_scopes: vec![type_scope.clone()],
             role_scope: HashMap::new(),
+            role_func_scopes: HashMap::new(),
+            client_func_scope: HashMap::new(),
             next_id,
-            func_to_role_map: HashMap::new(),
             current_role: None,
             pre_populated_types: PrepopulatedTypes {
                 int: int_type,
@@ -365,13 +372,6 @@ impl Resolver {
         Ok(id)
     }
 
-    fn declare_func(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        let id = self.new_name_id();
-        // All functions are declared in the single global function scope
-        Self::declare_in_scope(&mut self.func_scope, name, id, span)?;
-        Ok(id)
-    }
-
     fn declare_type(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
         let id = self.new_name_id();
         Self::declare_in_scope(self.type_scopes.last_mut().unwrap(), name, id, span)?;
@@ -382,6 +382,7 @@ impl Resolver {
         let id = self.new_name_id();
         Self::declare_in_scope(&mut self.role_scope, name, id, span)?;
         Self::declare_in_scope(self.type_scopes.last_mut().unwrap(), name, id, span)?;
+        self.role_func_scopes.insert(id, HashMap::new());
         Ok(id)
     }
 
@@ -406,7 +407,20 @@ impl Resolver {
     }
 
     fn lookup_func(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        Self::lookup_in_scopes(std::iter::once(&self.func_scope), name, span)
+        let scope_to_check = if let Some(role_id) = self.current_role {
+            self.role_func_scopes.get(&role_id)
+        } else {
+            Some(&self.client_func_scope)
+        };
+
+        if let Some(scope) = scope_to_check {
+            scope.get(name)
+                .copied()
+                .ok_or_else(|| ResolutionError::NameNotFound(name.to_string(), span))
+        } else {
+            // This should not happen if resolve_program is correct
+            Err(ResolutionError::NameNotFound(name.to_string(), span))
+        }
     }
 
     fn lookup_type(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
@@ -429,7 +443,7 @@ impl Resolver {
     }
 
     pub fn resolve_program(mut self, program: Program) -> Result<ResolvedProgram, ResolutionError> {
-        // == PASS 1: DECLARE ALL TOP-LEVEL NAMES AND MAP FUNCTIONS TO ROLES ==
+        // Pass 1: declare all types and roles.
         for def in &program.top_level_defs {
             if let TopLevelDef::Type(type_def) = def {
                 self.declare_type(&type_def.name, type_def.span)?;
@@ -440,20 +454,24 @@ impl Resolver {
                 self.declare_role(&role_def.name, role_def.span)?;
             }
         }
+
         for def in &program.top_level_defs {
             if let TopLevelDef::Role(role_def) = def {
+                let role_id = self.lookup_role(&role_def.name, role_def.span)?;
+
                 for func in &role_def.func_defs {
-                    self.declare_func(&func.name, func.span)?;
+                    let id = self.new_name_id();
+                    let scope = self.role_func_scopes.get_mut(&role_id).unwrap();
+                    Self::declare_in_scope(scope, &func.name, id, func.span)?;
                 }
             }
         }
         for func in &program.client_def.func_defs {
-            let id = self.declare_func(&func.name, func.span)?;
-            self.func_to_role_map
-                .insert(id, "ClientInterface".to_string());
+            let id = self.new_name_id();
+            Self::declare_in_scope(&mut self.client_func_scope, &func.name, id, func.span)?;
         }
 
-        // == PASS 2: RESOLVE ALL BODIES ==
+        // Pass 2: resolve all bodies
         let resolved_top_levels = program
             .top_level_defs
             .into_iter()
@@ -482,9 +500,9 @@ impl Resolver {
 
     fn resolve_role_def(&mut self, role: RoleDef) -> Result<ResolvedRoleDef, ResolutionError> {
         let prev_role = self.current_role.clone();
-        self.current_role = Some(role.name.clone());
-
         let name_id = self.lookup_role(&role.name, role.span)?;
+        self.current_role = Some(name_id);
+
         self.enter_scope();
         let var_inits = role
             .var_inits
@@ -513,7 +531,7 @@ impl Resolver {
         client: ClientDef,
     ) -> Result<ResolvedClientDef, ResolutionError> {
         let prev_role = self.current_role.clone();
-        self.current_role = Some("ClientInterface".to_string());
+        self.current_role = None;
 
         self.enter_scope();
         let var_inits = client
@@ -852,19 +870,7 @@ impl Resolver {
                         fc.span,
                     ))
                 } else {
-                    let func_name = fc.name.clone();
                     let resolved_call = self.resolve_user_func_call(fc)?;
-
-                    // Check for invalid cross-role calls
-                    if let Some(current_role_name) = &self.current_role {
-                        if let Some(target_func_role) =
-                            self.func_to_role_map.get(&resolved_call.name)
-                        {
-                            if current_role_name != target_func_role {
-                                return Err(ResolutionError::InvalidCrossRoleCall(func_name, span));
-                            }
-                        }
-                    }
                     ResolvedExprKind::FuncCall(ResolvedFuncCall::User(resolved_call))
                 }
             }
@@ -920,10 +926,23 @@ impl Resolver {
             ExprKind::Head(e) => ResolvedExprKind::Head(Box::new(self.resolve_expr(*e)?)),
             ExprKind::Tail(e) => ResolvedExprKind::Tail(Box::new(self.resolve_expr(*e)?)),
             ExprKind::Len(e) => ResolvedExprKind::Len(Box::new(self.resolve_expr(*e)?)),
-            ExprKind::RpcCall(target, call) => ResolvedExprKind::RpcCall(
-                Box::new(self.resolve_expr(*target)?),
-                self.resolve_user_func_call(call)?,
-            ),
+            ExprKind::RpcCall(target, call) => {
+                let resolved_target = Box::new(self.resolve_expr(*target)?);
+                let resolved_args = call
+                    .args
+                    .into_iter()
+                    .map(|arg| self.resolve_expr(arg))
+                    .collect::<Result<_, _>>()?;
+
+                ResolvedExprKind::RpcCall(
+                    resolved_target,
+                    ResolvedRpcCall {
+                        original_name: call.name,
+                        args: resolved_args,
+                        span: call.span,
+                    },
+                )
+            }
             ExprKind::Await(e) => ResolvedExprKind::Await(Box::new(self.resolve_expr(*e)?)),
             ExprKind::SpinAwait(e) => ResolvedExprKind::SpinAwait(Box::new(self.resolve_expr(*e)?)),
             ExprKind::CreatePromise => ResolvedExprKind::CreatePromise,

@@ -147,6 +147,7 @@ pub struct TypeChecker {
     func_signatures: HashMap<NameId, FunctionSignature>,
     builtin_signatures: HashMap<BuiltinFn, FunctionSignature>,
     role_defs: HashMap<NameId, String>,
+    role_func_signatures: HashMap<NameId, HashMap<String, (NameId, FunctionSignature)>>,
     struct_names: HashMap<NameId, String>,
     current_return_type: Option<Type>,
     current_func_is_sync: bool,
@@ -193,6 +194,7 @@ impl TypeChecker {
             func_signatures: HashMap::new(),
             builtin_signatures,
             role_defs: HashMap::new(),
+            role_func_signatures: HashMap::new(),
             struct_names: HashMap::new(),
             current_return_type: None,
             current_func_is_sync: false,
@@ -235,11 +237,20 @@ impl TypeChecker {
                 }
                 ResolvedTopLevelDef::Role(role) => {
                     self.role_defs.insert(role.name, role.original_name.clone());
+                    self.role_func_signatures.insert(role.name, HashMap::new());
+                }
+            }
+        }
 
-                    for func in &role.func_defs {
-                        let sig = self.build_function_signature(func)?;
-                        self.func_signatures.insert(func.name, sig);
-                    }
+        for top_level_def in &program.top_level_defs {
+            if let ResolvedTopLevelDef::Role(role) = top_level_def {
+
+                for func in &role.func_defs {
+                    let sig = self.build_function_signature(func)?;
+                    let role_funcs = self.role_func_signatures.get_mut(&role.name).unwrap();
+
+                    self.func_signatures.insert(func.name, sig.clone());
+                    role_funcs.insert(func.original_name.clone(), (func.name, sig));
                 }
             }
         }
@@ -1106,19 +1117,26 @@ impl TypeChecker {
                 }
 
                 let typed_target = self.check_expr(*target)?;
-                if !matches!(typed_target.ty, Type::Role(..)) {
-                    return Err(TypeError::RpcCallTargetNotRole {
+                let role_id = match &typed_target.ty {
+                    Type::Role(id, _) => *id,
+                    _ => return Err(TypeError::RpcCallTargetNotRole {
                         ty: typed_target.ty,
-                        span,
-                    });
+                        span: typed_target.span,
+                    }),
+                };
+
+                let role_funcs = self.role_func_signatures.get(&role_id)
+                    .ok_or(TypeError::UndefinedType(typed_target.span))?;
+
+                let (func_id, sig) = role_funcs.get(&call.original_name)
+                    .ok_or_else(|| TypeError::FieldNotFound {
+                        field_name: call.original_name.clone(),
+                        span: call.span,
+                    })?;
+
+                if self.current_func_is_sync {
+                    return Err(TypeError::RpcCallInSyncFunc { span });
                 }
-
-                let sig = self
-                    .func_signatures
-                    .get(&call.name)
-                    .ok_or_else(|| TypeError::UndefinedType(call.span))?
-                    .clone();
-
                 if sig.is_sync {
                     return Err(TypeError::RpcCallToSyncFunc {
                         func_name: call.original_name.clone(),
@@ -1126,8 +1144,16 @@ impl TypeChecker {
                     });
                 }
 
-                let typed_call = self.check_user_func_call(call, &sig)?;
-                let return_ty = Type::Future(Box::new(typed_call.return_type.clone()));
+                let typed_args = self.check_call_args(&sig.params, call.args, call.span)?;
+                let typed_call = TypedUserFuncCall {
+                    name: *func_id,
+                    original_name: call.original_name,
+                    args: typed_args,
+                    return_type: sig.return_type.clone(),
+                    span: call.span,
+                };
+                
+                let return_ty = Type::Future(Box::new(sig.return_type.clone()));
                 Ok(TypedExpr {
                     kind: TypedExprKind::RpcCall(Box::new(typed_target), typed_call),
                     ty: return_ty,

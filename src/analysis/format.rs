@@ -39,18 +39,6 @@ pub fn report_resolution_errors(
                 .with_notes(vec![
                     "names must be unique within a given scope".to_string(),
                 ]),
-
-            ResolutionError::InvalidCrossRoleCall(name, span) => Diagnostic::error()
-                .with_message("invalid cross-role function call")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("`{}` belongs to another role", name)),
-                ])
-                .with_notes(vec![
-                    "help: Direct calls are only allowed to functions in the same role. \
-                    To call a function in another role, use an `rpc_call`."
-                        .to_string(),
-                ]),
         };
         term::emit_to_write_style(&mut writer_lock, &config, &files, &diagnostic)?;
     }

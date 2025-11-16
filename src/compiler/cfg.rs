@@ -140,9 +140,9 @@ pub struct Compiler {
 
     rpc_map: HashMap<String, FunctionInfo>,
     client_ops_map: HashMap<String, FunctionInfo>,
-    compiling_for_role: bool,
 
     func_sync_map: HashMap<NameId, bool>,
+    func_qualifier_map: HashMap<NameId, String>,
 }
 
 fn resolved_name(name_id: NameId, original_name: &str) -> String {
@@ -156,8 +156,8 @@ impl Compiler {
             temp_counter: 0,
             rpc_map: HashMap::new(),
             client_ops_map: HashMap::new(),
-            compiling_for_role: false,
             func_sync_map: HashMap::new(),
+            func_qualifier_map: HashMap::new(),
         }
     }
 
@@ -182,28 +182,30 @@ impl Compiler {
         for def in &program.top_level_defs {
             match def {
                 TypedTopLevelDef::Role(role) => {
+                    let qualifier = role.original_name.clone();
                     for func in &role.func_defs {
                         self.func_sync_map.insert(func.name, func.is_sync);
+                        self.func_qualifier_map.insert(func.name, qualifier.clone());
                     }
                 }
             }
         }
+
+        let client_qualifier = "ClientInterface".to_string();
         for func in &program.client_def.func_defs {
             self.func_sync_map.insert(func.name, func.is_sync);
+            self.func_qualifier_map
+                .insert(func.name, client_qualifier.clone());
         }
 
         // Compile all top-level definitions
         for def in program.top_level_defs {
             match def {
                 TypedTopLevelDef::Role(role) => {
-                    self.compiling_for_role = true;
                     // Compile role's var_inits into a special init function
                     let init_fn = self.compile_init_func(
                         &role.var_inits,
-                        format!(
-                            "{}_BASE_NODE_INIT",
-                            resolved_name(role.name, &role.original_name)
-                        ),
+                        format!("{}.{}", role.original_name, "BASE_NODE_INIT"),
                     );
                     self.rpc_map.insert(init_fn.name.clone(), init_fn);
 
@@ -216,12 +218,10 @@ impl Compiler {
             }
         }
 
-        self.compiling_for_role = false;
-
         // Compile client definition
         let client_init_fn = self.compile_init_func(
             &program.client_def.var_inits,
-            "BASE_CLIENT_INIT".to_string(),
+            format!("{}.{}", "ClientInterface", "BASE_NODE_INIT"),
         );
         self.client_ops_map
             .insert(client_init_fn.name.clone(), client_init_fn);
@@ -303,9 +303,14 @@ impl Compiler {
             body_entry,
         ));
 
+        let qualifier = self
+            .func_qualifier_map
+            .get(&func.name)
+            .expect("Function qualifier should exist in map");
+
         FunctionInfo {
             entry,
-            name: resolved_name(func.name, &func.original_name),
+            name: format!("{}.{}", qualifier, func.original_name),
             formals,
             locals,
             is_sync: func.is_sync,
@@ -1070,13 +1075,17 @@ impl Compiler {
             })
             .unzip();
 
+        let qualifier = self
+            .func_qualifier_map
+            .get(&call.name)
+            .expect("Function qualifier should exist in map");
+        let func_name = format!("{}.{}", qualifier, call.original_name);
+
         // Build the call chain backwards (Async -> next_vertex).
         let async_label = Label::Instr(
             Instr::Async(
-                target,
-                node_expr, // Use the provided node expression
-                resolved_name(call.name, &call.original_name),
-                arg_exprs,
+                target, node_expr, // Use the provided node expression
+                func_name, arg_exprs,
             ),
             next_vertex,
         );
@@ -1118,12 +1127,17 @@ impl Compiler {
                         })
                         .unzip();
 
+                    let qualifier = self
+                        .func_qualifier_map
+                        .get(&user_call.name)
+                        .expect("Function qualifier should exist in map");
+                    let func_name = format!("{}.{}", qualifier, user_call.original_name);
+
                     // Create the SyncCall instruction.
                     let sync_call_label = Label::Instr(
                         Instr::SyncCall(
                             target, // The final Lhs for the return value
-                            resolved_name(user_call.name, &user_call.original_name),
-                            arg_exprs,
+                            func_name, arg_exprs,
                         ),
                         next_vertex,
                     );
@@ -1179,10 +1193,8 @@ impl Compiler {
             BuiltinFn::IntToString => {
                 let arg_var = self.new_temp_var(locals);
                 let final_expr = Expr::EIntToString(Box::new(Expr::EVar(arg_var.clone())));
-                let assign_vertex = self.add_label(Label::Instr(
-                    Instr::Assign(target, final_expr),
-                    next_vertex,
-                ));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
                 let arg_expr = args.get(0).expect("IntToString should have 1 arg");
                 self.compile_expr_to_value(locals, arg_expr, Lhs::Var(arg_var), assign_vertex)
