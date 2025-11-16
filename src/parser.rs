@@ -10,7 +10,6 @@ pub type Span = SimpleSpan<usize>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub top_level_defs: Vec<TopLevelDef>,
-    pub client_def: ClientDef,
     pub span: Span,
 }
 
@@ -23,13 +22,6 @@ pub enum TopLevelDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoleDef {
     pub name: String,
-    pub var_inits: Vec<VarInit>,
-    pub func_defs: Vec<FuncDef>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ClientDef {
     pub var_inits: Vec<VarInit>,
     pub func_defs: Vec<FuncDef>,
     pub span: Span,
@@ -975,7 +967,7 @@ where
     };
 
     let role_def = just(TokenKind::Role)
-        .ignore_then(ident)
+        .ignore_then(ident.clone())
         .then(role_contents())
         .map_with(|(name, (var_inits, func_defs)), e| {
             TopLevelDef::Role(RoleDef {
@@ -986,24 +978,25 @@ where
             })
         });
 
-    let top_level_def = choice((role_def, type_def_stmt.map(TopLevelDef::Type)));
-
     let client_def = just(TokenKind::ClientInterface)
         .ignore_then(role_contents())
-        .map_with(|(var_inits, func_defs), e| ClientDef {
-            var_inits,
-            func_defs,
-            span: e.span(),
+        .map_with(|(var_inits, func_defs), e| {
+            TopLevelDef::Role(RoleDef {
+                name: "ClientInterface".to_string(),
+                var_inits,
+                func_defs,
+                span: e.span(),
+            })
         });
+
+    let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type)));
 
     // --- Final Program Parser ---
     top_level_def
         .repeated()
         .collect()
-        .then(client_def)
-        .map_with(|(top_level_defs, client_def), e| Program {
+        .map_with(|top_level_defs, e| Program {
             top_level_defs,
-            client_def,
             span: e.span(),
         })
         .then_ignore(end())

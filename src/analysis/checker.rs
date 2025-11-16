@@ -1,12 +1,12 @@
 use crate::analysis::resolver::{
-    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedClientDef, ResolvedCondStmts,
+    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedCondStmts,
     ResolvedExpr, ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall,
     ResolvedFuncDef, ResolvedPattern, ResolvedPatternKind, ResolvedProgram, ResolvedRoleDef,
     ResolvedStatement, ResolvedStatementKind, ResolvedTopLevelDef, ResolvedTypeDef,
     ResolvedTypeDefStmtKind, ResolvedUserFuncCall, ResolvedVarInit,
 };
 use crate::analysis::types::{
-    Type, TypedAssignment, TypedClientDef, TypedCondStmts, TypedExpr, TypedExprKind,
+    Type, TypedAssignment, TypedCondStmts, TypedExpr, TypedExprKind,
     TypedForInLoop, TypedForLoop, TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam,
     TypedIfBranch, TypedPattern, TypedPatternKind, TypedProgram, TypedRoleDef, TypedStatement,
     TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
@@ -216,11 +216,8 @@ impl TypeChecker {
             }
         }
 
-        let typed_client = self.check_client_def(program.client_def)?;
-
         Ok(TypedProgram {
             top_level_defs: typed_top_levels,
-            client_def: typed_client,
         })
     }
 
@@ -253,11 +250,6 @@ impl TypeChecker {
                     role_funcs.insert(func.original_name.clone(), (func.name, sig));
                 }
             }
-        }
-
-        for func in &program.client_def.func_defs {
-            let sig = self.build_function_signature(func)?;
-            self.func_signatures.insert(func.name, sig);
         }
 
         Ok(())
@@ -306,27 +298,6 @@ impl TypeChecker {
             var_inits: typed_var_inits,
             func_defs: typed_func_defs,
             span: role.span,
-        })
-    }
-
-    fn check_client_def(&mut self, client: ResolvedClientDef) -> Result<TypedClientDef, TypeError> {
-        self.enter_scope();
-
-        let mut typed_var_inits = Vec::new();
-        for var_init in client.var_inits {
-            typed_var_inits.push(self.check_var_init(var_init)?);
-        }
-
-        let mut typed_func_defs = Vec::new();
-        for func in client.func_defs {
-            typed_func_defs.push(self.check_func_def(func)?);
-        }
-
-        self.exit_scope();
-        Ok(TypedClientDef {
-            var_inits: typed_var_inits,
-            func_defs: typed_func_defs,
-            span: client.span,
         })
     }
 

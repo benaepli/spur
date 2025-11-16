@@ -215,7 +215,6 @@ pub enum TypedPatternKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedProgram {
     pub top_level_defs: Vec<TypedTopLevelDef>,
-    pub client_def: TypedClientDef,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -227,13 +226,6 @@ pub enum TypedTopLevelDef {
 pub struct TypedRoleDef {
     pub name: NameId,
     pub original_name: String,
-    pub var_inits: Vec<TypedVarInit>,
-    pub func_defs: Vec<TypedFuncDef>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TypedClientDef {
     pub var_inits: Vec<TypedVarInit>,
     pub func_defs: Vec<TypedFuncDef>,
     pub span: Span,

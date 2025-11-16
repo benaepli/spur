@@ -36,7 +36,6 @@ pub enum ResolutionError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProgram {
     pub top_level_defs: Vec<ResolvedTopLevelDef>,
-    pub client_def: ResolvedClientDef,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,13 +48,6 @@ pub enum ResolvedTopLevelDef {
 pub struct ResolvedRoleDef {
     pub name: NameId,
     pub original_name: String,
-    pub var_inits: Vec<ResolvedVarInit>,
-    pub func_defs: Vec<ResolvedFuncDef>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedClientDef {
     pub var_inits: Vec<ResolvedVarInit>,
     pub func_defs: Vec<ResolvedFuncDef>,
     pub span: Span,
@@ -466,10 +458,6 @@ impl Resolver {
                 }
             }
         }
-        for func in &program.client_def.func_defs {
-            let id = self.new_name_id();
-            Self::declare_in_scope(&mut self.client_func_scope, &func.name, id, func.span)?;
-        }
 
         // Pass 2: resolve all bodies
         let resolved_top_levels = program
@@ -478,11 +466,8 @@ impl Resolver {
             .map(|def| self.resolve_top_level_def(def))
             .collect::<Result<_, _>>()?;
 
-        let resolved_client = self.resolve_client_def(program.client_def)?;
-
         Ok(ResolvedProgram {
             top_level_defs: resolved_top_levels,
-            client_def: resolved_client,
         })
     }
 
@@ -523,34 +508,6 @@ impl Resolver {
             var_inits,
             func_defs,
             span: role.span,
-        })
-    }
-
-    fn resolve_client_def(
-        &mut self,
-        client: ClientDef,
-    ) -> Result<ResolvedClientDef, ResolutionError> {
-        let prev_role = self.current_role.clone();
-        self.current_role = None;
-
-        self.enter_scope();
-        let var_inits = client
-            .var_inits
-            .into_iter()
-            .map(|v| self.resolve_var_init(v))
-            .collect::<Result<_, _>>()?;
-        let func_defs = client
-            .func_defs
-            .into_iter()
-            .map(|f| self.resolve_func_def(f))
-            .collect::<Result<_, _>>()?;
-        self.exit_scope();
-
-        self.current_role = prev_role;
-        Ok(ResolvedClientDef {
-            var_inits,
-            func_defs,
-            span: client.span,
         })
     }
 

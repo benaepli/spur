@@ -8,6 +8,7 @@ use crate::parser::BinOp;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt;
 use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -106,18 +107,33 @@ pub enum Label {
     Unlock(Expr, Vertex /* next_vertex */),
 }
 
+pub struct FutureValue {
+    pub value: Option<Value>,
+    pub waiters: Vec<Box<dyn FnMut(Value)>>,
+}
+
+impl fmt::Debug for FutureValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FutureValue")
+            .field("value", &self.value)
+            .field("waiters", &format!("<{} waiters>", self.waiters.len()))
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     VInt(i64),
     VBool(bool),
-    VString(String),
-    VNode(i64),
-    VUnit,
-    VOption(Option<Box<Value>>),
-    VTuple(Vec<Value>),
-    VList(Rc<RefCell<Vec<Value>>>),
-    VFuture(Rc<RefCell<Option<Value>>>),
     VMap(Rc<RefCell<HashMap<Value, Value>>>),
+    VList(Rc<RefCell<Vec<Value>>>),
+    VOption(Option<Box<Value>>),
+    VFuture(Rc<RefCell<FutureValue>>),
+    VLock(Rc<RefCell<bool>>),
+    VNode(i64),
+    VString(String),
+    VUnit,
+    VTuple(Vec<Value>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -129,7 +145,6 @@ pub struct Program {
 
     // Map of function_name -> FunctionInfo
     pub rpc: HashMap<String, FunctionInfo>,
-    pub client_ops: HashMap<String, FunctionInfo>,
 }
 
 pub struct Compiler {
@@ -139,7 +154,6 @@ pub struct Compiler {
     temp_counter: usize,
 
     rpc_map: HashMap<String, FunctionInfo>,
-    client_ops_map: HashMap<String, FunctionInfo>,
 
     func_sync_map: HashMap<NameId, bool>,
     func_qualifier_map: HashMap<NameId, String>,
@@ -155,7 +169,6 @@ impl Compiler {
             cfg: Vec::new(),
             temp_counter: 0,
             rpc_map: HashMap::new(),
-            client_ops_map: HashMap::new(),
             func_sync_map: HashMap::new(),
             func_qualifier_map: HashMap::new(),
         }
@@ -178,7 +191,7 @@ impl Compiler {
 
     /// The main entry point.
     pub fn compile_program(mut self, program: TypedProgram) -> Program {
-        // Build func_sync_map
+        // Build func_sync_map and compile all top-level definitions
         for def in &program.top_level_defs {
             match def {
                 TypedTopLevelDef::Role(role) => {
@@ -189,13 +202,6 @@ impl Compiler {
                     }
                 }
             }
-        }
-
-        let client_qualifier = "ClientInterface".to_string();
-        for func in &program.client_def.func_defs {
-            self.func_sync_map.insert(func.name, func.is_sync);
-            self.func_qualifier_map
-                .insert(func.name, client_qualifier.clone());
         }
 
         // Compile all top-level definitions
@@ -218,23 +224,9 @@ impl Compiler {
             }
         }
 
-        // Compile client definition
-        let client_init_fn = self.compile_init_func(
-            &program.client_def.var_inits,
-            format!("{}.{}", "ClientInterface", "BASE_NODE_INIT"),
-        );
-        self.client_ops_map
-            .insert(client_init_fn.name.clone(), client_init_fn);
-        for func in program.client_def.func_defs {
-            let func_info = self.compile_func_def(func);
-            self.client_ops_map
-                .insert(func_info.name.clone(), func_info);
-        }
-
         Program {
             cfg: self.cfg,
             rpc: self.rpc_map,
-            client_ops: self.client_ops_map,
         }
     }
 
