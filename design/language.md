@@ -186,7 +186,7 @@ This asynchronous model extends seamlessly to remote procedure calls (RPCs). The
 but it requires a target role instance:
 
 ```
-var f: string = rpc_call(other_role, some_func(1, 2))!;
+var f: future<string> = rpc_call(other_role, some_func(1, 2));
 ```
 
 ### Spin Await
