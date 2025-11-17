@@ -280,11 +280,15 @@ impl TypeChecker {
 
     fn check_role_def(&mut self, role: ResolvedRoleDef) -> Result<TypedRoleDef, TypeError> {
         self.enter_scope();
+        
+        self.current_func_is_sync = true;
 
         let mut typed_var_inits = Vec::new();
         for var_init in role.var_inits {
             typed_var_inits.push(self.check_var_init(var_init)?);
         }
+        
+        self.current_func_is_sync = false;
 
         let mut typed_func_defs = Vec::new();
         for func in role.func_defs {

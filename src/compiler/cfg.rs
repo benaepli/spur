@@ -261,7 +261,7 @@ impl Compiler {
             name,
             formals: vec![],
             locals, // Inits are "globals"
-            is_sync: false,
+            is_sync: true,
         }
     }
 
