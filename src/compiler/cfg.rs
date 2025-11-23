@@ -406,60 +406,67 @@ impl Compiler {
         return_target: Vertex,
         return_var: &str,
     ) -> Vertex {
-        // The [Condition] check is the "head" of the loop.
-        let cond_vertex = self.add_label(Label::Return(Expr::EUnit)); // Dummy label
+        let loop_head_vertex = self.add_label(Label::Return(Expr::EUnit));
 
-        // Compile the [Increment] block.
-        //    After it runs, it loops back to the [Condition].
         let increment_vertex = match &loop_stmt.increment {
             Some(assign) => {
                 let lhs = self.convert_lhs(&assign.target);
-                self.compile_expr_to_value(locals, &assign.value, lhs, cond_vertex)
+                self.compile_expr_to_value(locals, &assign.value, lhs, loop_head_vertex)
             }
-            None => cond_vertex, // No increment, just jump to condition
+            None => loop_head_vertex,
         };
 
-        // Compile the [Body] block.
-        // After it runs, it goes to [Increment].
-        // Any `Break` inside it goes to `next_vertex`.
         let body_vertex = self.compile_block(
             locals,
             &loop_stmt.body,
             increment_vertex, // After body, go to increment
-            next_vertex,      // `break` goes to after the loop
+            next_vertex,      // Break goes to exit
             return_target,
             return_var,
         );
 
-        let cond_expr = loop_stmt.condition.as_ref().map_or(
-            Expr::EBool(true), // No condition == `true`
-            |c| self.convert_simple_expr(c),
-        );
-        let cond_label = Label::Cond(
-            cond_expr,
-            body_vertex, // On true, go to body
-            next_vertex, // On false, exit loop
+        let cond_var = self.new_temp_var(locals);
+
+        let cond_check_vertex = self.add_label(Label::Cond(
+            Expr::EVar(cond_var.clone()),
+            body_vertex, // True -> Body
+            next_vertex, // False -> Exit
+        ));
+
+        let cond_expr = loop_stmt.condition.as_ref().cloned().unwrap_or_else(|| {
+            // If no condition, default to true
+            TypedExpr {
+                kind: TypedExprKind::BoolLit(true),
+                ty: crate::analysis::types::Type::Bool,
+                span: loop_stmt.span,
+            }
+        });
+
+        let cond_calc_vertex = self.compile_expr_to_value(
+            locals,
+            &cond_expr,
+            Lhs::Var(cond_var),
+            cond_check_vertex,
         );
 
-        self.cfg[cond_vertex] = cond_label;
+        self.cfg[loop_head_vertex] = Label::Instr(
+            Instr::Assign(Lhs::Var(self.new_temp_var(locals)), Expr::EUnit),
+            cond_calc_vertex
+        );
 
-        // Compile the [Init] block.
-        // It runs once, then goes to [Condition].
-        let init_vertex = match &loop_stmt.init {
+        match &loop_stmt.init {
             Some(TypedForLoopInit::VarInit(vi)) => self.compile_expr_to_value(
                 locals,
                 &vi.value,
                 Lhs::Var(resolved_name(vi.name, &vi.original_name)),
-                cond_vertex,
+                loop_head_vertex,
             ),
             Some(TypedForLoopInit::Assignment(assign)) => {
                 let lhs = self.convert_lhs(&assign.target);
-                self.compile_expr_to_value(locals, &assign.value, lhs, cond_vertex)
+                self.compile_expr_to_value(locals, &assign.value, lhs, loop_head_vertex)
             }
-            None => cond_vertex,
-        };
-
-        init_vertex
+            None => loop_head_vertex,
+        }
     }
 
     fn compile_conditional(
@@ -492,9 +499,18 @@ impl Compiler {
                 return_target,
                 return_var,
             );
-            let cond_expr = self.convert_simple_expr(&branch.condition);
-            next_cond_vertex =
-                self.add_label(Label::Cond(cond_expr, body_vertex, next_cond_vertex));
+            let cond_tmp = self.new_temp_var(locals);
+            let check_vertex = self.add_label(Label::Cond(
+                Expr::EVar(cond_tmp.clone()),
+                body_vertex,
+                next_cond_vertex,
+            ));
+            next_cond_vertex = self.compile_expr_to_value(
+                locals,
+                &branch.condition,
+                Lhs::Var(cond_tmp),
+                check_vertex,
+            );
         }
 
         let if_body_vertex = self.compile_block(
@@ -505,9 +521,20 @@ impl Compiler {
             return_target,
             return_var,
         );
-        let if_cond_expr = self.convert_simple_expr(&cond.if_branch.condition);
+        let if_cond_tmp = self.new_temp_var(locals);
 
-        self.add_label(Label::Cond(if_cond_expr, if_body_vertex, next_cond_vertex))
+        let if_check_vertex = self.add_label(Label::Cond(
+            Expr::EVar(if_cond_tmp.clone()),
+            if_body_vertex,
+            next_cond_vertex,
+        ));
+
+        self.compile_expr_to_value(
+            locals,
+            &cond.if_branch.condition,
+            Lhs::Var(if_cond_tmp),
+            if_check_vertex,
+        )
     }
 
     fn compile_for_in_loop(
