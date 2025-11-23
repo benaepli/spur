@@ -2,7 +2,7 @@
 
 Spur is a domain-specific language for specifying distributed protocols.
 
-This repository provides a compiler frontend in Rust that is used in  [jennLang](https://github.com/jl3953/jennLang/)
+This repository provides a compiler frontend in Rust that is used in [jennLang](https://github.com/jl3953/jennLang/)
 for consistency (linearizability, etc.) refutation.
 
 ## Features
@@ -12,10 +12,12 @@ for consistency (linearizability, etc.) refutation.
 - Static, strong type system: comprehensive type checking with primitives, structs, and optional types
 
 The language design is detailed in [language.md](design/language.md). On the compiler side, we most importantly achieve:
+
 - Compilation to a CFG (control-flow graph, see [cfg.rs](src/compiler/cfg.rs))
 - Helpful error messages throughout all compilation phases
 
-## Examples 
+## Examples
+
 See the [specs](specs) directory. For brevity, we provide a short example here:
 
 ```
@@ -31,8 +33,8 @@ role Node {
 }
 
 ClientInterface {
-  func write(node: Node, key: string, value: Command) {
-      rpc_call(node, Write(key, value))!;
+  func Write(node: Node, key: string, value: Command) {
+      await rpc_call(node, Write(key, value));
   }
 }
 ```
@@ -42,15 +44,18 @@ ClientInterface {
 ### Building
 
 This project uses Rust and cargo. To build the compiler:
+
 ```bash
 cargo build --release
 ```
 
 ### Compiling Specifications
+
 The compiler takes a Spur specification file and outputs a JSON representation of the compiled
-control flow graph. 
+control flow graph.
 
 **Example:**
+
 ```bash
 # Compile the simple key-value store
 cargo run -- specs/simple.spur output.json
@@ -58,4 +63,4 @@ cargo run -- specs/simple.spur output.json
 
 ## Resources
 
-- There is a [VSCode extension](https://marketplace.visualstudio.com/items?itemName=baepli.spur) for syntax highlighting. 
+- There is a [VSCode extension](https://marketplace.visualstudio.com/items?itemName=baepli.spur) for syntax highlighting.
