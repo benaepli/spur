@@ -120,10 +120,6 @@ pub enum TypeError {
     AwaitInSyncFunc { span: Span },
     #[error("spin_await cannot be used inside a `sync` function")]
     SpinAwaitInSyncFunc { span: Span },
-    #[error("`sync` function cannot call async function `{func_name}`")]
-    SyncCallToAsync { func_name: String, span: Span },
-    #[error("RPC calls cannot be made from inside a `sync` function")]
-    RpcCallInSyncFunc { span: Span },
     #[error("RPC call targets a `sync` function `{func_name}`, but RPC calls must be async")]
     RpcCallToSyncFunc { func_name: String, span: Span },
 }
@@ -757,13 +753,6 @@ impl TypeChecker {
                         .ok_or_else(|| TypeError::UndefinedType(user_call.span))?
                         .clone();
 
-                    if self.current_func_is_sync && !sig.is_sync {
-                        return Err(TypeError::SyncCallToAsync {
-                            func_name: user_call.original_name.clone(),
-                            span,
-                        });
-                    }
-
                     let typed_call = self.check_user_func_call(user_call, &sig)?;
                     let return_ty = if sig.is_sync {
                         sig.return_type
@@ -1087,10 +1076,6 @@ impl TypeChecker {
                 self.check_struct_literal(struct_id, fields, span)
             }
             ResolvedExprKind::RpcCall(target, call) => {
-                if self.current_func_is_sync {
-                    return Err(TypeError::RpcCallInSyncFunc { span });
-                }
-
                 let typed_target = self.check_expr(*target)?;
                 let role_id = match &typed_target.ty {
                     Type::Role(id, _) => *id,
@@ -1108,10 +1093,7 @@ impl TypeChecker {
                         field_name: call.original_name.clone(),
                         span: call.span,
                     })?;
-
-                if self.current_func_is_sync {
-                    return Err(TypeError::RpcCallInSyncFunc { span });
-                }
+                
                 if sig.is_sync {
                     return Err(TypeError::RpcCallToSyncFunc {
                         func_name: call.original_name.clone(),

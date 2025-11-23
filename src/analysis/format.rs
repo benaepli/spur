@@ -404,28 +404,6 @@ pub fn report_type_errors(
                     "note: remove the `sync` keyword from the function declaration to use spin_await".to_string(),
                 ]),
 
-            TypeError::SyncCallToAsync { func_name, span } => Diagnostic::error()
-                .with_message("sync function cannot call async function")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("`{}` is an async function", func_name)),
-                ])
-                .with_notes(vec![
-                    format!("help: sync functions can only call other sync functions, but `{}` is async", func_name),
-                    "note: consider marking this function as async or making the callee function sync".to_string(),
-                ]),
-
-            TypeError::RpcCallInSyncFunc { span } => Diagnostic::error()
-                .with_message("RPC calls cannot be made from sync functions")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message("RPC call not allowed here"),
-                ])
-                .with_notes(vec![
-                    "help: RPC calls are async operations and cannot be used in sync functions".to_string(),
-                    "note: remove the `sync` keyword from the function declaration to use RPC calls".to_string(),
-                ]),
-
             TypeError::RpcCallToSyncFunc { func_name, span } => Diagnostic::error()
                 .with_message("RPC call to sync function not allowed")
                 .with_labels(vec![
