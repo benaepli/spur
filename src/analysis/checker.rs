@@ -1,15 +1,15 @@
 use crate::analysis::resolver::{
-    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedCondStmts,
-    ResolvedExpr, ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall,
-    ResolvedFuncDef, ResolvedPattern, ResolvedPatternKind, ResolvedProgram, ResolvedRoleDef,
-    ResolvedStatement, ResolvedStatementKind, ResolvedTopLevelDef, ResolvedTypeDef,
-    ResolvedTypeDefStmtKind, ResolvedUserFuncCall, ResolvedVarInit,
+    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedCondStmts, ResolvedExpr,
+    ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall, ResolvedFuncDef,
+    ResolvedPattern, ResolvedPatternKind, ResolvedProgram, ResolvedRoleDef, ResolvedStatement,
+    ResolvedStatementKind, ResolvedTopLevelDef, ResolvedTypeDef, ResolvedTypeDefStmtKind,
+    ResolvedUserFuncCall, ResolvedVarInit,
 };
 use crate::analysis::types::{
-    Type, TypedAssignment, TypedCondStmts, TypedExpr, TypedExprKind,
-    TypedForInLoop, TypedForLoop, TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam,
-    TypedIfBranch, TypedPattern, TypedPatternKind, TypedProgram, TypedRoleDef, TypedStatement,
-    TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
+    Type, TypedAssignment, TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop,
+    TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam, TypedIfBranch, TypedPattern,
+    TypedPatternKind, TypedProgram, TypedRoleDef, TypedStatement, TypedStatementKind,
+    TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
 };
 use crate::parser::{BinOp, Span};
 use std::collections::HashMap;
@@ -237,7 +237,6 @@ impl TypeChecker {
 
         for top_level_def in &program.top_level_defs {
             if let ResolvedTopLevelDef::Role(role) = top_level_def {
-
                 for func in &role.func_defs {
                     let sig = self.build_function_signature(func)?;
                     let role_funcs = self.role_func_signatures.get_mut(&role.name).unwrap();
@@ -276,14 +275,14 @@ impl TypeChecker {
 
     fn check_role_def(&mut self, role: ResolvedRoleDef) -> Result<TypedRoleDef, TypeError> {
         self.enter_scope();
-        
+
         self.current_func_is_sync = true;
 
         let mut typed_var_inits = Vec::new();
         for var_init in role.var_inits {
             typed_var_inits.push(self.check_var_init(var_init)?);
         }
-        
+
         self.current_func_is_sync = false;
 
         let mut typed_func_defs = Vec::new();
@@ -695,6 +694,46 @@ impl TypeChecker {
         }
     }
 
+    fn resolve_struct_definition(
+        &self,
+        start_id: NameId,
+        span: Span,
+        field_context: &str,
+    ) -> Result<(NameId, &Vec<crate::analysis::resolver::ResolvedFieldDef>), TypeError> {
+        let mut current_id = start_id;
+
+        loop {
+            let type_def = self
+                .type_defs
+                .get(&current_id)
+                .ok_or(TypeError::UndefinedType(span))?;
+
+            match type_def {
+                TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => {
+                    return Ok((current_id, fields));
+                }
+                TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
+                    ResolvedTypeDef::Named(next_id),
+                )) => {
+                    current_id = *next_id;
+                }
+                _ => {
+                    let struct_name = self
+                        .struct_names
+                        .get(&current_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("type_{}", current_id.0));
+
+                    return Err(TypeError::NotAStruct {
+                        ty: Type::Struct(current_id, struct_name),
+                        field_name: field_context.to_string(),
+                        span,
+                    });
+                }
+            }
+        }
+    }
+
     fn check_expr(&self, expr: ResolvedExpr) -> Result<TypedExpr, TypeError> {
         let span = expr.span;
         match expr.kind {
@@ -1079,21 +1118,26 @@ impl TypeChecker {
                 let typed_target = self.check_expr(*target)?;
                 let role_id = match &typed_target.ty {
                     Type::Role(id, _) => *id,
-                    _ => return Err(TypeError::RpcCallTargetNotRole {
-                        ty: typed_target.ty,
-                        span: typed_target.span,
-                    }),
+                    _ => {
+                        return Err(TypeError::RpcCallTargetNotRole {
+                            ty: typed_target.ty,
+                            span: typed_target.span,
+                        });
+                    }
                 };
 
-                let role_funcs = self.role_func_signatures.get(&role_id)
+                let role_funcs = self
+                    .role_func_signatures
+                    .get(&role_id)
                     .ok_or(TypeError::UndefinedType(typed_target.span))?;
 
-                let (func_id, sig) = role_funcs.get(&call.original_name)
-                    .ok_or_else(|| TypeError::FieldNotFound {
+                let (func_id, sig) = role_funcs.get(&call.original_name).ok_or_else(|| {
+                    TypeError::FieldNotFound {
                         field_name: call.original_name.clone(),
                         span: call.span,
-                    })?;
-                
+                    }
+                })?;
+
                 if sig.is_sync {
                     return Err(TypeError::RpcCallToSyncFunc {
                         func_name: call.original_name.clone(),
@@ -1109,7 +1153,7 @@ impl TypeChecker {
                     return_type: sig.return_type.clone(),
                     span: call.span,
                 };
-                
+
                 let return_ty = Type::Future(Box::new(sig.return_type.clone()));
                 Ok(TypedExpr {
                     kind: TypedExprKind::RpcCall(Box::new(typed_target), typed_call),
@@ -1543,39 +1587,7 @@ impl TypeChecker {
         fields: Vec<(String, ResolvedExpr)>,
         span: Span,
     ) -> Result<TypedExpr, TypeError> {
-        let type_def = self
-            .type_defs
-            .get(&struct_id)
-            .ok_or(TypeError::UndefinedType(span))?
-            .clone();
-
-        let field_defs = match type_def {
-            TypeDefinition::Builtin(_) => {
-                let struct_name = self
-                    .struct_names
-                    .get(&struct_id)
-                    .map(|s| s.clone())
-                    .unwrap_or_else(|| format!("struct_{}", struct_id.0));
-                return Err(TypeError::NotAStruct {
-                    ty: Type::Struct(struct_id, struct_name),
-                    field_name: "".to_string(),
-                    span,
-                });
-            }
-            TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => fields,
-            TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(_)) => {
-                let struct_name = self
-                    .struct_names
-                    .get(&struct_id)
-                    .map(|s| s.clone())
-                    .unwrap_or_else(|| format!("struct_{}", struct_id.0));
-                return Err(TypeError::NotAStruct {
-                    ty: Type::Struct(struct_id, struct_name),
-                    field_name: "".to_string(),
-                    span,
-                });
-            }
-        };
+        let (resolved_id, field_defs) = self.resolve_struct_definition(struct_id, span, "")?;
 
         let mut typed_fields = Vec::new();
         for (field_name, field_expr) in fields {
@@ -1595,7 +1607,7 @@ impl TypeChecker {
             typed_fields.push((field_name, coerced_expr));
         }
 
-        for field_def in &field_defs {
+        for field_def in field_defs {
             if !typed_fields.iter().any(|(name, _)| name == &field_def.name) {
                 return Err(TypeError::MissingStructField {
                     field_name: field_def.name.clone(),
@@ -1606,12 +1618,13 @@ impl TypeChecker {
 
         let struct_name = self
             .struct_names
-            .get(&struct_id)
-            .map(|s| s.clone())
-            .unwrap_or_else(|| format!("struct_{}", struct_id.0));
-        let ty = Type::Struct(struct_id, struct_name);
+            .get(&resolved_id)
+            .cloned()
+            .unwrap_or_else(|| format!("struct_{}", resolved_id.0));
+
+        let ty = Type::Struct(resolved_id, struct_name);
         Ok(TypedExpr {
-            kind: TypedExprKind::StructLit(struct_id, typed_fields),
+            kind: TypedExprKind::StructLit(resolved_id, typed_fields),
             ty,
             span,
         })
@@ -1623,38 +1636,7 @@ impl TypeChecker {
         field_name: &str,
         span: Span,
     ) -> Result<Type, TypeError> {
-        let type_def = self
-            .type_defs
-            .get(&struct_id)
-            .ok_or(TypeError::UndefinedType(span))?;
-
-        let field_defs = match type_def {
-            TypeDefinition::Builtin(_) => {
-                let struct_name = self
-                    .struct_names
-                    .get(&struct_id)
-                    .map(|s| s.clone())
-                    .unwrap_or_else(|| format!("struct_{}", struct_id.0));
-                return Err(TypeError::NotAStruct {
-                    ty: Type::Struct(struct_id, struct_name),
-                    field_name: field_name.to_string(),
-                    span,
-                });
-            }
-            TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => fields,
-            TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(_)) => {
-                let struct_name = self
-                    .struct_names
-                    .get(&struct_id)
-                    .map(|s| s.clone())
-                    .unwrap_or_else(|| format!("struct_{}", struct_id.0));
-                return Err(TypeError::NotAStruct {
-                    ty: Type::Struct(struct_id, struct_name),
-                    field_name: field_name.to_string(),
-                    span,
-                });
-            }
-        };
+        let (_, field_defs) = self.resolve_struct_definition(struct_id, span, field_name)?;
 
         let field_def = field_defs
             .iter()
