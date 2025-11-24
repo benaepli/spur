@@ -743,20 +743,66 @@ impl Compiler {
                 self.compile_expr_to_value(locals, e, Lhs::Var(bool_var), spin_vertex)
             }
 
-            // --- Compound expressions that may contain complex sub-expressions ---
             TypedExprKind::BinOp(op, l, r) => {
-                let l_tmp = self.new_temp_var(locals);
-                let r_tmp = self.new_temp_var(locals);
-                let l_expr = Box::new(Expr::EVar(l_tmp.clone()));
-                let r_expr = Box::new(Expr::EVar(r_tmp.clone()));
-                let final_expr = self.convert_simple_binop(op, l_expr, r_expr);
+                match op {
+                    BinOp::And => {
+                        let assign_false_vertex = self.add_label(Label::Instr(
+                            Instr::Assign(target.clone(), Expr::EBool(false)),
+                            next_vertex,
+                        ));
 
-                let assign_vertex =
-                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                let r_vertex =
-                    self.compile_expr_to_value(locals, r, Lhs::Var(r_tmp), assign_vertex);
-                let l_vertex = self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), r_vertex);
-                l_vertex
+                        let eval_right_vertex =
+                            self.compile_expr_to_value(locals, r, target.clone(), next_vertex);
+
+                        // Branch based on Left result
+                        let l_tmp = self.new_temp_var(locals);
+                        let cond_vertex = self.add_label(Label::Cond(
+                            Expr::EVar(l_tmp.clone()),
+                            eval_right_vertex,   // If True: evaluate right
+                            assign_false_vertex, // If False: short-circuit to false
+                        ));
+
+                        self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), cond_vertex)
+                    }
+                    BinOp::Or => {
+                        let assign_true_vertex = self.add_label(Label::Instr(
+                            Instr::Assign(target.clone(), Expr::EBool(true)),
+                            next_vertex,
+                        ));
+
+
+                        let eval_right_vertex =
+                            self.compile_expr_to_value(locals, r, target.clone(), next_vertex);
+
+                        // Branch based on Left result
+                        let l_tmp = self.new_temp_var(locals);
+                        let cond_vertex = self.add_label(Label::Cond(
+                            Expr::EVar(l_tmp.clone()),
+                            assign_true_vertex, // If True: short-circuit to true
+                            eval_right_vertex,  // If False: evaluate right
+                        ));
+
+                        self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), cond_vertex)
+                    }
+                    _ => {
+                        // Standard strict evaluation for non-boolean ops (+, -, *, etc.)
+                        let l_tmp = self.new_temp_var(locals);
+                        let r_tmp = self.new_temp_var(locals);
+                        let l_expr = Box::new(Expr::EVar(l_tmp.clone()));
+                        let r_expr = Box::new(Expr::EVar(r_tmp.clone()));
+                        let final_expr = self.convert_simple_binop(op, l_expr, r_expr);
+
+                        let assign_vertex = self.add_label(Label::Instr(
+                            Instr::Assign(target, final_expr),
+                            next_vertex,
+                        ));
+                        let r_vertex =
+                            self.compile_expr_to_value(locals, r, Lhs::Var(r_tmp), assign_vertex);
+                        let l_vertex =
+                            self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), r_vertex);
+                        l_vertex
+                    }
+                }
             }
 
             TypedExprKind::Not(e) => {

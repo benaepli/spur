@@ -1137,7 +1137,6 @@ impl TypeChecker {
                         span: call.span,
                     }
                 })?;
-
                 if sig.is_sync {
                     return Err(TypeError::RpcCallToSyncFunc {
                         func_name: call.original_name.clone(),
