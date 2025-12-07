@@ -68,6 +68,8 @@ pub enum TypeError {
         found: Type,
         span: Span,
     },
+    #[error("store requires a list or map, found `{ty}`")]
+    StoreOnInvalidType { ty: Type, span: Span },
     #[error("Invalid assignment target")]
     InvalidAssignmentTarget(Span),
     #[error("A function that is not `unit` must have a return statement on all paths")]
@@ -684,8 +686,6 @@ impl TypeChecker {
     fn is_valid_lvalue(&self, expr_kind: &ResolvedExprKind) -> bool {
         match expr_kind {
             ResolvedExprKind::Var(_, _) => true,
-            ResolvedExprKind::FieldAccess(_, _) => true,
-            ResolvedExprKind::Index(_, _) => true,
             _ => false,
         }
     }
@@ -871,6 +871,54 @@ impl TypeChecker {
                     ty: list_ty,
                     span,
                 })
+            }
+            ResolvedExprKind::Store(collection, key, value) => {
+                let typed_collection = self.check_expr(*collection)?;
+                let typed_key = self.check_expr(*key)?;
+                let typed_value = self.check_expr(*value)?;
+
+                match typed_collection.ty.clone() {
+                    Type::List(elem_ty) => {
+                        self.check_type_compatibility(&Type::Int, &typed_key.ty, span)?;
+                        let coerced_value = self.check_and_coerce(
+                            &elem_ty,
+                            typed_value,
+                            span,
+                            true,
+                        )?;
+                        Ok(TypedExpr {
+                            kind: TypedExprKind::Store(
+                                Box::new(typed_collection.clone()),
+                                Box::new(typed_key),
+                                Box::new(coerced_value),
+                            ),
+                            ty: typed_collection.ty,
+                            span,
+                        })
+                    }
+                    Type::Map(key_ty, val_ty) => {
+                        self.check_type_compatibility(&key_ty, &typed_key.ty, span)?;
+                        let coerced_value = self.check_and_coerce(
+                            &val_ty,
+                            typed_value,
+                            span,
+                            true,
+                        )?;
+                        Ok(TypedExpr {
+                            kind: TypedExprKind::Store(
+                                Box::new(typed_collection.clone()),
+                                Box::new(typed_key),
+                                Box::new(coerced_value),
+                            ),
+                            ty: typed_collection.ty,
+                            span,
+                        })
+                    }
+                    _ => Err(TypeError::StoreOnInvalidType {
+                        ty: typed_collection.ty,
+                        span,
+                    }),
+                }
             }
             ResolvedExprKind::Head(list_expr) => {
                 let typed_list = self.check_expr(*list_expr)?;

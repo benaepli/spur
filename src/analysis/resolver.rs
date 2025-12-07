@@ -217,6 +217,7 @@ pub enum ResolvedExprKind {
     Min(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Exists(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Erase(Box<ResolvedExpr>, Box<ResolvedExpr>),
+    Store(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     Head(Box<ResolvedExpr>),
     Tail(Box<ResolvedExpr>),
     Len(Box<ResolvedExpr>),
@@ -868,6 +869,11 @@ impl Resolver {
             ExprKind::Erase(e1, e2) => ResolvedExprKind::Erase(
                 Box::new(self.resolve_expr(*e1)?),
                 Box::new(self.resolve_expr(*e2)?),
+            ),
+            ExprKind::Store(e1, e2, e3) => ResolvedExprKind::Store(
+                Box::new(self.resolve_expr(*e1)?),
+                Box::new(self.resolve_expr(*e2)?),
+                Box::new(self.resolve_expr(*e3)?),
             ),
             ExprKind::Head(e) => ResolvedExprKind::Head(Box::new(self.resolve_expr(*e)?)),
             ExprKind::Tail(e) => ResolvedExprKind::Tail(Box::new(self.resolve_expr(*e)?)),

@@ -82,6 +82,7 @@ pub enum TypedExprKind {
     Min(Box<TypedExpr>, Box<TypedExpr>),
     Exists(Box<TypedExpr>, Box<TypedExpr>),
     Erase(Box<TypedExpr>, Box<TypedExpr>),
+    Store(Box<TypedExpr>, Box<TypedExpr>, Box<TypedExpr>),
     Head(Box<TypedExpr>),
     Tail(Box<TypedExpr>),
     Len(Box<TypedExpr>),

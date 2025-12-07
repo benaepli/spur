@@ -223,6 +223,7 @@ pub enum ExprKind {
     Min(Box<Expr>, Box<Expr>),
     Exists(Box<Expr>, Box<Expr>),
     Erase(Box<Expr>, Box<Expr>),
+    Store(Box<Expr>, Box<Expr>, Box<Expr>),
     Head(Box<Expr>),
     Tail(Box<Expr>),
     Len(Box<Expr>),
@@ -519,6 +520,18 @@ where
             .clone()
             .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen));
 
+        let three_arg_builtin = |name, constructor: fn(Box<Expr>, Box<Expr>, Box<Expr>) -> ExprKind| {
+            just(name).ignore_then(
+                expr.clone()
+                    .then_ignore(just(TokenKind::Comma))
+                    .then(expr.clone())
+                    .then_ignore(just(TokenKind::Comma))
+                    .then(expr.clone())
+                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                    .map(move |((a, b), c)| constructor(Box::new(a), Box::new(b), Box::new(c))),
+            )
+        };
+
         let two_arg_builtin = |name, constructor: fn(Box<Expr>, Box<Expr>) -> ExprKind| {
             just(name).ignore_then(
                 expr.clone()
@@ -563,6 +576,7 @@ where
             two_arg_builtin(TokenKind::Min, ExprKind::Min),
             two_arg_builtin(TokenKind::Exists, ExprKind::Exists),
             two_arg_builtin(TokenKind::Erase, ExprKind::Erase),
+            three_arg_builtin(TokenKind::Store, ExprKind::Store),
             one_arg_builtin(TokenKind::Head, ExprKind::Head),
             one_arg_builtin(TokenKind::Tail, ExprKind::Tail),
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
@@ -733,8 +747,9 @@ where
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
         };
 
-        let assignment = primary
+        let assignment = ident
             .clone()
+            .map_with(|name, e| Expr::new(ExprKind::Var(name), e.span()))
             .then_ignore(just(TokenKind::Equal))
             .then(expr.clone())
             .map_with(|(target, value), e| Assignment {

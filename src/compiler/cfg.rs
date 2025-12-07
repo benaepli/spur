@@ -33,6 +33,7 @@ pub enum Expr {
     EGreaterThanEquals(Box<Expr>, Box<Expr>),
     EKeyExists(Box<Expr>, Box<Expr>),
     EMapErase(Box<Expr>, Box<Expr>),
+    EStore(Box<Expr>, Box<Expr>, Box<Expr>),
     EListLen(Box<Expr>),
     EListAccess(Box<Expr>, usize),
     EPlus(Box<Expr>, Box<Expr>),
@@ -56,7 +57,6 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Lhs {
     Var(String),
-    Access(Expr, Expr),
     Tuple(Vec<String>),
 }
 
@@ -1315,6 +1315,11 @@ impl Compiler {
                 Box::new(self.convert_simple_expr(key)),
                 Box::new(self.convert_simple_expr(map)),
             ),
+            TypedExprKind::Store(collection, key, value) => Expr::EStore(
+                Box::new(self.convert_simple_expr(collection)),
+                Box::new(self.convert_simple_expr(key)),
+                Box::new(self.convert_simple_expr(value)),
+            ),
             // Desugar: `head(l)` -> `EListAccess(l, 0)`
             TypedExprKind::Head(l) => Expr::EListAccess(Box::new(self.convert_simple_expr(l)), 0),
             // Desugar: `tail(l)` -> `EListSubsequence(l, 1, len(l))`
@@ -1379,16 +1384,6 @@ impl Compiler {
     fn convert_lhs(&mut self, expr: &TypedExpr) -> Lhs {
         match &expr.kind {
             TypedExprKind::Var(id, name) => Lhs::Var(resolved_name(*id, name)),
-            // Desugar: `s[i] = ...` -> `LAccess(s, i)`
-            TypedExprKind::Index(target, index) => Lhs::Access(
-                self.convert_simple_expr(target),
-                self.convert_simple_expr(index),
-            ),
-            // Desugar: `s.field = ...` -> `LAccess(s, "field")`
-            TypedExprKind::FieldAccess(target, field) => Lhs::Access(
-                self.convert_simple_expr(target),
-                Expr::EString(field.clone()),
-            ),
             _ => panic!("Invalid assignment target: {:?}", expr),
         }
     }

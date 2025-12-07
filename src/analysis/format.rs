@@ -178,6 +178,16 @@ pub fn report_type_errors(
                     format!("help: all values in this map must be of type `{}`", expected),
                 ]),
 
+            TypeError::StoreOnInvalidType { ty, span } => Diagnostic::error()
+                .with_message("store requires a list or map")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected list or map, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: store can only be used on lists or maps, but `{}` is neither", ty),
+                ]),
+
             TypeError::InvalidAssignmentTarget(span) => Diagnostic::error()
                 .with_message("invalid assignment target")
                 .with_labels(vec![
@@ -185,7 +195,7 @@ pub fn report_type_errors(
                         .with_message("cannot assign to this expression"),
                 ])
                 .with_notes(vec![
-                    "help: only variables, fields, and index expressions can be assigned to".to_string(),
+                    "help: only variables can be assigned to".to_string(),
                 ]),
 
             TypeError::MissingReturn(span) => Diagnostic::error()

@@ -63,7 +63,7 @@ else_stmt ::= 'else' '{' statements '}'
 for_loop ::= 'for' '(' ( var_init | assignment )? ';' expr? ';' assignment? ')' '{' statements '}'
 for_in_loop ::= 'for' '(' pattern 'in' expr ')' '{' statements '}'
 
-assignment ::= primary_expr '=' expr
+assignment ::= ID '=' expr
 
 pattern ::=
 ID
@@ -102,9 +102,7 @@ ID
 | list_ops
 | 'append' '(' expr ',' expr ')'
 | 'prepend' '(' expr ',' expr ')'     
-| 'poll_for_resps' '(' expr ',' expr ')'
-| 'poll_for_any_resp' '(' expr ')'
-| 'next_resp' '(' expr ')'
+| 'store' '(' expr ',' expr ',' expr ')'
 | 'min' '(' expr ',' expr ')'
 | 'exists' '(' expr ',' expr ')'
 | 'erase' '(' expr ',' expr ')'
@@ -140,8 +138,6 @@ list_ops ::= ( 'head' | 'tail' | 'len' ) '(' expr ')'
 
 rpc_call ::= ( 'rpc_call' ) '('
 ```
-
-The type checker verifies if the left side is a valid assignment.
 
 ## Typing
 
