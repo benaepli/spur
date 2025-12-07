@@ -79,9 +79,6 @@ pub enum TypedExprKind {
 
     Append(Box<TypedExpr>, Box<TypedExpr>),
     Prepend(Box<TypedExpr>, Box<TypedExpr>),
-    PollForResps(Box<TypedExpr>, Box<TypedExpr>),
-    PollForAnyResp(Box<TypedExpr>),
-    NextResp(Box<TypedExpr>),
     Min(Box<TypedExpr>, Box<TypedExpr>),
     Exists(Box<TypedExpr>, Box<TypedExpr>),
     Erase(Box<TypedExpr>, Box<TypedExpr>),

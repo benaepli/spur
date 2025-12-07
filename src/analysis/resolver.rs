@@ -214,9 +214,6 @@ pub enum ResolvedExprKind {
     TupleLit(Vec<ResolvedExpr>),
     Append(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Prepend(Box<ResolvedExpr>, Box<ResolvedExpr>),
-    PollForResps(Box<ResolvedExpr>, Box<ResolvedExpr>),
-    PollForAnyResp(Box<ResolvedExpr>),
-    NextResp(Box<ResolvedExpr>),
     Min(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Exists(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Erase(Box<ResolvedExpr>, Box<ResolvedExpr>),
@@ -860,14 +857,6 @@ impl Resolver {
                 Box::new(self.resolve_expr(*l)?),
                 Box::new(self.resolve_expr(*r)?),
             ),
-            ExprKind::PollForResps(e1, e2) => ResolvedExprKind::PollForResps(
-                Box::new(self.resolve_expr(*e1)?),
-                Box::new(self.resolve_expr(*e2)?),
-            ),
-            ExprKind::PollForAnyResp(e) => {
-                ResolvedExprKind::PollForAnyResp(Box::new(self.resolve_expr(*e)?))
-            }
-            ExprKind::NextResp(e) => ResolvedExprKind::NextResp(Box::new(self.resolve_expr(*e)?)),
             ExprKind::Min(e1, e2) => ResolvedExprKind::Min(
                 Box::new(self.resolve_expr(*e1)?),
                 Box::new(self.resolve_expr(*e2)?),

@@ -40,9 +40,6 @@ pub enum Expr {
     ETimes(Box<Expr>, Box<Expr>),
     EDiv(Box<Expr>, Box<Expr>),
     EMod(Box<Expr>, Box<Expr>),
-    EPollForResps(Box<Expr>, Box<Expr>),
-    EPollForAnyResp(Box<Expr>),
-    ENextResp(Box<Expr>),
     EMin(Box<Expr>, Box<Expr>),
     ETuple(Vec<Expr>),
     ETupleAccess(Box<Expr>, usize),
@@ -1045,35 +1042,6 @@ impl Compiler {
                 self.compile_expr_list_recursive(locals, val_exprs.iter(), tmps, assign_vertex)
             }
 
-            TypedExprKind::PollForResps(e1, e2) => {
-                let e1_tmp = self.new_temp_var(locals);
-                let e2_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EPollForResps(
-                    Box::new(Expr::EVar(e1_tmp.clone())),
-                    Box::new(Expr::EVar(e2_tmp.clone())),
-                );
-                let assign_vertex =
-                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                let e2_vertex =
-                    self.compile_expr_to_value(locals, e2, Lhs::Var(e2_tmp), assign_vertex);
-                self.compile_expr_to_value(locals, e1, Lhs::Var(e1_tmp), e2_vertex)
-            }
-
-            TypedExprKind::PollForAnyResp(e) => {
-                let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EPollForAnyResp(Box::new(Expr::EVar(e_tmp.clone())));
-                let assign_vertex =
-                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
-            }
-
-            TypedExprKind::NextResp(e) => {
-                let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::ENextResp(Box::new(Expr::EVar(e_tmp.clone())));
-                let assign_vertex =
-                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
-            }
 
             TypedExprKind::ResolvePromise(p, v) => {
                 let p_tmp = self.new_temp_var(locals);
@@ -1405,14 +1373,6 @@ impl Compiler {
                     expr
                 )
             }
-            TypedExprKind::PollForResps(e1, e2) => Expr::EPollForResps(
-                Box::new(self.convert_simple_expr(e1)),
-                Box::new(self.convert_simple_expr(e2)),
-            ),
-            TypedExprKind::PollForAnyResp(e) => {
-                Expr::EPollForAnyResp(Box::new(self.convert_simple_expr(e)))
-            }
-            TypedExprKind::NextResp(e) => Expr::ENextResp(Box::new(self.convert_simple_expr(e))),
         }
     }
 

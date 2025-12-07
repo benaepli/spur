@@ -112,10 +112,6 @@ pub enum TypeError {
     NotAPromise { ty: Type, span: Span },
     #[error("await lock can only be used on a Lock, found `{ty}`")]
     NotALock { ty: Type, span: Span },
-    #[error("Polling operation requires a collection of futures or bools, found `{ty}`")]
-    PollingOnInvalidType { ty: Type, span: Span },
-    #[error("next_resp requires a map of futures, found `{ty}`")]
-    NextRespOnInvalidType { ty: Type, span: Span },
     #[error("await cannot be used inside a `sync` function")]
     AwaitInSyncFunc { span: Span },
     #[error("spin_await cannot be used inside a `sync` function")]
@@ -1191,97 +1187,6 @@ impl TypeChecker {
                     _ => Err(TypeError::SpinAwaitOnNonBool {
                         ty: typed_bool.ty,
                         span: typed_bool.span,
-                    }),
-                }
-            }
-            ResolvedExprKind::PollForResps(collection, value) => {
-                let typed_collection = self.check_expr(*collection)?;
-                let typed_value = self.check_expr(*value)?;
-                match &typed_collection.ty {
-                    Type::List(elem_ty) => {
-                        if !matches!(**elem_ty, Type::Future(_) | Type::Bool) {
-                            return Err(TypeError::PollingOnInvalidType {
-                                ty: typed_collection.ty.clone(),
-                                span: typed_collection.span,
-                            });
-                        }
-                    }
-                    Type::Map(_, val_ty) => {
-                        if !matches!(**val_ty, Type::Future(_) | Type::Bool) {
-                            return Err(TypeError::PollingOnInvalidType {
-                                ty: typed_collection.ty.clone(),
-                                span: typed_collection.span,
-                            });
-                        }
-                    }
-                    _ => {
-                        return Err(TypeError::PollingOnInvalidType {
-                            ty: typed_collection.ty.clone(),
-                            span: typed_collection.span,
-                        });
-                    }
-                }
-                Ok(TypedExpr {
-                    kind: TypedExprKind::PollForResps(
-                        Box::new(typed_collection),
-                        Box::new(typed_value),
-                    ),
-                    ty: Type::Int,
-                    span,
-                })
-            }
-            ResolvedExprKind::PollForAnyResp(collection) => {
-                let typed_collection = self.check_expr(*collection)?;
-                match &typed_collection.ty {
-                    Type::List(elem_ty) => {
-                        if !matches!(**elem_ty, Type::Future(_) | Type::Bool) {
-                            return Err(TypeError::PollingOnInvalidType {
-                                ty: typed_collection.ty.clone(),
-                                span: typed_collection.span,
-                            });
-                        }
-                    }
-                    Type::Map(_, val_ty) => {
-                        if !matches!(**val_ty, Type::Future(_) | Type::Bool) {
-                            return Err(TypeError::PollingOnInvalidType {
-                                ty: typed_collection.ty.clone(),
-                                span: typed_collection.span,
-                            });
-                        }
-                    }
-                    _ => {
-                        return Err(TypeError::PollingOnInvalidType {
-                            ty: typed_collection.ty.clone(),
-                            span: typed_collection.span,
-                        });
-                    }
-                }
-                Ok(TypedExpr {
-                    kind: TypedExprKind::PollForAnyResp(Box::new(typed_collection)),
-                    ty: Type::Bool,
-                    span,
-                })
-            }
-            ResolvedExprKind::NextResp(collection) => {
-                let typed_collection = self.check_expr(*collection)?;
-                match typed_collection.ty.clone() {
-                    Type::Map(key_ty, val_ty) => {
-                        if let Type::Future(inner_ty) = *val_ty {
-                            Ok(TypedExpr {
-                                kind: TypedExprKind::NextResp(Box::new(typed_collection)),
-                                ty: *inner_ty,
-                                span,
-                            })
-                        } else {
-                            Err(TypeError::NextRespOnInvalidType {
-                                ty: Type::Map(key_ty, val_ty),
-                                span: typed_collection.span,
-                            })
-                        }
-                    }
-                    _ => Err(TypeError::NextRespOnInvalidType {
-                        ty: typed_collection.ty,
-                        span: typed_collection.span,
                     }),
                 }
             }

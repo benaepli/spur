@@ -362,25 +362,6 @@ pub fn report_type_errors(
                     format!("help: await lock can only be used on lock types, but `{}` is not a lock", ty),
                 ]),
 
-            TypeError::PollingOnInvalidType { ty, span } => Diagnostic::error()
-                .with_message("invalid polling operation")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("expected collection of futures or bools, found `{}`", ty)),
-                ])
-                .with_notes(vec![
-                    format!("help: polling operations require a list or map of futures or bools, but `{}` does not match this requirement", ty),
-                ]),
-
-            TypeError::NextRespOnInvalidType { ty, span } => Diagnostic::error()
-                .with_message("invalid next_resp operation")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("expected map of futures, found `{}`", ty)),
-                ])
-                .with_notes(vec![
-                    format!("help: next_resp requires a map where values are futures, but `{}` does not match this requirement", ty),
-                ]),
 
             TypeError::AwaitInSyncFunc { span } => Diagnostic::error()
                 .with_message("await cannot be used in sync function")
