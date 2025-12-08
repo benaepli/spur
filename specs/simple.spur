@@ -4,7 +4,7 @@ role Head {
     var db: map<string, Value> = {"hi": 0};
 
     func Write(key: string, value: int) -> bool {
-        db = db[key := value];
+        db = db[key] := value;
         return true;
     }
 

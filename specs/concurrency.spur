@@ -4,7 +4,7 @@ role Head {
     var db: map<string, Value> = {};
 
     func headWrite(key: string, value: int) {
-        db = db[key := value];
+        db = db[key] := value;
     }
 
     func AsyncWrite(key: string, value: int) -> bool {

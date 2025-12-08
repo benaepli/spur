@@ -4,11 +4,11 @@ role Head {
     var db: map<string, Value> = {"hi": 0};
 
     sync func write1(key: string, value: Value) {
-        db = db[key := value];
+        db = db[key] := value;
     }
 
     sync func write2(key: string)  {
-       db = db[key := db[key] + 1];
+       db = db[key] := db[key] + 1;
     }
 
     func WritePlusOne(key: string, value: int) -> bool {

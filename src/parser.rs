@@ -607,21 +607,18 @@ where
         enum PostfixOp {
             Index(Expr),
             Slice(Expr, Expr),
-            IndexUpdate(Expr, Expr),
             TupleAccess(usize, Span),
             FieldAccess(String, Span),
-            FieldUpdate(String, Expr),
             Unwrap(Span),
             RpcCall(FuncCall),
+            Update(Expr),
         }
 
         let postfix_op = choice((
-            // Index Update: [expr := expr]
-            expr.clone()
-                .then_ignore(just(TokenKind::ColonEqual))
-                .then(expr.clone())
-                .delimited_by(just(TokenKind::LeftBracket), just(TokenKind::RightBracket))
-                .map(|(idx, val)| PostfixOp::IndexUpdate(idx, val)),
+            // Update: := expr
+            just(TokenKind::ColonEqual)
+                .ignore_then(expr.clone())
+                .map(PostfixOp::Update),
             // Index: [expr]
             expr.clone()
                 .delimited_by(just(TokenKind::LeftBracket), just(TokenKind::RightBracket))
@@ -632,12 +629,6 @@ where
                 .then(expr.clone())
                 .delimited_by(just(TokenKind::LeftBracket), just(TokenKind::RightBracket))
                 .map(|(start, end)| PostfixOp::Slice(start, end)),
-            // Field Update: .ID := expr
-            just(TokenKind::Dot)
-                .ignore_then(ident.clone())
-                .then_ignore(just(TokenKind::ColonEqual))
-                .then(expr.clone())
-                .map_with(|(name, val), _| PostfixOp::FieldUpdate(name, val)),
             // Tuple Access: .INT
             just(TokenKind::Dot)
                 .ignore_then(select! { TokenKind::Integer(i) => i as usize })
@@ -665,14 +656,16 @@ where
                     span,
                 )
             }
-            PostfixOp::IndexUpdate(idx, val) => {
+            PostfixOp::Update(val) => {
                 let span = lhs.span.union(val.span);
-                unwind_update(lhs, idx, val, span)
-            }
-            PostfixOp::FieldUpdate(name, val) => {
-                let span = lhs.span.union(val.span);
-                let key = Expr::new(ExprKind::StringLit(name), span);
-                unwind_update(lhs, key, val, span)
+                match lhs.kind {
+                    ExprKind::Index(parent, index) => unwind_update(*parent, *index, val, span),
+                    ExprKind::FieldAccess(parent, field_name) => {
+                        let key = Expr::new(ExprKind::StringLit(field_name), span);
+                        unwind_update(*parent, key, val, span)
+                    }
+                    _ => lhs,
+                }
             }
             PostfixOp::TupleAccess(idx, op_span) => {
                 let span = lhs.span.union(op_span);

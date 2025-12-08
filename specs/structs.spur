@@ -27,7 +27,7 @@ role Registry {
     }
 
     func UpdateAge(new_age: int) -> bool {
-        record = record["age" := new_age];
+        record = record.age := new_age;
         return true;
     }
 

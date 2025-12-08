@@ -5,11 +5,11 @@ role Head {
     var l: lock = create_lock();
 
     func write1(key: string, value: Value) {
-        db = db[key := value];
+        db = db[key] := value;
     }
 
     func write2(key: string)  {
-        db = db[key := db[key] + 1];
+        db = db[key] := db[key] + 1];
     }
 
     func WritePlusOne(key: string, value: int) -> bool {
