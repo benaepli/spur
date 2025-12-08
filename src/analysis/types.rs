@@ -105,7 +105,7 @@ pub enum TypedExprKind {
 
     StructLit(NameId, Vec<(String, TypedExpr)>),
 
-    WrapInOptional(Box<TypedExpr>) // Internal representation of widening.
+    WrapInOptional(Box<TypedExpr>), // Internal representation of widening.
 }
 
 #[derive(Debug, Clone, PartialEq)]

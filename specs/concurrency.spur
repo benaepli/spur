@@ -18,7 +18,7 @@ role Head {
 
     func AsyncRead(key: string) -> Value {
         var p: promise<Value> = create_promise();
-        f := create_future(p);
+        var f = create_future(p);
         headRead(p, key);
         return await f;
     }
@@ -26,10 +26,10 @@ role Head {
 
 ClientInterface {
     func write(node: Head, key: string, value: Value) {
-        @rpc_call(node, AsyncWrite(key, value));
+        @node->AsyncWrite(key, value);
     }
 
     func read(node: Head, key: string) -> Value {
-        return @rpc_call(node, AsyncRead(key));
+        return @node->AsyncRead(key);
     }
 }

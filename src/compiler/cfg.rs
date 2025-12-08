@@ -439,16 +439,12 @@ impl Compiler {
             }
         });
 
-        let cond_calc_vertex = self.compile_expr_to_value(
-            locals,
-            &cond_expr,
-            Lhs::Var(cond_var),
-            cond_check_vertex,
-        );
+        let cond_calc_vertex =
+            self.compile_expr_to_value(locals, &cond_expr, Lhs::Var(cond_var), cond_check_vertex);
 
         self.cfg[loop_head_vertex] = Label::Instr(
             Instr::Assign(Lhs::Var(self.new_temp_var(locals)), Expr::EUnit),
-            cond_calc_vertex
+            cond_calc_vertex,
         );
 
         match &loop_stmt.init {
@@ -767,7 +763,6 @@ impl Compiler {
                             next_vertex,
                         ));
 
-
                         let eval_right_vertex =
                             self.compile_expr_to_value(locals, r, target.clone(), next_vertex);
 
@@ -1041,7 +1036,6 @@ impl Compiler {
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_list_recursive(locals, val_exprs.iter(), tmps, assign_vertex)
             }
-
 
             TypedExprKind::ResolvePromise(p, v) => {
                 let p_tmp = self.new_temp_var(locals);

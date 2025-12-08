@@ -1,9 +1,9 @@
+use crate::analysis::checker::TypeError;
 use crate::analysis::resolver::ResolutionError;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-use crate::analysis::checker::TypeError;
 
 pub fn report_resolution_errors(
     source: &str,

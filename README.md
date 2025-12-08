@@ -24,17 +24,17 @@ See the [specs](specs) directory. For brevity, we provide a short example here:
 type Command = int;
 
 role Node {
-  let db: map<string, Command> = {};
+  var db: map<string, Command> = {};
 
   func Write(key: string, value: Command) -> bool {
-      db[key] = value;
+      db = db[key := value];
       return true;
   }
 }
 
 ClientInterface {
   func Write(node: Node, key: string, value: Command) {
-      await rpc_call(node, Write(key, value));
+      await node->Write(key, value);
   }
 }
 ```

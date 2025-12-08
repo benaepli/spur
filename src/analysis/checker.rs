@@ -689,8 +689,8 @@ impl TypeChecker {
                     return Ok((current_id, fields));
                 }
                 TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
-                                                ResolvedTypeDef::Named(next_id),
-                                            )) => {
+                    ResolvedTypeDef::Named(next_id),
+                )) => {
                     current_id = *next_id;
                 }
                 _ => {
@@ -710,11 +710,7 @@ impl TypeChecker {
         }
     }
 
-    fn check_expr(
-        &self,
-        expr: ResolvedExpr,
-        expected: &Type,
-    ) -> Result<TypedExpr, TypeError> {
+    fn check_expr(&self, expr: ResolvedExpr, expected: &Type) -> Result<TypedExpr, TypeError> {
         let span = expr.span;
         match (&expr.kind, expected) {
             (ResolvedExprKind::NilLit, Type::Optional(_)) => Ok(TypedExpr {
@@ -750,10 +746,10 @@ impl TypeChecker {
             }
 
             (ResolvedExprKind::StructLit(struct_id, fields), Type::Struct(expected_id, _))
-            if *struct_id == *expected_id =>
-                {
-                    self.check_struct_literal(*struct_id, fields.clone(), span)
-                }
+                if *struct_id == *expected_id =>
+            {
+                self.check_struct_literal(*struct_id, fields.clone(), span)
+            }
 
             _ => {
                 let inferred = self.infer_expr(expr)?;
@@ -1312,12 +1308,8 @@ impl TypeChecker {
             BinOp::Equal | BinOp::NotEqual => {
                 let typed_left = self.infer_expr(left)?;
                 let typed_right = self.infer_expr(right)?;
-                let (coerced_left, coerced_right) = self.check_and_coerce_symmetric(
-                    typed_left,
-                    typed_right,
-                    op.clone(),
-                    span,
-                )?;
+                let (coerced_left, coerced_right) =
+                    self.check_and_coerce_symmetric(typed_left, typed_right, op.clone(), span)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(coerced_left), Box::new(coerced_right)),
                     ty: Type::Bool,
@@ -1347,11 +1339,7 @@ impl TypeChecker {
                 if let Type::Optional(inner_ty) = typed_left.ty.clone() {
                     let typed_right = self.check_expr(right, &inner_ty)?;
                     Ok(TypedExpr {
-                        kind: TypedExprKind::BinOp(
-                            op,
-                            Box::new(typed_left),
-                            Box::new(typed_right),
-                        ),
+                        kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                         ty: *inner_ty,
                         span,
                     })
@@ -1641,8 +1629,8 @@ impl TypeChecker {
                             Ok(Type::Struct(*name_id, name))
                         }
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
-                                                        aliased_type,
-                                                    )) => self.resolve_type(aliased_type),
+                            aliased_type,
+                        )) => self.resolve_type(aliased_type),
                     }
                 } else if let Some(role_name) = self.role_defs.get(name_id) {
                     Ok(Type::Role(*name_id, role_name.clone()))

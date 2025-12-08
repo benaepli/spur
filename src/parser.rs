@@ -558,15 +558,6 @@ where
                 .to(kind)
         };
 
-        let rpc_call = just(TokenKind::RpcCall)
-            .then(
-                expr.clone()
-                    .then_ignore(just(TokenKind::Comma))
-                    .then(func_call.clone())
-                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-            )
-            .map(|(_, (target, call))| ExprKind::RpcCall(Box::new(target), call));
-
         let atom = choice((
             val,
             list_lit,
@@ -585,10 +576,9 @@ where
             one_arg_builtin(TokenKind::CreateFuture, ExprKind::CreateFuture),
             two_arg_builtin(TokenKind::ResolvePromise, ExprKind::ResolvePromise),
             zero_arg_builtin(TokenKind::CreateLock, ExprKind::CreateLock),
-            func_call.map(ExprKind::FuncCall),
+            func_call.clone().map(ExprKind::FuncCall),
             ident.clone().map(ExprKind::Var),
             tuple_lit,
-            rpc_call,
         ))
         .map_with(|kind, e| Expr::new(kind, e.span()));
 
@@ -605,6 +595,7 @@ where
             TupleAccess(usize, Span),
             FieldAccess(String, Span),
             Unwrap(Span),
+            RpcCall(FuncCall),
         }
 
         let postfix_op = choice((
@@ -633,6 +624,10 @@ where
                 .ignore_then(ident.clone())
                 .map_with(|name, e| PostfixOp::FieldAccess(name, e.span())),
             just(TokenKind::Bang).map_with(|_, e| PostfixOp::Unwrap(e.span())),
+            // RPC Call: -> call()
+            just(TokenKind::Arrow)
+                .ignore_then(func_call.clone())
+                .map(PostfixOp::RpcCall),
         ));
 
         primary_base.foldl(postfix_op.repeated(), |lhs, op| match op {
@@ -665,6 +660,10 @@ where
             PostfixOp::Unwrap(op_span) => {
                 let span = lhs.span.union(op_span);
                 Expr::new(ExprKind::Unwrap(Box::new(lhs)), span)
+            }
+            PostfixOp::RpcCall(call) => {
+                let span = lhs.span.union(call.span);
+                Expr::new(ExprKind::RpcCall(Box::new(lhs), call), span)
             }
         })
     };
@@ -778,32 +777,12 @@ where
 
         let var_init_stmt = var_init_core
             .clone()
-            .then_ignore(just(TokenKind::Semicolon))
+            .then_ignore(just(TokenKind::Semicolon).or_not())
             .map_with(|var_init, e| Statement::new(StatementKind::VarInit(var_init), e.span()));
-
-        let short_var_decl = ident
-            .clone()
-            .then_ignore(just(TokenKind::ColonEqual))
-            .then(expr.clone())
-            .then_ignore(just(TokenKind::Semicolon))
-            .map_with(|(name, value), e| {
-                Statement::new(
-                    StatementKind::VarInit(VarInit {
-                        name,
-                        type_def: None,
-                        value,
-                        span: e.span(),
-                    }),
-                    e.span(),
-                )
-            });
 
         let if_branch = |kw| {
             just(kw)
-                .ignore_then(
-                    expr.clone()
-                        .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-                )
+                .ignore_then(expr.clone())
                 .then(block())
                 .map_with(|(condition, body), e| IfBranch {
                     condition,
@@ -831,19 +810,25 @@ where
             assignment.clone().map(ForLoopInit::Assignment),
         ));
 
+        let three_part_header = for_loop_init
+            .clone()
+            .or_not()
+            .then_ignore(just(TokenKind::Semicolon))
+            .then(expr.clone().or_not())
+            .then_ignore(just(TokenKind::Semicolon))
+            .then(assignment.clone().or_not())
+            .map(|((init, condition), increment)| (init, condition, increment));
+
+        let single_cond_header = expr.clone().map(|condition| (None, Some(condition), None));
+
+        let infinite_header = empty().to((None, None, None));
+
+        let for_header = choice((three_part_header, single_cond_header, infinite_header));
+
         let for_loop = just(TokenKind::For)
-            .ignore_then(
-                for_loop_init
-                    .clone()
-                    .or_not()
-                    .then_ignore(just(TokenKind::Semicolon))
-                    .then(expr.clone().or_not())
-                    .then_ignore(just(TokenKind::Semicolon))
-                    .then(assignment.clone().or_not())
-                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-            )
+            .ignore_then(for_header)
             .then(block())
-            .map_with(|(((init, condition), increment), body), e| {
+            .map_with(|((init, condition, increment), body), e| {
                 Statement::new(
                     StatementKind::ForLoop(ForLoop {
                         init,
@@ -861,8 +846,7 @@ where
                 pattern
                     .clone()
                     .then_ignore(just(TokenKind::In))
-                    .then(expr.clone())
-                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
+                    .then(expr.clone()),
             )
             .then(block())
             .map_with(|((pattern, iterable), body), e| {
@@ -880,7 +864,7 @@ where
         let simple_stmt = |kind, constructor: fn(Expr) -> StatementKind| {
             just(kind)
                 .ignore_then(expr.clone())
-                .then_ignore(just(TokenKind::Semicolon))
+                .then_ignore(just(TokenKind::Semicolon).or_not())
                 .map_with(move |expr, e| Statement::new(constructor(expr), e.span()))
         };
 
@@ -898,19 +882,18 @@ where
         choice((
             cond_stmts,
             var_init_stmt,
-            short_var_decl,
             assignment
-                .then_ignore(just(TokenKind::Semicolon))
+                .then_ignore(just(TokenKind::Semicolon).or_not())
                 .map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
             expr.clone()
-                .then_ignore(just(TokenKind::Semicolon))
+                .then_ignore(just(TokenKind::Semicolon).or_not())
                 .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span())),
             simple_stmt(TokenKind::Return, StatementKind::Return),
             for_loop,
             for_in_loop,
             lock_stmt,
             just(TokenKind::Break)
-                .then_ignore(just(TokenKind::Semicolon))
+                .then_ignore(just(TokenKind::Semicolon).or_not())
                 .map_with(|_, e| Statement::new(StatementKind::Break, e.span())),
         ))
     });
@@ -924,7 +907,7 @@ where
         )
         .then_ignore(just(TokenKind::Equal))
         .then(expr.clone())
-        .then_ignore(just(TokenKind::Semicolon))
+        .then_ignore(just(TokenKind::Semicolon).or_not())
         .map_with(|((name, type_def), value), e| VarInit {
             name,
             type_def,
@@ -998,7 +981,7 @@ where
                 .ignore_then(type_def.clone())
                 .map(TypeDefStmtKind::Alias),
         )))
-        .then_ignore(just(TokenKind::Semicolon))
+        .then_ignore(just(TokenKind::Semicolon).or_not())
         .map_with(|(name, def), e| TypeDefStmt {
             name,
             def,

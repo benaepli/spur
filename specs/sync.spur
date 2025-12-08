@@ -4,11 +4,11 @@ role Head {
     var db: map<string, Value> = {"hi": 0};
 
     sync func write1(key: string, value: Value) {
-        db[key] = value;
+        db = db[key := value];
     }
 
     sync func write2(key: string)  {
-        db[key] = db[key] + 1;
+       db = db[key := db[key] + 1];
     }
 
     func WritePlusOne(key: string, value: int) -> bool {
@@ -24,10 +24,10 @@ role Head {
 
 ClientInterface {
     func write(node: Head, key: string, value: Value) {
-        @rpc_call(node, WritePlusOne(key, value));
+        @node->WritePlusOne(key, value);
     }
 
     func read(node: Head, key: string) -> Value {
-        return @rpc_call(node, Read(key));
+        return @node->Read(key);
     }
 }

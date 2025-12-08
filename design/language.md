@@ -42,6 +42,7 @@ ID
 | 'list' '<' type_def '>'
 | 'promise' '<' type_def '>'
 | 'future' '<' type_def '>'
+| 'lock'
 | '(' type_def_list? ')'
 
 statements ::= statement*
@@ -53,6 +54,7 @@ cond_stmts
 | 'return' expr ';'
 | for_loop
 | for_in_loop
+| lock_stmt
 | 'break' ';'
 
 cond_stmts ::= if_stmt ( elseif_stmt )* ( else_stmt )?
@@ -60,8 +62,9 @@ if_stmt ::= 'if' '(' expr ')' '{' statements '}'
 elseif_stmt ::= 'elseif' '(' expr ')' '{' statements '}'
 else_stmt ::= 'else' '{' statements '}'
 
-for_loop ::= 'for' '(' ( var_init | assignment )? ';' expr? ';' assignment? ')' '{' statements '}'
-for_in_loop ::= 'for' '(' pattern 'in' expr ')' '{' statements '}'
+for_loop ::= 'for' ( ( var_init | assignment )? ';' expr? ';' assignment? | expr | ) '{' statements '}'
+for_in_loop ::= 'for' pattern 'in' expr '{' statements '}'
+lock_stmt ::= 'await' 'lock' '(' expr ')' '{' statements '}'
 
 assignment ::= ID '=' expr
 
@@ -91,17 +94,16 @@ unary_expr ::= ( '!' | '-' | 'await' | 'spin_await' | '@' ) unary_expr | primary
 
 primary_expr ::= primary_base postfix_op*
 
-primary_base ::= 
+primary_base ::=
 ID
 | 'true' | 'false' | 'nil'
 | literals
 | func_call
 | struct_literal
 | collection
-| rpc_call
 | list_ops
 | 'append' '(' expr ',' expr ')'
-| 'prepend' '(' expr ',' expr ')'     
+| 'prepend' '(' expr ',' expr ')'
 | 'store' '(' expr ',' expr ',' expr ')'
 | 'min' '(' expr ',' expr ')'
 | 'exists' '(' expr ',' expr ')'
@@ -109,14 +111,17 @@ ID
 | 'create_promise' '(' ')'
 | 'create_future' '(' expr ')'
 | 'resolve_promise' '(' expr ',' expr ')'
+| 'create_lock' '(' ')'
 | '(' expr ')'
 
 postfix_op ::=
 '[' expr ']'
 | '[' expr ':' expr ']'
+| '[' expr ':=' expr ']'
 | '.' INT
 | '.' ID
 | '!'
+| '->' func_call
 
 literals ::= STRING | INT
 
@@ -135,8 +140,6 @@ field_inits ::= field_init ( ',' field_init )* ','?
 field_init ::= ID ':' expr
 
 list_ops ::= ( 'head' | 'tail' | 'len' ) '(' expr ')'
-
-rpc_call ::= ( 'rpc_call' ) '('
 ```
 
 ## Typing
@@ -178,11 +181,11 @@ To address this, we provide a `lock` type.
 
 ### RPCs
 
-This asynchronous model extends seamlessly to remote procedure calls (RPCs). The syntax is nearly identical,
-but it requires a target role instance:
+This asynchronous model extends seamlessly to remote procedure calls (RPCs). RPCs use the `->` arrow operator
+to call a function on a target role instance:
 
 ```
-var f: future<string> = rpc_call(other_role, some_func(1, 2));
+var f: future<string> = other_role->some_func(1, 2);
 ```
 
 ### Spin Await
