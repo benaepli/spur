@@ -100,18 +100,12 @@ pub enum TypeError {
     NotAList { ty: Type, span: Span },
     #[error("Operator `!` can only be used on an optional, found `{ty}`")]
     UnwrapOnNonOptional { ty: Type, span: Span },
-    #[error("await can only be used on a future, found `{ty}`")]
-    AwaitOnNonFuture { ty: Type, span: Span },
-    #[error("spin_await can only be used on a bool, found `{ty}`")]
-    SpinAwaitOnNonBool { ty: Type, span: Span },
-    #[error("Operation requires a promise, found `{ty}`")]
-    NotAPromise { ty: Type, span: Span },
-    #[error("await lock can only be used on a Lock, found `{ty}`")]
-    NotALock { ty: Type, span: Span },
-    #[error("await cannot be used inside a `sync` function")]
-    AwaitInSyncFunc { span: Span },
-    #[error("spin_await cannot be used inside a `sync` function")]
-    SpinAwaitInSyncFunc { span: Span },
+    #[error("Operation requires a channel, found `{ty}`")]
+    NotAChannel { ty: Type, span: Span },
+    #[error("recv cannot be used inside a `sync` function")]
+    RecvInSyncFunc { span: Span },
+    #[error("send cannot be used inside a `sync` function")]
+    SendInSyncFunc { span: Span },
     #[error("RPC call targets a `sync` function `{func_name}`, but RPC calls must be async")]
     RpcCallToSyncFunc { func_name: String, span: Span },
 }
@@ -753,6 +747,15 @@ impl TypeChecker {
                 self.check_struct_literal(*struct_id, fields.clone(), span)
             }
 
+            (ResolvedExprKind::MakeChannel(cap), Type::Chan(_)) => {
+                let typed_cap = self.check_expr(*cap.clone(), &Type::Int)?;
+                Ok(TypedExpr {
+                    kind: TypedExprKind::MakeChannel(Box::new(typed_cap)),
+                    ty: expected.clone(),
+                    span,
+                })
+            }
+
             _ => {
                 let inferred = self.infer_expr(expr)?;
                 self.check_types_match(inferred, expected)
@@ -820,7 +823,7 @@ impl TypeChecker {
                     let return_ty = if sig.is_sync {
                         sig.return_type
                     } else {
-                        Type::Future(Box::new(sig.return_type.clone()))
+                        Type::Chan(Box::new(sig.return_type.clone()))
                     };
 
                     Ok(TypedExpr {
@@ -1063,43 +1066,53 @@ impl TypeChecker {
                     })
                 }
             }
-            ResolvedExprKind::CreatePromise => Ok(TypedExpr {
-                kind: TypedExprKind::CreatePromise,
-                ty: Type::EmptyPromise,
-                span,
-            }),
-            ResolvedExprKind::CreateFuture(promise_expr) => {
-                let typed_promise = self.infer_expr(*promise_expr)?;
-                match typed_promise.ty.clone() {
-                    Type::Promise(inner_ty) => Ok(TypedExpr {
-                        kind: TypedExprKind::CreateFuture(Box::new(typed_promise)),
-                        ty: Type::Future(inner_ty),
+            ResolvedExprKind::MakeChannel(cap) => {
+                let typed_cap = self.check_expr(*cap, &Type::Int)?;
+                Ok(TypedExpr {
+                    kind: TypedExprKind::MakeChannel(Box::new(typed_cap)),
+                    ty: Type::UnknownChannel,
+                    span,
+                })
+            }
+            ResolvedExprKind::Send(chan_expr, val_expr) => {
+                if self.current_func_is_sync {
+                    return Err(TypeError::SendInSyncFunc { span });
+                }
+
+                let typed_chan = self.infer_expr(*chan_expr)?;
+
+                if let Type::Chan(inner_ty) = &typed_chan.ty {
+                    let typed_val = self.check_expr(*val_expr, inner_ty)?;
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Send(Box::new(typed_chan), Box::new(typed_val)),
+                        ty: Type::Tuple(vec![]),
                         span,
-                    }),
-                    _ => Err(TypeError::NotAPromise {
-                        ty: typed_promise.ty,
-                        span: typed_promise.span,
-                    }),
+                    })
+                } else {
+                    Err(TypeError::NotAChannel {
+                        ty: typed_chan.ty,
+                        span,
+                    })
                 }
             }
-            ResolvedExprKind::ResolvePromise(promise_expr, value_expr) => {
-                let typed_promise = self.infer_expr(*promise_expr)?;
-                match typed_promise.ty.clone() {
-                    Type::Promise(inner_ty) => {
-                        let typed_value = self.check_expr(*value_expr, &inner_ty)?;
-                        Ok(TypedExpr {
-                            kind: TypedExprKind::ResolvePromise(
-                                Box::new(typed_promise),
-                                Box::new(typed_value),
-                            ),
-                            ty: Type::Tuple(vec![]),
-                            span,
-                        })
-                    }
-                    _ => Err(TypeError::NotAPromise {
-                        ty: typed_promise.ty,
-                        span: typed_promise.span,
-                    }),
+            ResolvedExprKind::Recv(chan_expr) => {
+                if self.current_func_is_sync {
+                    return Err(TypeError::RecvInSyncFunc { span });
+                }
+
+                let typed_chan = self.infer_expr(*chan_expr)?;
+
+                if let Type::Chan(inner_ty) = typed_chan.ty.clone() {
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Recv(Box::new(typed_chan)),
+                        ty: *inner_ty,
+                        span,
+                    })
+                } else {
+                    Err(TypeError::NotAChannel {
+                        ty: typed_chan.ty,
+                        span,
+                    })
                 }
             }
             ResolvedExprKind::CreateLock => Ok(TypedExpr {
@@ -1231,38 +1244,10 @@ impl TypeChecker {
                     span: call.span,
                 };
 
-                let return_ty = Type::Future(Box::new(sig.return_type.clone()));
+                let return_ty = Type::Chan(Box::new(sig.return_type.clone()));
                 Ok(TypedExpr {
                     kind: TypedExprKind::RpcCall(Box::new(typed_target), typed_call),
                     ty: return_ty,
-                    span,
-                })
-            }
-            ResolvedExprKind::Await(e) => {
-                if self.current_func_is_sync {
-                    return Err(TypeError::AwaitInSyncFunc { span });
-                }
-                let typed_future = self.infer_expr(*e)?;
-                match typed_future.ty.clone() {
-                    Type::Future(inner_ty) => Ok(TypedExpr {
-                        kind: TypedExprKind::Await(Box::new(typed_future)),
-                        ty: *inner_ty,
-                        span,
-                    }),
-                    _ => Err(TypeError::AwaitOnNonFuture {
-                        ty: typed_future.ty,
-                        span,
-                    }),
-                }
-            }
-            ResolvedExprKind::SpinAwait(e) => {
-                if self.current_func_is_sync {
-                    return Err(TypeError::SpinAwaitInSyncFunc { span });
-                }
-                let typed_bool = self.check_expr(*e, &Type::Bool)?;
-                Ok(TypedExpr {
-                    kind: TypedExprKind::SpinAwait(Box::new(typed_bool)),
-                    ty: Type::Tuple(vec![]),
                     span,
                 })
             }
@@ -1288,8 +1273,8 @@ impl TypeChecker {
             typed_expr.ty = Type::Map(k.clone(), v.clone());
             return Ok(typed_expr);
         }
-        if let (Type::Promise(p), Type::EmptyPromise) = (expected, actual) {
-            typed_expr.ty = Type::Promise(p.clone());
+        if let (Type::Chan(e), Type::UnknownChannel) = (expected, actual) {
+            typed_expr.ty = Type::Chan(e.clone());
             return Ok(typed_expr);
         }
 
@@ -1701,13 +1686,9 @@ impl TypeChecker {
                     Ok(Type::Optional(Box::new(base_type)))
                 }
             }
-            ResolvedTypeDef::Future(t) => {
+            ResolvedTypeDef::Chan(t) => {
                 let base_type = self.resolve_type(t)?;
-                Ok(Type::Future(Box::new(base_type)))
-            }
-            ResolvedTypeDef::Promise(t) => {
-                let base_type = self.resolve_type(t)?;
-                Ok(Type::Promise(Box::new(base_type)))
+                Ok(Type::Chan(Box::new(base_type)))
             }
             ResolvedTypeDef::Lock => Ok(Type::Lock),
         }
@@ -1729,7 +1710,7 @@ impl TypeChecker {
         if let (Type::Map(_, _), Type::EmptyMap) = (expected, actual) {
             return Ok(());
         }
-        if let (Type::Promise(_), Type::EmptyPromise) = (expected, actual) {
+        if let (Type::Chan(_), Type::UnknownChannel) = (expected, actual) {
             return Ok(());
         }
 
@@ -1748,7 +1729,7 @@ impl TypeChecker {
                 return Ok(());
             }
         }
-        if let (Type::Future(expected_inner), Type::Future(actual_inner)) = (expected, actual) {
+        if let (Type::Chan(expected_inner), Type::Chan(actual_inner)) = (expected, actual) {
             return self.check_type_compatibility(expected_inner, actual_inner, span);
         }
 

@@ -109,8 +109,7 @@ pub enum ResolvedTypeDef {
     List(Box<ResolvedTypeDef>),
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
-    Future(Box<ResolvedTypeDef>),
-    Promise(Box<ResolvedTypeDef>),
+    Chan(Box<ResolvedTypeDef>),
     Lock,
 }
 
@@ -222,11 +221,11 @@ pub enum ResolvedExprKind {
     Tail(Box<ResolvedExpr>),
     Len(Box<ResolvedExpr>),
     RpcCall(Box<ResolvedExpr>, ResolvedRpcCall),
-    Await(Box<ResolvedExpr>),
-    SpinAwait(Box<ResolvedExpr>),
-    CreatePromise,
-    CreateFuture(Box<ResolvedExpr>),
-    ResolvePromise(Box<ResolvedExpr>, Box<ResolvedExpr>),
+
+    MakeChannel(Box<ResolvedExpr>),
+    Send(Box<ResolvedExpr>, Box<ResolvedExpr>),
+    Recv(Box<ResolvedExpr>),
+
     CreateLock,
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
@@ -622,10 +621,7 @@ impl Resolver {
             TypeDefKind::Optional(t) => Ok(ResolvedTypeDef::Optional(Box::new(
                 self.resolve_type_def(*t)?,
             ))),
-            TypeDefKind::Future(t) => Ok(ResolvedTypeDef::Future(Box::new(
-                self.resolve_type_def(*t)?,
-            ))),
-            TypeDefKind::Promise(t) => Ok(ResolvedTypeDef::Promise(Box::new(
+            TypeDefKind::Chan(t) => Ok(ResolvedTypeDef::Chan(Box::new(
                 self.resolve_type_def(*t)?,
             ))),
             TypeDefKind::Lock => Ok(ResolvedTypeDef::Lock),
@@ -899,16 +895,14 @@ impl Resolver {
                     },
                 )
             }
-            ExprKind::Await(e) => ResolvedExprKind::Await(Box::new(self.resolve_expr(*e)?)),
-            ExprKind::SpinAwait(e) => ResolvedExprKind::SpinAwait(Box::new(self.resolve_expr(*e)?)),
-            ExprKind::CreatePromise => ResolvedExprKind::CreatePromise,
-            ExprKind::CreateFuture(e) => {
-                ResolvedExprKind::CreateFuture(Box::new(self.resolve_expr(*e)?))
+            ExprKind::MakeChannel(cap) => {
+                ResolvedExprKind::MakeChannel(Box::new(self.resolve_expr(*cap)?))
             }
-            ExprKind::ResolvePromise(p, v) => ResolvedExprKind::ResolvePromise(
-                Box::new(self.resolve_expr(*p)?),
-                Box::new(self.resolve_expr(*v)?),
+            ExprKind::Send(ch, val) => ResolvedExprKind::Send(
+                Box::new(self.resolve_expr(*ch)?),
+                Box::new(self.resolve_expr(*val)?),
             ),
+            ExprKind::Recv(ch) => ResolvedExprKind::Recv(Box::new(self.resolve_expr(*ch)?)),
             ExprKind::CreateLock => ResolvedExprKind::CreateLock,
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)?),

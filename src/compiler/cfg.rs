@@ -84,7 +84,9 @@ pub struct FunctionInfo {
 pub enum Label {
     Instr(Instr, Vertex /* next_vertex */),
     Pause(Vertex /* next_vertex */),
-    Await(Lhs, Expr, Vertex /* next_vertex */),
+    MakeChannel(Lhs, usize, Vertex),
+    Send(Expr, Expr, Vertex),
+    Recv(Lhs, Expr, Vertex),
     SpinAwait(Expr, Vertex /* next_vertex */),
     Return(Expr),
     Cond(
@@ -708,32 +710,40 @@ impl Compiler {
             TypedExprKind::RpcCall(target_expr, call) => {
                 self.compile_rpc_call(locals, target_expr, call, target, next_vertex)
             }
-            TypedExprKind::Await(e) => {
-                let future_var = self.new_temp_var(locals);
-                // The Await label takes the `target` Lhs directly.
-                // This is where the result of the future will be stored.
-                let await_label = Label::Await(target, Expr::EVar(future_var.clone()), next_vertex);
-                let await_vertex = self.add_label(await_label);
-                // Compile the inner expression `e` to get the future,
-                // storing it in `future_var`.
-                self.compile_expr_to_value(locals, e, Lhs::Var(future_var), await_vertex)
+            TypedExprKind::MakeChannel(cap_expr) => {
+                let capacity = match &cap_expr.kind {
+                    TypedExprKind::IntLit(n) => *n as usize,
+                    _ => 0,
+                };
+                self.add_label(Label::MakeChannel(target, capacity, next_vertex))
             }
-            TypedExprKind::SpinAwait(e) => {
-                let bool_var = self.new_temp_var(locals);
+            TypedExprKind::Send(chan_expr, val_expr) => {
+                let chan_tmp = self.new_temp_var(locals);
+                let val_tmp = self.new_temp_var(locals);
 
-                // 1. Assign unit to the target, which runs *after* the spinawait.
                 let assign_unit_vertex = self.add_label(Label::Instr(
                     Instr::Assign(target, Expr::EUnit),
                     next_vertex,
                 ));
 
-                // 2. The SpinAwait label. It just blocks, then goes to assign unit.
-                let spin_label = Label::SpinAwait(Expr::EVar(bool_var.clone()), assign_unit_vertex);
-                let spin_vertex = self.add_label(spin_label);
+                let send_vertex = self.add_label(Label::Send(
+                    Expr::EVar(chan_tmp.clone()),
+                    Expr::EVar(val_tmp.clone()),
+                    assign_unit_vertex,
+                ));
 
-                // 3. Compile the inner expression `e` to get the boolean,
-                //    storing it in `bool_var`.
-                self.compile_expr_to_value(locals, e, Lhs::Var(bool_var), spin_vertex)
+                let val_vertex =
+                    self.compile_expr_to_value(locals, val_expr, Lhs::Var(val_tmp), send_vertex);
+                self.compile_expr_to_value(locals, chan_expr, Lhs::Var(chan_tmp), val_vertex)
+            }
+            TypedExprKind::Recv(chan_expr) => {
+                let chan_tmp = self.new_temp_var(locals);
+                let recv_vertex = self.add_label(Label::Recv(
+                    target,
+                    Expr::EVar(chan_tmp.clone()),
+                    next_vertex,
+                ));
+                self.compile_expr_to_value(locals, chan_expr, Lhs::Var(chan_tmp), recv_vertex)
             }
 
             TypedExprKind::BinOp(op, l, r) => {
@@ -1037,39 +1047,7 @@ impl Compiler {
                 self.compile_expr_list_recursive(locals, val_exprs.iter(), tmps, assign_vertex)
             }
 
-            TypedExprKind::ResolvePromise(p, v) => {
-                let p_tmp = self.new_temp_var(locals);
-                let v_tmp = self.new_temp_var(locals);
-
-                // Assign unit to the target (e.g., `_tmp = ()`)
-                let assign_unit_label =
-                    Label::Instr(Instr::Assign(target, Expr::EUnit), next_vertex);
-                let assign_unit_vertex = self.add_label(assign_unit_label);
-
-                // Resolve the promise (e.g., `resolve(_p_tmp, _v_tmp)`)
-                let resolve_label = Label::Instr(
-                    Instr::Resolve(Lhs::Var(p_tmp.clone()), Expr::EVar(v_tmp.clone())),
-                    assign_unit_vertex,
-                );
-                let resolve_vertex = self.add_label(resolve_label);
-
-                // Compile p and v
-                let v_vertex =
-                    self.compile_expr_to_value(locals, v, Lhs::Var(v_tmp), resolve_vertex);
-                self.compile_expr_to_value(locals, p, Lhs::Var(p_tmp), v_vertex)
-            }
-
             // --- Truly simple, non-side-effecting cases ---
-            TypedExprKind::CreateFuture(e) => {
-                // create_future(p) is just a copy of p.
-                self.compile_expr_to_value(locals, e, target, next_vertex)
-            }
-
-            TypedExprKind::CreatePromise => {
-                let label = Label::Instr(Instr::Assign(target, Expr::ECreatePromise), next_vertex);
-                self.add_label(label)
-            }
-
             TypedExprKind::CreateLock => {
                 let label = Label::Instr(Instr::Assign(target, Expr::ECreateLock), next_vertex);
                 self.add_label(label)
@@ -1237,21 +1215,52 @@ impl Compiler {
         target: Lhs,
         next_vertex: Vertex,
     ) -> Vertex {
-        //  Allocate a temp var to hold the target role
-        let target_var = self.new_temp_var(locals);
-        let node_expr = Expr::EVar(target_var.clone());
+        // Create response channel
+        let resp_chan_name = self.new_temp_var(locals);
 
-        // Get the entry vertex for the internal call logic
-        let internal_call_vertex =
-            self.compile_async_call_internal(locals, node_expr, call, target, next_vertex);
+        let assign_resp_vertex = self.add_label(Label::Instr(
+            Instr::Assign(target, Expr::EVar(resp_chan_name.clone())),
+            next_vertex,
+        ));
 
-        // Compile the target_expr, which runs *before* the internal call
-        // The result is stored in `target_var`, which `internal_call_vertex` will use.
+        // Allocate temps for args
+        let (arg_tmps, mut arg_exprs) = self.compile_temp_list(locals, call.args.len());
+
+        // Append the response channel to the arguments
+        arg_exprs.push(Expr::EVar(resp_chan_name.clone()));
+
+        let qualifier = self
+            .func_qualifier_map
+            .get(&call.name)
+            .expect("Function qualifier should exist in map");
+        let func_name = format!("{}.{}", qualifier, call.original_name);
+
+        // Use dummy LHS for the call itself
+        let call_ret_dummy = self.new_temp_var(locals);
+
+        let call_label = Label::Instr(
+            Instr::SyncCall(Lhs::Var(call_ret_dummy), func_name, arg_exprs),
+            assign_resp_vertex,
+        );
+        let call_vertex = self.add_label(call_label);
+
+        let args_entry_vertex =
+            self.compile_expr_list_recursive(locals, call.args.iter(), arg_tmps, call_vertex);
+
+        let make_chan_label = Label::MakeChannel(
+            Lhs::Var(resp_chan_name.clone()),
+            1,
+            args_entry_vertex,
+        );
+        let make_chan_vertex = self.add_label(make_chan_label);
+
+        // We evaluate it for side-effects or consistency, though it's not explicitly used in SyncCall here
+        let target_dummy_var = self.new_temp_var(locals);
         self.compile_expr_to_value(
             locals,
             target_expr,
-            Lhs::Var(target_var),
-            internal_call_vertex,
+            Lhs::Var(target_dummy_var),
+            make_chan_vertex,
         )
     }
 
@@ -1325,7 +1334,6 @@ impl Compiler {
                     Box::new(Expr::EListLen(Box::new(list_expr))),
                 )
             }
-            TypedExprKind::CreateFuture(e) => self.convert_simple_expr(e),
             // Desugar: `s[i]` -> `EFind(s, i)`
             TypedExprKind::Index(target, index) => Expr::EFind(
                 Box::new(self.convert_simple_expr(target)),
@@ -1363,10 +1371,9 @@ impl Compiler {
             // --- Panic on complex expressions ---
             TypedExprKind::FuncCall(_)
             | TypedExprKind::RpcCall(_, _)
-            | TypedExprKind::Await(_)
-            | TypedExprKind::SpinAwait(_)
-            | TypedExprKind::CreatePromise
-            | TypedExprKind::ResolvePromise(_, _) => {
+            | TypedExprKind::MakeChannel(_)
+            | TypedExprKind::Send(_, _)
+            | TypedExprKind::Recv(_) => {
                 panic!(
                     "Cannot have complex call inside a simple expression: {:?}",
                     expr

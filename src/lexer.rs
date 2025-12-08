@@ -63,6 +63,7 @@ pub enum TokenKind {
     Greater,
     GreaterEqual,
     Arrow,
+    LeftArrow,
     ColonEqual,
 
     // Literals
@@ -78,8 +79,6 @@ pub enum TokenKind {
     Type,
     Return,
     For,
-    Await,
-    SpinAwait,
     Sync,
     Break,
     If,
@@ -103,11 +102,10 @@ pub enum TokenKind {
     False,
     Nil,
     Erase,
-    CreatePromise,
-    CreateFuture,
-    ResolvePromise,
-    Future,
-    Promise,
+    Chan,
+    Make,
+    Send,
+    Recv,
     Lock,
     CreateLock,
     Store,
@@ -144,6 +142,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Greater => write!(f, ">"),
             TokenKind::GreaterEqual => write!(f, ">="),
             TokenKind::Arrow => write!(f, "->"),
+            TokenKind::LeftArrow => write!(f, "<-"),
             TokenKind::ColonEqual => write!(f, ":="),
             TokenKind::Identifier(s) => write!(f, "{}", s),
             TokenKind::String(s) => write!(f, "\"{}\"", s),
@@ -155,8 +154,6 @@ impl fmt::Display for TokenKind {
             TokenKind::Type => write!(f, "type"),
             TokenKind::Return => write!(f, "return"),
             TokenKind::For => write!(f, "for"),
-            TokenKind::Await => write!(f, "await"),
-            TokenKind::SpinAwait => write!(f, "spin_await"),
             TokenKind::Sync => write!(f, "sync"),
             TokenKind::Break => write!(f, "break"),
             TokenKind::If => write!(f, "if"),
@@ -180,11 +177,10 @@ impl fmt::Display for TokenKind {
             TokenKind::False => write!(f, "false"),
             TokenKind::Nil => write!(f, "nil"),
             TokenKind::Erase => write!(f, "erase"),
-            TokenKind::CreatePromise => write!(f, "create_promise"),
-            TokenKind::CreateFuture => write!(f, "create_future"),
-            TokenKind::ResolvePromise => write!(f, "resolve_promise"),
-            TokenKind::Future => write!(f, "future"),
-            TokenKind::Promise => write!(f, "promise"),
+            TokenKind::Chan => write!(f, "chan"),
+            TokenKind::Make => write!(f, "make"),
+            TokenKind::Send => write!(f, "send"),
+            TokenKind::Recv => write!(f, "recv"),
             TokenKind::Lock => write!(f, "lock"),
             TokenKind::CreateLock => write!(f, "create_lock"),
             TokenKind::Store => write!(f, "store"),
@@ -200,8 +196,6 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "type" => TokenKind::Type,
     "return" => TokenKind::Return,
     "for" => TokenKind::For,
-    "await" => TokenKind::Await,
-    "spin_await" => TokenKind::SpinAwait,
     "sync" => TokenKind::Sync,
     "break" => TokenKind::Break,
     "if" => TokenKind::If,
@@ -225,11 +219,10 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "false" => TokenKind::False,
     "nil" => TokenKind::Nil,
     "erase" => TokenKind::Erase,
-    "create_promise" => TokenKind::CreatePromise,
-    "create_future" => TokenKind::CreateFuture,
-    "resolve_promise" => TokenKind::ResolvePromise,
-    "future" => TokenKind::Future,
-    "promise" => TokenKind::Promise,
+    "chan" => TokenKind::Chan,
+    "make" => TokenKind::Make,
+    "send" => TokenKind::Send,
+    "recv" => TokenKind::Recv,
     "lock" => TokenKind::Lock,
     "create_lock" => TokenKind::CreateLock,
     "store" => TokenKind::Store,
@@ -518,7 +511,9 @@ impl<'a> Iterator for Lexer<'a> {
             }
 
             '<' => {
-                if self.match_next('=') {
+                if self.match_next('-') {
+                    Ok(TokenKind::LeftArrow)
+                } else if self.match_next('=') {
                     Ok(TokenKind::LessEqual)
                 } else {
                     Ok(TokenKind::Less)

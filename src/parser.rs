@@ -79,8 +79,7 @@ pub enum TypeDefKind {
     List(Box<TypeDef>),
     Tuple(Vec<TypeDef>),
     Optional(Box<TypeDef>),
-    Future(Box<TypeDef>),
-    Promise(Box<TypeDef>),
+    Chan(Box<TypeDef>),
     Lock,
 }
 
@@ -230,12 +229,9 @@ pub enum ExprKind {
 
     RpcCall(Box<Expr>, FuncCall),
 
-    Await(Box<Expr>),
-    SpinAwait(Box<Expr>),
-
-    CreatePromise,
-    CreateFuture(Box<Expr>),
-    ResolvePromise(Box<Expr>, Box<Expr>),
+    MakeChannel(Box<Expr>),
+    Send(Box<Expr>, Box<Expr>),
+    Recv(Box<Expr>),
     CreateLock,
 
     // Postfix operations
@@ -417,29 +413,18 @@ where
                 span: e.span(),
             });
 
-        let future = just(TokenKind::Future)
+        let chan_type = just(TokenKind::Chan)
             .ignore_then(
                 type_def
                     .clone()
                     .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
             )
             .map_with(|t, e| TypeDef {
-                kind: TypeDefKind::Future(Box::new(t)),
+                kind: TypeDefKind::Chan(Box::new(t)),
                 span: e.span(),
             });
 
-        let promise = just(TokenKind::Promise)
-            .ignore_then(
-                type_def
-                    .clone()
-                    .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
-            )
-            .map_with(|t, e| TypeDef {
-                kind: TypeDefKind::Promise(Box::new(t)),
-                span: e.span(),
-            });
-
-        let base_type = choice((named, lock_type, map, list, tuple, future, promise));
+        let base_type = choice((named, lock_type, map, list, tuple, chan_type));
 
         base_type
             .clone()
@@ -591,9 +576,9 @@ where
             one_arg_builtin(TokenKind::Head, ExprKind::Head),
             one_arg_builtin(TokenKind::Tail, ExprKind::Tail),
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
-            zero_arg_builtin(TokenKind::CreatePromise, ExprKind::CreatePromise),
-            one_arg_builtin(TokenKind::CreateFuture, ExprKind::CreateFuture),
-            two_arg_builtin(TokenKind::ResolvePromise, ExprKind::ResolvePromise),
+            one_arg_builtin(TokenKind::Make, ExprKind::MakeChannel),
+            two_arg_builtin(TokenKind::Send, ExprKind::Send),
+            one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
             zero_arg_builtin(TokenKind::CreateLock, ExprKind::CreateLock),
             func_call.clone().map(ExprKind::FuncCall),
             ident.clone().map(ExprKind::Var),
@@ -689,23 +674,15 @@ where
     expr.define({
         let unary = recursive(|unary| {
             choice((
-                just(TokenKind::At)
-                    .then(unary.clone())
-                    .map_with(|(_, val), e| Expr::new(ExprKind::Await(Box::new(val)), e.span())),
                 just(TokenKind::Bang)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Not(Box::new(val)), e.span())),
                 just(TokenKind::Minus)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Negate(Box::new(val)), e.span())),
-                just(TokenKind::Await)
+                just(TokenKind::LeftArrow)
                     .then(unary.clone())
-                    .map_with(|(_, val), e| Expr::new(ExprKind::Await(Box::new(val)), e.span())),
-                just(TokenKind::SpinAwait)
-                    .then(unary.clone())
-                    .map_with(|(_, val), e| {
-                        Expr::new(ExprKind::SpinAwait(Box::new(val)), e.span())
-                    }),
+                    .map_with(|(_, val), e| Expr::new(ExprKind::Recv(Box::new(val)), e.span())),
                 primary.clone(),
             ))
         });
@@ -886,8 +863,7 @@ where
                 .map_with(move |expr, e| Statement::new(constructor(expr), e.span()))
         };
 
-        let lock_stmt = just(TokenKind::Await)
-            .ignore_then(just(TokenKind::Lock))
+        let lock_stmt = just(TokenKind::Lock)
             .ignore_then(
                 expr.clone()
                     .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),

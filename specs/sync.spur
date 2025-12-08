@@ -24,10 +24,10 @@ role Head {
 
 ClientInterface {
     func write(node: Head, key: string, value: Value) {
-        @node->WritePlusOne(key, value);
+        <-node->WritePlusOne(key, value);
     }
 
     func read(node: Head, key: string) -> Value {
-        return @node->Read(key);
+        return <-node->Read(key);
     }
 }

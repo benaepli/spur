@@ -47,18 +47,18 @@ role Registry {
 
 ClientInterface {
     func update_city(reg: Registry, city: string) {
-        @reg->UpdateCity(city);
+        <-reg->UpdateCity(city);
     }
 
     func update_age(reg: Registry, age: int) {
-        @reg->UpdateAge(age);
+        <-reg->UpdateAge(age);
     }
 
     func update_zip(reg: Registry, zip: int) {
-        @reg->UpdateZip(zip);
+        <-reg->UpdateZip(zip);
     }
 
     func get_city(reg: Registry) -> string {
-        return @reg->GetCity();
+        return <-reg->GetCity();
     }
 }

@@ -12,14 +12,13 @@ pub enum Type {
     Struct(NameId, String),
     Role(NameId, String),
     Optional(Box<Type>),
-    Future(Box<Type>),
-    Promise(Box<Type>),
+    Chan(Box<Type>),
     Lock,
 
     // Placeholder types.
     EmptyList,
     EmptyMap,
-    EmptyPromise,
+    UnknownChannel,
     Nil,
 }
 
@@ -42,12 +41,11 @@ impl std::fmt::Display for Type {
             Type::Struct(_, name) => write!(f, "{}", name),
             Type::Role(_, name) => write!(f, "{}", name),
             Type::Optional(t) => write!(f, "{}?", t),
-            Type::Future(t) => write!(f, "future<{}>", t),
-            Type::Promise(t) => write!(f, "promise<{}>", t),
+            Type::Chan(t) => write!(f, "chan<{}>", t),
             Type::Lock => write!(f, "lock"),
             Type::EmptyList => write!(f, "empty list"),
             Type::EmptyMap => write!(f, "empty map"),
-            Type::EmptyPromise => write!(f, "empty promise"),
+            Type::UnknownChannel => write!(f, "unknown channel"),
             Type::Nil => write!(f, "nil"),
         }
     }
@@ -90,12 +88,11 @@ pub enum TypedExprKind {
     RpcCall(Box<TypedExpr>, TypedUserFuncCall),
 
     UnwrapOptional(Box<TypedExpr>), // T? -> T
-    Await(Box<TypedExpr>),          // future<T> -> T
-    SpinAwait(Box<TypedExpr>),      // bool -> unit
 
-    CreatePromise,
-    CreateFuture(Box<TypedExpr>),
-    ResolvePromise(Box<TypedExpr>, Box<TypedExpr>),
+    MakeChannel(Box<TypedExpr>),
+    Send(Box<TypedExpr>, Box<TypedExpr>),
+    Recv(Box<TypedExpr>),
+
     CreateLock,
 
     Index(Box<TypedExpr>, Box<TypedExpr>),

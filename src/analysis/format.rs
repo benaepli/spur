@@ -319,70 +319,38 @@ pub fn report_type_errors(
                 ])
                 .with_notes(vec![
                     format!("help: the force-unwrap operator `!` can only be used on optional types, but `{}` is not optional", ty),
-                    "note: to await a future, use the `await` keyword or `@` shorthand".to_string(),
                 ]),
 
-            TypeError::AwaitOnNonFuture { ty, span } => Diagnostic::error()
-                .with_message("cannot await non-future type")
+            TypeError::NotAChannel { ty, span } => Diagnostic::error()
+                .with_message("channel operation on non-channel type")
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("expected future type, found `{}`", ty)),
+                        .with_message(format!("expected channel type, found `{}`", ty)),
                 ])
                 .with_notes(vec![
-                    format!("help: await can only be used on future types, but `{}` is not a future", ty),
+                    format!("help: the `<-` operator can only be used on channel types, but `{}` is not a channel", ty),
                 ]),
 
-            TypeError::SpinAwaitOnNonBool { ty, span } => Diagnostic::error()
-                .with_message("cannot spin_await on non-bool type")
+            TypeError::RecvInSyncFunc { span } => Diagnostic::error()
+                .with_message("recv cannot be used in sync function")
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("expected bool type, found `{}`", ty)),
+                        .with_message("recv (`<-`) not allowed here"),
                 ])
                 .with_notes(vec![
-                    format!("help: spin_await can only be used on bool types, but `{}` is not a bool", ty),
+                    "help: recv can only be used in async functions, but this function is marked as `sync`".to_string(),
+                    "note: remove the `sync` keyword from the function declaration to use recv".to_string(),
                 ]),
 
-            TypeError::NotAPromise { ty, span } => Diagnostic::error()
-                .with_message("promise operation on non-promise type")
+            TypeError::SendInSyncFunc { span } => Diagnostic::error()
+                .with_message("send cannot be used in sync function")
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("expected promise type, found `{}`", ty)),
+                        .with_message("send (`<-`) not allowed here"),
                 ])
                 .with_notes(vec![
-                    format!("help: this operation requires a promise type, but `{}` is not a promise", ty),
-                ]),
-
-            TypeError::NotALock { ty, span } => Diagnostic::error()
-                .with_message("cannot await lock on non-lock type")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("expected lock type, found `{}`", ty)),
-                ])
-                .with_notes(vec![
-                    format!("help: await lock can only be used on lock types, but `{}` is not a lock", ty),
-                ]),
-
-
-            TypeError::AwaitInSyncFunc { span } => Diagnostic::error()
-                .with_message("await cannot be used in sync function")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message("await not allowed here"),
-                ])
-                .with_notes(vec![
-                    "help: await can only be used in async functions, but this function is marked as `sync`".to_string(),
-                    "note: remove the `sync` keyword from the function declaration to use await".to_string(),
-                ]),
-
-            TypeError::SpinAwaitInSyncFunc { span } => Diagnostic::error()
-                .with_message("spin_await cannot be used in sync function")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message("spin_await not allowed here"),
-                ])
-                .with_notes(vec![
-                    "help: spin_await can only be used in async functions, but this function is marked as `sync`".to_string(),
-                    "note: remove the `sync` keyword from the function declaration to use spin_await".to_string(),
+                    "help: send can only be used in async functions, but this function is marked as `sync`".to_string(),
+                    "note: remove the `sync` keyword from the function declaration to use send".to_string(),
                 ]),
 
             TypeError::RpcCallToSyncFunc { func_name, span } => Diagnostic::error()
