@@ -168,16 +168,6 @@ pub fn report_type_errors(
                     format!("help: all keys in this map must be of type `{}`", expected),
                 ]),
 
-            TypeError::InvalidMapValueType { expected, found, span } => Diagnostic::error()
-                .with_message("invalid map value type")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("expected `{}`, found `{}`", expected, found)),
-                ])
-                .with_notes(vec![
-                    format!("help: all values in this map must be of type `{}`", expected),
-                ]),
-
             TypeError::StoreOnInvalidType { ty, span } => Diagnostic::error()
                 .with_message("store requires a list or map")
                 .with_labels(vec![
@@ -309,16 +299,6 @@ pub fn report_type_errors(
                 ])
                 .with_notes(vec![
                     format!("help: this operation requires a list type, but `{}` is not a list", ty),
-                ]),
-
-            TypeError::InvalidRoleOperation { ty, span } => Diagnostic::error()
-                .with_message("invalid operation on role type")
-                .with_labels(vec![
-                    Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("cannot apply this operation to role type `{}`", ty)),
-                ])
-                .with_notes(vec![
-                    "help: role types can only be used for RPC calls".to_string(),
                 ]),
 
             TypeError::UnwrapOnNonOptional { ty, span } => Diagnostic::error()

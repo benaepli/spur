@@ -63,6 +63,7 @@ pub enum TokenKind {
     Greater,
     GreaterEqual,
     Arrow,
+    ColonEqual,
 
     // Literals
     Identifier(String),
@@ -143,6 +144,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Greater => write!(f, ">"),
             TokenKind::GreaterEqual => write!(f, ">="),
             TokenKind::Arrow => write!(f, "->"),
+            TokenKind::ColonEqual => write!(f, ":="),
             TokenKind::Identifier(s) => write!(f, "{}", s),
             TokenKind::String(s) => write!(f, "\"{}\"", s),
             TokenKind::Integer(i) => write!(f, "{}", i),
@@ -439,7 +441,13 @@ impl<'a> Iterator for Lexer<'a> {
             ']' => Ok(TokenKind::RightBracket),
             ',' => Ok(TokenKind::Comma),
             ';' => Ok(TokenKind::Semicolon),
-            ':' => Ok(TokenKind::Colon),
+            ':' => {
+                if self.match_next('=') {
+                    Ok(TokenKind::ColonEqual)
+                } else {
+                    Ok(TokenKind::Colon)
+                }
+            }
             '.' => Ok(TokenKind::Dot),
             '@' => Ok(TokenKind::At),
 

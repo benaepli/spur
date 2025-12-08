@@ -76,7 +76,7 @@ pub struct ResolvedFuncParam {
 pub struct ResolvedVarInit {
     pub name: NameId,
     pub original_name: String,
-    pub type_def: ResolvedTypeDef,
+    pub type_def: Option<ResolvedTypeDef>,
     pub value: ResolvedExpr,
     pub span: Span,
 }
@@ -404,7 +404,8 @@ impl Resolver {
         };
 
         if let Some(scope) = scope_to_check {
-            scope.get(name)
+            scope
+                .get(name)
                 .copied()
                 .ok_or_else(|| ResolutionError::NameNotFound(name.to_string(), span))
         } else {
@@ -553,7 +554,10 @@ impl Resolver {
     }
 
     fn resolve_var_init(&mut self, init: VarInit) -> Result<ResolvedVarInit, ResolutionError> {
-        let type_def = self.resolve_type_def(init.type_def)?;
+        let type_def = init
+            .type_def
+            .map(|t| self.resolve_type_def(t))
+            .transpose()?;
         let value = self.resolve_expr(init.value)?;
         let name_id = self.declare_var(&init.name, init.span)?;
         Ok(ResolvedVarInit {

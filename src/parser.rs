@@ -47,7 +47,7 @@ pub struct FuncParam {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarInit {
     pub name: String,
-    pub type_def: TypeDef,
+    pub type_def: Option<TypeDef>,
     pub value: Expr,
     pub span: Span,
 }
@@ -520,17 +520,18 @@ where
             .clone()
             .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen));
 
-        let three_arg_builtin = |name, constructor: fn(Box<Expr>, Box<Expr>, Box<Expr>) -> ExprKind| {
-            just(name).ignore_then(
-                expr.clone()
-                    .then_ignore(just(TokenKind::Comma))
-                    .then(expr.clone())
-                    .then_ignore(just(TokenKind::Comma))
-                    .then(expr.clone())
-                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
-                    .map(move |((a, b), c)| constructor(Box::new(a), Box::new(b), Box::new(c))),
-            )
-        };
+        let three_arg_builtin =
+            |name, constructor: fn(Box<Expr>, Box<Expr>, Box<Expr>) -> ExprKind| {
+                just(name).ignore_then(
+                    expr.clone()
+                        .then_ignore(just(TokenKind::Comma))
+                        .then(expr.clone())
+                        .then_ignore(just(TokenKind::Comma))
+                        .then(expr.clone())
+                        .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                        .map(move |((a, b), c)| constructor(Box::new(a), Box::new(b), Box::new(c))),
+                )
+            };
 
         let two_arg_builtin = |name, constructor: fn(Box<Expr>, Box<Expr>) -> ExprKind| {
             just(name).ignore_then(
@@ -600,12 +601,19 @@ where
         enum PostfixOp {
             Index(Expr),
             Slice(Expr, Expr),
+            IndexUpdate(Expr, Expr),
             TupleAccess(usize, Span),
             FieldAccess(String, Span),
             Unwrap(Span),
         }
 
         let postfix_op = choice((
+            // Index Update: [expr := expr]
+            expr.clone()
+                .then_ignore(just(TokenKind::ColonEqual))
+                .then(expr.clone())
+                .delimited_by(just(TokenKind::LeftBracket), just(TokenKind::RightBracket))
+                .map(|(idx, val)| PostfixOp::IndexUpdate(idx, val)),
             // Index: [expr]
             expr.clone()
                 .delimited_by(just(TokenKind::LeftBracket), just(TokenKind::RightBracket))
@@ -636,6 +644,13 @@ where
                 let span = lhs.span.union(end.span);
                 Expr::new(
                     ExprKind::Slice(Box::new(lhs), Box::new(start), Box::new(end)),
+                    span,
+                )
+            }
+            PostfixOp::IndexUpdate(idx, val) => {
+                let span = lhs.span.union(val.span);
+                Expr::new(
+                    ExprKind::Store(Box::new(lhs), Box::new(idx), Box::new(val)),
                     span,
                 )
             }
@@ -727,8 +742,11 @@ where
 
     let var_init_core = just(TokenKind::Var)
         .ignore_then(ident.clone())
-        .then_ignore(just(TokenKind::Colon))
-        .then(type_def.clone())
+        .then(
+            just(TokenKind::Colon)
+                .ignore_then(type_def.clone())
+                .or_not(),
+        )
         .then_ignore(just(TokenKind::Equal))
         .then(expr.clone())
         .map_with(|((name, type_def), value), e| VarInit {
@@ -762,6 +780,23 @@ where
             .clone()
             .then_ignore(just(TokenKind::Semicolon))
             .map_with(|var_init, e| Statement::new(StatementKind::VarInit(var_init), e.span()));
+
+        let short_var_decl = ident
+            .clone()
+            .then_ignore(just(TokenKind::ColonEqual))
+            .then(expr.clone())
+            .then_ignore(just(TokenKind::Semicolon))
+            .map_with(|(name, value), e| {
+                Statement::new(
+                    StatementKind::VarInit(VarInit {
+                        name,
+                        type_def: None,
+                        value,
+                        span: e.span(),
+                    }),
+                    e.span(),
+                )
+            });
 
         let if_branch = |kw| {
             just(kw)
@@ -863,6 +898,7 @@ where
         choice((
             cond_stmts,
             var_init_stmt,
+            short_var_decl,
             assignment
                 .then_ignore(just(TokenKind::Semicolon))
                 .map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
@@ -881,8 +917,11 @@ where
 
     let var_init = just(TokenKind::Var)
         .ignore_then(ident.clone())
-        .then_ignore(just(TokenKind::Colon))
-        .then(type_def.clone())
+        .then(
+            just(TokenKind::Colon)
+                .ignore_then(type_def.clone())
+                .or_not(),
+        )
         .then_ignore(just(TokenKind::Equal))
         .then(expr.clone())
         .then_ignore(just(TokenKind::Semicolon))

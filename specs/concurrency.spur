@@ -4,7 +4,7 @@ role Head {
     var db: map<string, Value> = {};
 
     func headWrite(key: string, value: int) {
-        db[key] = value;
+        db = db[key := value];
     }
 
     func AsyncWrite(key: string, value: int) -> bool {
@@ -18,7 +18,7 @@ role Head {
 
     func AsyncRead(key: string) -> Value {
         var p: promise<Value> = create_promise();
-        var f: future<Value> = create_future(p);
+        f := create_future(p);
         headRead(p, key);
         return await f;
     }

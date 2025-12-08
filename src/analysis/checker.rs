@@ -23,7 +23,7 @@ pub enum TypeError {
         found: Type,
         span: Span,
     },
-    #[error("Undefined type name used (this should be caught by resolver)")]
+    #[error("Undefined type name used")]
     UndefinedType(Span),
     #[error("Operator `{op}` cannot be applied to type `{ty}`")]
     InvalidUnaryOp {
@@ -62,12 +62,6 @@ pub enum TypeError {
         found: Type,
         span: Span,
     },
-    #[error("Invalid map value type. Expected `{expected}`, but found `{found}`")]
-    InvalidMapValueType {
-        expected: Type,
-        found: Type,
-        span: Span,
-    },
     #[error("store requires a list or map, found `{ty}`")]
     StoreOnInvalidType { ty: Type, span: Span },
     #[error("Invalid assignment target")]
@@ -102,8 +96,6 @@ pub enum TypeError {
     RpcCallTargetNotRole { ty: Type, span: Span },
     #[error("List operation requires a list type, found `{ty}`")]
     NotAList { ty: Type, span: Span },
-    #[error("Cannot apply operation to role type `{ty}`")]
-    InvalidRoleOperation { ty: Type, span: Span },
     #[error("Operator `!` can only be used on an optional, found `{ty}`")]
     UnwrapOnNonOptional { ty: Type, span: Span },
     #[error("await can only be used on a future, found `{ty}`")]
@@ -170,7 +162,7 @@ impl TypeChecker {
             FunctionSignature {
                 params: vec![Type::String],
                 return_type: unit_type.clone(),
-                is_sync: true, // All builtins are sync
+                is_sync: true,
             },
         );
         builtin_signatures.insert(
@@ -183,7 +175,7 @@ impl TypeChecker {
         );
 
         Self {
-            scopes: vec![HashMap::new()], // Global scope
+            scopes: vec![HashMap::new()],
             type_defs: predefined,
             func_signatures: HashMap::new(),
             builtin_signatures,
@@ -273,7 +265,6 @@ impl TypeChecker {
 
     fn check_role_def(&mut self, role: ResolvedRoleDef) -> Result<TypedRoleDef, TypeError> {
         self.enter_scope();
-
         self.current_func_is_sync = true;
 
         let mut typed_var_inits = Vec::new();
@@ -349,17 +340,22 @@ impl TypeChecker {
     }
 
     fn check_var_init(&mut self, var_init: ResolvedVarInit) -> Result<TypedVarInit, TypeError> {
-        let expected_type = self.resolve_type(&var_init.type_def)?;
-        let typed_value = self.check_expr(var_init.value)?;
+        let (typed_value, type_def) = if let Some(def) = var_init.type_def {
+            let expected_ty = self.resolve_type(&def)?;
+            let typed_val = self.check_expr(var_init.value, &expected_ty)?;
+            (typed_val, expected_ty)
+        } else {
+            let typed_val = self.infer_expr(var_init.value)?;
+            let inferred_ty = typed_val.ty.clone();
+            (typed_val, inferred_ty)
+        };
 
-        let coerced_value =
-            self.check_and_coerce(&expected_type, typed_value, var_init.span, true)?;
-        self.add_var(var_init.name, expected_type.clone());
+        self.add_var(var_init.name, type_def.clone());
         Ok(TypedVarInit {
             name: var_init.name,
             original_name: var_init.original_name,
-            type_def: expected_type,
-            value: coerced_value,
+            type_def,
+            value: typed_value,
             span: var_init.span,
         })
     }
@@ -395,7 +391,7 @@ impl TypeChecker {
                 Ok((typed_stmt, false))
             }
             ResolvedStatementKind::Expr(expr) => {
-                let typed_expr = self.check_expr(expr)?;
+                let typed_expr = self.infer_expr(expr)?;
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::Expr(typed_expr),
                     span,
@@ -403,19 +399,16 @@ impl TypeChecker {
                 Ok((typed_stmt, false))
             }
             ResolvedStatementKind::Return(expr) => {
-                let typed_expr = self.check_expr(expr)?;
-                let coerced_expr;
                 if let Some(expected_return_type) = &self.current_return_type {
-                    coerced_expr =
-                        self.check_and_coerce(expected_return_type, typed_expr, span, true)?;
+                    let typed_expr = self.check_expr(expr, expected_return_type)?;
+                    let typed_stmt = TypedStatement {
+                        kind: TypedStatementKind::Return(typed_expr),
+                        span,
+                    };
+                    Ok((typed_stmt, true))
                 } else {
-                    return Err(TypeError::ReturnOutsideFunction(span));
+                    Err(TypeError::ReturnOutsideFunction(span))
                 }
-                let typed_stmt = TypedStatement {
-                    kind: TypedStatementKind::Return(coerced_expr),
-                    span,
-                };
-                Ok((typed_stmt, true))
             }
             ResolvedStatementKind::ForLoop(for_loop) => {
                 let typed_loop = self.check_for_loop(for_loop)?;
@@ -444,14 +437,7 @@ impl TypeChecker {
                 Ok((typed_stmt, false))
             }
             ResolvedStatementKind::Lock(lock_expr, body) => {
-                let typed_lock_expr = self.check_expr(*lock_expr)?;
-                if typed_lock_expr.ty != Type::Lock {
-                    return Err(TypeError::NotALock {
-                        ty: typed_lock_expr.ty,
-                        span: typed_lock_expr.span,
-                    });
-                }
-
+                let typed_lock_expr = self.check_expr(*lock_expr, &Type::Lock)?;
                 let (typed_body, body_returns) = self.check_block(body)?;
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::Lock(Box::new(typed_lock_expr), typed_body),
@@ -484,8 +470,7 @@ impl TypeChecker {
         &mut self,
         cond: ResolvedCondStmts,
     ) -> Result<(TypedCondStmts, bool), TypeError> {
-        let typed_if_cond = self.check_expr(cond.if_branch.condition)?;
-        self.check_type_compatibility(&Type::Bool, &typed_if_cond.ty, cond.if_branch.span)?;
+        let typed_if_cond = self.check_expr(cond.if_branch.condition, &Type::Bool)?;
         let (typed_if_body, if_returns) = self.check_block(cond.if_branch.body)?;
         let typed_if_branch = TypedIfBranch {
             condition: typed_if_cond,
@@ -496,8 +481,7 @@ impl TypeChecker {
         let mut all_branches_return = if_returns;
         let mut typed_elseif_branches = Vec::new();
         for elseif in cond.elseif_branches {
-            let typed_elseif_cond = self.check_expr(elseif.condition)?;
-            self.check_type_compatibility(&Type::Bool, &typed_elseif_cond.ty, elseif.span)?;
+            let typed_elseif_cond = self.check_expr(elseif.condition, &Type::Bool)?;
             let (typed_elseif_body, elseif_returns) = self.check_block(elseif.body)?;
 
             typed_elseif_branches.push(TypedIfBranch {
@@ -547,9 +531,7 @@ impl TypeChecker {
         };
 
         let typed_condition = if let Some(condition) = for_loop.condition {
-            let typed_cond = self.check_expr(condition)?;
-            self.check_type_compatibility(&Type::Bool, &typed_cond.ty, for_loop.span)?;
-            Some(typed_cond)
+            Some(self.check_expr(condition, &Type::Bool)?)
         } else {
             None
         };
@@ -581,7 +563,7 @@ impl TypeChecker {
         &mut self,
         for_in_loop: ResolvedForInLoop,
     ) -> Result<TypedForInLoop, TypeError> {
-        let typed_iterable = self.check_expr(for_in_loop.iterable)?;
+        let typed_iterable = self.infer_expr(for_in_loop.iterable)?;
 
         let element_type = match &typed_iterable.ty {
             Type::List(elem_ty) => (**elem_ty).clone(),
@@ -671,14 +653,12 @@ impl TypeChecker {
             return Err(TypeError::InvalidAssignmentTarget(assign.span));
         }
 
-        let typed_target = self.check_expr(assign.target)?;
-        let typed_value = self.check_expr(assign.value)?;
+        let typed_target = self.infer_expr(assign.target)?;
+        let typed_value = self.check_expr(assign.value, &typed_target.ty)?;
 
-        let coerced_value =
-            self.check_and_coerce(&typed_target.ty, typed_value, assign.span, true)?;
         Ok(TypedAssignment {
             target: typed_target,
-            value: coerced_value,
+            value: typed_value,
             span: assign.span,
         })
     }
@@ -709,8 +689,8 @@ impl TypeChecker {
                     return Ok((current_id, fields));
                 }
                 TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
-                    ResolvedTypeDef::Named(next_id),
-                )) => {
+                                                ResolvedTypeDef::Named(next_id),
+                                            )) => {
                     current_id = *next_id;
                 }
                 _ => {
@@ -730,7 +710,59 @@ impl TypeChecker {
         }
     }
 
-    fn check_expr(&self, expr: ResolvedExpr) -> Result<TypedExpr, TypeError> {
+    fn check_expr(
+        &self,
+        expr: ResolvedExpr,
+        expected: &Type,
+    ) -> Result<TypedExpr, TypeError> {
+        let span = expr.span;
+        match (&expr.kind, expected) {
+            (ResolvedExprKind::NilLit, Type::Optional(_)) => Ok(TypedExpr {
+                kind: TypedExprKind::NilLit,
+                ty: expected.clone(),
+                span,
+            }),
+
+            (ResolvedExprKind::ListLit(items), Type::List(elem_ty)) => {
+                let mut typed_items = Vec::new();
+                for item in items.clone() {
+                    typed_items.push(self.check_expr(item, elem_ty)?);
+                }
+                Ok(TypedExpr {
+                    kind: TypedExprKind::ListLit(typed_items),
+                    ty: expected.clone(),
+                    span,
+                })
+            }
+
+            (ResolvedExprKind::MapLit(pairs), Type::Map(key_ty, val_ty)) => {
+                let mut typed_pairs = Vec::new();
+                for (key, val) in pairs.clone() {
+                    let typed_key = self.check_expr(key, key_ty)?;
+                    let typed_val = self.check_expr(val, val_ty)?;
+                    typed_pairs.push((typed_key, typed_val));
+                }
+                Ok(TypedExpr {
+                    kind: TypedExprKind::MapLit(typed_pairs),
+                    ty: expected.clone(),
+                    span,
+                })
+            }
+
+            (ResolvedExprKind::StructLit(struct_id, fields), Type::Struct(expected_id, _))
+            if *struct_id == *expected_id =>
+                {
+                    self.check_struct_literal(*struct_id, fields.clone(), span)
+                }
+
+            _ => {
+                let inferred = self.infer_expr(expr)?;
+                self.check_types_match(inferred, expected)
+            }
+        }
+    }
+
+    fn infer_expr(&self, expr: ResolvedExpr) -> Result<TypedExpr, TypeError> {
         let span = expr.span;
         match expr.kind {
             ResolvedExprKind::Var(name_id, name) => {
@@ -761,10 +793,9 @@ impl TypeChecker {
                 ty: Type::Nil,
                 span,
             }),
-            ResolvedExprKind::BinOp(op, left, right) => self.check_binop(op, *left, *right, span),
+            ResolvedExprKind::BinOp(op, left, right) => self.infer_binop(op, *left, *right, span),
             ResolvedExprKind::Not(e) => {
-                let typed_e = self.check_expr(*e)?;
-                self.check_type_compatibility(&Type::Bool, &typed_e.ty, span)?;
+                let typed_e = self.check_expr(*e, &Type::Bool)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::Not(Box::new(typed_e)),
                     ty: Type::Bool,
@@ -772,8 +803,7 @@ impl TypeChecker {
                 })
             }
             ResolvedExprKind::Negate(e) => {
-                let typed_e = self.check_expr(*e)?;
-                self.check_type_compatibility(&Type::Int, &typed_e.ty, span)?;
+                let typed_e = self.check_expr(*e, &Type::Int)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::Negate(Box::new(typed_e)),
                     ty: Type::Int,
@@ -806,13 +836,13 @@ impl TypeChecker {
                 }
             },
 
-            ResolvedExprKind::MapLit(pairs) => self.check_map_literal(pairs, span),
-            ResolvedExprKind::ListLit(items) => self.check_list_literal(items, span),
+            ResolvedExprKind::MapLit(pairs) => self.infer_map_literal(pairs, span),
+            ResolvedExprKind::ListLit(items) => self.infer_list_literal(items, span),
             ResolvedExprKind::TupleLit(items) => {
                 let mut typed_items = Vec::new();
                 let mut types = Vec::new();
                 for item in items {
-                    let typed_item = self.check_expr(item)?;
+                    let typed_item = self.infer_expr(item)?;
                     types.push(typed_item.ty.clone());
                     typed_items.push(typed_item);
                 }
@@ -823,13 +853,12 @@ impl TypeChecker {
                 })
             }
             ResolvedExprKind::Append(list_expr, item_expr) => {
-                let typed_list = self.check_expr(*list_expr)?;
-                let typed_item = self.check_expr(*item_expr)?;
+                let typed_list = self.infer_expr(*list_expr)?;
+                let typed_item = self.infer_expr(*item_expr)?;
 
                 let (list_ty, coerced_item) = match typed_list.ty.clone() {
                     Type::List(elem_ty) => {
-                        let coerced =
-                            self.check_and_coerce(elem_ty.as_ref(), typed_item, span, true)?;
+                        let coerced = self.check_types_match(typed_item, &elem_ty)?;
                         (Type::List(elem_ty), coerced)
                     }
                     Type::EmptyList => (Type::List(Box::new(typed_item.ty.clone())), typed_item),
@@ -848,13 +877,12 @@ impl TypeChecker {
                 })
             }
             ResolvedExprKind::Prepend(item_expr, list_expr) => {
-                let typed_item = self.check_expr(*item_expr)?;
-                let typed_list = self.check_expr(*list_expr)?;
+                let typed_item = self.infer_expr(*item_expr)?;
+                let typed_list = self.infer_expr(*list_expr)?;
 
                 let (list_ty, coerced_item) = match typed_list.ty.clone() {
                     Type::List(elem_ty) => {
-                        let coerced =
-                            self.check_and_coerce(elem_ty.as_ref(), typed_item, span, true)?;
+                        let coerced = self.check_types_match(typed_item, &elem_ty)?;
                         (Type::List(elem_ty), coerced)
                     }
                     Type::EmptyList => (Type::List(Box::new(typed_item.ty.clone())), typed_item),
@@ -873,19 +901,14 @@ impl TypeChecker {
                 })
             }
             ResolvedExprKind::Store(collection, key, value) => {
-                let typed_collection = self.check_expr(*collection)?;
-                let typed_key = self.check_expr(*key)?;
-                let typed_value = self.check_expr(*value)?;
+                let typed_collection = self.infer_expr(*collection)?;
+                let typed_key = self.infer_expr(*key)?;
+                let typed_value = self.infer_expr(*value)?;
 
                 match typed_collection.ty.clone() {
                     Type::List(elem_ty) => {
                         self.check_type_compatibility(&Type::Int, &typed_key.ty, span)?;
-                        let coerced_value = self.check_and_coerce(
-                            &elem_ty,
-                            typed_value,
-                            span,
-                            true,
-                        )?;
+                        let coerced_value = self.check_types_match(typed_value, &elem_ty)?;
                         Ok(TypedExpr {
                             kind: TypedExprKind::Store(
                                 Box::new(typed_collection.clone()),
@@ -898,12 +921,7 @@ impl TypeChecker {
                     }
                     Type::Map(key_ty, val_ty) => {
                         self.check_type_compatibility(&key_ty, &typed_key.ty, span)?;
-                        let coerced_value = self.check_and_coerce(
-                            &val_ty,
-                            typed_value,
-                            span,
-                            true,
-                        )?;
+                        let coerced_value = self.check_types_match(typed_value, &val_ty)?;
                         Ok(TypedExpr {
                             kind: TypedExprKind::Store(
                                 Box::new(typed_collection.clone()),
@@ -921,7 +939,7 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::Head(list_expr) => {
-                let typed_list = self.check_expr(*list_expr)?;
+                let typed_list = self.infer_expr(*list_expr)?;
                 if let Type::List(elem_ty) = typed_list.ty.clone() {
                     Ok(TypedExpr {
                         kind: TypedExprKind::Head(Box::new(typed_list)),
@@ -936,7 +954,7 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::Tail(list_expr) => {
-                let typed_list = self.check_expr(*list_expr)?;
+                let typed_list = self.infer_expr(*list_expr)?;
                 if let Type::List(_) = &typed_list.ty {
                     Ok(TypedExpr {
                         kind: TypedExprKind::Tail(Box::new(typed_list.clone())),
@@ -951,7 +969,7 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::Len(expr) => {
-                let typed_e = self.check_expr(*expr)?;
+                let typed_e = self.infer_expr(*expr)?;
                 match typed_e.ty {
                     Type::List(_) | Type::Map(_, _) | Type::String => Ok(TypedExpr {
                         kind: TypedExprKind::Len(Box::new(typed_e)),
@@ -966,10 +984,8 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::Min(left, right) => {
-                let typed_left = self.check_expr(*left)?;
-                let typed_right = self.check_expr(*right)?;
-                self.check_type_compatibility(&Type::Int, &typed_left.ty, span)?;
-                self.check_type_compatibility(&Type::Int, &typed_right.ty, span)?;
+                let typed_left = self.check_expr(*left, &Type::Int)?;
+                let typed_right = self.check_expr(*right, &Type::Int)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::Min(Box::new(typed_left), Box::new(typed_right)),
                     ty: Type::Int,
@@ -977,8 +993,8 @@ impl TypeChecker {
                 })
             }
             ResolvedExprKind::Exists(map_expr, key_expr) => {
-                let typed_map = self.check_expr(*map_expr)?;
-                let typed_key = self.check_expr(*key_expr)?;
+                let typed_map = self.infer_expr(*map_expr)?;
+                let typed_key = self.infer_expr(*key_expr)?;
 
                 if let Type::Map(expected_key_ty, _) = &typed_map.ty {
                     self.check_type_compatibility(expected_key_ty, &typed_key.ty, span)?;
@@ -996,8 +1012,8 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::Erase(map_expr, key_expr) => {
-                let typed_map = self.check_expr(*map_expr)?;
-                let typed_key = self.check_expr(*key_expr)?;
+                let typed_map = self.infer_expr(*map_expr)?;
+                let typed_key = self.infer_expr(*key_expr)?;
 
                 if let Type::Map(expected_key_ty, _) = &typed_map.ty {
                     self.check_type_compatibility(expected_key_ty, &typed_key.ty, span)?;
@@ -1023,7 +1039,7 @@ impl TypeChecker {
                 span,
             }),
             ResolvedExprKind::CreateFuture(promise_expr) => {
-                let typed_promise = self.check_expr(*promise_expr)?;
+                let typed_promise = self.infer_expr(*promise_expr)?;
                 match typed_promise.ty.clone() {
                     Type::Promise(inner_ty) => Ok(TypedExpr {
                         kind: TypedExprKind::CreateFuture(Box::new(typed_promise)),
@@ -1037,25 +1053,16 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::ResolvePromise(promise_expr, value_expr) => {
-                let typed_promise = self.check_expr(*promise_expr)?;
-                let typed_value = self.check_expr(*value_expr)?;
-
-                let value_span = typed_value.span.clone();
-
+                let typed_promise = self.infer_expr(*promise_expr)?;
                 match typed_promise.ty.clone() {
                     Type::Promise(inner_ty) => {
-                        let coerced_value = self.check_and_coerce(
-                            inner_ty.as_ref(),
-                            typed_value,
-                            value_span,
-                            true,
-                        )?;
+                        let typed_value = self.check_expr(*value_expr, &inner_ty)?;
                         Ok(TypedExpr {
                             kind: TypedExprKind::ResolvePromise(
                                 Box::new(typed_promise),
-                                Box::new(coerced_value),
+                                Box::new(typed_value),
                             ),
-                            ty: Type::Tuple(vec![]), // unit
+                            ty: Type::Tuple(vec![]),
                             span,
                         })
                     }
@@ -1070,14 +1077,11 @@ impl TypeChecker {
                 ty: Type::Lock,
                 span,
             }),
-            ResolvedExprKind::Index(target, index) => self.check_index(*target, *index, span),
+            ResolvedExprKind::Index(target, index) => self.infer_index(*target, *index, span),
             ResolvedExprKind::Slice(target, start, end) => {
-                let typed_target = self.check_expr(*target)?;
-                let typed_start = self.check_expr(*start)?;
-                let typed_end = self.check_expr(*end)?;
-
-                self.check_type_compatibility(&Type::Int, &typed_start.ty, span)?;
-                self.check_type_compatibility(&Type::Int, &typed_end.ty, span)?;
+                let typed_target = self.infer_expr(*target)?;
+                let typed_start = self.check_expr(*start, &Type::Int)?;
+                let typed_end = self.check_expr(*end, &Type::Int)?;
 
                 match typed_target.ty.clone() {
                     Type::List(_) | Type::String => Ok(TypedExpr {
@@ -1096,7 +1100,7 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::TupleAccess(tuple_expr, index) => {
-                let typed_tuple = self.check_expr(*tuple_expr)?;
+                let typed_tuple = self.infer_expr(*tuple_expr)?;
                 if let Type::Tuple(types) = typed_tuple.ty.clone() {
                     if index < types.len() {
                         Ok(TypedExpr {
@@ -1119,7 +1123,7 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::FieldAccess(struct_expr, field_name) => {
-                let typed_struct = self.check_expr(*struct_expr)?;
+                let typed_struct = self.infer_expr(*struct_expr)?;
                 if matches!(typed_struct.ty, Type::Optional(_)) {
                     return Err(TypeError::NotAStruct {
                         ty: typed_struct.ty,
@@ -1143,7 +1147,7 @@ impl TypeChecker {
                 }
             }
             ResolvedExprKind::Unwrap(e) => {
-                let typed_e = self.check_expr(*e)?;
+                let typed_e = self.infer_expr(*e)?;
                 let inner_ty = typed_e.ty.clone();
 
                 match inner_ty {
@@ -1159,7 +1163,7 @@ impl TypeChecker {
                 self.check_struct_literal(struct_id, fields, span)
             }
             ResolvedExprKind::RpcCall(target, call) => {
-                let typed_target = self.check_expr(*target)?;
+                let typed_target = self.infer_expr(*target)?;
                 let role_id = match &typed_target.ty {
                     Type::Role(id, _) => *id,
                     _ => {
@@ -1208,7 +1212,7 @@ impl TypeChecker {
                 if self.current_func_is_sync {
                     return Err(TypeError::AwaitInSyncFunc { span });
                 }
-                let typed_future = self.check_expr(*e)?;
+                let typed_future = self.infer_expr(*e)?;
                 match typed_future.ty.clone() {
                     Type::Future(inner_ty) => Ok(TypedExpr {
                         kind: TypedExprKind::Await(Box::new(typed_future)),
@@ -1225,39 +1229,80 @@ impl TypeChecker {
                 if self.current_func_is_sync {
                     return Err(TypeError::SpinAwaitInSyncFunc { span });
                 }
-                let typed_bool = self.check_expr(*e)?;
-                match typed_bool.ty.clone() {
-                    Type::Bool => Ok(TypedExpr {
-                        kind: TypedExprKind::SpinAwait(Box::new(typed_bool)),
-                        ty: Type::Tuple(vec![]), // Evaluates to unit
-                        span,
-                    }),
-                    _ => Err(TypeError::SpinAwaitOnNonBool {
-                        ty: typed_bool.ty,
-                        span: typed_bool.span,
-                    }),
-                }
+                let typed_bool = self.check_expr(*e, &Type::Bool)?;
+                Ok(TypedExpr {
+                    kind: TypedExprKind::SpinAwait(Box::new(typed_bool)),
+                    ty: Type::Tuple(vec![]),
+                    span,
+                })
             }
         }
     }
 
-    fn check_binop(
+    fn check_types_match(
+        &self,
+        mut typed_expr: TypedExpr,
+        expected: &Type,
+    ) -> Result<TypedExpr, TypeError> {
+        let actual = &typed_expr.ty;
+
+        if actual == expected {
+            return Ok(typed_expr);
+        }
+
+        if let (Type::List(e), Type::EmptyList) = (expected, actual) {
+            typed_expr.ty = Type::List(e.clone());
+            return Ok(typed_expr);
+        }
+        if let (Type::Map(k, v), Type::EmptyMap) = (expected, actual) {
+            typed_expr.ty = Type::Map(k.clone(), v.clone());
+            return Ok(typed_expr);
+        }
+        if let (Type::Promise(p), Type::EmptyPromise) = (expected, actual) {
+            typed_expr.ty = Type::Promise(p.clone());
+            return Ok(typed_expr);
+        }
+
+        if let Type::Optional(expected_inner) = expected {
+            if *actual == Type::Nil {
+                typed_expr.ty = expected.clone();
+                return Ok(typed_expr);
+            }
+
+            if let Type::Optional(actual_inner) = actual {
+                return self
+                    .check_type_compatibility(expected_inner, actual_inner, typed_expr.span)
+                    .map(|_| typed_expr);
+            }
+
+            let span = typed_expr.span.clone();
+            if self
+                .check_type_compatibility(expected_inner, actual, span)
+                .is_ok()
+            {
+                return Ok(TypedExpr {
+                    kind: TypedExprKind::WrapInOptional(Box::new(typed_expr)),
+                    ty: expected.clone(),
+                    span,
+                });
+            }
+        }
+
+        self.check_type_compatibility(expected, actual, typed_expr.span)?;
+        Ok(typed_expr)
+    }
+
+    fn infer_binop(
         &self,
         op: BinOp,
         left: ResolvedExpr,
         right: ResolvedExpr,
         span: Span,
     ) -> Result<TypedExpr, TypeError> {
-        let typed_left = self.check_expr(left)?;
-        let typed_right = self.check_expr(right)?;
-
-        let left_ty = typed_left.ty.clone();
-        let right_ty = typed_right.ty.clone();
-
         match op {
             BinOp::Add | BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {
-                self.check_type_compatibility(&Type::Int, &left_ty, typed_left.span)?;
-                self.check_type_compatibility(&Type::Int, &right_ty, typed_right.span)?;
+                let typed_left = self.check_expr(left, &Type::Int)?;
+                let typed_right = self.check_expr(right, &Type::Int)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                     ty: Type::Int,
@@ -1265,14 +1310,14 @@ impl TypeChecker {
                 })
             }
             BinOp::Equal | BinOp::NotEqual => {
+                let typed_left = self.infer_expr(left)?;
+                let typed_right = self.infer_expr(right)?;
                 let (coerced_left, coerced_right) = self.check_and_coerce_symmetric(
                     typed_left,
                     typed_right,
                     op.clone(),
                     span,
-                    false,
                 )?;
-
                 Ok(TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(coerced_left), Box::new(coerced_right)),
                     ty: Type::Bool,
@@ -1280,8 +1325,8 @@ impl TypeChecker {
                 })
             }
             BinOp::Less | BinOp::LessEqual | BinOp::Greater | BinOp::GreaterEqual => {
-                self.check_type_compatibility(&Type::Int, &left_ty, typed_left.span)?;
-                self.check_type_compatibility(&Type::Int, &right_ty, typed_right.span)?;
+                let typed_left = self.check_expr(left, &Type::Int)?;
+                let typed_right = self.check_expr(right, &Type::Int)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                     ty: Type::Bool,
@@ -1289,8 +1334,8 @@ impl TypeChecker {
                 })
             }
             BinOp::And | BinOp::Or => {
-                self.check_type_compatibility(&Type::Bool, &left_ty, typed_left.span)?;
-                self.check_type_compatibility(&Type::Bool, &right_ty, typed_right.span)?;
+                let typed_left = self.check_expr(left, &Type::Bool)?;
+                let typed_right = self.check_expr(right, &Type::Bool)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                     ty: Type::Bool,
@@ -1298,14 +1343,14 @@ impl TypeChecker {
                 })
             }
             BinOp::Coalesce => {
-                if let Type::Optional(inner_ty) = left_ty.clone() {
-                    let coerced_right =
-                        self.check_and_coerce(inner_ty.as_ref(), typed_right, span, true)?;
+                let typed_left = self.infer_expr(left)?;
+                if let Type::Optional(inner_ty) = typed_left.ty.clone() {
+                    let typed_right = self.check_expr(right, &inner_ty)?;
                     Ok(TypedExpr {
                         kind: TypedExprKind::BinOp(
                             op,
                             Box::new(typed_left),
-                            Box::new(coerced_right),
+                            Box::new(typed_right),
                         ),
                         ty: *inner_ty,
                         span,
@@ -1313,8 +1358,8 @@ impl TypeChecker {
                 } else {
                     Err(TypeError::InvalidBinOp {
                         op: BinOp::Coalesce,
-                        left: left_ty,
-                        right: right_ty,
+                        left: typed_left.ty,
+                        right: Type::Nil,
                         span,
                     })
                 }
@@ -1328,30 +1373,21 @@ impl TypeChecker {
         typed_right: TypedExpr,
         op: BinOp,
         span: Span,
-        wrap_optional: bool,
     ) -> Result<(TypedExpr, TypedExpr), TypeError> {
         let left_ty = typed_left.ty.clone();
         let right_ty = typed_right.ty.clone();
 
-        match self.check_and_coerce(
-            &left_ty,
-            typed_right.clone(),
-            typed_right.span.clone(),
-            wrap_optional,
-        ) {
+        match self.check_types_match(typed_right.clone(), &left_ty) {
             Ok(coerced_right) => Ok((typed_left, coerced_right)),
-            Err(_) => {
-                let left_span = typed_left.span.clone();
-                match self.check_and_coerce(&right_ty, typed_left, left_span, wrap_optional) {
-                    Ok(coerced_left) => Ok((coerced_left, typed_right)),
-                    Err(_) => Err(TypeError::InvalidBinOp {
-                        op,
-                        left: left_ty,
-                        right: right_ty,
-                        span,
-                    }),
-                }
-            }
+            Err(_) => match self.check_types_match(typed_left.clone(), &right_ty) {
+                Ok(coerced_left) => Ok((coerced_left, typed_right)),
+                Err(_) => Err(TypeError::InvalidBinOp {
+                    op,
+                    left: left_ty,
+                    right: right_ty,
+                    span,
+                }),
+            },
         }
     }
 
@@ -1370,11 +1406,9 @@ impl TypeChecker {
         }
 
         let mut typed_args = Vec::new();
-        for (arg, param_ty) in args.into_iter().zip(expected_params.iter()) {
-            let typed_arg = self.check_expr(arg)?;
-            let arg_span = typed_arg.span.clone();
-            let coerced_arg = self.check_and_coerce(param_ty, typed_arg, arg_span, true)?;
-            typed_args.push(coerced_arg);
+        for (arg, expected_ty) in args.into_iter().zip(expected_params.iter()) {
+            let typed_arg = self.check_expr(arg, expected_ty)?;
+            typed_args.push(typed_arg);
         }
         Ok(typed_args)
     }
@@ -1419,14 +1453,14 @@ impl TypeChecker {
         })
     }
 
-    fn check_index(
+    fn infer_index(
         &self,
         target: ResolvedExpr,
         index: ResolvedExpr,
         span: Span,
     ) -> Result<TypedExpr, TypeError> {
-        let typed_target = self.check_expr(target)?;
-        let typed_index = self.check_expr(index)?;
+        let typed_target = self.infer_expr(target)?;
+        let typed_index = self.infer_expr(index)?;
 
         let target_ty = typed_target.ty.clone();
         let index_ty = typed_index.ty.clone();
@@ -1463,7 +1497,7 @@ impl TypeChecker {
         }
     }
 
-    fn check_list_literal(
+    fn infer_list_literal(
         &self,
         mut items: Vec<ResolvedExpr>,
         span: Span,
@@ -1477,15 +1511,13 @@ impl TypeChecker {
         }
 
         let mut typed_items = Vec::new();
-        let first_typed = self.check_expr(items.remove(0))?;
+        let first_typed = self.infer_expr(items.remove(0))?;
         let first_ty = first_typed.ty.clone();
         typed_items.push(first_typed);
 
         for item in items {
-            let typed_item = self.check_expr(item)?;
-            let item_span = typed_item.span.clone();
-            let coerced_item = self.check_and_coerce(&first_ty, typed_item, item_span, true)?;
-            typed_items.push(coerced_item);
+            let typed_item = self.check_expr(item, &first_ty)?;
+            typed_items.push(typed_item);
         }
 
         Ok(TypedExpr {
@@ -1495,7 +1527,7 @@ impl TypeChecker {
         })
     }
 
-    fn check_map_literal(
+    fn infer_map_literal(
         &self,
         mut pairs: Vec<(ResolvedExpr, ResolvedExpr)>,
         span: Span,
@@ -1509,22 +1541,17 @@ impl TypeChecker {
         }
 
         let (first_key, first_val) = pairs.remove(0);
-        let typed_first_key = self.check_expr(first_key)?;
-        let typed_first_val = self.check_expr(first_val)?;
+        let typed_first_key = self.infer_expr(first_key)?;
+        let typed_first_val = self.infer_expr(first_val)?;
         let key_ty = typed_first_key.ty.clone();
         let val_ty = typed_first_val.ty.clone();
 
         let mut typed_pairs = vec![(typed_first_key, typed_first_val)];
 
         for (key, val) in pairs {
-            let typed_key = self.check_expr(key)?;
-            let typed_val = self.check_expr(val)?;
-            let key_span = typed_key.span.clone();
-            let val_span = typed_val.span.clone();
-
-            let coerced_key = self.check_and_coerce(&key_ty, typed_key, key_span, true)?;
-            let coerced_val = self.check_and_coerce(&val_ty, typed_val, val_span, true)?;
-            typed_pairs.push((coerced_key, coerced_val));
+            let typed_key = self.check_expr(key, &key_ty)?;
+            let typed_val = self.check_expr(val, &val_ty)?;
+            typed_pairs.push((typed_key, typed_val));
         }
 
         Ok(TypedExpr {
@@ -1533,6 +1560,7 @@ impl TypeChecker {
             span,
         })
     }
+
     fn check_struct_literal(
         &self,
         struct_id: NameId,
@@ -1552,11 +1580,8 @@ impl TypeChecker {
                 })?;
 
             let expected_ty = self.resolve_type(&field_def.type_def)?;
-            let typed_field_expr = self.check_expr(field_expr)?;
-            let field_span = typed_field_expr.span.clone();
-            let coerced_expr =
-                self.check_and_coerce(&expected_ty, typed_field_expr, field_span, true)?;
-            typed_fields.push((field_name, coerced_expr));
+            let typed_field_expr = self.check_expr(field_expr, &expected_ty)?;
+            typed_fields.push((field_name, typed_field_expr));
         }
 
         for field_def in field_defs {
@@ -1616,8 +1641,8 @@ impl TypeChecker {
                             Ok(Type::Struct(*name_id, name))
                         }
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
-                            aliased_type,
-                        )) => self.resolve_type(aliased_type),
+                                                        aliased_type,
+                                                    )) => self.resolve_type(aliased_type),
                     }
                 } else if let Some(role_name) = self.role_defs.get(name_id) {
                     Ok(Type::Role(*name_id, role_name.clone()))
@@ -1703,70 +1728,6 @@ impl TypeChecker {
         }
         if let (Type::Future(expected_inner), Type::Future(actual_inner)) = (expected, actual) {
             return self.check_type_compatibility(expected_inner, actual_inner, span);
-        }
-
-        Err(TypeError::Mismatch {
-            expected: expected.clone(),
-            found: actual.clone(),
-            span,
-        })
-    }
-
-    fn check_and_coerce(
-        &self,
-        expected: &Type,
-        mut actual_expr: TypedExpr,
-        span: Span,
-        wrap_optional: bool,
-    ) -> Result<TypedExpr, TypeError> {
-        let actual = &actual_expr.ty;
-
-        if expected == actual {
-            return Ok(actual_expr);
-        }
-
-        if let (Type::List(e), Type::EmptyList) = (expected, actual) {
-            actual_expr.ty = Type::List(e.clone());
-            return Ok(actual_expr);
-        }
-        if let (Type::Map(k, v), Type::EmptyMap) = (expected, actual) {
-            actual_expr.ty = Type::Map(k.clone(), v.clone());
-            return Ok(actual_expr);
-        }
-        if let (Type::Promise(p), Type::EmptyPromise) = (expected, actual) {
-            actual_expr.ty = Type::Promise(p.clone());
-            return Ok(actual_expr);
-        }
-
-        if let Type::Optional(expected_inner) = expected {
-            if *actual == Type::Nil {
-                actual_expr.ty = expected.clone();
-                return Ok(actual_expr);
-            }
-
-            if let Type::Optional(actual_inner) = actual {
-                return self
-                    .check_type_compatibility(expected_inner, actual_inner, span)
-                    .map(|_| actual_expr);
-            }
-
-            if wrap_optional
-                && self
-                    .check_type_compatibility(expected_inner, actual, span)
-                    .is_ok()
-            {
-                return Ok(TypedExpr {
-                    kind: TypedExprKind::WrapInOptional(Box::new(actual_expr)),
-                    ty: expected.clone(),
-                    span,
-                });
-            }
-        }
-
-        if let (Type::Future(expected_inner), Type::Future(actual_inner)) = (expected, actual) {
-            return self
-                .check_type_compatibility(expected_inner, actual_inner, span)
-                .map(|_| actual_expr);
         }
 
         Err(TypeError::Mismatch {
