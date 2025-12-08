@@ -62,6 +62,8 @@ pub enum TypeError {
         found: Type,
         span: Span,
     },
+    #[error("Invalid struct key type. Expected `string`, but found `{found}`")]
+    InvalidStructKeyType { found: Type, span: Span },
     #[error("store requires a list or map, found `{ty}`")]
     StoreOnInvalidType { ty: Type, span: Span },
     #[error("Invalid assignment target")]
@@ -898,31 +900,63 @@ impl TypeChecker {
             }
             ResolvedExprKind::Store(collection, key, value) => {
                 let typed_collection = self.infer_expr(*collection)?;
-                let typed_key = self.infer_expr(*key)?;
-                let typed_value = self.infer_expr(*value)?;
 
                 match typed_collection.ty.clone() {
                     Type::List(elem_ty) => {
+                        let typed_key = self.infer_expr(*key)?;
                         self.check_type_compatibility(&Type::Int, &typed_key.ty, span)?;
-                        let coerced_value = self.check_types_match(typed_value, &elem_ty)?;
+
+                        let typed_value = self.check_expr(*value, &elem_ty)?;
+
                         Ok(TypedExpr {
                             kind: TypedExprKind::Store(
                                 Box::new(typed_collection.clone()),
                                 Box::new(typed_key),
-                                Box::new(coerced_value),
+                                Box::new(typed_value),
                             ),
                             ty: typed_collection.ty,
                             span,
                         })
                     }
                     Type::Map(key_ty, val_ty) => {
-                        self.check_type_compatibility(&key_ty, &typed_key.ty, span)?;
-                        let coerced_value = self.check_types_match(typed_value, &val_ty)?;
+                        let typed_key = self.check_expr(*key, &key_ty)?;
+                        let typed_value = self.check_expr(*value, &val_ty)?;
+
                         Ok(TypedExpr {
                             kind: TypedExprKind::Store(
                                 Box::new(typed_collection.clone()),
                                 Box::new(typed_key),
-                                Box::new(coerced_value),
+                                Box::new(typed_value),
+                            ),
+                            ty: typed_collection.ty,
+                            span,
+                        })
+                    }
+                    Type::Struct(struct_id, _) => {
+                        let key_span = key.span;
+                        let field_name = if let ResolvedExprKind::StringLit(s) = &key.kind {
+                            s.clone()
+                        } else {
+                            return Err(TypeError::InvalidStructKeyType {
+                                found: self.infer_expr(*key)?.ty,
+                                span: key_span,
+                            });
+                        };
+
+                        let field_ty = self.get_field_type(struct_id, &field_name, span)?;
+                        let typed_value = self.check_expr(*value, &field_ty)?;
+
+                        let typed_key = TypedExpr {
+                            kind: TypedExprKind::StringLit(field_name),
+                            ty: Type::String,
+                            span: key_span,
+                        };
+
+                        Ok(TypedExpr {
+                            kind: TypedExprKind::Store(
+                                Box::new(typed_collection.clone()),
+                                Box::new(typed_key),
+                                Box::new(typed_value),
                             ),
                             ty: typed_collection.ty,
                             span,

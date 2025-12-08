@@ -315,6 +315,25 @@ where
     )
 }
 
+fn unwind_update(lhs: Expr, key: Expr, value: Expr, span: Span) -> Expr {
+    let store_lhs = lhs.clone();
+    let current_update = Expr::new(
+        ExprKind::Store(Box::new(store_lhs), Box::new(key), Box::new(value)),
+        span,
+    );
+
+    match lhs.kind {
+        ExprKind::FieldAccess(parent, field_name) => {
+            let parent_key = Expr::new(ExprKind::StringLit(field_name), span);
+            unwind_update(*parent, parent_key, current_update, span)
+        }
+        ExprKind::Index(parent, index_expr) => {
+            unwind_update(*parent, *index_expr, current_update, span)
+        }
+        _ => current_update,
+    }
+}
+
 fn program<'a, I>() -> impl Parser<'a, I, Program, extra::Err<Rich<'a, TokenKind>>>
 where
     I: BorrowInput<'a, Token = TokenKind, Span = SimpleSpan> + Clone,
@@ -582,10 +601,7 @@ where
         ))
         .map_with(|kind, e| Expr::new(kind, e.span()));
 
-        let primary_base = choice((
-            paren_expr, // Try to parse (expr) first
-            atom,       // Then try all other atoms
-        ));
+        let primary_base = choice((paren_expr, atom));
 
         #[derive(Clone)]
         enum PostfixOp {
@@ -594,6 +610,7 @@ where
             IndexUpdate(Expr, Expr),
             TupleAccess(usize, Span),
             FieldAccess(String, Span),
+            FieldUpdate(String, Expr),
             Unwrap(Span),
             RpcCall(FuncCall),
         }
@@ -615,6 +632,12 @@ where
                 .then(expr.clone())
                 .delimited_by(just(TokenKind::LeftBracket), just(TokenKind::RightBracket))
                 .map(|(start, end)| PostfixOp::Slice(start, end)),
+            // Field Update: .ID := expr
+            just(TokenKind::Dot)
+                .ignore_then(ident.clone())
+                .then_ignore(just(TokenKind::ColonEqual))
+                .then(expr.clone())
+                .map_with(|(name, val), _| PostfixOp::FieldUpdate(name, val)),
             // Tuple Access: .INT
             just(TokenKind::Dot)
                 .ignore_then(select! { TokenKind::Integer(i) => i as usize })
@@ -644,10 +667,12 @@ where
             }
             PostfixOp::IndexUpdate(idx, val) => {
                 let span = lhs.span.union(val.span);
-                Expr::new(
-                    ExprKind::Store(Box::new(lhs), Box::new(idx), Box::new(val)),
-                    span,
-                )
+                unwind_update(lhs, idx, val, span)
+            }
+            PostfixOp::FieldUpdate(name, val) => {
+                let span = lhs.span.union(val.span);
+                let key = Expr::new(ExprKind::StringLit(name), span);
+                unwind_update(lhs, key, val, span)
             }
             PostfixOp::TupleAccess(idx, op_span) => {
                 let span = lhs.span.union(op_span);
@@ -1022,7 +1047,6 @@ where
 
     let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type)));
 
-    // --- Final Program Parser ---
     top_level_def
         .repeated()
         .collect()

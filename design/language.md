@@ -120,6 +120,7 @@ postfix_op ::=
 | '[' expr ':=' expr ']'
 | '.' INT
 | '.' ID
+| '.' ID ':=' expr
 | '!'
 | '->' func_call
 
@@ -158,6 +159,48 @@ The type system is composed of:
 
 Primitives and tuples are passed by value.
 All other types are passed by reference.
+
+## Struct Updates
+
+Spur provides immutable update syntax for structs, maps, and lists using the `:=` operator.
+This allows you to create a modified copy without mutating the original.
+
+### Field Update Syntax
+
+You can update struct fields using the `.field := value` syntax:
+
+```
+var updated = record.address.city := "New York";
+```
+
+This creates a copy of `record` with the nested field `address.city` updated to `"New York"`.
+All intermediate structures are copied to preserve immutability.
+
+### Index Update Syntax
+
+You can update map or list elements using the `[key := value]` syntax:
+
+```
+var updated = record["age" := 30];
+```
+
+This creates a copy of `record` with the `"age"` key updated to `30`.
+
+### Nested Updates
+
+Both syntaxes can be chained for deeply nested updates:
+
+```
+var updated = record.address.zip := 12345;
+var updated2 = my_map["outer"]["inner" := value];
+```
+
+### Desugaring
+
+Update expressions are syntactic sugar for the `store` built-in function:
+- `x.field := value` desugars to `store(x, "field", value)`
+- `x[key := value]` desugars to `store(x, key, value)`
+- Nested updates like `x.a.b := v` desugar to `store(x, "a", store(x.a, "b", v))`
 
 ## Concurrency
 

@@ -168,14 +168,24 @@ pub fn report_type_errors(
                     format!("help: all keys in this map must be of type `{}`", expected),
                 ]),
 
-            TypeError::StoreOnInvalidType { ty, span } => Diagnostic::error()
-                .with_message("store requires a list or map")
+            TypeError::InvalidStructKeyType { found, span } => Diagnostic::error()
+                .with_message("invalid struct key type")
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
-                        .with_message(format!("expected list or map, found `{}`", ty)),
+                        .with_message(format!("expected `string`, found `{}`", found)),
                 ])
                 .with_notes(vec![
-                    format!("help: store can only be used on lists or maps, but `{}` is neither", ty),
+                    "help: struct fields must be accessed with string literal keys".to_string(),
+                ]),
+
+            TypeError::StoreOnInvalidType { ty, span } => Diagnostic::error()
+                .with_message("store requires a list, map, or struct")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected list, map, or struct, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: store can only be used on lists, maps, or structs, but `{}` is none of these", ty),
                 ]),
 
             TypeError::InvalidAssignmentTarget(span) => Diagnostic::error()

@@ -1,0 +1,64 @@
+type Address {
+    street: string;
+    city: string;
+    zip: int;
+};
+
+type Person {
+    name: string;
+    age: int;
+    address: Address;
+};
+
+role Registry {
+    var record: Person = Person {
+        name: "Alice",
+        age: 30,
+        address: Address {
+            street: "123 Main St",
+            city: "Springfield",
+            zip: 12345
+        }
+    };
+
+    func UpdateCity(new_city: string) -> bool {
+        record = record.address.city := new_city;
+        return true;
+    }
+
+    func UpdateAge(new_age: int) -> bool {
+        record = record["age" := new_age];
+        return true;
+    }
+
+    func UpdateZip(new_zip: int) -> bool {
+        record = record.address.zip := new_zip;
+        return true;
+    }
+
+    func GetPerson() -> Person {
+        return record;
+    }
+
+    func GetCity() -> string {
+        return record.address.city;
+    }
+}
+
+ClientInterface {
+    func update_city(reg: Registry, city: string) {
+        @reg->UpdateCity(city);
+    }
+
+    func update_age(reg: Registry, age: int) {
+        @reg->UpdateAge(age);
+    }
+
+    func update_zip(reg: Registry, zip: int) {
+        @reg->UpdateZip(zip);
+    }
+
+    func get_city(reg: Registry) -> string {
+        return @reg->GetCity();
+    }
+}
