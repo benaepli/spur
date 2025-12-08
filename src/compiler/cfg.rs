@@ -1215,19 +1215,10 @@ impl Compiler {
         target: Lhs,
         next_vertex: Vertex,
     ) -> Vertex {
-        // Create response channel
-        let resp_chan_name = self.new_temp_var(locals);
+        let (arg_tmps, arg_exprs) = self.compile_temp_list(locals, call.args.len());
 
-        let assign_resp_vertex = self.add_label(Label::Instr(
-            Instr::Assign(target, Expr::EVar(resp_chan_name.clone())),
-            next_vertex,
-        ));
-
-        // Allocate temps for args
-        let (arg_tmps, mut arg_exprs) = self.compile_temp_list(locals, call.args.len());
-
-        // Append the response channel to the arguments
-        arg_exprs.push(Expr::EVar(resp_chan_name.clone()));
+        let node_tmp = self.new_temp_var(locals);
+        let node_expr = Expr::EVar(node_tmp.clone());
 
         let qualifier = self
             .func_qualifier_map
@@ -1235,35 +1226,24 @@ impl Compiler {
             .expect("Function qualifier should exist in map");
         let func_name = format!("{}.{}", qualifier, call.original_name);
 
-        // Use dummy LHS for the call itself
-        let call_ret_dummy = self.new_temp_var(locals);
-
-        let call_label = Label::Instr(
-            Instr::SyncCall(Lhs::Var(call_ret_dummy), func_name, arg_exprs),
-            assign_resp_vertex,
+        // The simulator's Async handler automatically creates a channel/future and stores it in `target`.
+        let async_label = Label::Instr(
+            Instr::Async(target, node_expr, func_name, arg_exprs),
+            next_vertex,
         );
-        let call_vertex = self.add_label(call_label);
+        let async_vertex = self.add_label(async_label);
 
         let args_entry_vertex =
-            self.compile_expr_list_recursive(locals, call.args.iter(), arg_tmps, call_vertex);
+            self.compile_expr_list_recursive(locals, call.args.iter(), arg_tmps, async_vertex);
 
-        let make_chan_label = Label::MakeChannel(
-            Lhs::Var(resp_chan_name.clone()),
-            1,
-            args_entry_vertex,
-        );
-        let make_chan_vertex = self.add_label(make_chan_label);
-
-        // We evaluate it for side-effects or consistency, though it's not explicitly used in SyncCall here
-        let target_dummy_var = self.new_temp_var(locals);
         self.compile_expr_to_value(
             locals,
             target_expr,
-            Lhs::Var(target_dummy_var),
-            make_chan_vertex,
+            Lhs::Var(node_tmp),
+            args_entry_vertex,
         )
     }
-
+    
     /// Converts a "simple" `TypedExpr` to a `cfg::Expr`.
     /// Panics if it encounters a complex (side-effecting) expression.
     fn convert_simple_expr(&mut self, expr: &TypedExpr) -> Expr {

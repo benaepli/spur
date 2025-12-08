@@ -1,7 +1,5 @@
 # Language Design
 
-Spur is an imperative, C-style language.
-
 ## EBNF Grammar
 
 ```ebnf
@@ -56,9 +54,9 @@ cond_stmts
 | lock_stmt
 | 'break' ';'
 
-cond_stmts ::= if_stmt ( elseif_stmt )* ( else_stmt )?
+cond_stmts ::= if_stmt ( else_if_stmt )* ( else_stmt )?
 if_stmt ::= 'if' '(' expr ')' '{' statements '}'
-elseif_stmt ::= 'elseif' '(' expr ')' '{' statements '}'
+else_if_stmt ::= 'else' 'if' '(' expr ')' '{' statements '}'
 else_stmt ::= 'else' '{' statements '}'
 
 for_loop ::= 'for' ( ( var_init | assignment )? ';' expr? ';' assignment? | expr | ) '{' statements '}'
@@ -157,6 +155,7 @@ The type system is composed of:
 
 Primitives and tuples are passed by value.
 All other types are passed by reference.
+This is likely irrelevant, since all maps, structs, and lists are immutable.
 
 ## Struct Updates
 
@@ -205,8 +204,8 @@ Update expressions are syntactic sugar for the `store` built-in function:
 Spur supports two function types for concurrency: `async` (default) and `sync`.
 
 By default, all functions are asynchronous. 
-Calling a standard func does not block execution and immediately returns a `future<T>`. 
-To get the actual return value, you must await the future, which will pause the current task.
+Calling a standard func does not block execution and immediately returns a `chan<T>`. 
+To get the actual return value, you must receive from the channel, which will pause the current task.
 
 A function can be explicitly marked as synchronous with the `sync` keyword:
 ```
@@ -228,7 +227,7 @@ This asynchronous model extends seamlessly to remote procedure calls (RPCs). RPC
 to call a function on a target role instance:
 
 ```
-var f: future<string> = other_role->some_func(1, 2);
+var f: chan<string> = other_role->some_func(1, 2);
 ```
 
 ### Channels

@@ -27,14 +27,14 @@ role Node {
   var db: map<string, Command> = {};
 
   func Write(key: string, value: Command) -> bool {
-      db = db[key := value];
+      db = db[key] := value;
       return true;
   }
 }
 
 ClientInterface {
   func Write(node: Node, key: string, value: Command) {
-      await node->Write(key, value);
+      <-node->Write(key, value);
   }
 }
 ```

@@ -785,8 +785,17 @@ where
                     span: e.span(),
                 })
         };
+        let else_if_branch = just(TokenKind::Else)
+            .ignore_then(just(TokenKind::If))
+            .ignore_then(expr.clone())
+            .then(block())
+            .map_with(|(condition, body), e| IfBranch {
+                condition,
+                body,
+                span: e.span(),
+            });
         let cond_stmts = if_branch(TokenKind::If)
-            .then(if_branch(TokenKind::ElseIf).repeated().collect())
+            .then(else_if_branch.repeated().collect())
             .then(just(TokenKind::Else).ignore_then(block()).or_not())
             .map_with(|((if_branch, elseif_branches), else_branch), e| {
                 Statement::new(
