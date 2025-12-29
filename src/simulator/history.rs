@@ -1,9 +1,9 @@
 use crate::simulator::core::{ChannelId, OpKind, Operation, Value};
+use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use serde_json::{Value as JsonValue, json};
 use std::error::Error;
 use std::path::Path;
-use rayon::prelude::*;
 
 fn json_of_value(v: &Value) -> JsonValue {
     match v {
@@ -161,7 +161,7 @@ pub fn save_history_sqlite(
     {
         let mut stmt = tx.prepare(
             "INSERT INTO executions (run_id, seq_num, unique_id, client_id, kind, action, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
 
         for (seq_num, (op, json_payload)) in prepared_records.iter().enumerate() {

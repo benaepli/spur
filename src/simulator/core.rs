@@ -1,15 +1,15 @@
 use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex};
 use imbl::{HashMap as ImHashMap, Vector};
+use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
+use std::rc::Rc;
 use std::{
     cmp::Ordering,
     collections::HashMap,
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
 };
-use std::rc::Rc;
-use std::cell::RefCell;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
@@ -225,7 +225,6 @@ impl Value {
     fn as_int(&self) -> Result<i64, RuntimeError> {
         match self {
             Value::Int(i) => Ok(*i),
-            Value::Node(n) => Ok(*n as i64),
             _ => Err(RuntimeError::TypeError {
                 expected: "int",
                 got: self.type_name(),
@@ -245,7 +244,6 @@ impl Value {
     fn as_node(&self) -> Result<usize, RuntimeError> {
         match self {
             Value::Node(n) => Ok(*n),
-            Value::Int(n) => Ok(*n as usize),
             _ => Err(RuntimeError::TypeError {
                 expected: "node",
                 got: self.type_name(),
@@ -446,9 +444,7 @@ fn store(
 
 fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, RuntimeError> {
     match col {
-        Value::Map(m) => {
-            Ok(Value::Map(m.update(key, val)))
-        }
+        Value::Map(m) => Ok(Value::Map(m.update(key, val))),
         Value::List(l) => {
             let idx = key.as_int()? as usize;
             if idx >= l.len() {
@@ -505,11 +501,13 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
         )),
         Expr::Some(e) => Ok(Value::Option(Some(Box::new(eval(local_env, node_env, e)?)))),
         Expr::Tuple(es) => {
-            let vals: Result<Vector<_>, _> = es.iter().map(|e| eval(local_env, node_env, e)).collect();
+            let vals: Result<Vector<_>, _> =
+                es.iter().map(|e| eval(local_env, node_env, e)).collect();
             Ok(Value::Tuple(vals?))
         }
         Expr::List(es) => {
-            let vals: Result<Vector<_>, _> = es.iter().map(|e| eval(local_env, node_env, e)).collect();
+            let vals: Result<Vector<_>, _> =
+                es.iter().map(|e| eval(local_env, node_env, e)).collect();
             Ok(Value::List(vals?))
         }
         Expr::Map(kv) => {

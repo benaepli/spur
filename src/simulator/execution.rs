@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy, Value,
-    eval, exec, exec_sync_on_node, schedule_record,
+    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy, Value, eval,
+    exec, exec_sync_on_node, schedule_record,
 };
 use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine};
 use log::{info, warn};
@@ -84,7 +84,7 @@ fn recover_node(
 
     let actuals = match topology.topology {
         Topology::Full => vec![
-            Value::Node(node_id),
+            Value::Int(node_id as i64),
             Value::List(
                 (0..topology.num_servers)
                     .map(|j| Value::Node(j as usize))

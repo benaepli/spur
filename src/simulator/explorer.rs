@@ -1,12 +1,12 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{RuntimeError, State, Value, eval, exec_sync_on_node};
-use std::collections::HashMap;
 use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
 use crate::simulator::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::history::{init_sqlite, save_history_sqlite};
 use log::{debug, error, info, warn};
 use rusqlite::Connection;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 
@@ -125,7 +125,7 @@ fn init_topology(
     let peer_list = Value::List((0..num_servers).map(|j| Value::Node(j)).collect());
 
     for node_id in 0..num_servers {
-        let actuals = vec![Value::Node(node_id), peer_list.clone()];
+        let actuals = vec![Value::Int(node_id as i64), peer_list.clone()];
         let mut env = HashMap::new();
 
         for (i, formal) in init_fn.formals.iter().enumerate() {
@@ -192,6 +192,10 @@ pub fn run_explorer(
 
     let config_json = fs::read_to_string(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+
+    if std::path::Path::new(output_path).exists() {
+        fs::remove_file(output_path)?;
+    }
 
     let mut conn = Connection::open(output_path)?;
     init_sqlite(&conn)?;
