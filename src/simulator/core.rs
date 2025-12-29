@@ -205,6 +205,52 @@ impl Hash for Value {
     }
 }
 
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Int(n) => write!(f, "{}", n),
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::String(s) => write!(f, "\"{}\"", s),
+            Value::Node(n) => write!(f, "node({})", n),
+            Value::Unit => write!(f, "()"),
+            Value::Option(None) => write!(f, "None"),
+            Value::Option(Some(v)) => write!(f, "Some({})", v),
+            Value::Channel(ch) => write!(f, "channel({}, {})", ch.node, ch.id),
+            Value::Lock(_) => write!(f, "<lock>"),
+            Value::Tuple(items) => {
+                write!(f, "(")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, ")")
+            }
+            Value::List(items) => {
+                write!(f, "[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "]")
+            }
+            Value::Map(map) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
+        }
+    }
+}
+
 impl Value {
     fn type_name(&self) -> &'static str {
         match self {
@@ -357,6 +403,7 @@ pub struct State {
     pub history: Vec<Operation>,
     pub free_clients: Vec<i32>,
     pub crash_info: CrashInfo,
+    next_channel_id: usize,
 }
 
 impl State {
@@ -375,7 +422,14 @@ impl State {
                 queued_messages: Vec::new(),
                 current_step: 0,
             },
+            next_channel_id: 0,
         }
+    }
+
+    pub fn alloc_channel_id(&mut self) -> usize {
+        let id = self.next_channel_id;
+        self.next_channel_id += 1;
+        id
     }
 }
 
@@ -730,10 +784,14 @@ fn exec_sync_inner(
                             args.iter().map(|a| eval(local_env, node_env, a)).collect();
                         let arg_vals = arg_vals?;
 
+                        let origin_node = local_env
+                            .get("self")
+                            .ok_or_else(|| RuntimeError::VariableNotFound("self".to_string()))?
+                            .as_node()?;
+
                         let chan_id = ChannelId {
-                            node: target_node,
-                            // So Channel attached to target node.
-                            id: state.channels.len(),
+                            node: origin_node,
+                            id: state.alloc_channel_id(),
                         };
 
                         state.channels.insert(
@@ -782,11 +840,6 @@ fn exec_sync_inner(
                             }
                         }
 
-                        let origin_node = local_env
-                            .get("self")
-                            .ok_or_else(|| RuntimeError::VariableNotFound("self".to_string()))?
-                            .as_node()?;
-
                         let new_record = Record {
                             pc: func_info.entry,
                             node: target_node,
@@ -814,10 +867,9 @@ fn exec_sync_inner(
                     .get("self")
                     .ok_or_else(|| RuntimeError::VariableNotFound("self".to_string()))?
                     .as_node()?;
-                let id = state.channels.len();
                 let cid = ChannelId {
                     node: origin_node,
-                    id,
+                    id: state.alloc_channel_id(),
                 };
                 state.channels.insert(
                     cid,
@@ -842,8 +894,8 @@ fn exec_sync_inner(
                 return eval(local_env, node_env, &expr);
             }
             Label::Print(expr, next) => {
-                // log_app!("{:?}", eval(local_env, node_env, &expr)?);
-                let _ = eval(local_env, node_env, &expr)?;
+                let val = eval(local_env, node_env, &expr)?;
+                // println!("{}", val);
                 pc = next;
             }
             Label::Break(target) => {
@@ -992,7 +1044,7 @@ pub fn exec(
                         // Make channel
                         let chan_id = ChannelId {
                             node: record.node,
-                            id: state.channels.len(),
+                            id: state.alloc_channel_id(),
                         };
                         state.channels.insert(
                             chan_id,
@@ -1072,10 +1124,9 @@ pub fn exec(
                 }
             }
             Label::MakeChannel(lhs, cap, next) => {
-                let id = state.channels.len();
                 let cid = ChannelId {
                     node: record.node,
-                    id,
+                    id: state.alloc_channel_id(),
                 };
                 state.channels.insert(
                     cid,
@@ -1167,8 +1218,8 @@ pub fn exec(
                 }
             }
             Label::Print(expr, next) => {
-                // log_app!("{:?}", eval(&local_env, &node_env.borrow(), &expr)?);
-                let _ = eval(&local_env, &node_env.borrow(), &expr)?;
+                let val = eval(&local_env, &node_env.borrow(), &expr)?;
+                // println!("{}", val);
                 record.pc = next;
             }
             Label::SpinAwait(expr, next) => {

@@ -111,6 +111,12 @@ pub fn save_history_to_csv<P: AsRef<Path>>(
 
 /// Initialize the SQLite database with the required tables.
 pub fn init_sqlite(conn: &Connection) -> Result<(), Box<dyn Error>> {
+    // Performance: less durability, but should be OK
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;"
+    )?;
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS runs (
 run_id INTEGER PRIMARY KEY,
