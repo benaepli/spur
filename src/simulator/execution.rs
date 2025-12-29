@@ -302,7 +302,9 @@ pub fn exec_plan(
             }
         }
 
-        // 2. Execute one simulation step
+        let history_start_len = state.history.len();
+
+        // Execute one simulation step
         if !state.runnable_records.is_empty() {
             schedule_record(
                 state,
@@ -315,11 +317,9 @@ pub fn exec_plan(
             )?;
         }
 
-        // 3. Check for completed client operations
-        let completed: Vec<i32> = state
-            .history
+        // Only scan new history entries added during this step
+        let completed: Vec<i32> = state.history[history_start_len..]
             .iter()
-            .rev()
             .filter(|op| matches!(op.kind, OpKind::Response))
             .filter_map(|op| {
                 in_progress.get(&op.unique_id).map(|event_id| {
