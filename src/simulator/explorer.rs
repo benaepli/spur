@@ -33,13 +33,13 @@ impl Range {
 
 #[derive(Debug, Deserialize)]
 pub struct ExplorerConfig {
-    pub num_servers_range: Range,
-    pub num_clients_range: Range,
-    pub num_write_ops_range: Range,
-    pub num_read_ops_range: Range,
-    pub num_timeouts_range: Range,
-    pub num_crashes_range: Range,
-    pub dependency_density_values: Vec<f64>,
+    pub num_servers: Range,
+    pub num_clients: Range,
+    pub num_write_ops: Range,
+    pub num_read_ops: Range,
+    pub num_timeouts: Range,
+    pub num_crashes: Range,
+    pub dependency_density: Vec<f64>,
     #[serde(default)]
     pub randomly_delay_msgs: bool,
     pub num_runs_per_config: i32,
@@ -167,20 +167,20 @@ pub fn run_explorer(
 ) -> Result<(), Box<dyn Error>> {
     info!("Starting Execution Explorer...");
     info!("Config: {}", config_json_path);
-    
+
     let config_json = fs::read_to_string(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
 
     let mut conn = Connection::open(output_path)?;
     init_sqlite(&conn)?;
 
-    let all_servers = config.num_servers_range.expand();
-    let all_clients = config.num_clients_range.expand();
-    let all_writes = config.num_write_ops_range.expand();
-    let all_reads = config.num_read_ops_range.expand();
-    let all_timeouts = config.num_timeouts_range.expand();
-    let all_crashes = config.num_crashes_range.expand();
-    let all_densities = &config.dependency_density_values;
+    let all_servers = config.num_servers.expand();
+    let all_clients = config.num_clients.expand();
+    let all_writes = config.num_write_ops.expand();
+    let all_reads = config.num_read_ops.expand();
+    let all_timeouts = config.num_timeouts.expand();
+    let all_crashes = config.num_crashes.expand();
+    let all_densities = &config.dependency_density;
 
     let mut config_counter = 0;
     let mut run_counter = 0;
@@ -195,7 +195,7 @@ pub fn run_explorer(
     info!("Total unique configurations: {}", total_configs);
     info!("Runs per config: {}", config.num_runs_per_config);
 
-    
+
     for &num_servers in &all_servers {
         for &num_clients in &all_clients {
             for &num_writes in &all_writes {
