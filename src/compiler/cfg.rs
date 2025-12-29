@@ -48,7 +48,6 @@ pub enum Expr {
     ENil,
     EUnwrap(Box<Expr>),
     ECoalesce(Box<Expr>, Box<Expr>),
-    ECreatePromise,
     ECreateLock,
     ESome(Box<Expr>),
     EIntToString(Box<Expr>),
@@ -65,7 +64,6 @@ pub enum Instr {
     Assign(Lhs, Expr),
     Async(Lhs, Expr, String, Vec<Expr>),
     Copy(Lhs, Expr),
-    Resolve(Lhs, Expr),
     SyncCall(Lhs, String, Vec<Expr>),
 }
 
@@ -106,20 +104,6 @@ pub enum Label {
     Unlock(Expr, Vertex /* next_vertex */),
 }
 
-pub struct FutureValue {
-    pub value: Option<Value>,
-    pub waiters: Vec<Box<dyn FnMut(Value)>>,
-}
-
-impl fmt::Debug for FutureValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FutureValue")
-            .field("value", &self.value)
-            .field("waiters", &format!("<{} waiters>", self.waiters.len()))
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Value {
     VInt(i64),
@@ -127,7 +111,6 @@ pub enum Value {
     VMap(Rc<RefCell<HashMap<Value, Value>>>),
     VList(Rc<RefCell<Vec<Value>>>),
     VOption(Option<Box<Value>>),
-    VFuture(Rc<RefCell<FutureValue>>),
     VLock(Rc<RefCell<bool>>),
     VNode(i64),
     VString(String),
@@ -1236,14 +1219,9 @@ impl Compiler {
         let args_entry_vertex =
             self.compile_expr_list_recursive(locals, call.args.iter(), arg_tmps, async_vertex);
 
-        self.compile_expr_to_value(
-            locals,
-            target_expr,
-            Lhs::Var(node_tmp),
-            args_entry_vertex,
-        )
+        self.compile_expr_to_value(locals, target_expr, Lhs::Var(node_tmp), args_entry_vertex)
     }
-    
+
     /// Converts a "simple" `TypedExpr` to a `cfg::Expr`.
     /// Panics if it encounters a complex (side-effecting) expression.
     fn convert_simple_expr(&mut self, expr: &TypedExpr) -> Expr {
