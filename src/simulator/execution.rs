@@ -5,8 +5,8 @@ use std::rc::Rc;
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy, Value,
-    SELF_NAME_ID, eval, exec, exec_sync_on_node, schedule_record,
+    Continuation, Env, OpKind, Operation, Record, RuntimeError, SELF_NAME_ID, State, UpdatePolicy,
+    Value, eval, exec, exec_sync_on_node, schedule_record,
 };
 use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine};
 use log::{info, warn};
@@ -115,7 +115,7 @@ fn recover_node(
         policy: UpdatePolicy::Identity,
     };
 
-    exec(state, &mut prog.clone(), record)
+    exec(state, &prog, record)
 }
 
 fn reinit_node(
@@ -310,7 +310,7 @@ pub fn exec_plan(
         if !state.runnable_records.is_empty() {
             schedule_record(
                 state,
-                &mut program,
+                &program,
                 false,
                 false,
                 false,

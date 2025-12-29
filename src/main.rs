@@ -51,7 +51,7 @@ fn main() {
                 Some(p) => p,
                 None => std::process::exit(1),
             };
-            if let Err(e) = run_explorer(&mut program, &config, &output) {
+            if let Err(e) = run_explorer(&program, &config, &output) {
                 eprintln!("Explorer failed: {}", e);
                 std::process::exit(1);
             }

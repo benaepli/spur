@@ -844,7 +844,8 @@ fn exec_sync_inner(
                             fn call(&self, state: &mut State, val: Value) {
                                 let chan = state.channels.get_mut(&self.chan_id).unwrap();
                                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                                    let node_env: Rc<RefCell<Env>> = Rc::clone(&state.nodes[reader.node]);
+                                    let node_env: Rc<RefCell<Env>> =
+                                        Rc::clone(&state.nodes[reader.node]);
                                     // Note: store errors in continuations are ignored (fire-and-forget)
                                     let _ = store(
                                         &lhs,
@@ -986,11 +987,7 @@ fn exec_sync_inner(
     }
 }
 
-pub fn exec(
-    state: &mut State,
-    program: &mut Program,
-    mut record: Record,
-) -> Result<(), RuntimeError> {
+pub fn exec(state: &mut State, program: &Program, mut record: Record) -> Result<(), RuntimeError> {
     let mut local_env = record.env;
     let node_env = Rc::clone(&state.nodes[record.node]);
 
@@ -1035,8 +1032,7 @@ pub fn exec(
                             callee_local.insert(*name, arg_vals[i].clone());
                         }
                         for (name, expr) in &func_info.locals {
-                            callee_local
-                                .insert(*name, eval(&local_env, &node_env.borrow(), expr)?);
+                            callee_local.insert(*name, eval(&local_env, &node_env.borrow(), expr)?);
                         }
 
                         if let Some(s) = local_env.get(&SELF_NAME_ID) {
@@ -1355,7 +1351,7 @@ pub fn exec(
 
 pub fn schedule_record(
     state: &mut State,
-    program: &mut Program,
+    program: &Program,
     randomly_drop_msgs: bool,
     cut_tail_from_mid: bool,
     sever_all_but_mid: bool,

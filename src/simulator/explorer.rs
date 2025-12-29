@@ -1,15 +1,21 @@
 use crate::compiler::cfg::Program;
-use crate::simulator::core::{Env, RuntimeError, State, Value, SELF_NAME_ID, eval, exec_sync_on_node};
+use crate::simulator::core::{
+    Env, RuntimeError, SELF_NAME_ID, State, Value, eval, exec_sync_on_node,
+};
 use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
 use crate::simulator::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::history::{init_sqlite, save_history_sqlite};
+use crossbeam::channel;
 use log::{debug, error, info, warn};
-use rusqlite::Connection;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rayon::iter::ParallelIterator;
+use rayon::prelude::ParallelBridge;
 use serde::Deserialize;
 use std::error::Error;
-use std::fs;
+use std::{fs, thread};
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Range {
     pub min: i32,
     pub max: i32,
@@ -30,7 +36,7 @@ impl Range {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ExplorerConfig {
     #[serde(rename = "num_servers")]
     pub num_servers_range: Range,
@@ -139,7 +145,7 @@ fn init_topology(
 /// Runs a single simulation configuration.
 pub fn run_single_simulation(
     program: &Program,
-    conn: &mut Connection,
+    pool: &Pool<SqliteConnectionManager>,
     run_id: i64,
     config: &SingleRunConfig,
 ) -> Result<(), Box<dyn Error>> {
@@ -176,13 +182,15 @@ pub fn run_single_simulation(
         config.randomly_delay_msgs,
     )?;
 
-    save_history_sqlite(conn, run_id, &state.history)?;
+    let mut conn = pool.get()?;
+    save_history_sqlite(&mut conn, run_id, &state.history)?;
 
     Ok(())
 }
 
+/// Runs a single simulation configuration.
 pub fn run_explorer(
-    program: &mut Program,
+    program: &Program,
     config_json_path: &str,
     output_path: &str,
 ) -> Result<(), Box<dyn Error>> {
@@ -196,86 +204,78 @@ pub fn run_explorer(
         fs::remove_file(output_path)?;
     }
 
-    let mut conn = Connection::open(output_path)?;
-    init_sqlite(&conn)?;
+    let manager = SqliteConnectionManager::file(output_path).with_init(|c| init_sqlite(c)); //
+    let pool = Pool::new(manager)?;
 
-    let all_servers = config.num_servers_range.expand();
-    let all_clients = config.num_clients_range.expand();
-    let all_writes = config.num_write_ops_range.expand();
-    let all_reads = config.num_read_ops_range.expand();
-    let all_timeouts = config.num_timeouts_range.expand();
-    let all_crashes = config.num_crashes_range.expand();
-    let all_densities = &config.dependency_density_values;
+    let (sender, receiver) = channel::bounded::<(i64, SingleRunConfig)>(100);
 
-    let mut config_counter = 0;
-    let mut run_counter = 0;
-    let total_configs = all_servers.len()
-        * all_clients.len()
-        * all_writes.len()
-        * all_reads.len()
-        * all_timeouts.len()
-        * all_crashes.len()
-        * all_densities.len();
+    let config_producer = config.clone();
 
-    info!("Total unique configurations: {}", total_configs);
-    info!("Runs per config: {}", config.num_runs_per_config);
+    thread::spawn(move || {
+        let config = config_producer;
 
-    for &num_servers in &all_servers {
-        for &num_clients in &all_clients {
-            for &num_writes in &all_writes {
-                for &num_reads in &all_reads {
-                    for &num_timeouts in &all_timeouts {
-                        for &num_crashes in &all_crashes {
-                            for &density in all_densities {
-                                config_counter += 1;
+        let all_servers = config.num_servers_range.expand();
+        let all_clients = config.num_clients_range.expand();
+        let all_writes = config.num_write_ops_range.expand();
+        let all_reads = config.num_read_ops_range.expand();
+        let all_timeouts = config.num_timeouts_range.expand();
+        let all_crashes = config.num_crashes_range.expand();
+        let all_densities = &config.dependency_density_values;
 
-                                let run_config = SingleRunConfig {
-                                    num_servers,
-                                    num_clients,
-                                    num_write_ops: num_writes,
-                                    num_read_ops: num_reads,
-                                    num_timeouts,
-                                    num_crashes,
-                                    dependency_density: density,
-                                    randomly_delay_msgs: config.randomly_delay_msgs,
-                                    max_iterations: config.max_iterations,
-                                };
+        let mut config_counter = 0;
+        let mut run_counter = 0;
+        let total_configs = all_servers.len()
+            * all_clients.len()
+            * all_writes.len()
+            * all_reads.len()
+            * all_timeouts.len()
+            * all_crashes.len()
+            * all_densities.len();
 
-                                info!("{}", "=".repeat(70));
-                                info!(
-                                    "Running Config {}/{}: s{}_c{}_w{}_r{}_t{}_crash{}_d{:.2}",
-                                    config_counter,
-                                    total_configs,
-                                    num_servers,
-                                    num_clients,
-                                    num_writes,
-                                    num_reads,
-                                    num_timeouts,
-                                    num_crashes,
-                                    density
-                                );
-                                info!("{}", "=".repeat(70));
+        info!("Total unique configurations: {}", total_configs);
+        info!("Runs per config: {}", config.num_runs_per_config);
 
-                                for i in 1..=config.num_runs_per_config {
-                                    run_counter += 1;
-                                    debug!(
-                                        "Run {}/{} (Total #{}) ... ",
-                                        i, config.num_runs_per_config, run_counter
+        for &num_servers in &all_servers {
+            for &num_clients in &all_clients {
+                for &num_writes in &all_writes {
+                    for &num_reads in &all_reads {
+                        for &num_timeouts in &all_timeouts {
+                            for &num_crashes in &all_crashes {
+                                for &density in all_densities {
+                                    config_counter += 1;
+
+                                    let run_config = SingleRunConfig {
+                                        num_servers,
+                                        num_clients,
+                                        num_write_ops: num_writes,
+                                        num_read_ops: num_reads,
+                                        num_timeouts,
+                                        num_crashes,
+                                        dependency_density: density,
+                                        randomly_delay_msgs: config.randomly_delay_msgs,
+                                        max_iterations: config.max_iterations,
+                                    };
+
+                                    info!("{}", "=".repeat(70));
+                                    info!(
+                                        "Queuing Config {}/{}: s{}_c{}_w{}_r{}_t{}_crash{}_d{:.2}",
+                                        config_counter,
+                                        total_configs,
+                                        num_servers,
+                                        num_clients,
+                                        num_writes,
+                                        num_reads,
+                                        num_timeouts,
+                                        num_crashes,
+                                        density
                                     );
+                                    info!("{}", "=".repeat(70));
 
-                                    let start = std::time::Instant::now();
-
-                                    match run_single_simulation(
-                                        &program,
-                                        &mut conn,
-                                        run_counter,
-                                        &run_config,
-                                    ) {
-                                        Ok(_) => debug!(
-                                            "Success ({:.4}s)",
-                                            start.elapsed().as_secs_f64()
-                                        ),
-                                        Err(e) => error!("Run failed: {}", e),
+                                    for _ in 1..=config.num_runs_per_config {
+                                        run_counter += 1;
+                                        if sender.send((run_counter, run_config.clone())).is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -284,7 +284,26 @@ pub fn run_explorer(
                 }
             }
         }
-    }
+    });
+
+    info!("Starting parallel simulation...");
+
+    receiver
+        .into_iter()
+        .par_bridge()
+        .for_each(|(run_id, run_config)| {
+            let start = std::time::Instant::now();
+            match run_single_simulation(program, &pool, run_id, &run_config) {
+                Ok(_) => {
+                    debug!(
+                        "Run {} Success ({:.4}s)",
+                        run_id,
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+                Err(e) => error!("Run {} failed: {}", run_id, e),
+            }
+        });
 
     info!("Execution explorer finished.");
     Ok(())

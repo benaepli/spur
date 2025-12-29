@@ -136,7 +136,9 @@ impl Program {
     /// Look up a function by its qualified name (e.g., "Node.Init").
     /// Returns the FunctionInfo if found, None otherwise.
     pub fn get_func_by_name(&self, name: &str) -> Option<&FunctionInfo> {
-        self.func_name_to_id.get(name).and_then(|id| self.rpc.get(id))
+        self.func_name_to_id
+            .get(name)
+            .and_then(|id| self.rpc.get(id))
     }
 }
 
@@ -258,7 +260,11 @@ impl Compiler {
         }
     }
 
-    fn compile_init_func(&mut self, inits: &[TypedVarInit], qualified_name: String) -> FunctionInfo {
+    fn compile_init_func(
+        &mut self,
+        inits: &[TypedVarInit],
+        qualified_name: String,
+    ) -> FunctionInfo {
         let mut locals = Vec::new();
         let return_var_id = self.new_temp_var(&mut locals);
         let final_vertex = self.add_label(Label::Return(Expr::Var(return_var_id)));
@@ -267,12 +273,8 @@ impl Compiler {
         // Build the init chain backwards
         for init in inits.iter().rev() {
             let var_id = self.register_var_name(init.name, &init.original_name);
-            next_vertex = self.compile_expr_to_value(
-                &mut locals,
-                &init.value,
-                Lhs::Var(var_id),
-                next_vertex,
-            );
+            next_vertex =
+                self.compile_expr_to_value(&mut locals, &init.value, Lhs::Var(var_id), next_vertex);
         }
 
         let entry = self.add_label(Label::Instr(
@@ -376,12 +378,7 @@ impl Compiler {
             TypedStatementKind::VarInit(init) => {
                 // Compile the value, assigning to the new variable
                 let var_id = self.register_var_name(init.name, &init.original_name);
-                self.compile_expr_to_value(
-                    locals,
-                    &init.value,
-                    Lhs::Var(var_id),
-                    next_vertex,
-                )
+                self.compile_expr_to_value(locals, &init.value, Lhs::Var(var_id), next_vertex)
             }
             TypedStatementKind::Assignment(assign) => {
                 // Compile the value, assigning to the target LHS
@@ -396,12 +393,7 @@ impl Compiler {
             TypedStatementKind::Return(expr) => {
                 // Compile the expression, store result in the dedicated return_var,
                 // and then jump to the function's final return_target.
-                self.compile_expr_to_value(
-                    locals,
-                    expr,
-                    Lhs::Var(return_var),
-                    return_target,
-                )
+                self.compile_expr_to_value(locals, expr, Lhs::Var(return_var), return_target)
             }
             TypedStatementKind::ForLoop(loop_stmt) => {
                 self.compile_for_loop(locals, loop_stmt, next_vertex, return_target, return_var)
@@ -486,12 +478,7 @@ impl Compiler {
         match &loop_stmt.init {
             Some(TypedForLoopInit::VarInit(vi)) => {
                 let var_id = self.register_var_name(vi.name, &vi.original_name);
-                self.compile_expr_to_value(
-                    locals,
-                    &vi.value,
-                    Lhs::Var(var_id),
-                    loop_head_vertex,
-                )
+                self.compile_expr_to_value(locals, &vi.value, Lhs::Var(var_id), loop_head_vertex)
             }
             Some(TypedForLoopInit::Assignment(assign)) => {
                 let lhs = self.convert_lhs(&assign.target);
@@ -773,11 +760,8 @@ impl Compiler {
             }
             TypedExprKind::Recv(chan_expr) => {
                 let chan_tmp = self.new_temp_var(locals);
-                let recv_vertex = self.add_label(Label::Recv(
-                    target,
-                    Expr::Var(chan_tmp),
-                    next_vertex,
-                ));
+                let recv_vertex =
+                    self.add_label(Label::Recv(target, Expr::Var(chan_tmp), next_vertex));
                 self.compile_expr_to_value(locals, chan_expr, Lhs::Var(chan_tmp), recv_vertex)
             }
 
@@ -852,8 +836,7 @@ impl Compiler {
 
             TypedExprKind::Negate(e) => {
                 let e_tmp = self.new_temp_var(locals);
-                let final_expr =
-                    Expr::Minus(Box::new(Expr::Int(0)), Box::new(Expr::Var(e_tmp)));
+                let final_expr = Expr::Minus(Box::new(Expr::Int(0)), Box::new(Expr::Var(e_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
@@ -900,10 +883,8 @@ impl Compiler {
             TypedExprKind::Append(l, i) => {
                 let l_tmp = self.new_temp_var(locals);
                 let i_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::ListAppend(
-                    Box::new(Expr::Var(l_tmp)),
-                    Box::new(Expr::Var(i_tmp)),
-                );
+                let final_expr =
+                    Expr::ListAppend(Box::new(Expr::Var(l_tmp)), Box::new(Expr::Var(i_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 let i_vertex =
@@ -914,10 +895,8 @@ impl Compiler {
             TypedExprKind::Prepend(i, l) => {
                 let i_tmp = self.new_temp_var(locals);
                 let l_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::ListPrepend(
-                    Box::new(Expr::Var(i_tmp)),
-                    Box::new(Expr::Var(l_tmp)),
-                );
+                let final_expr =
+                    Expr::ListPrepend(Box::new(Expr::Var(i_tmp)), Box::new(Expr::Var(l_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 let l_vertex =
@@ -936,10 +915,7 @@ impl Compiler {
             TypedExprKind::Min(l, r) => {
                 let l_tmp = self.new_temp_var(locals);
                 let r_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::Min(
-                    Box::new(Expr::Var(l_tmp)),
-                    Box::new(Expr::Var(r_tmp)),
-                );
+                let final_expr = Expr::Min(Box::new(Expr::Var(l_tmp)), Box::new(Expr::Var(r_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 let r_vertex =
@@ -950,10 +926,8 @@ impl Compiler {
             TypedExprKind::Exists(map, key) => {
                 let map_tmp = self.new_temp_var(locals);
                 let key_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::KeyExists(
-                    Box::new(Expr::Var(key_tmp)),
-                    Box::new(Expr::Var(map_tmp)),
-                );
+                let final_expr =
+                    Expr::KeyExists(Box::new(Expr::Var(key_tmp)), Box::new(Expr::Var(map_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 let key_vertex =
@@ -964,10 +938,8 @@ impl Compiler {
             TypedExprKind::Erase(map, key) => {
                 let map_tmp = self.new_temp_var(locals);
                 let key_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::MapErase(
-                    Box::new(Expr::Var(key_tmp)),
-                    Box::new(Expr::Var(map_tmp)),
-                );
+                let final_expr =
+                    Expr::MapErase(Box::new(Expr::Var(key_tmp)), Box::new(Expr::Var(map_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 let key_vertex =
