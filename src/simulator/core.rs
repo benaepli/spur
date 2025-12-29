@@ -3,12 +3,13 @@ use imbl::{HashMap as ImHashMap, Vector};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
 use std::{
-    cell::RefCell,
     cmp::Ordering,
     collections::HashMap,
     hash::{Hash, Hasher},
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
+use std::rc::Rc;
+use std::cell::RefCell;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
@@ -92,7 +93,7 @@ pub enum Value {
     List(Vector<Value>),
     Option(Option<Box<Value>>),
     Channel(ChannelId),
-    Lock(Rc<RefCell<bool>>),
+    Lock(Arc<Mutex<bool>>),
     Node(usize),
     String(String),
     Unit,
@@ -112,7 +113,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
             (Value::Channel(a), Value::Channel(b)) => a == b,
-            (Value::Lock(a), Value::Lock(b)) => Rc::ptr_eq(a, b),
+            (Value::Lock(a), Value::Lock(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -146,7 +147,7 @@ impl Ord for Value {
             }
             (Channel(a), Channel(b)) => a.cmp(b),
             (Lock(a), Lock(b)) => {
-                if Rc::ptr_eq(a, b) {
+                if Arc::ptr_eq(a, b) {
                     Ordering::Equal
                 } else {
                     Ordering::Less
@@ -199,7 +200,7 @@ impl Hash for Value {
                 }
             }
             Value::Channel(c) => c.hash(state),
-            Value::Lock(l) => (Rc::as_ptr(l) as usize).hash(state),
+            Value::Lock(l) => (Arc::as_ptr(l) as usize).hash(state),
         }
     }
 }
@@ -281,7 +282,7 @@ impl Value {
             })
         }
     }
-    fn as_lock(&self) -> Result<&Rc<RefCell<bool>>, RuntimeError> {
+    fn as_lock(&self) -> Result<&Arc<Mutex<bool>>, RuntimeError> {
         if let Value::Lock(l) = self {
             Ok(l)
         } else {
@@ -534,7 +535,7 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
                 got: other.type_name(),
             }),
         },
-        Expr::CreateLock => Ok(Value::Lock(Rc::new(RefCell::new(false)))),
+        Expr::CreateLock => Ok(Value::Lock(Arc::new(Mutex::new(false)))),
         Expr::ListPrepend(head, tail) => {
             let h = eval(local_env, node_env, head)?;
             let t = eval(local_env, node_env, tail)?.as_list()?.clone();
@@ -1250,8 +1251,8 @@ pub fn exec(
             Label::Lock(lock_expr, next) => {
                 let lock_val = eval(&local_env, &node_env.borrow(), &lock_expr)?;
                 let lock = lock_val.as_lock()?;
-                if *lock.borrow() == false {
-                    *lock.borrow_mut() = true;
+                if *lock.lock().unwrap() == false {
+                    *lock.lock().unwrap() = true;
                     record.pc = next;
                 } else {
                     record.env = local_env;
@@ -1262,8 +1263,8 @@ pub fn exec(
             Label::Unlock(lock_expr, next) => {
                 let lock_val = eval(&local_env, &node_env.borrow(), &lock_expr)?;
                 let lock = lock_val.as_lock()?;
-                if *lock.borrow() == true {
-                    *lock.borrow_mut() = false;
+                if *lock.lock().unwrap() == true {
+                    *lock.lock().unwrap() = false;
                     record.pc = next;
                 } else {
                     return Err(RuntimeError::UnlockAlreadyUnlocked);

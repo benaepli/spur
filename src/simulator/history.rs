@@ -3,6 +3,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value as JsonValue, json};
 use std::error::Error;
 use std::path::Path;
+use rayon::prelude::*;
 
 fn json_of_value(v: &Value) -> JsonValue {
     match v {
@@ -65,7 +66,7 @@ fn json_of_value(v: &Value) -> JsonValue {
             })
         }
         Value::Lock(l) => {
-            let val = *l.borrow();
+            let val = *l.lock().unwrap();
             json!({
             "type": "VLock",
             "value": val
@@ -109,7 +110,6 @@ pub fn save_history_to_csv<P: AsRef<Path>>(
 }
 
 /// Initialize the SQLite database with the required tables.
-/// Matches `init_sqlite` .
 pub fn init_sqlite(conn: &Connection) -> Result<(), Box<dyn Error>> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS runs (
@@ -143,30 +143,32 @@ PRIMARY KEY (run_id, seq_num)
 }
 
 /// Saves the simulation history to the SQLite database.
-/// Matches `save_history` .
 pub fn save_history_sqlite(
     conn: &mut Connection,
     run_id: i64,
     history: &[Operation],
 ) -> Result<(), Box<dyn Error>> {
+    let prepared_records: Vec<(&Operation, String)> = history
+        .par_iter()
+        .map(|op| {
+            let json = payload_to_json_string(&op.payload);
+            (op, json)
+        })
+        .collect();
+
     conn.execute("INSERT INTO runs (run_id) VALUES (?1)", params![run_id])?;
-
     let tx = conn.transaction()?;
-
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO executions
-(run_id, seq_num, unique_id, client_id, kind, action, payload)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO executions (run_id, seq_num, unique_id, client_id, kind, action, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         )?;
 
-        for (seq_num, op) in history.iter().enumerate() {
+        for (seq_num, (op, json_payload)) in prepared_records.iter().enumerate() {
             let kind = match op.kind {
                 OpKind::Response => "Response",
                 OpKind::Invocation => "Invocation",
             };
-
-            let payload_str = payload_to_json_string(&op.payload);
 
             stmt.execute(params![
                 run_id,
@@ -175,11 +177,10 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 op.client_id as i64,
                 kind,
                 op.op_action,
-                payload_str
+                json_payload
             ])?;
         }
     }
-
     tx.commit()?;
     Ok(())
 }
