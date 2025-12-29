@@ -1,5 +1,7 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use spur::compiler;
+use spur::compiler::cfg::Program;
+use spur::simulator::explorer::run_explorer;
 use std::fs;
 use std::path::Path;
 
@@ -7,55 +9,101 @@ use std::path::Path;
 #[command(name = "spur-frontend")]
 #[command(about = "A compiler for spur.", long_about = None)]
 struct Args {
-    /// Input specification file
-    spec: String,
-    /// Compiled output file
-    output: String,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Compile a specification file to JSON
+    Compile {
+        /// Input specification file
+        spec: String,
+        /// Compiled output file
+        output: String,
+    },
+    /// Compile and run the execution explorer
+    Explore {
+        /// Input specification file
+        spec: String,
+        /// Explorer configuration JSON file
+        config: String,
+        /// SQLite output file for results
+        output: String,
+    },
 }
 
 fn main() {
     let args = Args::parse();
-    println!(
-        "Input spec: {}, Output location: {}",
-        args.spec, args.output
-    );
 
-    let path = Path::new(&args.spec);
-
-    if !path.exists() {
-        eprintln!("Error: Input file '{}' does not exist", args.spec);
-        std::process::exit(1);
-    }
-
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) => {
-            eprintln!("Error: Failed to read input file '{}': {}", args.spec, e);
-            std::process::exit(1);
+    match args.command {
+        Commands::Compile { spec, output } => {
+            compile_spec(&spec, &output);
         }
-    };
-
-    match compiler::compile(&content, &args.spec) {
-        Ok(program) => {
-            let json = serde_json::to_string_pretty(&program).expect("Failed to serialize program");
-
-            if let Err(e) = fs::write(&args.output, json) {
-                eprintln!(
-                    "Error: Failed to write output file '{}': {}",
-                    args.output, e
-                );
-                eprintln!("Possible causes:");
-                eprintln!("  - Directory does not exist");
-                eprintln!("  - Insufficient permissions");
-                eprintln!("  - Disk full or read-only filesystem");
+        Commands::Explore { spec, config, output } => {
+            let mut program = match compile_spec_to_program(&spec) {
+                Some(p) => p,
+                None => std::process::exit(1),
+            };
+            if let Err(e) = run_explorer(&mut program, &config, &output) {
+                eprintln!("Explorer failed: {}", e);
                 std::process::exit(1);
             }
+            println!("Explorer finished. Results saved to {}", output);
+        }
+    }
+}
 
-            println!("Successfully compiled to {}", args.output);
+fn read_spec_file(spec: &str) -> Option<String> {
+    let path = Path::new(spec);
+
+    if !path.exists() {
+        eprintln!("Error: Input file '{}' does not exist", spec);
+        return None;
+    }
+
+    match fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(e) => {
+            eprintln!("Error: Failed to read input file '{}': {}", spec, e);
+            None
+        }
+    }
+}
+
+fn compile_spec_to_program(spec: &str) -> Option<Program> {
+    let content = read_spec_file(spec)?;
+
+    match compiler::compile(&content, spec) {
+        Ok(program) => {
+            println!("Successfully compiled {}", spec);
+            Some(program)
         }
         Err(e) => {
             eprintln!("Compilation failed: {}", e);
-            std::process::exit(1);
+            None
         }
     }
+}
+
+fn compile_spec(spec: &str, output: &str) {
+    println!("Input spec: {}, Output location: {}", spec, output);
+
+    let program = match compile_spec_to_program(spec) {
+        Some(p) => p,
+        None => std::process::exit(1),
+    };
+
+    let json = serde_json::to_string_pretty(&program).expect("Failed to serialize program");
+
+    if let Err(e) = fs::write(output, json) {
+        eprintln!("Error: Failed to write output file '{}': {}", output, e);
+        eprintln!("Possible causes:");
+        eprintln!("  - Directory does not exist");
+        eprintln!("  - Insufficient permissions");
+        eprintln!("  - Disk full or read-only filesystem");
+        std::process::exit(1);
+    }
+
+    println!("Successfully compiled to {}", output);
 }

@@ -8,6 +8,70 @@ use std::{
     hash::{Hash, Hasher},
     rc::Rc,
 };
+use thiserror::Error;
+
+#[derive(Debug, Clone, Error)]
+pub enum RuntimeError {
+    #[error("type error: expected {expected}, got {got}")]
+    TypeError {
+        expected: &'static str,
+        got: &'static str,
+    },
+
+    #[error("variable not found: {0}")]
+    VariableNotFound(String),
+
+    #[error("function not found: {0}")]
+    FunctionNotFound(String),
+
+    #[error("index out of bounds: index {index}, length {len}")]
+    IndexOutOfBounds { index: usize, len: usize },
+
+    #[error("map key not found")]
+    KeyNotFound,
+
+    #[error("tuple length mismatch: expected {expected}, got {got}")]
+    TupleLengthMismatch { expected: usize, got: usize },
+
+    #[error("cannot assign non-tuple to tuple LHS, got {got}")]
+    NonTupleAssignment { got: &'static str },
+
+    #[error("unwrap called on None")]
+    UnwrapNone,
+
+    #[error("coalesce called on non-option, got {got}")]
+    CoalesceNonOption { got: &'static str },
+
+    #[error("sync function tried to call non-sync function: {0}")]
+    SyncCallToAsyncFunction(String),
+
+    #[error("instruction not allowed in sync function: {0}")]
+    UnsupportedSyncInstruction(String),
+
+    #[error("for-loop collection must be a variable")]
+    ForLoopCollectionNotVariable,
+
+    #[error("for-loop over map expects tuple LHS")]
+    ForLoopMapExpectsTupleLhs,
+
+    #[error("for-loop requires collection, got {got}")]
+    ForLoopNotCollection { got: &'static str },
+
+    #[error("attempted to unlock an already-unlocked lock")]
+    UnlockAlreadyUnlocked,
+
+    #[error("cannot read remote channel directly")]
+    RemoteChannelRead,
+
+    #[error("networked channels are unsupported")]
+    NetworkedChannelUnsupported,
+
+    #[error("cannot index into non-collection, got {got}")]
+    NotACollection { got: &'static str },
+
+    #[error("list subsequence out of bounds: start {start}, end {end}, length {len}")]
+    SubsequenceOutOfBounds { start: usize, end: usize, len: usize },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChannelId {
@@ -136,53 +200,74 @@ impl Value {
         }
     }
 
-    fn as_int(&self) -> i64 {
+    fn as_int(&self) -> Result<i64, RuntimeError> {
         if let Value::Int(i) = self {
-            *i
+            Ok(*i)
         } else {
-            panic!("Expected int, got {}", self.type_name())
+            Err(RuntimeError::TypeError {
+                expected: "int",
+                got: self.type_name(),
+            })
         }
     }
-    fn as_bool(&self) -> bool {
+    fn as_bool(&self) -> Result<bool, RuntimeError> {
         if let Value::Bool(b) = self {
-            *b
+            Ok(*b)
         } else {
-            panic!("Expected bool, got {}", self.type_name())
+            Err(RuntimeError::TypeError {
+                expected: "bool",
+                got: self.type_name(),
+            })
         }
     }
-    fn as_node(&self) -> usize {
+    fn as_node(&self) -> Result<usize, RuntimeError> {
         match self {
-            Value::Node(n) => *n,
-            Value::Int(n) => *n as usize,
-            _ => panic!("Expected node/int, got {}", self.type_name()),
+            Value::Node(n) => Ok(*n),
+            Value::Int(n) => Ok(*n as usize),
+            _ => Err(RuntimeError::TypeError {
+                expected: "node",
+                got: self.type_name(),
+            }),
         }
     }
-    fn as_map(&self) -> &BTreeMap<Value, Value> {
+    fn as_map(&self) -> Result<&BTreeMap<Value, Value>, RuntimeError> {
         if let Value::Map(m) = self {
-            m
+            Ok(m)
         } else {
-            panic!("Expected map")
+            Err(RuntimeError::TypeError {
+                expected: "map",
+                got: self.type_name(),
+            })
         }
     }
-    fn as_list(&self) -> &Vec<Value> {
+    fn as_list(&self) -> Result<&Vec<Value>, RuntimeError> {
         if let Value::List(l) = self {
-            l
+            Ok(l)
         } else {
-            panic!("Expected list")
+            Err(RuntimeError::TypeError {
+                expected: "list",
+                got: self.type_name(),
+            })
         }
     }
-    fn as_channel(&self) -> ChannelId {
+    fn as_channel(&self) -> Result<ChannelId, RuntimeError> {
         if let Value::Channel(c) = self {
-            *c
+            Ok(*c)
         } else {
-            panic!("Expected channel")
+            Err(RuntimeError::TypeError {
+                expected: "channel",
+                got: self.type_name(),
+            })
         }
     }
-    fn as_lock(&self) -> &Rc<RefCell<bool>> {
+    fn as_lock(&self) -> Result<&Rc<RefCell<bool>>, RuntimeError> {
         if let Value::Lock(l) = self {
-            l
+            Ok(l)
         } else {
-            panic!("Expected lock")
+            Err(RuntimeError::TypeError {
+                expected: "lock",
+                got: self.type_name(),
+            })
         }
     }
 }
@@ -224,8 +309,7 @@ pub struct CrashInfo {
 pub struct ChannelState {
     pub capacity: i32,
     pub buffer: VecDeque<Value>,
-    // Store record index or cloned record? OCaml stores the record.
-    // In Rust, we move Record out of Runnable and into Waiting.
+    // We move Record out of Runnable and into Waiting.
     pub waiting_readers: VecDeque<(Record, Lhs)>,
     pub waiting_writers: VecDeque<(Record, Value)>,
 }
@@ -287,17 +371,22 @@ impl Continuation for NoOpContinuation {
     fn call(&self, _state: &mut State, _val: Value) {}
 }
 
-fn load(var: &str, local_env: &Env, node_env: &Env) -> Value {
+fn load(var: &str, local_env: &Env, node_env: &Env) -> Result<Value, RuntimeError> {
     if let Some(v) = local_env.get(var) {
-        v.clone()
+        Ok(v.clone())
     } else if let Some(v) = node_env.get(var) {
-        v.clone()
+        Ok(v.clone())
     } else {
-        panic!("Variable not found: {}", var);
+        Err(RuntimeError::VariableNotFound(var.to_string()))
     }
 }
 
-fn store(lhs: &Lhs, val: Value, local_env: &mut Env, node_env: &mut Env) {
+fn store(
+    lhs: &Lhs,
+    val: Value,
+    local_env: &mut Env,
+    node_env: &mut Env,
+) -> Result<(), RuntimeError> {
     match lhs {
         Lhs::Var(name) => {
             if local_env.contains_key(name) {
@@ -310,184 +399,228 @@ fn store(lhs: &Lhs, val: Value, local_env: &mut Env, node_env: &mut Env) {
                     local_env.insert(name.clone(), val);
                 }
             }
+            Ok(())
         }
         Lhs::Tuple(vars) => {
             if let Value::Tuple(vals) = val {
                 if vars.len() != vals.len() {
-                    panic!("Tuple assignment mismatch");
+                    return Err(RuntimeError::TupleLengthMismatch {
+                        expected: vars.len(),
+                        got: vals.len(),
+                    });
                 }
                 for (name, v) in vars.iter().zip(vals.into_iter()) {
-                    store(&Lhs::Var(name.clone()), v, local_env, node_env);
+                    store(&Lhs::Var(name.clone()), v, local_env, node_env)?;
                 }
+                Ok(())
             } else {
-                panic!("Assigning non-tuple to tuple LHS");
+                Err(RuntimeError::NonTupleAssignment {
+                    got: val.type_name(),
+                })
             }
         }
     }
 }
 
-fn update_collection(col: Value, key: Value, val: Value) -> Value {
+fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, RuntimeError> {
     match col {
         Value::Map(mut m) => {
             m.insert(key, val);
-            Value::Map(m)
+            Ok(Value::Map(m))
         }
         Value::List(mut l) => {
-            let idx = key.as_int() as usize;
+            let idx = key.as_int()? as usize;
             if idx >= l.len() {
-                panic!("List index out of bounds in update");
+                return Err(RuntimeError::IndexOutOfBounds {
+                    index: idx,
+                    len: l.len(),
+                });
             }
             l[idx] = val;
-            Value::List(l)
+            Ok(Value::List(l))
         }
-        _ => panic!("Not a collection"),
+        _ => Err(RuntimeError::NotACollection {
+            got: col.type_name(),
+        }),
     }
 }
 
-pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Value {
+pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, RuntimeError> {
     match expr {
-        Expr::Int(i) => Value::Int(*i),
-        Expr::Bool(b) => Value::Bool(*b),
-        Expr::String(s) => Value::String(s.clone()),
-        Expr::Unit => Value::Unit,
-        Expr::Nil => Value::Option(None),
+        Expr::Int(i) => Ok(Value::Int(*i)),
+        Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::String(s) => Ok(Value::String(s.clone())),
+        Expr::Unit => Ok(Value::Unit),
+        Expr::Nil => Ok(Value::Option(None)),
         Expr::Var(s) => load(s, local_env, node_env),
-        Expr::Plus(e1, e2) => Value::Int(
-            eval(local_env, node_env, e1).as_int() + eval(local_env, node_env, e2).as_int(),
-        ),
-        Expr::Minus(e1, e2) => Value::Int(
-            eval(local_env, node_env, e1).as_int() - eval(local_env, node_env, e2).as_int(),
-        ),
-        Expr::Times(e1, e2) => Value::Int(
-            eval(local_env, node_env, e1).as_int() * eval(local_env, node_env, e2).as_int(),
-        ),
-        Expr::Div(e1, e2) => Value::Int(
-            eval(local_env, node_env, e1).as_int() / eval(local_env, node_env, e2).as_int(),
-        ),
-        Expr::Mod(e1, e2) => Value::Int(
-            eval(local_env, node_env, e1).as_int() % eval(local_env, node_env, e2).as_int(),
-        ),
+        Expr::Plus(e1, e2) => Ok(Value::Int(
+            eval(local_env, node_env, e1)?.as_int()? + eval(local_env, node_env, e2)?.as_int()?,
+        )),
+        Expr::Minus(e1, e2) => Ok(Value::Int(
+            eval(local_env, node_env, e1)?.as_int()? - eval(local_env, node_env, e2)?.as_int()?,
+        )),
+        Expr::Times(e1, e2) => Ok(Value::Int(
+            eval(local_env, node_env, e1)?.as_int()? * eval(local_env, node_env, e2)?.as_int()?,
+        )),
+        Expr::Div(e1, e2) => Ok(Value::Int(
+            eval(local_env, node_env, e1)?.as_int()? / eval(local_env, node_env, e2)?.as_int()?,
+        )),
+        Expr::Mod(e1, e2) => Ok(Value::Int(
+            eval(local_env, node_env, e1)?.as_int()? % eval(local_env, node_env, e2)?.as_int()?,
+        )),
         Expr::LessThan(e1, e2) => {
-            Value::Bool(eval(local_env, node_env, e1) < eval(local_env, node_env, e2))
+            Ok(Value::Bool(eval(local_env, node_env, e1)? < eval(local_env, node_env, e2)?))
         }
         Expr::EqualsEquals(e1, e2) => {
-            Value::Bool(eval(local_env, node_env, e1) == eval(local_env, node_env, e2))
+            Ok(Value::Bool(eval(local_env, node_env, e1)? == eval(local_env, node_env, e2)?))
         }
-        Expr::Not(e) => Value::Bool(!eval(local_env, node_env, e).as_bool()),
-        Expr::And(e1, e2) => Value::Bool(
-            eval(local_env, node_env, e1).as_bool() && eval(local_env, node_env, e2).as_bool(),
-        ),
-        Expr::Or(e1, e2) => Value::Bool(
-            eval(local_env, node_env, e1).as_bool() || eval(local_env, node_env, e2).as_bool(),
-        ),
-        Expr::Some(e) => Value::Option(Some(Box::new(eval(local_env, node_env, e)))),
-        Expr::Tuple(es) => Value::Tuple(es.iter().map(|e| eval(local_env, node_env, e)).collect()),
-        Expr::List(es) => Value::List(es.iter().map(|e| eval(local_env, node_env, e)).collect()),
+        Expr::Not(e) => Ok(Value::Bool(!eval(local_env, node_env, e)?.as_bool()?)),
+        Expr::And(e1, e2) => Ok(Value::Bool(
+            eval(local_env, node_env, e1)?.as_bool()? && eval(local_env, node_env, e2)?.as_bool()?,
+        )),
+        Expr::Or(e1, e2) => Ok(Value::Bool(
+            eval(local_env, node_env, e1)?.as_bool()? || eval(local_env, node_env, e2)?.as_bool()?,
+        )),
+        Expr::Some(e) => Ok(Value::Option(Some(Box::new(eval(local_env, node_env, e)?)))),
+        Expr::Tuple(es) => {
+            let vals: Result<Vec<_>, _> = es.iter().map(|e| eval(local_env, node_env, e)).collect();
+            Ok(Value::Tuple(vals?))
+        }
+        Expr::List(es) => {
+            let vals: Result<Vec<_>, _> = es.iter().map(|e| eval(local_env, node_env, e)).collect();
+            Ok(Value::List(vals?))
+        }
         Expr::Map(kv) => {
             let mut m = BTreeMap::new();
             for (k, v) in kv {
-                m.insert(eval(local_env, node_env, k), eval(local_env, node_env, v));
+                m.insert(eval(local_env, node_env, k)?, eval(local_env, node_env, v)?);
             }
-            Value::Map(m)
+            Ok(Value::Map(m))
         }
-        Expr::Find(col, key) => match eval(local_env, node_env, col) {
-            Value::Map(m) => m
-                .get(&eval(local_env, node_env, key))
-                .expect("Map key not found")
-                .clone(),
-            Value::List(l) => {
-                let idx = eval(local_env, node_env, key).as_int() as usize;
-                l.get(idx).expect("List index out of bounds").clone()
+        Expr::Find(col, key) => match eval(local_env, node_env, col)? {
+            Value::Map(m) => {
+                let k = eval(local_env, node_env, key)?;
+                m.get(&k).cloned().ok_or(RuntimeError::KeyNotFound)
             }
-            _ => panic!("Cannot find in non-collection"),
+            Value::List(l) => {
+                let idx = eval(local_env, node_env, key)?.as_int()? as usize;
+                l.get(idx).cloned().ok_or(RuntimeError::IndexOutOfBounds {
+                    index: idx,
+                    len: l.len(),
+                })
+            }
+            other => Err(RuntimeError::NotACollection {
+                got: other.type_name(),
+            }),
         },
-        Expr::CreateLock => Value::Lock(Rc::new(RefCell::new(false))),
+        Expr::CreateLock => Ok(Value::Lock(Rc::new(RefCell::new(false)))),
         Expr::ListPrepend(head, tail) => {
-            let h = eval(local_env, node_env, head);
-            let mut t = eval(local_env, node_env, tail).as_list().clone();
+            let h = eval(local_env, node_env, head)?;
+            let mut t = eval(local_env, node_env, tail)?.as_list()?.clone();
             t.insert(0, h);
-            Value::List(t)
+            Ok(Value::List(t))
         }
         Expr::ListAppend(list, item) => {
-            let mut l = eval(local_env, node_env, list).as_list().clone();
-            let i = eval(local_env, node_env, item);
+            let mut l = eval(local_env, node_env, list)?.as_list()?.clone();
+            let i = eval(local_env, node_env, item)?;
             l.push(i);
-            Value::List(l)
+            Ok(Value::List(l))
         }
         Expr::ListSubsequence(list, start, end) => {
-            let l = eval(local_env, node_env, list);
-            let s = eval(local_env, node_env, start).as_int() as usize;
-            let e = eval(local_env, node_env, end).as_int() as usize;
-            let vec = l.as_list();
-            if s >= vec.len() || e > vec.len() || s > e {
-                panic!("List subsequence out of bounds");
+            let l = eval(local_env, node_env, list)?;
+            let s = eval(local_env, node_env, start)?.as_int()? as usize;
+            let e = eval(local_env, node_env, end)?.as_int()? as usize;
+            let vec = l.as_list()?;
+            if s > vec.len() || e > vec.len() || s > e {
+                return Err(RuntimeError::SubsequenceOutOfBounds {
+                    start: s,
+                    end: e,
+                    len: vec.len(),
+                });
             }
-            Value::List(vec[s..e].to_vec())
+            Ok(Value::List(vec[s..e].to_vec()))
         }
         Expr::LessThanEquals(e1, e2) => {
-            Value::Bool(eval(local_env, node_env, e1) <= eval(local_env, node_env, e2))
+            Ok(Value::Bool(eval(local_env, node_env, e1)? <= eval(local_env, node_env, e2)?))
         }
         Expr::GreaterThan(e1, e2) => {
-            Value::Bool(eval(local_env, node_env, e1) > eval(local_env, node_env, e2))
+            Ok(Value::Bool(eval(local_env, node_env, e1)? > eval(local_env, node_env, e2)?))
         }
         Expr::GreaterThanEquals(e1, e2) => {
-            Value::Bool(eval(local_env, node_env, e1) >= eval(local_env, node_env, e2))
+            Ok(Value::Bool(eval(local_env, node_env, e1)? >= eval(local_env, node_env, e2)?))
         }
         Expr::KeyExists(key, map) => {
-            let k = eval(local_env, node_env, key);
-            let m = eval(local_env, node_env, map);
-            Value::Bool(m.as_map().contains_key(&k))
+            let k = eval(local_env, node_env, key)?;
+            let m = eval(local_env, node_env, map)?;
+            Ok(Value::Bool(m.as_map()?.contains_key(&k)))
         }
         Expr::MapErase(key, map) => {
-            let k = eval(local_env, node_env, key);
-            let mut m = eval(local_env, node_env, map).as_map().clone();
+            let k = eval(local_env, node_env, key)?;
+            let mut m = eval(local_env, node_env, map)?.as_map()?.clone();
             m.remove(&k);
-            Value::Map(m)
+            Ok(Value::Map(m))
         }
-        Expr::ListLen(list) => match eval(local_env, node_env, list) {
-            Value::List(l) => Value::Int(l.len() as i64),
-            Value::Map(m) => Value::Int(m.len() as i64),
-            _ => panic!("ListLen on non-collection"),
+        Expr::ListLen(list) => match eval(local_env, node_env, list)? {
+            Value::List(l) => Ok(Value::Int(l.len() as i64)),
+            Value::Map(m) => Ok(Value::Int(m.len() as i64)),
+            other => Err(RuntimeError::NotACollection {
+                got: other.type_name(),
+            }),
         },
         Expr::ListAccess(list, idx) => {
-            let l = eval(local_env, node_env, list);
-            let vec = l.as_list();
+            let l = eval(local_env, node_env, list)?;
+            let vec = l.as_list()?;
             let i = *idx;
             if i >= vec.len() {
-                panic!("List index out of bounds");
+                return Err(RuntimeError::IndexOutOfBounds {
+                    index: i,
+                    len: vec.len(),
+                });
             }
-            vec[i].clone()
+            Ok(vec[i].clone())
         }
         Expr::Min(e1, e2) => {
-            let v1 = eval(local_env, node_env, e1).as_int();
-            let v2 = eval(local_env, node_env, e2).as_int();
-            Value::Int(v1.min(v2))
+            let v1 = eval(local_env, node_env, e1)?.as_int()?;
+            let v2 = eval(local_env, node_env, e2)?.as_int()?;
+            Ok(Value::Int(v1.min(v2)))
         }
         Expr::TupleAccess(tuple, idx) => {
-            let t = eval(local_env, node_env, tuple);
+            let t = eval(local_env, node_env, tuple)?;
             if let Value::Tuple(vec) = t {
-                if *idx < 0 || *idx >= vec.len() {
-                    panic!("Tuple access out of bounds");
+                if *idx >= vec.len() {
+                    return Err(RuntimeError::IndexOutOfBounds {
+                        index: *idx,
+                        len: vec.len(),
+                    });
                 }
-                vec[*idx].clone()
+                Ok(vec[*idx].clone())
             } else {
-                panic!("TupleAccess on non-tuple");
+                Err(RuntimeError::TypeError {
+                    expected: "tuple",
+                    got: t.type_name(),
+                })
             }
         }
-        Expr::Unwrap(e) => match eval(local_env, node_env, e) {
-            Value::Option(Some(v)) => *v,
-            _ => panic!("Unwrap on None"),
+        Expr::Unwrap(e) => match eval(local_env, node_env, e)? {
+            Value::Option(Some(v)) => Ok(*v),
+            Value::Option(None) => Err(RuntimeError::UnwrapNone),
+            other => Err(RuntimeError::TypeError {
+                expected: "option",
+                got: other.type_name(),
+            }),
         },
-        Expr::Coalesce(opt, default) => match eval(local_env, node_env, opt) {
-            Value::Option(Some(v)) => *v,
+        Expr::Coalesce(opt, default) => match eval(local_env, node_env, opt)? {
+            Value::Option(Some(v)) => Ok(*v),
             Value::Option(None) => eval(local_env, node_env, default),
-            _ => panic!("Coalesce on non-option"),
+            other => Err(RuntimeError::CoalesceNonOption {
+                got: other.type_name(),
+            }),
         },
-        Expr::IntToString(e) => Value::String(eval(local_env, node_env, e).as_int().to_string()),
+        Expr::IntToString(e) => Ok(Value::String(eval(local_env, node_env, e)?.as_int()?.to_string())),
         Expr::Store(col, key, val) => update_collection(
-            eval(local_env, node_env, col),
-            eval(local_env, node_env, key),
-            eval(local_env, node_env, val),
+            eval(local_env, node_env, col)?,
+            eval(local_env, node_env, key)?,
+            eval(local_env, node_env, val)?,
         ),
     }
 }
@@ -498,7 +631,7 @@ pub fn exec_sync_on_node(
     local_env: &mut Env,
     node_id: usize,
     start_pc: usize,
-) -> Value {
+) -> Result<Value, RuntimeError> {
     let node_env = Rc::clone(&state.nodes[node_id]);
     exec_sync_inner(
         state,
@@ -515,7 +648,7 @@ fn exec_sync_inner(
     local_env: &mut Env,
     node_env: &mut Env,
     start_pc: usize,
-) -> Value {
+) -> Result<Value, RuntimeError> {
     let mut pc = start_pc;
     loop {
         let label = program.cfg.get_label(pc).clone();
@@ -524,22 +657,24 @@ fn exec_sync_inner(
                 pc = next;
                 match instr {
                     Instr::Assign(lhs, rhs) => {
-                        let v = eval(local_env, node_env, &rhs);
-                        store(&lhs, v, local_env, node_env);
+                        let v = eval(local_env, node_env, &rhs)?;
+                        store(&lhs, v, local_env, node_env)?;
                     }
                     Instr::Copy(lhs, rhs) => {
-                        let v = eval(local_env, node_env, &rhs);
-                        store(&lhs, v, local_env, node_env);
+                        let v = eval(local_env, node_env, &rhs)?;
+                        store(&lhs, v, local_env, node_env)?;
                     }
                     Instr::SyncCall(lhs, func_name, args) => {
-                        let arg_vals: Vec<Value> =
+                        let arg_vals: Result<Vec<Value>, _> =
                             args.iter().map(|a| eval(local_env, node_env, a)).collect();
-                        let func_info = program.rpc.get(&func_name).expect("Function not found");
+                        let arg_vals = arg_vals?;
+                        let func_info = program
+                            .rpc
+                            .get(&func_name)
+                            .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
 
                         if !func_info.is_sync {
-                            panic!(
-                                "Runtime Error: 'sync' function tried to call non-sync function synchronously"
-                            );
+                            return Err(RuntimeError::SyncCallToAsyncFunction(func_name.clone()));
                         }
 
                         let mut callee_local = HashMap::new();
@@ -547,7 +682,7 @@ fn exec_sync_inner(
                             callee_local.insert(name.clone(), arg_vals[i].clone());
                         }
                         for (name, expr) in &func_info.locals {
-                            callee_local.insert(name.clone(), eval(local_env, node_env, expr));
+                            callee_local.insert(name.clone(), eval(local_env, node_env, expr)?);
                         }
 
                         if let Some(s) = local_env.get("self") {
@@ -561,20 +696,19 @@ fn exec_sync_inner(
                             &mut callee_local,
                             node_env,
                             func_info.entry,
-                        );
+                        )?;
 
-                        store(&lhs, val, local_env, node_env);
+                        store(&lhs, val, local_env, node_env)?;
                     }
                     Instr::Async(lhs, node_expr, func_name, args) => {
                         // Similar to exec Async but we are inside sync.
-                        let target_node = eval(local_env, node_env, &node_expr).as_node();
-                        let arg_vals: Vec<Value> =
+                        let target_node = eval(local_env, node_env, &node_expr)?.as_node()?;
+                        let arg_vals: Result<Vec<Value>, _> =
                             args.iter().map(|a| eval(local_env, node_env, a)).collect();
+                        let arg_vals = arg_vals?;
 
                         let chan_id = ChannelId {
-                            node: target_node, // Origin is self? No, ChannelId node is usually creator?
-                            // OCaml: "let chan_id = { node = node_id; id = ... }" where node_id is target?
-                            // Checking ml: "let chan_id = { node = node_id; ... }" where node_id is result of eval node_expr.
+                            node: target_node,
                             // So Channel attached to target node.
                             id: state.channels.len(),
                         };
@@ -588,15 +722,18 @@ fn exec_sync_inner(
                                 waiting_writers: VecDeque::new(),
                             },
                         );
-                        store(&lhs, Value::Channel(chan_id), local_env, node_env);
+                        store(&lhs, Value::Channel(chan_id), local_env, node_env)?;
 
-                        let func_info = program.rpc.get(&func_name).expect("Function not found");
+                        let func_info = program
+                            .rpc
+                            .get(&func_name)
+                            .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
                         let mut callee_locals = HashMap::new();
                         for (i, name) in func_info.formals.iter().enumerate() {
                             callee_locals.insert(name.clone(), arg_vals[i].clone());
                         }
                         for (name, expr) in &func_info.locals {
-                            callee_locals.insert(name.clone(), eval(local_env, node_env, expr));
+                            callee_locals.insert(name.clone(), eval(local_env, node_env, expr)?);
                         }
 
                         #[derive(Debug)]
@@ -608,7 +745,9 @@ fn exec_sync_inner(
                                 let chan = state.channels.get_mut(&self.chan_id).unwrap();
                                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                                     let node_env = Rc::clone(&state.nodes[reader.node]);
-                                    store(&lhs, val, &mut reader.env, &mut node_env.borrow_mut());
+                                    // Note: store errors in continuations are ignored (fire-and-forget)
+                                    let _ =
+                                        store(&lhs, val, &mut reader.env, &mut node_env.borrow_mut());
                                     state.runnable_records.push(reader);
                                 } else {
                                     chan.buffer.push_back(val);
@@ -616,7 +755,10 @@ fn exec_sync_inner(
                             }
                         }
 
-                        let origin_node = local_env.get("self").unwrap().as_node();
+                        let origin_node = local_env
+                            .get("self")
+                            .ok_or_else(|| RuntimeError::VariableNotFound("self".to_string()))?
+                            .as_node()?;
 
                         let new_record = Record {
                             pc: func_info.entry,
@@ -641,7 +783,10 @@ fn exec_sync_inner(
                 }
             }
             Label::MakeChannel(lhs, cap, next) => {
-                let origin_node = local_env.get("self").unwrap().as_node();
+                let origin_node = local_env
+                    .get("self")
+                    .ok_or_else(|| RuntimeError::VariableNotFound("self".to_string()))?
+                    .as_node()?;
                 let id = state.channels.len();
                 let cid = ChannelId {
                     node: origin_node,
@@ -656,11 +801,11 @@ fn exec_sync_inner(
                         waiting_writers: VecDeque::new(),
                     },
                 );
-                store(&lhs, Value::Channel(cid), local_env, node_env);
+                store(&lhs, Value::Channel(cid), local_env, node_env)?;
                 pc = next;
             }
             Label::Cond(cond, bthen, belse) => {
-                if eval(local_env, node_env, &cond).as_bool() {
+                if eval(local_env, node_env, &cond)?.as_bool()? {
                     pc = bthen;
                 } else {
                     pc = belse;
@@ -670,7 +815,8 @@ fn exec_sync_inner(
                 return eval(local_env, node_env, &expr);
             }
             Label::Print(expr, next) => {
-                // log_app!("{:?}", eval(local_env, node_env, &expr));
+                // log_app!("{:?}", eval(local_env, node_env, &expr)?);
+                let _ = eval(local_env, node_env, &expr)?;
                 pc = next;
             }
             Label::Break(target) => {
@@ -680,7 +826,7 @@ fn exec_sync_inner(
                 // Simplified iteration: we need to handle list/map iteration
                 // Since we don't have easy mutable iterator in this loop structure
                 // We rely on "eval" fetching the current state of collection
-                let col_val = eval(local_env, node_env, &expr);
+                let col_val = eval(local_env, node_env, &expr)?;
 
                 match col_val {
                     Value::Map(m) => {
@@ -695,18 +841,18 @@ fn exec_sync_inner(
 
                             if let Expr::Var(vname) = expr {
                                 let updated = Value::Map(new_m);
-                                store(&Lhs::Var(vname), updated, local_env, node_env);
+                                store(&Lhs::Var(vname), updated, local_env, node_env)?;
 
                                 match lhs {
                                     Lhs::Tuple(vars) if vars.len() == 2 => {
-                                        store(&Lhs::Var(vars[0].clone()), k, local_env, node_env);
-                                        store(&Lhs::Var(vars[1].clone()), v, local_env, node_env);
+                                        store(&Lhs::Var(vars[0].clone()), k, local_env, node_env)?;
+                                        store(&Lhs::Var(vars[1].clone()), v, local_env, node_env)?;
                                         pc = body;
                                     }
-                                    _ => panic!("ForLoopIn map expects tuple lhs"),
+                                    _ => return Err(RuntimeError::ForLoopMapExpectsTupleLhs),
                                 }
                             } else {
-                                panic!("ForLoopIn collection must be a variable");
+                                return Err(RuntimeError::ForLoopCollectionNotVariable);
                             }
                         }
                     }
@@ -718,24 +864,37 @@ fn exec_sync_inner(
                             // Update collection
                             if let Expr::Var(vname) = expr {
                                 let new_l = Value::List(l[1..].to_vec());
-                                store(&Lhs::Var(vname), new_l, local_env, node_env);
+                                store(&Lhs::Var(vname), new_l, local_env, node_env)?;
 
-                                store(&lhs, item, local_env, node_env);
+                                store(&lhs, item, local_env, node_env)?;
                                 pc = body;
                             } else {
-                                panic!("ForLoopIn collection must be a variable");
+                                return Err(RuntimeError::ForLoopCollectionNotVariable);
                             }
                         }
                     }
-                    _ => panic!("ForLoopIn not a collection"),
+                    other => {
+                        return Err(RuntimeError::ForLoopNotCollection {
+                            got: other.type_name(),
+                        })
+                    }
                 }
             }
-            _ => panic!("Instruction not allowed in sync function"),
+            other => {
+                return Err(RuntimeError::UnsupportedSyncInstruction(format!(
+                    "{:?}",
+                    other
+                )))
+            }
         }
     }
 }
 
-pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
+pub fn exec(
+    state: &mut State,
+    program: &mut Program,
+    mut record: Record,
+) -> Result<(), RuntimeError> {
     let mut local_env = record.env;
     let node_env = Rc::clone(&state.nodes[record.node]);
 
@@ -749,22 +908,26 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                 record.pc = next;
                 match instr {
                     Instr::Assign(lhs, rhs) => {
-                        let v = eval(&local_env, &node_env.borrow(), &rhs);
-                        store(&lhs, v, &mut local_env, &mut node_env.borrow_mut());
+                        let v = eval(&local_env, &node_env.borrow(), &rhs)?;
+                        store(&lhs, v, &mut local_env, &mut node_env.borrow_mut())?;
                     }
                     Instr::Copy(lhs, rhs) => {
-                        let v = eval(&local_env, &node_env.borrow(), &rhs);
-                        store(&lhs, v, &mut local_env, &mut node_env.borrow_mut());
+                        let v = eval(&local_env, &node_env.borrow(), &rhs)?;
+                        store(&lhs, v, &mut local_env, &mut node_env.borrow_mut())?;
                     }
                     Instr::SyncCall(lhs, func_name, args) => {
-                        let arg_vals: Vec<Value> = args
+                        let arg_vals: Result<Vec<Value>, _> = args
                             .iter()
                             .map(|a| eval(&local_env, &node_env.borrow(), a))
                             .collect();
-                        let func_info = program.rpc.get(&func_name).expect("Function not found");
+                        let arg_vals = arg_vals?;
+                        let func_info = program
+                            .rpc
+                            .get(&func_name)
+                            .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
 
                         if !func_info.is_sync {
-                            panic!("Runtime Error: 'exec' tried to SyncCall non-sync function");
+                            return Err(RuntimeError::SyncCallToAsyncFunction(func_name.clone()));
                         }
 
                         let mut callee_local = HashMap::new();
@@ -773,7 +936,7 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                         }
                         for (name, expr) in &func_info.locals {
                             callee_local
-                                .insert(name.clone(), eval(&local_env, &node_env.borrow(), expr));
+                                .insert(name.clone(), eval(&local_env, &node_env.borrow(), expr)?);
                         }
 
                         if let Some(s) = local_env.get("self") {
@@ -787,18 +950,19 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                             &mut callee_local,
                             &mut node_env.borrow_mut(),
                             func_info.entry,
-                        );
+                        )?;
 
-                        store(&lhs, ret_val, &mut local_env, &mut node_env.borrow_mut());
+                        store(&lhs, ret_val, &mut local_env, &mut node_env.borrow_mut())?;
                     }
                     Instr::Async(lhs, node_expr, func_name, args) => {
                         // Async logic
                         let target_node =
-                            eval(&local_env, &node_env.borrow(), &node_expr).as_node();
-                        let arg_vals: Vec<Value> = args
+                            eval(&local_env, &node_env.borrow(), &node_expr)?.as_node()?;
+                        let arg_vals: Result<Vec<Value>, _> = args
                             .iter()
                             .map(|a| eval(&local_env, &node_env.borrow(), a))
                             .collect();
+                        let arg_vals = arg_vals?;
 
                         // Make channel
                         let chan_id = ChannelId {
@@ -819,10 +983,13 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                             Value::Channel(chan_id),
                             &mut local_env,
                             &mut node_env.borrow_mut(),
-                        );
+                        )?;
 
                         // Setup Callee Record
-                        let func_info = program.rpc.get(&func_name).expect("Function not found");
+                        let func_info = program
+                            .rpc
+                            .get(&func_name)
+                            .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
                         let mut callee_locals = HashMap::new();
                         for (i, name) in func_info.formals.iter().enumerate() {
                             callee_locals.insert(name.clone(), arg_vals[i].clone());
@@ -840,7 +1007,9 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                                     // Direct handoff
                                     let node_env = Rc::clone(&state.nodes[reader.node]);
-                                    store(&lhs, val, &mut reader.env, &mut node_env.borrow_mut());
+                                    // Note: store errors in continuations are ignored (fire-and-forget)
+                                    let _ =
+                                        store(&lhs, val, &mut reader.env, &mut node_env.borrow_mut());
                                     state.runnable_records.push(reader);
                                 } else {
                                     chan.buffer.push_back(val);
@@ -890,21 +1059,21 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                     Value::Channel(cid),
                     &mut local_env,
                     &mut node_env.borrow_mut(),
-                );
+                )?;
                 record.pc = next;
             }
             Label::Send(chan_expr, val_expr, next) => {
-                let cid = eval(&local_env, &node_env.borrow(), &chan_expr).as_channel();
-                let val = eval(&local_env, &node_env.borrow(), &val_expr);
+                let cid = eval(&local_env, &node_env.borrow(), &chan_expr)?.as_channel()?;
+                let val = eval(&local_env, &node_env.borrow(), &val_expr)?;
                 if cid.node != record.node {
-                    todo!("Networked channels are unsupported for now.");
+                    return Err(RuntimeError::NetworkedChannelUnsupported);
                 }
                 // Local Send
                 let chan = state.channels.get_mut(&cid).unwrap();
                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                     // Wakeup reader
                     let r_node = Rc::clone(&state.nodes[reader.node]);
-                    store(&lhs, val, &mut reader.env, &mut r_node.borrow_mut());
+                    store(&lhs, val, &mut reader.env, &mut r_node.borrow_mut())?;
                     state.runnable_records.push(reader);
                     record.pc = next;
                 } else if (chan.buffer.len() as i32) < chan.capacity {
@@ -914,19 +1083,19 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                     record.env = local_env;
                     record.pc = next;
                     chan.waiting_writers.push_back((record, val));
-                    return;
+                    return Ok(());
                 }
             }
             Label::Recv(lhs, chan_expr, next) => {
-                let cid = eval(&local_env, &node_env.borrow(), &chan_expr).as_channel();
+                let cid = eval(&local_env, &node_env.borrow(), &chan_expr)?.as_channel()?;
                 if cid.node != record.node {
-                    panic!("Cannot read remote channel directly");
+                    return Err(RuntimeError::RemoteChannelRead);
                 }
 
                 let chan = state.channels.get_mut(&cid).unwrap();
 
                 if let Some(val) = chan.buffer.pop_front() {
-                    store(&lhs, val, &mut local_env, &mut node_env.borrow_mut());
+                    store(&lhs, val, &mut local_env, &mut node_env.borrow_mut())?;
                     // Wake writer if any
                     if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
                         chan.buffer.push_back(w_val);
@@ -934,7 +1103,7 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                     }
                     record.pc = next;
                 } else if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
-                    store(&lhs, w_val, &mut local_env, &mut node_env.borrow_mut());
+                    store(&lhs, w_val, &mut local_env, &mut node_env.borrow_mut())?;
                     state.runnable_records.push(writer);
                     record.pc = next;
                 } else {
@@ -942,44 +1111,45 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                     record.env = local_env;
                     record.pc = next; // When woke, proceed to next
                     chan.waiting_readers.push_back((record, lhs));
-                    return; // Stop execution
+                    return Ok(()); // Stop execution
                 }
             }
             Label::Return(expr) => {
-                let val = eval(&local_env, &node_env.borrow(), &expr);
+                let val = eval(&local_env, &node_env.borrow(), &expr)?;
                 record.env = local_env;
                 // Call continuation
                 record.continuation.call(state, val);
-                return; // End thread
+                return Ok(()); // End thread
             }
             Label::Pause(next) => {
                 record.env = local_env;
                 record.pc = next;
                 state.runnable_records.push(record);
-                return; // Yield
+                return Ok(()); // Yield
             }
             Label::Cond(cond, bthen, belse) => {
-                if eval(&local_env, &node_env.borrow(), &cond).as_bool() {
+                if eval(&local_env, &node_env.borrow(), &cond)?.as_bool()? {
                     record.pc = bthen;
                 } else {
                     record.pc = belse;
                 }
             }
             Label::Print(expr, next) => {
-                // log_app!("{:?}", eval(&local_env, &node_env.borrow(), &expr));
+                // log_app!("{:?}", eval(&local_env, &node_env.borrow(), &expr)?);
+                let _ = eval(&local_env, &node_env.borrow(), &expr)?;
                 record.pc = next;
             }
             Label::SpinAwait(expr, next) => {
-                if eval(&local_env, &node_env.borrow(), &expr).as_bool() {
+                if eval(&local_env, &node_env.borrow(), &expr)?.as_bool()? {
                     record.pc = next;
                 } else {
                     record.env = local_env;
                     state.runnable_records.push(record);
-                    return; // Yield
+                    return Ok(()); // Yield
                 }
             }
             Label::ForLoopIn(lhs, expr, body_pc, next_pc) => {
-                let col_val = eval(&local_env, &node_env.borrow(), &expr);
+                let col_val = eval(&local_env, &node_env.borrow(), &expr)?;
                 match col_val {
                     Value::Map(m) => {
                         if m.is_empty() {
@@ -998,7 +1168,7 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                                     updated,
                                     &mut local_env,
                                     &mut node_env.borrow_mut(),
-                                );
+                                )?;
 
                                 match lhs {
                                     Lhs::Tuple(vars) if vars.len() == 2 => {
@@ -1007,19 +1177,19 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                                             k,
                                             &mut local_env,
                                             &mut node_env.borrow_mut(),
-                                        );
+                                        )?;
                                         store(
                                             &Lhs::Var(vars[1].clone()),
                                             v,
                                             &mut local_env,
                                             &mut node_env.borrow_mut(),
-                                        );
+                                        )?;
                                         record.pc = body_pc;
                                     }
-                                    _ => panic!("ForLoopIn map expects tuple lhs"),
+                                    _ => return Err(RuntimeError::ForLoopMapExpectsTupleLhs),
                                 }
                             } else {
-                                panic!("ForLoopIn collection must be a variable");
+                                return Err(RuntimeError::ForLoopCollectionNotVariable);
                             }
                         }
                     }
@@ -1035,38 +1205,42 @@ pub fn exec(state: &mut State, program: &mut Program, mut record: Record) {
                                     new_l,
                                     &mut local_env,
                                     &mut node_env.borrow_mut(),
-                                );
+                                )?;
 
-                                store(&lhs, item, &mut local_env, &mut node_env.borrow_mut());
+                                store(&lhs, item, &mut local_env, &mut node_env.borrow_mut())?;
                                 record.pc = body_pc;
                             } else {
-                                panic!("ForLoopIn collection must be a variable");
+                                return Err(RuntimeError::ForLoopCollectionNotVariable);
                             }
                         }
                     }
-                    _ => panic!("ForLoopIn not a collection"),
+                    other => {
+                        return Err(RuntimeError::ForLoopNotCollection {
+                            got: other.type_name(),
+                        })
+                    }
                 }
             }
             Label::Lock(lock_expr, next) => {
-                let lock_val = eval(&local_env, &node_env.borrow(), &lock_expr);
-                let lock = lock_val.as_lock();
+                let lock_val = eval(&local_env, &node_env.borrow(), &lock_expr)?;
+                let lock = lock_val.as_lock()?;
                 if *lock.borrow() == false {
                     *lock.borrow_mut() = true;
                     record.pc = next;
                 } else {
                     record.env = local_env;
                     state.runnable_records.push(record);
-                    return; // Yield
+                    return Ok(()); // Yield
                 }
             }
             Label::Unlock(lock_expr, next) => {
-                let lock_val = eval(&local_env, &node_env.borrow(), &lock_expr);
-                let lock = lock_val.as_lock();
+                let lock_val = eval(&local_env, &node_env.borrow(), &lock_expr)?;
+                let lock = lock_val.as_lock()?;
                 if *lock.borrow() == true {
                     *lock.borrow_mut() = false;
                     record.pc = next;
                 } else {
-                    panic!("Runtime error: Attempted to 'Unlock' an already-unlocked lock");
+                    return Err(RuntimeError::UnlockAlreadyUnlocked);
                 }
             }
             Label::Break(target) => {
@@ -1084,10 +1258,10 @@ pub fn schedule_record(
     sever_all_but_mid: bool,
     partition_away_nodes: &[usize],
     randomly_delay_msgs: bool,
-) {
+) -> Result<(), RuntimeError> {
     let len = state.runnable_records.len();
     if len == 0 {
-        return; // Halt equivalent
+        return Ok(()); // Halt equivalent
     }
 
     use rand::Rng;
@@ -1098,7 +1272,7 @@ pub fn schedule_record(
 
     if state.crash_info.currently_crashed.contains(&r.node) {
         // log_err!("Failure: source {} for dst {}", r.origin_node, r.node);
-        return;
+        return Ok(());
     }
 
     let src_node = r.origin_node;
@@ -1108,7 +1282,7 @@ pub fn schedule_record(
         if state.crash_info.currently_crashed.contains(&dest_node) {
             // Queue message
             state.crash_info.queued_messages.push((dest_node, r));
-            return;
+            return Ok(());
         } else {
             let mut should_execute = true;
             if randomly_drop_msgs && rng.random::<f64>() < 0.3 {
@@ -1139,15 +1313,16 @@ pub fn schedule_record(
                     r.x = r.policy.update(r.x);
                     should_execute = false;
                     state.runnable_records.push(r);
-                    return;
+                    return Ok(());
                 }
             }
 
             if should_execute {
-                exec(state, program, r);
+                exec(state, program, r)?;
             }
         }
     } else {
-        exec(state, program, r);
+        exec(state, program, r)?;
     }
+    Ok(())
 }

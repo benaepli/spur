@@ -4,10 +4,11 @@ use std::rc::Rc;
 
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Continuation, Env, OpKind, Operation, Record, State, UpdatePolicy, Value, eval, exec,
-    exec_sync_on_node, schedule_record,
+    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy, Value, eval,
+    exec, exec_sync_on_node, schedule_record,
 };
 use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine};
+use log::{info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topology {
@@ -25,7 +26,7 @@ fn create_env(
     formals: &[String],
     actuals: Vec<Value>,
     locals: &[(String, crate::compiler::cfg::Expr)],
-) -> Env {
+) -> Result<Env, RuntimeError> {
     assert_eq!(
         formals.len(),
         actuals.len(),
@@ -38,10 +39,10 @@ fn create_env(
 
     let node_env_ref = node_env.borrow();
     for (name, default_expr) in locals {
-        env.insert(name.clone(), eval(&env, &node_env_ref, default_expr));
+        env.insert(name.clone(), eval(&env, &node_env_ref, default_expr)?);
     }
 
-    env
+    Ok(env)
 }
 
 #[derive(Debug)]
@@ -71,9 +72,14 @@ impl Continuation for ClientOpContinuation {
     }
 }
 
-fn recover_node(topology: &TopologyInfo, state: &mut State, prog: &Program, node_id: usize) {
+fn recover_node(
+    topology: &TopologyInfo,
+    state: &mut State,
+    prog: &Program,
+    node_id: usize,
+) -> Result<(), RuntimeError> {
     let Some(recover_fn) = prog.rpc.get("Node.RecoverInit") else {
-        return;
+        return Ok(());
     };
 
     let actuals = match topology.topology {
@@ -92,7 +98,7 @@ fn recover_node(topology: &TopologyInfo, state: &mut State, prog: &Program, node
         &recover_fn.formals,
         actuals,
         &recover_fn.locals,
-    );
+    )?;
 
     let record = Record {
         pc: recover_fn.entry,
@@ -105,28 +111,33 @@ fn recover_node(topology: &TopologyInfo, state: &mut State, prog: &Program, node
         policy: UpdatePolicy::Identity,
     };
 
-    exec(state, &mut prog.clone(), record);
+    exec(state, &mut prog.clone(), record)
 }
 
-fn reinit_node(topology: &TopologyInfo, state: &mut State, prog: &Program, node_id: usize) {
+fn reinit_node(
+    topology: &TopologyInfo,
+    state: &mut State,
+    prog: &Program,
+    node_id: usize,
+) -> Result<(), RuntimeError> {
     let init_fn = prog
         .rpc
         .get("Node.BASE_NODE_INIT")
         .expect("BASE_NODE_INIT not found");
 
-    let mut env = create_env(&state.nodes[node_id], &[], vec![], &init_fn.locals);
+    let mut env = create_env(&state.nodes[node_id], &[], vec![], &init_fn.locals)?;
     env.insert("self".to_string(), Value::Node(node_id));
 
-    exec_sync_on_node(state, prog, &mut env, node_id, init_fn.entry);
+    exec_sync_on_node(state, prog, &mut env, node_id, init_fn.entry)?;
 
-    recover_node(topology, state, prog, node_id);
+    recover_node(topology, state, prog, node_id)
 }
 
 fn crash_node(state: &mut State, node_id: usize) {
     let ci = &mut state.crash_info;
 
     if !ci.currently_crashed.insert(node_id) {
-        eprintln!("WARN: Node {} is already crashed", node_id);
+        warn!("Node {} is already crashed", node_id);
         return;
     }
 
@@ -152,14 +163,14 @@ fn recover_crashed_node(
     prog: &Program,
     topology: &TopologyInfo,
     node_id: usize,
-) {
+) -> Result<(), RuntimeError> {
     if !state.crash_info.currently_crashed.remove(&node_id) {
-        eprintln!("WARN: Node {} is not crashed", node_id);
-        return;
+        warn!("Node {} is not crashed", node_id);
+        return Ok(());
     }
 
     state.nodes[node_id] = Rc::new(RefCell::new(HashMap::new()));
-    reinit_node(topology, state, prog, node_id);
+    reinit_node(topology, state, prog, node_id)?;
 
     let mut queued_for_node = Vec::new();
     let mut remaining = Vec::new();
@@ -172,6 +183,7 @@ fn recover_crashed_node(
     }
     state.crash_info.queued_messages = remaining;
     state.runnable_records.extend(queued_for_node);
+    Ok(())
 }
 
 fn schedule_client_op(
@@ -180,7 +192,7 @@ fn schedule_client_op(
     op_id: i32,
     op_spec: &ClientOpSpec,
     client_id: i32,
-) {
+) -> Result<(), RuntimeError> {
     let (op_name, actuals) = match op_spec {
         ClientOpSpec::Write(target, key, val) => (
             "ClientInterface.Write",
@@ -206,7 +218,7 @@ fn schedule_client_op(
         &op_func.formals,
         actuals.clone(),
         &op_func.locals,
-    );
+    )?;
 
     state.history.push(Operation {
         client_id,
@@ -230,6 +242,7 @@ fn schedule_client_op(
         x: 0.4,
         policy: UpdatePolicy::Identity,
     });
+    Ok(())
 }
 
 pub fn exec_plan(
@@ -239,15 +252,15 @@ pub fn exec_plan(
     max_iterations: i32,
     topology: TopologyInfo,
     randomly_delay_msgs: bool,
-) {
+) -> Result<(), RuntimeError> {
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, String> = HashMap::new();
 
     for step in 0..max_iterations {
         if engine.is_complete() {
-            println!("Plan completed in {} steps", step);
-            return;
+            info!("Plan completed in {} steps", step);
+            return Ok(());
         }
 
         state.crash_info.current_step = step;
@@ -259,7 +272,7 @@ pub fn exec_plan(
                     if let Some(client_id) = state.free_clients.pop() {
                         op_id_counter += 1;
                         in_progress.insert(op_id_counter, event.id.clone());
-                        schedule_client_op(state, &program, op_id_counter, op_spec, client_id);
+                        schedule_client_op(state, &program, op_id_counter, op_spec, client_id)?;
                     } else {
                         engine
                             .mark_as_ready(&event.id)
@@ -273,7 +286,7 @@ pub fn exec_plan(
                         .expect("Failed to complete crash");
                 }
                 EventAction::RecoverNode(node_id) => {
-                    recover_crashed_node(state, &program, &topology, *node_id as usize);
+                    recover_crashed_node(state, &program, &topology, *node_id as usize)?;
                     engine
                         .mark_event_completed(&event.id)
                         .expect("Failed to complete recover");
@@ -291,7 +304,7 @@ pub fn exec_plan(
                 false,
                 &[],
                 randomly_delay_msgs,
-            );
+            )?;
         }
 
         // 3. Check for completed client operations
@@ -313,8 +326,9 @@ pub fn exec_plan(
         }
     }
 
-    eprintln!(
-        "WARN: Hit max iterations ({}) before plan completion",
+    warn!(
+        "Hit max iterations ({}) before plan completion",
         max_iterations
     );
+    Ok(())
 }
