@@ -1,12 +1,11 @@
 use crate::compiler::cfg::Program;
-use crate::simulator::core::{RuntimeError, State, Value, eval, exec_sync_on_node};
+use crate::simulator::core::{Env, RuntimeError, State, Value, SELF_NAME_ID, eval, exec_sync_on_node};
 use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
 use crate::simulator::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::history::{init_sqlite, save_history_sqlite};
 use log::{debug, error, info, warn};
 use rusqlite::Connection;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 
@@ -81,27 +80,27 @@ fn initialize_state(
     let mut state = State::new(num_servers + num_clients);
     state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
 
-    if let Some(init_fn) = program.rpc.get("ClientInterface.BASE_NODE_INIT") {
+    if let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
         for i in 0..num_clients {
             let client_id = num_servers + i;
-            let mut env = HashMap::new();
-            env.insert("self".to_string(), Value::Node(client_id));
+            let mut env = Env::default();
+            env.insert(SELF_NAME_ID, Value::Node(client_id));
             let node_env = state.nodes[client_id].borrow();
             for (name, expr) in &init_fn.locals {
-                env.insert(name.clone(), eval(&env, &node_env, expr)?);
+                env.insert(*name, eval(&env, &node_env, expr)?);
             }
             drop(node_env);
             exec_sync_on_node(&mut state, program, &mut env, client_id, init_fn.entry)?;
         }
     }
 
-    if let Some(init_fn) = program.rpc.get("Node.BASE_NODE_INIT") {
+    if let Some(init_fn) = program.get_func_by_name("Node.BASE_NODE_INIT") {
         for node_id in 0..num_servers {
-            let mut env = HashMap::new();
-            env.insert("self".to_string(), Value::Node(node_id));
+            let mut env = Env::default();
+            env.insert(SELF_NAME_ID, Value::Node(node_id));
             let node_env = state.nodes[node_id].borrow();
             for (name, expr) in &init_fn.locals {
-                env.insert(name.clone(), eval(&env, &node_env, expr)?);
+                env.insert(*name, eval(&env, &node_env, expr)?);
             }
             drop(node_env);
             exec_sync_on_node(&mut state, program, &mut env, node_id, init_fn.entry)?;
@@ -117,7 +116,7 @@ fn init_topology(
     num_servers: usize,
 ) -> Result<(), RuntimeError> {
     let init_fn_name = "Node.Init";
-    let Some(init_fn) = program.rpc.get(init_fn_name) else {
+    let Some(init_fn) = program.get_func_by_name(init_fn_name) else {
         warn!("{} not found", init_fn_name);
         return Ok(());
     };
@@ -126,10 +125,10 @@ fn init_topology(
 
     for node_id in 0..num_servers {
         let actuals = vec![Value::Int(node_id as i64), peer_list.clone()];
-        let mut env = HashMap::new();
+        let mut env = Env::default();
 
         for (i, formal) in init_fn.formals.iter().enumerate() {
-            env.insert(formal.clone(), actuals[i].clone());
+            env.insert(*formal, actuals[i].clone());
         }
 
         exec_sync_on_node(state, program, &mut env, node_id, init_fn.entry)?;

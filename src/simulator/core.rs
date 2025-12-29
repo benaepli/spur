@@ -1,12 +1,13 @@
+use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex};
 use imbl::{HashMap as ImHashMap, Vector};
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::rc::Rc;
 use std::{
     cmp::Ordering,
-    collections::HashMap,
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
 };
@@ -21,7 +22,7 @@ pub enum RuntimeError {
     },
 
     #[error("variable not found: {0}")]
-    VariableNotFound(String),
+    VariableNotFound(NameId),
 
     #[error("function not found: {0}")]
     FunctionNotFound(String),
@@ -410,7 +411,7 @@ impl State {
     pub fn new(node_count: usize) -> Self {
         Self {
             nodes: (0..node_count)
-                .map(|_| Rc::new(RefCell::new(HashMap::new())))
+                .map(|_| Rc::new(RefCell::new(Env::default())))
                 .collect(),
             runnable_records: Vec::new(),
             waiting_records: Vec::new(),
@@ -433,7 +434,17 @@ impl State {
     }
 }
 
-pub type Env = HashMap<String, Value>;
+/// Special NameId for "self" - uses max usize to avoid collision with normal IDs
+pub const SELF_NAME_ID: NameId = NameId(usize::MAX);
+
+/// Creates a special NameId for for-loop iterator state based on the PC.
+/// Uses high bit range to avoid collision with normal IDs.
+fn iter_name_id(pc: Vertex) -> NameId {
+    // Use a high range that won't collide with normal IDs or SELF_NAME_ID
+    NameId(usize::MAX - 1 - pc)
+}
+
+pub type Env = FxHashMap<NameId, Value>;
 
 pub trait Continuation: Debug {
     fn call(&self, state: &mut State, val: Value);
@@ -445,13 +456,13 @@ impl Continuation for NoOpContinuation {
     fn call(&self, _state: &mut State, _val: Value) {}
 }
 
-fn load(var: &str, local_env: &Env, node_env: &Env) -> Result<Value, RuntimeError> {
-    if let Some(v) = local_env.get(var) {
+fn load(var: NameId, local_env: &Env, node_env: &Env) -> Result<Value, RuntimeError> {
+    if let Some(v) = local_env.get(&var) {
         Ok(v.clone())
-    } else if let Some(v) = node_env.get(var) {
+    } else if let Some(v) = node_env.get(&var) {
         Ok(v.clone())
     } else {
-        Err(RuntimeError::VariableNotFound(var.to_string()))
+        Err(RuntimeError::VariableNotFound(var))
     }
 }
 
@@ -464,13 +475,13 @@ fn store(
     match lhs {
         Lhs::Var(name) => {
             if local_env.contains_key(name) {
-                local_env.insert(name.clone(), val);
+                local_env.insert(*name, val);
             } else {
                 // Node preference for new variables.
                 if local_env.contains_key(name) {
-                    local_env.insert(name.clone(), val);
+                    local_env.insert(*name, val);
                 } else {
-                    node_env.insert(name.clone(), val);
+                    node_env.insert(*name, val);
                 }
             }
             Ok(())
@@ -484,7 +495,7 @@ fn store(
                     });
                 }
                 for (name, v) in vars.iter().zip(vals.into_iter()) {
-                    store(&Lhs::Var(name.clone()), v, local_env, node_env)?;
+                    store(&Lhs::Var(*name), v, local_env, node_env)?;
                 }
                 Ok(())
             } else {
@@ -522,7 +533,7 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
         Expr::String(s) => Ok(Value::String(s.clone())),
         Expr::Unit => Ok(Value::Unit),
         Expr::Nil => Ok(Value::Option(None)),
-        Expr::Var(s) => load(s, local_env, node_env),
+        Expr::Var(s) => load(*s, local_env, node_env),
         Expr::Plus(e1, e2) => Ok(Value::Int(
             eval(local_env, node_env, e1)?.as_int()? + eval(local_env, node_env, e2)?.as_int()?,
         )),
@@ -745,25 +756,29 @@ fn exec_sync_inner(
                         let arg_vals: Result<Vec<Value>, _> =
                             args.iter().map(|a| eval(local_env, node_env, a)).collect();
                         let arg_vals = arg_vals?;
+                        let func_name_id = program
+                            .func_name_to_id
+                            .get(&func_name)
+                            .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
                         let func_info = program
                             .rpc
-                            .get(&func_name)
+                            .get(func_name_id)
                             .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
 
                         if !func_info.is_sync {
                             return Err(RuntimeError::SyncCallToAsyncFunction(func_name.clone()));
                         }
 
-                        let mut callee_local = HashMap::new();
+                        let mut callee_local = Env::default();
                         for (i, name) in func_info.formals.iter().enumerate() {
-                            callee_local.insert(name.clone(), arg_vals[i].clone());
+                            callee_local.insert(*name, arg_vals[i].clone());
                         }
                         for (name, expr) in &func_info.locals {
-                            callee_local.insert(name.clone(), eval(local_env, node_env, expr)?);
+                            callee_local.insert(*name, eval(local_env, node_env, expr)?);
                         }
 
-                        if let Some(s) = local_env.get("self") {
-                            callee_local.insert("self".to_string(), s.clone());
+                        if let Some(s) = local_env.get(&SELF_NAME_ID) {
+                            callee_local.insert(SELF_NAME_ID, s.clone());
                         }
 
                         // Pass node_env directly (it's already mutable borrowed from caller)
@@ -785,8 +800,8 @@ fn exec_sync_inner(
                         let arg_vals = arg_vals?;
 
                         let origin_node = local_env
-                            .get("self")
-                            .ok_or_else(|| RuntimeError::VariableNotFound("self".to_string()))?
+                            .get(&SELF_NAME_ID)
+                            .ok_or_else(|| RuntimeError::VariableNotFound(SELF_NAME_ID))?
                             .as_node()?;
 
                         let chan_id = ChannelId {
@@ -805,16 +820,20 @@ fn exec_sync_inner(
                         );
                         store(&lhs, Value::Channel(chan_id), local_env, node_env)?;
 
-                        let func_info = program
-                            .rpc
+                        let func_name_id = program
+                            .func_name_to_id
                             .get(&func_name)
                             .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
-                        let mut callee_locals = HashMap::new();
+                        let func_info = program
+                            .rpc
+                            .get(func_name_id)
+                            .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
+                        let mut callee_locals = Env::default();
                         for (i, name) in func_info.formals.iter().enumerate() {
-                            callee_locals.insert(name.clone(), arg_vals[i].clone());
+                            callee_locals.insert(*name, arg_vals[i].clone());
                         }
                         for (name, expr) in &func_info.locals {
-                            callee_locals.insert(name.clone(), eval(local_env, node_env, expr)?);
+                            callee_locals.insert(*name, eval(local_env, node_env, expr)?);
                         }
 
                         #[derive(Debug)]
@@ -825,7 +844,7 @@ fn exec_sync_inner(
                             fn call(&self, state: &mut State, val: Value) {
                                 let chan = state.channels.get_mut(&self.chan_id).unwrap();
                                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                                    let node_env = Rc::clone(&state.nodes[reader.node]);
+                                    let node_env: Rc<RefCell<Env>> = Rc::clone(&state.nodes[reader.node]);
                                     // Note: store errors in continuations are ignored (fire-and-forget)
                                     let _ = store(
                                         &lhs,
@@ -864,8 +883,8 @@ fn exec_sync_inner(
             }
             Label::MakeChannel(lhs, cap, next) => {
                 let origin_node = local_env
-                    .get("self")
-                    .ok_or_else(|| RuntimeError::VariableNotFound("self".to_string()))?
+                    .get(&SELF_NAME_ID)
+                    .ok_or_else(|| RuntimeError::VariableNotFound(SELF_NAME_ID))?
                     .as_node()?;
                 let cid = ChannelId {
                     node: origin_node,
@@ -902,11 +921,11 @@ fn exec_sync_inner(
                 pc = target;
             }
             Label::ForLoopIn(lhs, expr, body, next) => {
-                let iter_key = format!("$iter_{}", pc);
+                let iter_key = iter_name_id(pc);
 
                 if !local_env.contains_key(&iter_key) {
                     let original_collection = eval(local_env, node_env, &expr)?;
-                    local_env.insert(iter_key.clone(), original_collection);
+                    local_env.insert(iter_key, original_collection);
                 }
 
                 let col_val = local_env
@@ -942,8 +961,8 @@ fn exec_sync_inner(
 
                             match lhs {
                                 Lhs::Tuple(vars) if vars.len() == 2 => {
-                                    store(&Lhs::Var(vars[0].clone()), k, local_env, node_env)?;
-                                    store(&Lhs::Var(vars[1].clone()), v, local_env, node_env)?;
+                                    store(&Lhs::Var(vars[0]), k, local_env, node_env)?;
+                                    store(&Lhs::Var(vars[1]), v, local_env, node_env)?;
                                     pc = body;
                                 }
                                 _ => return Err(RuntimeError::ForLoopMapExpectsTupleLhs),
@@ -975,7 +994,7 @@ pub fn exec(
     let mut local_env = record.env;
     let node_env = Rc::clone(&state.nodes[record.node]);
 
-    local_env.insert("self".to_string(), Value::Node(record.node));
+    local_env.insert(SELF_NAME_ID, Value::Node(record.node));
 
     loop {
         let label = program.cfg.get_label(record.pc).clone();
@@ -998,26 +1017,30 @@ pub fn exec(
                             .map(|a| eval(&local_env, &node_env.borrow(), a))
                             .collect();
                         let arg_vals = arg_vals?;
+                        let func_name_id = program
+                            .func_name_to_id
+                            .get(&func_name)
+                            .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
                         let func_info = program
                             .rpc
-                            .get(&func_name)
+                            .get(func_name_id)
                             .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
 
                         if !func_info.is_sync {
                             return Err(RuntimeError::SyncCallToAsyncFunction(func_name.clone()));
                         }
 
-                        let mut callee_local = HashMap::new();
+                        let mut callee_local = Env::default();
                         for (i, name) in func_info.formals.iter().enumerate() {
-                            callee_local.insert(name.clone(), arg_vals[i].clone());
+                            callee_local.insert(*name, arg_vals[i].clone());
                         }
                         for (name, expr) in &func_info.locals {
                             callee_local
-                                .insert(name.clone(), eval(&local_env, &node_env.borrow(), expr)?);
+                                .insert(*name, eval(&local_env, &node_env.borrow(), expr)?);
                         }
 
-                        if let Some(s) = local_env.get("self") {
-                            callee_local.insert("self".to_string(), s.clone());
+                        if let Some(s) = local_env.get(&SELF_NAME_ID) {
+                            callee_local.insert(SELF_NAME_ID, s.clone());
                         }
 
                         // Pass node_env directly
@@ -1063,17 +1086,21 @@ pub fn exec(
                         )?;
 
                         // Setup Callee Record
-                        let func_info = program
-                            .rpc
+                        let func_name_id = program
+                            .func_name_to_id
                             .get(&func_name)
                             .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
-                        let mut callee_locals = HashMap::new();
+                        let func_info = program
+                            .rpc
+                            .get(func_name_id)
+                            .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
+                        let mut callee_locals = Env::default();
                         for (i, name) in func_info.formals.iter().enumerate() {
-                            callee_locals.insert(name.clone(), arg_vals[i].clone());
+                            callee_locals.insert(*name, arg_vals[i].clone());
                         }
                         for (name, expr) in &func_info.locals {
                             callee_locals
-                                .insert(name.clone(), eval(&local_env, &node_env.borrow(), expr)?);
+                                .insert(*name, eval(&local_env, &node_env.borrow(), expr)?);
                         }
 
                         // Continuation for the async call
@@ -1232,11 +1259,11 @@ pub fn exec(
                 }
             }
             Label::ForLoopIn(lhs, expr, body_pc, next_pc) => {
-                let iter_key = format!("$iter_{}", record.pc);
+                let iter_key = iter_name_id(record.pc);
 
                 if !local_env.contains_key(&iter_key) {
                     let original_collection = eval(&local_env, &node_env.borrow(), &expr)?;
-                    local_env.insert(iter_key.clone(), original_collection);
+                    local_env.insert(iter_key, original_collection);
                 }
 
                 let col_val = local_env
@@ -1273,13 +1300,13 @@ pub fn exec(
                             match lhs {
                                 Lhs::Tuple(vars) if vars.len() == 2 => {
                                     store(
-                                        &Lhs::Var(vars[0].clone()),
+                                        &Lhs::Var(vars[0]),
                                         k,
                                         &mut local_env,
                                         &mut node_env.borrow_mut(),
                                     )?;
                                     store(
-                                        &Lhs::Var(vars[1].clone()),
+                                        &Lhs::Var(vars[1]),
                                         v,
                                         &mut local_env,
                                         &mut node_env.borrow_mut(),

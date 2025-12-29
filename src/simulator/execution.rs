@@ -2,10 +2,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy, Value, eval,
-    exec, exec_sync_on_node, schedule_record,
+    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy, Value,
+    SELF_NAME_ID, eval, exec, exec_sync_on_node, schedule_record,
 };
 use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine};
 use log::{info, warn};
@@ -23,9 +24,9 @@ pub struct TopologyInfo {
 
 fn create_env(
     node_env: &Rc<RefCell<Env>>,
-    formals: &[String],
+    formals: &[NameId],
     actuals: Vec<Value>,
-    locals: &[(String, crate::compiler::cfg::Expr)],
+    locals: &[(NameId, crate::compiler::cfg::Expr)],
 ) -> Result<Env, RuntimeError> {
     assert_eq!(
         formals.len(),
@@ -35,11 +36,11 @@ fn create_env(
         actuals.len()
     );
 
-    let mut env: Env = formals.iter().cloned().zip(actuals).collect();
+    let mut env: Env = formals.iter().copied().zip(actuals).collect();
 
     let node_env_ref = node_env.borrow();
     for (name, default_expr) in locals {
-        env.insert(name.clone(), eval(&env, &node_env_ref, default_expr)?);
+        env.insert(*name, eval(&env, &node_env_ref, default_expr)?);
     }
 
     Ok(env)
@@ -78,7 +79,7 @@ fn recover_node(
     prog: &Program,
     node_id: usize,
 ) -> Result<(), RuntimeError> {
-    let Some(recover_fn) = prog.rpc.get("Node.RecoverInit") else {
+    let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
         return Ok(());
     };
 
@@ -93,13 +94,13 @@ fn recover_node(
         ],
     };
 
-    let mut env = HashMap::new();
+    let mut env = Env::default();
     for (i, formal) in recover_fn.formals.iter().enumerate() {
-        env.insert(formal.clone(), actuals[i].clone());
+        env.insert(*formal, actuals[i].clone());
     }
     let node_env = state.nodes[node_id].borrow();
     for (name, expr) in &recover_fn.locals {
-        env.insert(name.clone(), eval(&env, &node_env, expr)?);
+        env.insert(*name, eval(&env, &node_env, expr)?);
     }
     drop(node_env);
 
@@ -124,15 +125,14 @@ fn reinit_node(
     node_id: usize,
 ) -> Result<(), RuntimeError> {
     let init_fn = prog
-        .rpc
-        .get("Node.BASE_NODE_INIT")
+        .get_func_by_name("Node.BASE_NODE_INIT")
         .expect("BASE_NODE_INIT not found");
 
-    let mut env = HashMap::new();
-    env.insert("self".to_string(), Value::Node(node_id));
+    let mut env = Env::default();
+    env.insert(SELF_NAME_ID, Value::Node(node_id));
     let node_env = state.nodes[node_id].borrow();
     for (name, expr) in &init_fn.locals {
-        env.insert(name.clone(), eval(&env, &node_env, expr)?);
+        env.insert(*name, eval(&env, &node_env, expr)?);
     }
     drop(node_env);
 
@@ -177,7 +177,7 @@ fn recover_crashed_node(
         return Ok(());
     }
 
-    state.nodes[node_id] = Rc::new(RefCell::new(HashMap::new()));
+    state.nodes[node_id] = Rc::new(RefCell::new(Env::default()));
     reinit_node(topology, state, prog, node_id)?;
 
     let mut queued_for_node = Vec::new();
@@ -220,7 +220,9 @@ fn schedule_client_op(
         ),
     };
 
-    let op_func = prog.rpc.get(op_name).expect("Client op function not found");
+    let op_func = prog
+        .get_func_by_name(op_name)
+        .expect("Client op function not found");
     let env = create_env(
         &state.nodes[client_id as usize],
         &op_func.formals,

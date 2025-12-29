@@ -210,6 +210,7 @@ pub enum TypedPatternKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedProgram {
     pub top_level_defs: Vec<TypedTopLevelDef>,
+    pub next_name_id: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

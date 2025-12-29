@@ -1,11 +1,18 @@
 use crate::parser::*;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use thiserror::Error;
 
 // A unique identifier for every named entity (variable, function, type, role).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct NameId(pub usize);
+
+impl std::fmt::Display for NameId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NameId({})", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinFn {
@@ -36,6 +43,7 @@ pub enum ResolutionError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProgram {
     pub top_level_defs: Vec<ResolvedTopLevelDef>,
+    pub next_name_id: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -466,6 +474,7 @@ impl Resolver {
 
         Ok(ResolvedProgram {
             top_level_defs: resolved_top_levels,
+            next_name_id: self.next_id,
         })
     }
 
