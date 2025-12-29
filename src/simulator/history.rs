@@ -1,6 +1,6 @@
 use crate::simulator::core::{ChannelId, OpKind, Operation, Value};
-use rusqlite::{params, Connection};
-use serde_json::{json, Value as JsonValue};
+use rusqlite::{Connection, params};
+use serde_json::{Value as JsonValue, json};
 use std::error::Error;
 use std::path::Path;
 

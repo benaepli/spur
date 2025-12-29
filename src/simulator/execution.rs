@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy, Value, eval,
-    exec, exec_sync_on_node, schedule_record,
+    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy, Value,
+    eval, exec, exec_sync_on_node, schedule_record,
 };
 use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine};
 use log::{info, warn};
@@ -93,12 +93,15 @@ fn recover_node(
         ],
     };
 
-    let env = create_env(
-        &state.nodes[node_id],
-        &recover_fn.formals,
-        actuals,
-        &recover_fn.locals,
-    )?;
+    let mut env = HashMap::new();
+    for (i, formal) in recover_fn.formals.iter().enumerate() {
+        env.insert(formal.clone(), actuals[i].clone());
+    }
+    let node_env = state.nodes[node_id].borrow();
+    for (name, expr) in &recover_fn.locals {
+        env.insert(name.clone(), eval(&env, &node_env, expr)?);
+    }
+    drop(node_env);
 
     let record = Record {
         pc: recover_fn.entry,
@@ -125,8 +128,13 @@ fn reinit_node(
         .get("Node.BASE_NODE_INIT")
         .expect("BASE_NODE_INIT not found");
 
-    let mut env = create_env(&state.nodes[node_id], &[], vec![], &init_fn.locals)?;
+    let mut env = HashMap::new();
     env.insert("self".to_string(), Value::Node(node_id));
+    let node_env = state.nodes[node_id].borrow();
+    for (name, expr) in &init_fn.locals {
+        env.insert(name.clone(), eval(&env, &node_env, expr)?);
+    }
+    drop(node_env);
 
     exec_sync_on_node(state, prog, &mut env, node_id, init_fn.entry)?;
 

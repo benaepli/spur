@@ -42,7 +42,11 @@ fn main() {
         Commands::Compile { spec, output } => {
             compile_spec(&spec, &output);
         }
-        Commands::Explore { spec, config, output } => {
+        Commands::Explore {
+            spec,
+            config,
+            output,
+        } => {
             let mut program = match compile_spec_to_program(&spec) {
                 Some(p) => p,
                 None => std::process::exit(1),

@@ -1,12 +1,12 @@
 use crate::compiler::cfg::Program;
-use crate::simulator::core::{exec_sync_on_node, RuntimeError, State, Value};
-use crate::simulator::execution::{exec_plan, Topology, TopologyInfo};
-use crate::simulator::generator::{generate_plan, GeneratorConfig};
+use crate::simulator::core::{RuntimeError, State, Value, eval, exec_sync_on_node};
+use std::collections::HashMap;
+use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
+use crate::simulator::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::history::{init_sqlite, save_history_sqlite};
 use log::{debug, error, info, warn};
 use rusqlite::Connection;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 
@@ -79,15 +79,18 @@ fn initialize_state(
     num_clients: usize,
 ) -> Result<State, RuntimeError> {
     let mut state = State::new(num_servers + num_clients);
-    state.free_clients = (0..num_clients)
-        .map(|i| (num_servers + i) as i32)
-        .collect();
+    state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
 
     if let Some(init_fn) = program.rpc.get("ClientInterface.BASE_NODE_INIT") {
         for i in 0..num_clients {
             let client_id = num_servers + i;
             let mut env = HashMap::new();
             env.insert("self".to_string(), Value::Node(client_id));
+            let node_env = state.nodes[client_id].borrow();
+            for (name, expr) in &init_fn.locals {
+                env.insert(name.clone(), eval(&env, &node_env, expr)?);
+            }
+            drop(node_env);
             exec_sync_on_node(&mut state, program, &mut env, client_id, init_fn.entry)?;
         }
     }
@@ -96,6 +99,11 @@ fn initialize_state(
         for node_id in 0..num_servers {
             let mut env = HashMap::new();
             env.insert("self".to_string(), Value::Node(node_id));
+            let node_env = state.nodes[node_id].borrow();
+            for (name, expr) in &init_fn.locals {
+                env.insert(name.clone(), eval(&env, &node_env, expr)?);
+            }
+            drop(node_env);
             exec_sync_on_node(&mut state, program, &mut env, node_id, init_fn.entry)?;
         }
     }
@@ -209,7 +217,6 @@ pub fn run_explorer(
     info!("Total unique configurations: {}", total_configs);
     info!("Runs per config: {}", config.num_runs_per_config);
 
-
     for &num_servers in &all_servers {
         for &num_clients in &all_clients {
             for &num_writes in &all_writes {
@@ -248,7 +255,10 @@ pub fn run_explorer(
 
                                 for i in 1..=config.num_runs_per_config {
                                     run_counter += 1;
-                                    debug!("Run {}/{} (Total #{}) ... ", i, config.num_runs_per_config, run_counter);
+                                    debug!(
+                                        "Run {}/{} (Total #{}) ... ",
+                                        i, config.num_runs_per_config, run_counter
+                                    );
 
                                     let start = std::time::Instant::now();
 
@@ -258,7 +268,10 @@ pub fn run_explorer(
                                         run_counter,
                                         &run_config,
                                     ) {
-                                        Ok(_) => debug!("Success ({:.4}s)", start.elapsed().as_secs_f64()),
+                                        Ok(_) => debug!(
+                                            "Success ({:.4}s)",
+                                            start.elapsed().as_secs_f64()
+                                        ),
                                         Err(e) => error!("Run failed: {}", e),
                                     }
                                 }
