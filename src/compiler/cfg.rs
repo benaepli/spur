@@ -6,51 +6,48 @@ use crate::analysis::types::{
 };
 use crate::parser::BinOp;
 use serde::Serialize;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt;
-use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Expr {
-    EVar(String),
-    EFind(Box<Expr>, Box<Expr>),
-    EInt(i64),
-    EBool(bool),
-    ENot(Box<Expr>),
-    EAnd(Box<Expr>, Box<Expr>),
-    EOr(Box<Expr>, Box<Expr>),
-    EEqualsEquals(Box<Expr>, Box<Expr>),
-    EMap(Vec<(Expr, Expr)>),
-    EList(Vec<Expr>),
-    EListPrepend(Box<Expr>, Box<Expr>),
-    EListAppend(Box<Expr>, Box<Expr>),
-    EListSubsequence(Box<Expr>, Box<Expr>, Box<Expr>),
-    EString(String),
-    ELessThan(Box<Expr>, Box<Expr>),
-    ELessThanEquals(Box<Expr>, Box<Expr>),
-    EGreaterThan(Box<Expr>, Box<Expr>),
-    EGreaterThanEquals(Box<Expr>, Box<Expr>),
-    EKeyExists(Box<Expr>, Box<Expr>),
-    EMapErase(Box<Expr>, Box<Expr>),
-    EStore(Box<Expr>, Box<Expr>, Box<Expr>),
-    EListLen(Box<Expr>),
-    EListAccess(Box<Expr>, usize),
-    EPlus(Box<Expr>, Box<Expr>),
-    EMinus(Box<Expr>, Box<Expr>),
-    ETimes(Box<Expr>, Box<Expr>),
-    EDiv(Box<Expr>, Box<Expr>),
-    EMod(Box<Expr>, Box<Expr>),
-    EMin(Box<Expr>, Box<Expr>),
-    ETuple(Vec<Expr>),
-    ETupleAccess(Box<Expr>, usize),
-    EUnit,
-    ENil,
-    EUnwrap(Box<Expr>),
-    ECoalesce(Box<Expr>, Box<Expr>),
-    ECreateLock,
-    ESome(Box<Expr>),
-    EIntToString(Box<Expr>),
+    Var(String),
+    Find(Box<Expr>, Box<Expr>),
+    Int(i64),
+    Bool(bool),
+    Not(Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    EqualsEquals(Box<Expr>, Box<Expr>),
+    Map(Vec<(Expr, Expr)>),
+    List(Vec<Expr>),
+    ListPrepend(Box<Expr>, Box<Expr>),
+    ListAppend(Box<Expr>, Box<Expr>),
+    ListSubsequence(Box<Expr>, Box<Expr>, Box<Expr>),
+    String(String),
+    LessThan(Box<Expr>, Box<Expr>),
+    LessThanEquals(Box<Expr>, Box<Expr>),
+    GreaterThan(Box<Expr>, Box<Expr>),
+    GreaterThanEquals(Box<Expr>, Box<Expr>),
+    KeyExists(Box<Expr>, Box<Expr>),
+    MapErase(Box<Expr>, Box<Expr>),
+    Store(Box<Expr>, Box<Expr>, Box<Expr>),
+    ListLen(Box<Expr>),
+    ListAccess(Box<Expr>, usize),
+    Plus(Box<Expr>, Box<Expr>),
+    Minus(Box<Expr>, Box<Expr>),
+    Times(Box<Expr>, Box<Expr>),
+    Div(Box<Expr>, Box<Expr>),
+    Mod(Box<Expr>, Box<Expr>),
+    Min(Box<Expr>, Box<Expr>),
+    Tuple(Vec<Expr>),
+    TupleAccess(Box<Expr>, usize),
+    Unit,
+    Nil,
+    Unwrap(Box<Expr>),
+    Coalesce(Box<Expr>, Box<Expr>),
+    CreateLock,
+    Some(Box<Expr>),
+    IntToString(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -104,18 +101,15 @@ pub enum Label {
     Unlock(Expr, Vertex /* next_vertex */),
 }
 
-#[derive(Debug, Clone)]
-pub enum Value {
-    VInt(i64),
-    VBool(bool),
-    VMap(Rc<RefCell<HashMap<Value, Value>>>),
-    VList(Rc<RefCell<Vec<Value>>>),
-    VOption(Option<Box<Value>>),
-    VLock(Rc<RefCell<bool>>),
-    VNode(i64),
-    VString(String),
-    VUnit,
-    VTuple(Vec<Value>),
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Cfg {
+    pub graph: Vec<Label>,
+}
+
+impl Cfg {
+    pub fn get_label(&self, v: Vertex) -> &Label {
+        &self.graph[v]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -123,7 +117,7 @@ pub struct Program {
     // The CFG is just a list of all vertices.
     // The `Vertex` indices in `Label` and `FunctionInfo`
     // are indices into this Vec.
-    pub cfg: Vec<Label>,
+    pub cfg: Cfg,
 
     // Map of function_name -> FunctionInfo
     pub rpc: HashMap<String, FunctionInfo>,
@@ -160,7 +154,7 @@ impl Compiler {
     fn new_temp_var(&mut self, locals: &mut Vec<(String, Expr)>) -> String {
         let name = format!("_tmp{}", self.temp_counter);
         self.temp_counter += 1;
-        locals.push((name.clone(), Expr::ENil));
+        locals.push((name.clone(), Expr::Nil));
         name
     }
 
@@ -207,7 +201,7 @@ impl Compiler {
         }
 
         Program {
-            cfg: self.cfg,
+            cfg: Cfg { graph: self.cfg },
             rpc: self.rpc_map,
         }
     }
@@ -215,7 +209,7 @@ impl Compiler {
     fn compile_init_func(&mut self, inits: &[TypedVarInit], name: String) -> FunctionInfo {
         let mut locals = Vec::new();
         let return_var_name = self.new_temp_var(&mut locals);
-        let final_vertex = self.add_label(Label::Return(Expr::EVar(return_var_name.clone())));
+        let final_vertex = self.add_label(Label::Return(Expr::Var(return_var_name.clone())));
 
         let mut next_vertex = final_vertex;
         // Build the init chain backwards
@@ -230,12 +224,12 @@ impl Compiler {
         }
 
         let entry = self.add_label(Label::Instr(
-            Instr::Assign(Lhs::Var(return_var_name.clone()), Expr::EUnit),
+            Instr::Assign(Lhs::Var(return_var_name.clone()), Expr::Unit),
             next_vertex,
         ));
 
         if let Some(local) = locals.iter_mut().find(|(n, _)| *n == return_var_name) {
-            local.1 = Expr::EUnit;
+            local.1 = Expr::Unit;
         }
 
         FunctionInfo {
@@ -250,8 +244,7 @@ impl Compiler {
     fn compile_func_def(&mut self, func: TypedFuncDef) -> FunctionInfo {
         let mut locals = self.scan_body(&func.body);
         let return_var_name = self.new_temp_var(&mut locals);
-        let final_return_vertex =
-            self.add_label(Label::Return(Expr::EVar(return_var_name.clone())));
+        let final_return_vertex = self.add_label(Label::Return(Expr::Var(return_var_name.clone())));
 
         let body_entry = self.compile_block(
             &mut locals,
@@ -269,11 +262,11 @@ impl Compiler {
             .collect();
 
         if let Some(local) = locals.iter_mut().find(|(n, _)| *n == return_var_name) {
-            local.1 = Expr::EUnit;
+            local.1 = Expr::Unit;
         }
 
         let entry = self.add_label(Label::Instr(
-            Instr::Assign(Lhs::Var(return_var_name.clone()), Expr::EUnit),
+            Instr::Assign(Lhs::Var(return_var_name.clone()), Expr::Unit),
             body_entry,
         ));
 
@@ -388,7 +381,7 @@ impl Compiler {
         return_target: Vertex,
         return_var: &str,
     ) -> Vertex {
-        let loop_head_vertex = self.add_label(Label::Return(Expr::EUnit));
+        let loop_head_vertex = self.add_label(Label::Return(Expr::Unit));
 
         let increment_vertex = match &loop_stmt.increment {
             Some(assign) => {
@@ -410,7 +403,7 @@ impl Compiler {
         let cond_var = self.new_temp_var(locals);
 
         let cond_check_vertex = self.add_label(Label::Cond(
-            Expr::EVar(cond_var.clone()),
+            Expr::Var(cond_var.clone()),
             body_vertex, // True -> Body
             next_vertex, // False -> Exit
         ));
@@ -428,7 +421,7 @@ impl Compiler {
             self.compile_expr_to_value(locals, &cond_expr, Lhs::Var(cond_var), cond_check_vertex);
 
         self.cfg[loop_head_vertex] = Label::Instr(
-            Instr::Assign(Lhs::Var(self.new_temp_var(locals)), Expr::EUnit),
+            Instr::Assign(Lhs::Var(self.new_temp_var(locals)), Expr::Unit),
             cond_calc_vertex,
         );
 
@@ -479,7 +472,7 @@ impl Compiler {
             );
             let cond_tmp = self.new_temp_var(locals);
             let check_vertex = self.add_label(Label::Cond(
-                Expr::EVar(cond_tmp.clone()),
+                Expr::Var(cond_tmp.clone()),
                 body_vertex,
                 next_cond_vertex,
             ));
@@ -502,7 +495,7 @@ impl Compiler {
         let if_cond_tmp = self.new_temp_var(locals);
 
         let if_check_vertex = self.add_label(Label::Cond(
-            Expr::EVar(if_cond_tmp.clone()),
+            Expr::Var(if_cond_tmp.clone()),
             if_body_vertex,
             next_cond_vertex,
         ));
@@ -525,7 +518,7 @@ impl Compiler {
     ) -> Vertex {
         // The [ForLoopIn] label is the "head" of the loop.
         // We add a dummy label to reserve its vertex index.
-        let for_vertex = self.add_label(Label::Return(Expr::EUnit)); // Dummy label
+        let for_vertex = self.add_label(Label::Return(Expr::Unit)); // Dummy label
 
         // Compile the [Body] block.
         // After it runs, it loops back to the [ForLoopIn] check.
@@ -545,7 +538,7 @@ impl Compiler {
         let iterable_copy_var = self.new_temp_var(locals);
         let for_label = Label::ForLoopIn(
             lhs,
-            Expr::EVar(iterable_copy_var.clone()),
+            Expr::Var(iterable_copy_var.clone()),
             body_vertex, // On iteration, go to body
             next_vertex, // When done, exit loop
         );
@@ -576,7 +569,7 @@ impl Compiler {
         return_var: &str,
     ) -> Vertex {
         let lock_var = self.new_temp_var(locals);
-        let lock_var_expr = Expr::EVar(lock_var.clone());
+        let lock_var_expr = Expr::Var(lock_var.clone());
 
         let unlock_then_break_vertex =
             self.add_label(Label::Unlock(lock_var_expr.clone(), break_target));
@@ -614,7 +607,7 @@ impl Compiler {
         (0..count)
             .map(|_| {
                 let tmp = self.new_temp_var(locals);
-                (tmp.clone(), Expr::EVar(tmp))
+                (tmp.clone(), Expr::Var(tmp))
             })
             .unzip()
     }
@@ -631,7 +624,7 @@ impl Compiler {
         for _ in 0..count {
             let key_tmp = self.new_temp_var(locals);
             let val_tmp = self.new_temp_var(locals);
-            simple_pairs.push((Expr::EVar(key_tmp.clone()), Expr::EVar(val_tmp.clone())));
+            simple_pairs.push((Expr::Var(key_tmp.clone()), Expr::Var(val_tmp.clone())));
             key_tmps.push(key_tmp);
             val_tmps.push(val_tmp);
         }
@@ -658,20 +651,20 @@ impl Compiler {
 
     fn convert_simple_binop(&mut self, op: &BinOp, left: Box<Expr>, right: Box<Expr>) -> Expr {
         match op {
-            BinOp::Add => Expr::EPlus(left, right),
-            BinOp::Subtract => Expr::EMinus(left, right),
-            BinOp::Multiply => Expr::ETimes(left, right),
-            BinOp::Divide => Expr::EDiv(left, right),
-            BinOp::Modulo => Expr::EMod(left, right),
-            BinOp::And => Expr::EAnd(left, right),
-            BinOp::Or => Expr::EOr(left, right),
-            BinOp::Equal => Expr::EEqualsEquals(left, right),
-            BinOp::NotEqual => Expr::ENot(Box::new(Expr::EEqualsEquals(left, right))),
-            BinOp::Less => Expr::ELessThan(left, right),
-            BinOp::LessEqual => Expr::ELessThanEquals(left, right),
-            BinOp::Greater => Expr::EGreaterThan(left, right),
-            BinOp::GreaterEqual => Expr::EGreaterThanEquals(left, right),
-            BinOp::Coalesce => Expr::ECoalesce(left, right),
+            BinOp::Add => Expr::Plus(left, right),
+            BinOp::Subtract => Expr::Minus(left, right),
+            BinOp::Multiply => Expr::Times(left, right),
+            BinOp::Divide => Expr::Div(left, right),
+            BinOp::Modulo => Expr::Mod(left, right),
+            BinOp::And => Expr::And(left, right),
+            BinOp::Or => Expr::Or(left, right),
+            BinOp::Equal => Expr::EqualsEquals(left, right),
+            BinOp::NotEqual => Expr::Not(Box::new(Expr::EqualsEquals(left, right))),
+            BinOp::Less => Expr::LessThan(left, right),
+            BinOp::LessEqual => Expr::LessThanEquals(left, right),
+            BinOp::Greater => Expr::GreaterThan(left, right),
+            BinOp::GreaterEqual => Expr::GreaterThanEquals(left, right),
+            BinOp::Coalesce => Expr::Coalesce(left, right),
         }
     }
 
@@ -704,14 +697,12 @@ impl Compiler {
                 let chan_tmp = self.new_temp_var(locals);
                 let val_tmp = self.new_temp_var(locals);
 
-                let assign_unit_vertex = self.add_label(Label::Instr(
-                    Instr::Assign(target, Expr::EUnit),
-                    next_vertex,
-                ));
+                let assign_unit_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
 
                 let send_vertex = self.add_label(Label::Send(
-                    Expr::EVar(chan_tmp.clone()),
-                    Expr::EVar(val_tmp.clone()),
+                    Expr::Var(chan_tmp.clone()),
+                    Expr::Var(val_tmp.clone()),
                     assign_unit_vertex,
                 ));
 
@@ -723,7 +714,7 @@ impl Compiler {
                 let chan_tmp = self.new_temp_var(locals);
                 let recv_vertex = self.add_label(Label::Recv(
                     target,
-                    Expr::EVar(chan_tmp.clone()),
+                    Expr::Var(chan_tmp.clone()),
                     next_vertex,
                 ));
                 self.compile_expr_to_value(locals, chan_expr, Lhs::Var(chan_tmp), recv_vertex)
@@ -733,7 +724,7 @@ impl Compiler {
                 match op {
                     BinOp::And => {
                         let assign_false_vertex = self.add_label(Label::Instr(
-                            Instr::Assign(target.clone(), Expr::EBool(false)),
+                            Instr::Assign(target.clone(), Expr::Bool(false)),
                             next_vertex,
                         ));
 
@@ -743,7 +734,7 @@ impl Compiler {
                         // Branch based on Left result
                         let l_tmp = self.new_temp_var(locals);
                         let cond_vertex = self.add_label(Label::Cond(
-                            Expr::EVar(l_tmp.clone()),
+                            Expr::Var(l_tmp.clone()),
                             eval_right_vertex,   // If True: evaluate right
                             assign_false_vertex, // If False: short-circuit to false
                         ));
@@ -752,7 +743,7 @@ impl Compiler {
                     }
                     BinOp::Or => {
                         let assign_true_vertex = self.add_label(Label::Instr(
-                            Instr::Assign(target.clone(), Expr::EBool(true)),
+                            Instr::Assign(target.clone(), Expr::Bool(true)),
                             next_vertex,
                         ));
 
@@ -762,7 +753,7 @@ impl Compiler {
                         // Branch based on Left result
                         let l_tmp = self.new_temp_var(locals);
                         let cond_vertex = self.add_label(Label::Cond(
-                            Expr::EVar(l_tmp.clone()),
+                            Expr::Var(l_tmp.clone()),
                             assign_true_vertex, // If True: short-circuit to true
                             eval_right_vertex,  // If False: evaluate right
                         ));
@@ -773,8 +764,8 @@ impl Compiler {
                         // Standard strict evaluation for non-boolean ops (+, -, *, etc.)
                         let l_tmp = self.new_temp_var(locals);
                         let r_tmp = self.new_temp_var(locals);
-                        let l_expr = Box::new(Expr::EVar(l_tmp.clone()));
-                        let r_expr = Box::new(Expr::EVar(r_tmp.clone()));
+                        let l_expr = Box::new(Expr::Var(l_tmp.clone()));
+                        let r_expr = Box::new(Expr::Var(r_tmp.clone()));
                         let final_expr = self.convert_simple_binop(op, l_expr, r_expr);
 
                         let assign_vertex = self.add_label(Label::Instr(
@@ -792,7 +783,7 @@ impl Compiler {
 
             TypedExprKind::Not(e) => {
                 let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::ENot(Box::new(Expr::EVar(e_tmp.clone())));
+                let final_expr = Expr::Not(Box::new(Expr::Var(e_tmp.clone())));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
@@ -801,7 +792,7 @@ impl Compiler {
             TypedExprKind::Negate(e) => {
                 let e_tmp = self.new_temp_var(locals);
                 let final_expr =
-                    Expr::EMinus(Box::new(Expr::EInt(0)), Box::new(Expr::EVar(e_tmp.clone())));
+                    Expr::Minus(Box::new(Expr::Int(0)), Box::new(Expr::Var(e_tmp.clone())));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
@@ -810,7 +801,7 @@ impl Compiler {
             TypedExprKind::MapLit(pairs) => {
                 let (key_tmps, val_tmps, simple_pairs) =
                     self.compile_temp_pairs(locals, pairs.len());
-                let final_expr = Expr::EMap(simple_pairs);
+                let final_expr = Expr::Map(simple_pairs);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
@@ -831,7 +822,7 @@ impl Compiler {
 
             TypedExprKind::ListLit(items) => {
                 let (tmps, simple_exprs) = self.compile_temp_list(locals, items.len());
-                let final_expr = Expr::EList(simple_exprs);
+                let final_expr = Expr::List(simple_exprs);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_list_recursive(locals, items.iter(), tmps, assign_vertex)
@@ -839,7 +830,7 @@ impl Compiler {
 
             TypedExprKind::TupleLit(items) => {
                 let (tmps, simple_exprs) = self.compile_temp_list(locals, items.len());
-                let final_expr = Expr::ETuple(simple_exprs);
+                let final_expr = Expr::Tuple(simple_exprs);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_list_recursive(locals, items.iter(), tmps, assign_vertex)
@@ -848,9 +839,9 @@ impl Compiler {
             TypedExprKind::Append(l, i) => {
                 let l_tmp = self.new_temp_var(locals);
                 let i_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListAppend(
-                    Box::new(Expr::EVar(l_tmp.clone())),
-                    Box::new(Expr::EVar(i_tmp.clone())),
+                let final_expr = Expr::ListAppend(
+                    Box::new(Expr::Var(l_tmp.clone())),
+                    Box::new(Expr::Var(i_tmp.clone())),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -862,9 +853,9 @@ impl Compiler {
             TypedExprKind::Prepend(i, l) => {
                 let i_tmp = self.new_temp_var(locals);
                 let l_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListPrepend(
-                    Box::new(Expr::EVar(i_tmp.clone())),
-                    Box::new(Expr::EVar(l_tmp.clone())),
+                let final_expr = Expr::ListPrepend(
+                    Box::new(Expr::Var(i_tmp.clone())),
+                    Box::new(Expr::Var(l_tmp.clone())),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -875,7 +866,7 @@ impl Compiler {
 
             TypedExprKind::Len(e) => {
                 let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListLen(Box::new(Expr::EVar(e_tmp.clone())));
+                let final_expr = Expr::ListLen(Box::new(Expr::Var(e_tmp.clone())));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
@@ -884,9 +875,9 @@ impl Compiler {
             TypedExprKind::Min(l, r) => {
                 let l_tmp = self.new_temp_var(locals);
                 let r_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EMin(
-                    Box::new(Expr::EVar(l_tmp.clone())),
-                    Box::new(Expr::EVar(r_tmp.clone())),
+                let final_expr = Expr::Min(
+                    Box::new(Expr::Var(l_tmp.clone())),
+                    Box::new(Expr::Var(r_tmp.clone())),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -898,9 +889,9 @@ impl Compiler {
             TypedExprKind::Exists(map, key) => {
                 let map_tmp = self.new_temp_var(locals);
                 let key_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EKeyExists(
-                    Box::new(Expr::EVar(key_tmp.clone())),
-                    Box::new(Expr::EVar(map_tmp.clone())),
+                let final_expr = Expr::KeyExists(
+                    Box::new(Expr::Var(key_tmp.clone())),
+                    Box::new(Expr::Var(map_tmp.clone())),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -912,9 +903,9 @@ impl Compiler {
             TypedExprKind::Erase(map, key) => {
                 let map_tmp = self.new_temp_var(locals);
                 let key_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EMapErase(
-                    Box::new(Expr::EVar(key_tmp.clone())),
-                    Box::new(Expr::EVar(map_tmp.clone())),
+                let final_expr = Expr::MapErase(
+                    Box::new(Expr::Var(key_tmp.clone())),
+                    Box::new(Expr::Var(map_tmp.clone())),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -925,7 +916,7 @@ impl Compiler {
 
             TypedExprKind::Head(l) => {
                 let l_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListAccess(Box::new(Expr::EVar(l_tmp.clone())), 0);
+                let final_expr = Expr::ListAccess(Box::new(Expr::Var(l_tmp.clone())), 0);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), assign_vertex)
@@ -933,11 +924,11 @@ impl Compiler {
 
             TypedExprKind::Tail(l) => {
                 let l_tmp = self.new_temp_var(locals);
-                let list_expr = Expr::EVar(l_tmp.clone());
-                let final_expr = Expr::EListSubsequence(
+                let list_expr = Expr::Var(l_tmp.clone());
+                let final_expr = Expr::ListSubsequence(
                     Box::new(list_expr.clone()),
-                    Box::new(Expr::EInt(1)),
-                    Box::new(Expr::EListLen(Box::new(list_expr))),
+                    Box::new(Expr::Int(1)),
+                    Box::new(Expr::ListLen(Box::new(list_expr))),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -947,9 +938,9 @@ impl Compiler {
             TypedExprKind::Index(target_expr, index_expr) => {
                 let target_tmp = self.new_temp_var(locals);
                 let index_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EFind(
-                    Box::new(Expr::EVar(target_tmp.clone())),
-                    Box::new(Expr::EVar(index_tmp.clone())),
+                let final_expr = Expr::Find(
+                    Box::new(Expr::Var(target_tmp.clone())),
+                    Box::new(Expr::Var(index_tmp.clone())),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -966,10 +957,10 @@ impl Compiler {
                 let target_tmp = self.new_temp_var(locals);
                 let start_tmp = self.new_temp_var(locals);
                 let end_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListSubsequence(
-                    Box::new(Expr::EVar(target_tmp.clone())),
-                    Box::new(Expr::EVar(start_tmp.clone())),
-                    Box::new(Expr::EVar(end_tmp.clone())),
+                let final_expr = Expr::ListSubsequence(
+                    Box::new(Expr::Var(target_tmp.clone())),
+                    Box::new(Expr::Var(start_tmp.clone())),
+                    Box::new(Expr::Var(end_tmp.clone())),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -982,8 +973,7 @@ impl Compiler {
 
             TypedExprKind::TupleAccess(tuple_expr, index) => {
                 let tuple_tmp = self.new_temp_var(locals);
-                let final_expr =
-                    Expr::ETupleAccess(Box::new(Expr::EVar(tuple_tmp.clone())), *index);
+                let final_expr = Expr::TupleAccess(Box::new(Expr::Var(tuple_tmp.clone())), *index);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_to_value(locals, tuple_expr, Lhs::Var(tuple_tmp), assign_vertex)
@@ -991,9 +981,9 @@ impl Compiler {
 
             TypedExprKind::FieldAccess(target_expr, field) => {
                 let target_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EFind(
-                    Box::new(Expr::EVar(target_tmp.clone())),
-                    Box::new(Expr::EString(field.clone())),
+                let final_expr = Expr::Find(
+                    Box::new(Expr::Var(target_tmp.clone())),
+                    Box::new(Expr::String(field.clone())),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -1002,7 +992,7 @@ impl Compiler {
 
             TypedExprKind::UnwrapOptional(e) => {
                 let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EUnwrap(Box::new(Expr::EVar(e_tmp.clone())));
+                let final_expr = Expr::Unwrap(Box::new(Expr::Var(e_tmp.clone())));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
@@ -1010,7 +1000,7 @@ impl Compiler {
 
             TypedExprKind::WrapInOptional(e) => {
                 let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::ESome(Box::new(Expr::EVar(e_tmp.clone())));
+                let final_expr = Expr::Some(Box::new(Expr::Var(e_tmp.clone())));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
@@ -1021,10 +1011,10 @@ impl Compiler {
                 let (tmps, simple_exprs) = self.compile_temp_list(locals, val_exprs.len());
                 let final_pairs = field_names
                     .into_iter()
-                    .map(Expr::EString)
+                    .map(Expr::String)
                     .zip(simple_exprs)
                     .collect();
-                let final_expr = Expr::EMap(final_pairs);
+                let final_expr = Expr::Map(final_pairs);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 self.compile_expr_list_recursive(locals, val_exprs.iter(), tmps, assign_vertex)
@@ -1032,7 +1022,7 @@ impl Compiler {
 
             // --- Truly simple, non-side-effecting cases ---
             TypedExprKind::CreateLock => {
-                let label = Label::Instr(Instr::Assign(target, Expr::ECreateLock), next_vertex);
+                let label = Label::Instr(Instr::Assign(target, Expr::CreateLock), next_vertex);
                 self.add_label(label)
             }
 
@@ -1059,7 +1049,7 @@ impl Compiler {
         let (arg_temp_vars, arg_exprs): (Vec<String>, Vec<Expr>) = (0..call.args.len())
             .map(|_| {
                 let tmp = self.new_temp_var(locals);
-                (tmp.clone(), Expr::EVar(tmp))
+                (tmp.clone(), Expr::Var(tmp))
             })
             .unzip();
 
@@ -1111,7 +1101,7 @@ impl Compiler {
                     let (arg_tmps, arg_exprs): (Vec<String>, Vec<Expr>) = (0..user_call.args.len())
                         .map(|_| {
                             let tmp = self.new_temp_var(locals);
-                            (tmp.clone(), Expr::EVar(tmp))
+                            (tmp.clone(), Expr::Var(tmp))
                         })
                         .unzip();
 
@@ -1139,7 +1129,7 @@ impl Compiler {
                         sync_call_vertex,
                     )
                 } else {
-                    let node_expr = Expr::EVar("self".to_string());
+                    let node_expr = Expr::Var("self".to_string());
                     self.compile_async_call_internal(
                         locals,
                         node_expr,
@@ -1166,13 +1156,11 @@ impl Compiler {
     ) -> Vertex {
         match builtin {
             BuiltinFn::Println => {
-                let assign_vertex = self.add_label(Label::Instr(
-                    Instr::Assign(target, Expr::EUnit),
-                    next_vertex,
-                ));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
 
                 let arg_var = self.new_temp_var(locals);
-                let print_label = Label::Print(Expr::EVar(arg_var.clone()), assign_vertex);
+                let print_label = Label::Print(Expr::Var(arg_var.clone()), assign_vertex);
                 let print_vertex = self.add_label(print_label);
 
                 let arg_expr = args.get(0).expect("Println should have 1 arg");
@@ -1180,7 +1168,7 @@ impl Compiler {
             }
             BuiltinFn::IntToString => {
                 let arg_var = self.new_temp_var(locals);
-                let final_expr = Expr::EIntToString(Box::new(Expr::EVar(arg_var.clone())));
+                let final_expr = Expr::IntToString(Box::new(Expr::Var(arg_var.clone())));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
@@ -1201,7 +1189,7 @@ impl Compiler {
         let (arg_tmps, arg_exprs) = self.compile_temp_list(locals, call.args.len());
 
         let node_tmp = self.new_temp_var(locals);
-        let node_expr = Expr::EVar(node_tmp.clone());
+        let node_expr = Expr::Var(node_tmp.clone());
 
         let qualifier = self
             .func_qualifier_map
@@ -1226,105 +1214,103 @@ impl Compiler {
     /// Panics if it encounters a complex (side-effecting) expression.
     fn convert_simple_expr(&mut self, expr: &TypedExpr) -> Expr {
         match &expr.kind {
-            TypedExprKind::Var(id, name) => Expr::EVar(resolved_name(*id, &name)),
-            TypedExprKind::IntLit(i) => Expr::EInt(i.clone()),
-            TypedExprKind::StringLit(s) => Expr::EString(s.clone()),
-            TypedExprKind::BoolLit(b) => Expr::EBool(b.clone()),
-            TypedExprKind::NilLit => Expr::ENil,
+            TypedExprKind::Var(id, name) => Expr::Var(resolved_name(*id, &name)),
+            TypedExprKind::IntLit(i) => Expr::Int(i.clone()),
+            TypedExprKind::StringLit(s) => Expr::String(s.clone()),
+            TypedExprKind::BoolLit(b) => Expr::Bool(b.clone()),
+            TypedExprKind::NilLit => Expr::Nil,
             TypedExprKind::BinOp(op, l, r) => {
                 let left = Box::new(self.convert_simple_expr(l));
                 let right = Box::new(self.convert_simple_expr(r));
                 self.convert_simple_binop(op, left, right)
             }
-            TypedExprKind::Not(e) => Expr::ENot(Box::new(self.convert_simple_expr(e))),
-            TypedExprKind::Negate(e) => Expr::EMinus(
-                Box::new(Expr::EInt(0)),
+            TypedExprKind::Not(e) => Expr::Not(Box::new(self.convert_simple_expr(e))),
+            TypedExprKind::Negate(e) => Expr::Minus(
+                Box::new(Expr::Int(0)),
                 Box::new(self.convert_simple_expr(e)),
             ),
-            TypedExprKind::MapLit(pairs) => Expr::EMap(
+            TypedExprKind::MapLit(pairs) => Expr::Map(
                 pairs
                     .iter()
                     .map(|(k, v)| (self.convert_simple_expr(k), self.convert_simple_expr(v)))
                     .collect(),
             ),
             TypedExprKind::ListLit(items) => {
-                Expr::EList(items.iter().map(|e| self.convert_simple_expr(e)).collect())
+                Expr::List(items.iter().map(|e| self.convert_simple_expr(e)).collect())
             }
             TypedExprKind::TupleLit(items) => {
-                Expr::ETuple(items.iter().map(|e| self.convert_simple_expr(e)).collect())
+                Expr::Tuple(items.iter().map(|e| self.convert_simple_expr(e)).collect())
             }
             // Desugar: `append(l, i)` -> `EListAppend(l, i)`
-            TypedExprKind::Append(l, i) => Expr::EListAppend(
+            TypedExprKind::Append(l, i) => Expr::ListAppend(
                 Box::new(self.convert_simple_expr(l)),
                 Box::new(self.convert_simple_expr(i)),
             ),
-            TypedExprKind::Prepend(i, l) => Expr::EListPrepend(
+            TypedExprKind::Prepend(i, l) => Expr::ListPrepend(
                 Box::new(self.convert_simple_expr(i)),
                 Box::new(self.convert_simple_expr(l)),
             ),
             // Desugar: `len(e)` -> `EListLen(e)`
-            TypedExprKind::Len(e) => Expr::EListLen(Box::new(self.convert_simple_expr(e))),
-            TypedExprKind::Min(l, r) => Expr::EMin(
+            TypedExprKind::Len(e) => Expr::ListLen(Box::new(self.convert_simple_expr(e))),
+            TypedExprKind::Min(l, r) => Expr::Min(
                 Box::new(self.convert_simple_expr(l)),
                 Box::new(self.convert_simple_expr(r)),
             ),
-            TypedExprKind::Exists(map, key) => Expr::EKeyExists(
+            TypedExprKind::Exists(map, key) => Expr::KeyExists(
                 Box::new(self.convert_simple_expr(key)),
                 Box::new(self.convert_simple_expr(map)),
             ),
-            TypedExprKind::Erase(map, key) => Expr::EMapErase(
+            TypedExprKind::Erase(map, key) => Expr::MapErase(
                 Box::new(self.convert_simple_expr(key)),
                 Box::new(self.convert_simple_expr(map)),
             ),
-            TypedExprKind::Store(collection, key, value) => Expr::EStore(
+            TypedExprKind::Store(collection, key, value) => Expr::Store(
                 Box::new(self.convert_simple_expr(collection)),
                 Box::new(self.convert_simple_expr(key)),
                 Box::new(self.convert_simple_expr(value)),
             ),
             // Desugar: `head(l)` -> `EListAccess(l, 0)`
-            TypedExprKind::Head(l) => Expr::EListAccess(Box::new(self.convert_simple_expr(l)), 0),
+            TypedExprKind::Head(l) => Expr::ListAccess(Box::new(self.convert_simple_expr(l)), 0),
             // Desugar: `tail(l)` -> `EListSubsequence(l, 1, len(l))`
             TypedExprKind::Tail(l) => {
                 let list_expr = self.convert_simple_expr(l);
-                Expr::EListSubsequence(
+                Expr::ListSubsequence(
                     Box::new(list_expr.clone()),
-                    Box::new(Expr::EInt(1)),
-                    Box::new(Expr::EListLen(Box::new(list_expr))),
+                    Box::new(Expr::Int(1)),
+                    Box::new(Expr::ListLen(Box::new(list_expr))),
                 )
             }
             // Desugar: `s[i]` -> `EFind(s, i)`
-            TypedExprKind::Index(target, index) => Expr::EFind(
+            TypedExprKind::Index(target, index) => Expr::Find(
                 Box::new(self.convert_simple_expr(target)),
                 Box::new(self.convert_simple_expr(index)),
             ),
             // Desugar: `s[i:j]` -> `EListSubsequence(s, i, j)`
-            TypedExprKind::Slice(target, start, end) => Expr::EListSubsequence(
+            TypedExprKind::Slice(target, start, end) => Expr::ListSubsequence(
                 Box::new(self.convert_simple_expr(target)),
                 Box::new(self.convert_simple_expr(start)),
                 Box::new(self.convert_simple_expr(end)),
             ),
             TypedExprKind::TupleAccess(tuple, index) => {
-                Expr::ETupleAccess(Box::new(self.convert_simple_expr(tuple)), *index)
+                Expr::TupleAccess(Box::new(self.convert_simple_expr(tuple)), *index)
             }
             // Desugar: `s.field` -> `EFind(s, "field")`
-            TypedExprKind::FieldAccess(target, field) => Expr::EFind(
+            TypedExprKind::FieldAccess(target, field) => Expr::Find(
                 Box::new(self.convert_simple_expr(target)),
-                Box::new(Expr::EString(field.clone())),
+                Box::new(Expr::String(field.clone())),
             ),
-            TypedExprKind::UnwrapOptional(e) => {
-                Expr::EUnwrap(Box::new(self.convert_simple_expr(e)))
-            }
+            TypedExprKind::UnwrapOptional(e) => Expr::Unwrap(Box::new(self.convert_simple_expr(e))),
 
-            TypedExprKind::WrapInOptional(e) => Expr::ESome(Box::new(self.convert_simple_expr(e))),
+            TypedExprKind::WrapInOptional(e) => Expr::Some(Box::new(self.convert_simple_expr(e))),
             // Desugar: `MyStruct { ... }` -> `EMap { ... }`
-            TypedExprKind::StructLit(_, fields) => Expr::EMap(
+            TypedExprKind::StructLit(_, fields) => Expr::Map(
                 fields
                     .iter()
-                    .map(|(name, val)| (Expr::EString(name.clone()), self.convert_simple_expr(val)))
+                    .map(|(name, val)| (Expr::String(name.clone()), self.convert_simple_expr(val)))
                     .collect(),
             ),
 
-            TypedExprKind::CreateLock => Expr::ECreateLock,
+            TypedExprKind::CreateLock => Expr::CreateLock,
 
             // --- Panic on complex expressions ---
             TypedExprKind::FuncCall(_)
@@ -1386,7 +1372,7 @@ impl Compiler {
                 // `let x = ...` adds a local
                 locals.push((
                     resolved_name(init.name, &init.original_name),
-                    Expr::ENil, // Use placeholder, actual init is handled by CFG
+                    Expr::Nil, // Use placeholder, actual init is handled by CFG
                 ));
             }
             TypedStatementKind::Conditional(cond) => {
@@ -1403,7 +1389,7 @@ impl Compiler {
                 if let Some(TypedForLoopInit::VarInit(init)) = &fl.init {
                     locals.push((
                         resolved_name(init.name, &init.original_name),
-                        Expr::ENil, // Use placeholder
+                        Expr::Nil, // Use placeholder
                     ));
                 }
                 self.scan_body_for_locals(&fl.body, locals);
@@ -1422,7 +1408,7 @@ impl Compiler {
         match &pat.kind {
             TypedPatternKind::Var(id, name) => {
                 // `ENil` is just a placeholder default
-                locals.push((resolved_name(*id, name), Expr::ENil));
+                locals.push((resolved_name(*id, name), Expr::Nil));
             }
             TypedPatternKind::Tuple(pats) => {
                 for p in pats {

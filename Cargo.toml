@@ -13,3 +13,6 @@ phf_macros = "0.13.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0.17"
+rand = "0.9.0"
+csv = "1.4.0"
+rusqlite = { version="0.38.0", features = ["bundled"] }

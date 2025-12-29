@@ -621,9 +621,7 @@ impl Resolver {
             TypeDefKind::Optional(t) => Ok(ResolvedTypeDef::Optional(Box::new(
                 self.resolve_type_def(*t)?,
             ))),
-            TypeDefKind::Chan(t) => Ok(ResolvedTypeDef::Chan(Box::new(
-                self.resolve_type_def(*t)?,
-            ))),
+            TypeDefKind::Chan(t) => Ok(ResolvedTypeDef::Chan(Box::new(self.resolve_type_def(*t)?))),
             TypeDefKind::Lock => Ok(ResolvedTypeDef::Lock),
         }
     }
