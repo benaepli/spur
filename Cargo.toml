@@ -22,4 +22,5 @@ imbl = "6.1.0"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
 crossbeam = "0.8.4"
-arcstr = { version = "1.2.0", features = ["serde"] }
+ecow = { version = "0.2.6", features = ["serde"] }
+dashmap = "6.1.0"

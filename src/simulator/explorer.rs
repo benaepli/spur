@@ -4,7 +4,7 @@ use crate::simulator::core::{
 };
 use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
 use crate::simulator::generator::{GeneratorConfig, generate_plan};
-use crate::simulator::history::{HistoryWriter, serialize_history};
+use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
 use crossbeam::channel;
 use log::{debug, error, info, warn};
 use rayon::iter::ParallelIterator;
@@ -181,7 +181,8 @@ pub fn run_single_simulation(
     )?;
 
     let serialized = serialize_history(&state.history);
-    writer.write(run_id, serialized);
+    let serialized_logs = serialize_logs(&state.logs);
+    writer.write(run_id, serialized, serialized_logs);
 
     Ok(())
 }

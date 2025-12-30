@@ -1,8 +1,8 @@
-use crate::simulator::core::{ChannelId, OpKind, Operation, Value};
+use crate::simulator::core::{ChannelId, LogEntry, OpKind, Operation, Value};
 use log::error;
 use rayon::prelude::*;
-use rusqlite::{params, Connection};
-use serde_json::{json, Value as JsonValue};
+use rusqlite::{Connection, params};
+use serde_json::{Value as JsonValue, json};
 use std::error::Error;
 use std::path::Path;
 use std::sync::mpsc::{self, Sender};
@@ -16,6 +16,22 @@ pub struct PersistableOp {
     pub kind: &'static str,
     pub action: String,
     pub payload_json: String,
+}
+
+pub struct PersistableLog {
+    pub node_id: i64,
+    pub content: String,
+    pub step: i32,
+}
+
+pub fn serialize_logs(logs: &[LogEntry]) -> Vec<PersistableLog> {
+    logs.par_iter()
+        .map(|l| PersistableLog {
+            node_id: l.node as i64,
+            content: l.content.clone(),
+            step: l.step,
+        })
+        .collect()
 }
 
 fn json_of_value(v: &Value) -> JsonValue {
@@ -176,6 +192,23 @@ PRIMARY KEY (run_id, seq_num)
         [],
     )?;
 
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS logs (
+            run_id INTEGER REFERENCES runs(run_id),
+            seq_num INTEGER,
+            node_id INTEGER,
+            step INTEGER,
+            content TEXT,
+            PRIMARY KEY (run_id, seq_num)
+        );",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_logs ON logs(run_id);",
+        [],
+    )?;
+
     Ok(())
 }
 
@@ -210,11 +243,38 @@ fn save_history_sqlite(
     Ok(())
 }
 
+fn save_logs_sqlite(
+    conn: &mut Connection,
+    run_id: i64,
+    logs: &[PersistableLog],
+) -> Result<(), Box<dyn Error>> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO logs (run_id, seq_num, node_id, step, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+
+        for (seq_num, log) in logs.iter().enumerate() {
+            stmt.execute(params![
+                run_id,
+                seq_num as i64,
+                log.node_id,
+                log.step,
+                &log.content
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Command sent to the background history writer thread.
 pub enum HistoryCommand {
     Write {
         run_id: i64,
         history: Vec<PersistableOp>,
+        logs: Vec<PersistableLog>,
     },
     Shutdown,
 }
@@ -237,9 +297,16 @@ impl HistoryWriter {
         let handle = thread::spawn(move || {
             while let Ok(cmd) = receiver.recv() {
                 match cmd {
-                    HistoryCommand::Write { run_id, history } => {
+                    HistoryCommand::Write {
+                        run_id,
+                        history,
+                        logs,
+                    } => {
                         if let Err(e) = save_history_sqlite(&mut conn, run_id, &history) {
                             error!("failed to save history for run {}: {}", run_id, e);
+                        }
+                        if let Err(e) = save_logs_sqlite(&mut conn, run_id, &logs) {
+                            error!("failed to save logs for run {}: {}", run_id, e);
                         }
                     }
                     HistoryCommand::Shutdown => break,
@@ -253,9 +320,13 @@ impl HistoryWriter {
         })
     }
 
-    /// Sends a pre-serialized history write request to the background thread.
-    pub fn write(&self, run_id: i64, history: Vec<PersistableOp>) {
-        let _ = self.sender.send(HistoryCommand::Write { run_id, history });
+    /// Sends a pre-serialized history and logs write request to the background thread.
+    pub fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>) {
+        let _ = self.sender.send(HistoryCommand::Write {
+            run_id,
+            history,
+            logs,
+        });
     }
 
     /// Shuts down the background writer, waiting for all pending writes to complete.

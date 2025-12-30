@@ -1,7 +1,7 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex};
+use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
-use arcstr::ArcStr;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -88,6 +88,13 @@ pub struct ChannelId {
 }
 
 #[derive(Clone, Debug)]
+pub struct LogEntry {
+    pub node: usize,
+    pub content: String,
+    pub step: i32,
+}
+
+#[derive(Clone, Debug)]
 pub enum Value {
     Int(i64),
     Bool(bool),
@@ -97,7 +104,7 @@ pub enum Value {
     Channel(ChannelId),
     Lock(Arc<Mutex<bool>>),
     Node(usize),
-    String(ArcStr),
+    String(EcoString),
     Unit,
     Tuple(Vector<Value>),
 }
@@ -403,6 +410,7 @@ pub struct State {
     pub waiting_records: Vec<Record>, // Generic waiting (timeouts etc, logic simplified here)
     pub channels: HashMap<ChannelId, ChannelState>,
     pub history: Vec<Operation>,
+    pub logs: Vec<LogEntry>,
     pub free_clients: Vec<i32>,
     pub crash_info: CrashInfo,
     next_channel_id: usize,
@@ -418,6 +426,7 @@ impl State {
             waiting_records: Vec::new(),
             channels: HashMap::new(),
             history: Vec::new(),
+            logs: Vec::new(),
             free_clients: Vec::new(),
             crash_info: CrashInfo {
                 currently_crashed: HashSet::new(),
@@ -703,7 +712,7 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
                 got: other.type_name(),
             }),
         },
-        Expr::IntToString(e) => Ok(Value::String(ArcStr::from(
+        Expr::IntToString(e) => Ok(Value::String(EcoString::from(
             eval(local_env, node_env, e)?.as_int()?.to_string(),
         ))),
         Expr::Store(col, key, val) => update_collection(
@@ -728,6 +737,7 @@ pub fn exec_sync_on_node(
         local_env,
         &mut node_env.borrow_mut(),
         start_pc,
+        node_id,
     )
 }
 
@@ -737,6 +747,7 @@ fn exec_sync_inner(
     local_env: &mut Env,
     node_env: &mut Env,
     start_pc: usize,
+    node_id: usize,
 ) -> Result<Value, RuntimeError> {
     let mut pc = start_pc;
     loop {
@@ -789,6 +800,7 @@ fn exec_sync_inner(
                             &mut callee_local,
                             node_env,
                             func_info.entry,
+                            node_id,
                         )?;
 
                         store(&lhs, val, local_env, node_env)?;
@@ -916,7 +928,11 @@ fn exec_sync_inner(
             }
             Label::Print(expr, next) => {
                 let val = eval(local_env, node_env, &expr)?;
-                // println!("{}", val);
+                state.logs.push(LogEntry {
+                    node: node_id,
+                    content: val.to_string(),
+                    step: state.crash_info.current_step,
+                });
                 pc = next;
             }
             Label::Break(target) => {
@@ -1047,6 +1063,7 @@ pub fn exec(state: &mut State, program: &Program, mut record: Record) -> Result<
                             &mut callee_local,
                             &mut node_env.borrow_mut(),
                             func_info.entry,
+                            record.node,
                         )?;
 
                         store(&lhs, ret_val, &mut local_env, &mut node_env.borrow_mut())?;
@@ -1243,7 +1260,11 @@ pub fn exec(state: &mut State, program: &Program, mut record: Record) -> Result<
             }
             Label::Print(expr, next) => {
                 let val = eval(&local_env, &node_env.borrow(), &expr)?;
-                // println!("{}", val);
+                state.logs.push(LogEntry {
+                    node: record.node,
+                    content: val.to_string(),
+                    step: state.crash_info.current_step,
+                });
                 record.pc = next;
             }
             Label::SpinAwait(expr, next) => {

@@ -9,7 +9,7 @@ use crate::simulator::core::{
     Value, eval, exec, exec_sync_on_node, schedule_record,
 };
 use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine};
-use arcstr::ArcStr;
+use ecow::EcoString;
 use log::{info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,13 +207,16 @@ fn schedule_client_op(
             "ClientInterface.Write",
             vec![
                 Value::Node(*target as usize),
-                Value::String(ArcStr::from(key.as_str())),
-                Value::String(ArcStr::from(val.as_str())),
+                Value::String(EcoString::from(key.as_str())),
+                Value::String(EcoString::from(val.as_str())),
             ],
         ),
         ClientOpSpec::Read(target, key) => (
             "ClientInterface.Read",
-            vec![Value::Node(*target as usize), Value::String(ArcStr::from(key.as_str()))],
+            vec![
+                Value::Node(*target as usize),
+                Value::String(EcoString::from(key.as_str())),
+            ],
         ),
         ClientOpSpec::SimulateTimeout(target) => (
             "ClientInterface.SimulateTimeout",
@@ -266,7 +269,7 @@ pub fn exec_plan(
 ) -> Result<(), RuntimeError> {
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
-    let mut in_progress: HashMap<i32, ArcStr> = HashMap::new();
+    let mut in_progress: HashMap<i32, EcoString> = HashMap::new();
 
     for step in 0..max_iterations {
         if engine.is_complete() {
