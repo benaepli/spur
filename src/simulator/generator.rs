@@ -2,6 +2,7 @@ use rand::prelude::*;
 use rand::rng;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+use arcstr::ArcStr;
 
 use crate::simulator::plan::{
     ClientOpSpec, Dependency, EventAction, EventId, ExecutionPlan, PlannedEvent,
@@ -57,12 +58,12 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
     let rand_val = || format!("val{}", rng().random_range(0..100));
 
     for _ in 0..config.num_write_ops {
-        let action = ClientOpSpec::Write(rand_server(), rand_key(), rand_val());
+        let action = ClientOpSpec::Write(rand_server(), ArcStr::from(rand_key()), ArcStr::from(rand_val()));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
     for _ in 0..config.num_read_ops {
-        let action = ClientOpSpec::Read(rand_server(), rand_key());
+        let action = ClientOpSpec::Read(rand_server(), ArcStr::from(rand_key()));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
@@ -92,11 +93,11 @@ fn create_intermediate_list(stubs: Vec<ActionStub>) -> Vec<IntermediateEvent> {
     let mut pair_group_counter = 0;
 
     // Maps server_id -> event_id of the last recovery on that server
-    let mut last_recovery_map: HashMap<i32, String> = HashMap::new();
+    let mut last_recovery_map: HashMap<i32, ArcStr> = HashMap::new();
 
     let mut next_id = || {
         event_id_counter += 1;
-        format!("e{}", event_id_counter)
+        ArcStr::from(format!("e{}", event_id_counter))
     };
 
     for stub in stubs {

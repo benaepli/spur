@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use thiserror::Error;
+use arcstr::ArcStr;
 
-pub type EventId = String;
+pub type EventId = ArcStr;
 
 #[derive(Debug, Error)]
 pub enum PlanError {
@@ -17,8 +18,8 @@ pub enum PlanError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientOpSpec {
-    Write(i32, String, String),
-    Read(i32, String),
+    Write(i32, ArcStr, ArcStr),
+    Read(i32, ArcStr),
     SimulateTimeout(i32),
 }
 
@@ -129,7 +130,7 @@ impl PlanEngine {
     /// Marks an event as completed and updates dependencies.
     pub fn mark_event_completed(&mut self, id: &str) -> Result<(), PlanError> {
         self.event_statuses
-            .insert(id.to_string(), EventStatus::Completed);
+            .insert(ArcStr::from(id), EventStatus::Completed);
 
         if let Some(children_ids) = self.reverse_dependencies.get(id).cloned() {
             for child_id in children_ids {
@@ -169,11 +170,11 @@ impl PlanEngine {
         match self.event_statuses.get(id) {
             Some(EventStatus::InProgress) => {
                 self.event_statuses
-                    .insert(id.to_string(), EventStatus::Ready);
+                    .insert(ArcStr::from(id), EventStatus::Ready);
                 Ok(())
             }
-            Some(_) => Err(PlanError::NotInProgress(id.to_string())),
-            None => Err(PlanError::EventNotFound(id.to_string())),
+            Some(_) => Err(PlanError::NotInProgress(ArcStr::from(id))),
+            None => Err(PlanError::EventNotFound(ArcStr::from(id))),
         }
     }
 

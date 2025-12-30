@@ -4,11 +4,9 @@ use crate::simulator::core::{
 };
 use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
 use crate::simulator::generator::{GeneratorConfig, generate_plan};
-use crate::simulator::history::{init_sqlite, save_history_sqlite};
+use crate::simulator::history::{HistoryWriter, serialize_history};
 use crossbeam::channel;
 use log::{debug, error, info, warn};
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::ParallelBridge;
 use serde::Deserialize;
@@ -145,7 +143,7 @@ fn init_topology(
 /// Runs a single simulation configuration.
 pub fn run_single_simulation(
     program: &Program,
-    pool: &Pool<SqliteConnectionManager>,
+    writer: &HistoryWriter,
     run_id: i64,
     config: &SingleRunConfig,
 ) -> Result<(), Box<dyn Error>> {
@@ -182,8 +180,8 @@ pub fn run_single_simulation(
         config.randomly_delay_msgs,
     )?;
 
-    let mut conn = pool.get()?;
-    save_history_sqlite(&mut conn, run_id, &state.history)?;
+    let serialized = serialize_history(&state.history);
+    writer.write(run_id, serialized);
 
     Ok(())
 }
@@ -204,8 +202,7 @@ pub fn run_explorer(
         fs::remove_file(output_path)?;
     }
 
-    let manager = SqliteConnectionManager::file(output_path).with_init(|c| init_sqlite(c)); //
-    let pool = Pool::new(manager)?;
+    let writer = std::sync::Arc::new(HistoryWriter::new(output_path)?);
 
     let (sender, receiver) = channel::bounded::<(i64, SingleRunConfig)>(100);
 
@@ -293,7 +290,7 @@ pub fn run_explorer(
         .par_bridge()
         .for_each(|(run_id, run_config)| {
             let start = std::time::Instant::now();
-            match run_single_simulation(program, &pool, run_id, &run_config) {
+            match run_single_simulation(program, &writer, run_id, &run_config) {
                 Ok(_) => {
                     debug!(
                         "Run {} Success ({:.4}s)",
@@ -304,6 +301,11 @@ pub fn run_explorer(
                 Err(e) => error!("Run {} failed: {}", run_id, e),
             }
         });
+
+    // Shutdown the writer, waiting for all pending writes to complete
+    if let Ok(w) = std::sync::Arc::try_unwrap(writer) {
+        w.shutdown();
+    }
 
     info!("Execution explorer finished.");
     Ok(())

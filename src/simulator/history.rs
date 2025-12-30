@@ -1,9 +1,22 @@
 use crate::simulator::core::{ChannelId, OpKind, Operation, Value};
+use log::error;
 use rayon::prelude::*;
-use rusqlite::{Connection, params};
-use serde_json::{Value as JsonValue, json};
+use rusqlite::{params, Connection};
+use serde_json::{json, Value as JsonValue};
 use std::error::Error;
 use std::path::Path;
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle};
+
+/// A pre-serialized operation ready for database insertion.
+/// JSON serialization is done by worker threads before sending to the writer.
+pub struct PersistableOp {
+    pub unique_id: i64,
+    pub client_id: i64,
+    pub kind: &'static str,
+    pub action: String,
+    pub payload_json: String,
+}
 
 fn json_of_value(v: &Value) -> JsonValue {
     match v {
@@ -80,6 +93,24 @@ fn payload_to_json_string(payload: &[Value]) -> String {
     serde_json::to_string(&json_list).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Serializes a list of Operations into PersistableOps.
+/// This should be called from worker threads to distribute CPU work.
+pub fn serialize_history(history: &[Operation]) -> Vec<PersistableOp> {
+    history
+        .par_iter()
+        .map(|op| PersistableOp {
+            unique_id: op.unique_id as i64,
+            client_id: op.client_id as i64,
+            kind: match op.kind {
+                OpKind::Response => "Response",
+                OpKind::Invocation => "Invocation",
+            },
+            action: op.op_action.clone(),
+            payload_json: payload_to_json_string(&op.payload),
+        })
+        .collect()
+}
+
 /// Saves the simulation history to a CSV file.
 pub fn save_history_to_csv<P: AsRef<Path>>(
     history: &[Operation],
@@ -148,20 +179,13 @@ PRIMARY KEY (run_id, seq_num)
     Ok(())
 }
 
-/// Saves the simulation history to the SQLite database.
-pub fn save_history_sqlite(
+/// Saves pre-serialized history to the SQLite database.
+/// This is a fast I/O-only operation since serialization is already done.
+fn save_history_sqlite(
     conn: &mut Connection,
     run_id: i64,
-    history: &[Operation],
+    history: &[PersistableOp],
 ) -> Result<(), Box<dyn Error>> {
-    let prepared_records: Vec<(&Operation, String)> = history
-        .par_iter()
-        .map(|op| {
-            let json = payload_to_json_string(&op.payload);
-            (op, json)
-        })
-        .collect();
-
     conn.execute("INSERT INTO runs (run_id) VALUES (?1)", params![run_id])?;
     let tx = conn.transaction()?;
     {
@@ -170,23 +194,75 @@ pub fn save_history_sqlite(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
 
-        for (seq_num, (op, json_payload)) in prepared_records.iter().enumerate() {
-            let kind = match op.kind {
-                OpKind::Response => "Response",
-                OpKind::Invocation => "Invocation",
-            };
-
+        for (seq_num, op) in history.iter().enumerate() {
             stmt.execute(params![
                 run_id,
                 seq_num as i64,
-                op.unique_id as i64,
-                op.client_id as i64,
-                kind,
-                op.op_action,
-                json_payload
+                op.unique_id,
+                op.client_id,
+                op.kind,
+                op.action,
+                op.payload_json
             ])?;
         }
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Command sent to the background history writer thread.
+pub enum HistoryCommand {
+    Write {
+        run_id: i64,
+        history: Vec<PersistableOp>,
+    },
+    Shutdown,
+}
+
+/// A background writer that serializes all SQLite writes to a single thread.
+pub struct HistoryWriter {
+    sender: Sender<HistoryCommand>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl HistoryWriter {
+    /// Creates a new HistoryWriter, opening and initializing the SQLite database.
+    /// The connection is then moved to a background thread that processes write requests.
+    pub fn new(db_path: &str) -> Result<Self, Box<dyn Error>> {
+        let mut conn = Connection::open(db_path)?;
+        init_sqlite(&conn)?;
+
+        let (sender, receiver) = mpsc::channel::<HistoryCommand>();
+
+        let handle = thread::spawn(move || {
+            while let Ok(cmd) = receiver.recv() {
+                match cmd {
+                    HistoryCommand::Write { run_id, history } => {
+                        if let Err(e) = save_history_sqlite(&mut conn, run_id, &history) {
+                            error!("failed to save history for run {}: {}", run_id, e);
+                        }
+                    }
+                    HistoryCommand::Shutdown => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            sender,
+            handle: Some(handle),
+        })
+    }
+
+    /// Sends a pre-serialized history write request to the background thread.
+    pub fn write(&self, run_id: i64, history: Vec<PersistableOp>) {
+        let _ = self.sender.send(HistoryCommand::Write { run_id, history });
+    }
+
+    /// Shuts down the background writer, waiting for all pending writes to complete.
+    pub fn shutdown(mut self) {
+        let _ = self.sender.send(HistoryCommand::Shutdown);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }

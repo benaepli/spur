@@ -5,6 +5,7 @@ use crate::analysis::types::{
     TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
 };
 use crate::parser::BinOp;
+use arcstr::ArcStr;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -23,7 +24,7 @@ pub enum Expr {
     ListPrepend(Box<Expr>, Box<Expr>),
     ListAppend(Box<Expr>, Box<Expr>),
     ListSubsequence(Box<Expr>, Box<Expr>, Box<Expr>),
-    String(String),
+    String(ArcStr),
     LessThan(Box<Expr>, Box<Expr>),
     LessThanEquals(Box<Expr>, Box<Expr>),
     GreaterThan(Box<Expr>, Box<Expr>),
@@ -1016,7 +1017,7 @@ impl Compiler {
                 let target_tmp = self.new_temp_var(locals);
                 let final_expr = Expr::Find(
                     Box::new(Expr::Var(target_tmp)),
-                    Box::new(Expr::String(field.clone())),
+                    Box::new(Expr::String(ArcStr::from(field.as_str()))),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
@@ -1044,7 +1045,7 @@ impl Compiler {
                 let (tmps, simple_exprs) = self.compile_temp_list(locals, val_exprs.len());
                 let final_pairs = field_names
                     .into_iter()
-                    .map(Expr::String)
+                    .map(|s| Expr::String(ArcStr::from(s.as_str())))
                     .zip(simple_exprs)
                     .collect();
                 let final_expr = Expr::Map(final_pairs);
@@ -1253,7 +1254,7 @@ impl Compiler {
                 Expr::Var(*id)
             }
             TypedExprKind::IntLit(i) => Expr::Int(i.clone()),
-            TypedExprKind::StringLit(s) => Expr::String(s.clone()),
+            TypedExprKind::StringLit(s) => Expr::String(ArcStr::from(s.as_str())),
             TypedExprKind::BoolLit(b) => Expr::Bool(b.clone()),
             TypedExprKind::NilLit => Expr::Nil,
             TypedExprKind::BinOp(op, l, r) => {
@@ -1334,7 +1335,7 @@ impl Compiler {
             // Desugar: `s.field` -> `EFind(s, "field")`
             TypedExprKind::FieldAccess(target, field) => Expr::Find(
                 Box::new(self.convert_simple_expr(target)),
-                Box::new(Expr::String(field.clone())),
+                Box::new(Expr::String(ArcStr::from(field.as_str()))),
             ),
             TypedExprKind::UnwrapOptional(e) => Expr::Unwrap(Box::new(self.convert_simple_expr(e))),
 
@@ -1343,7 +1344,7 @@ impl Compiler {
             TypedExprKind::StructLit(_, fields) => Expr::Map(
                 fields
                     .iter()
-                    .map(|(name, val)| (Expr::String(name.clone()), self.convert_simple_expr(val)))
+                    .map(|(name, val)| (Expr::String(ArcStr::from(name.as_str())), self.convert_simple_expr(val)))
                     .collect(),
             ),
 

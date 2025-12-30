@@ -1,6 +1,7 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex};
 use imbl::{HashMap as ImHashMap, Vector};
+use arcstr::ArcStr;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -92,11 +93,11 @@ pub enum Value {
     Bool(bool),
     Map(ImHashMap<Value, Value>),
     List(Vector<Value>),
-    Option(Option<Box<Value>>),
+    Option(Option<Arc<Value>>),
     Channel(ChannelId),
     Lock(Arc<Mutex<bool>>),
     Node(usize),
-    String(String),
+    String(ArcStr),
     Unit,
     Tuple(Vector<Value>),
 }
@@ -564,7 +565,7 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
             eval(local_env, node_env, e1)?.as_bool()?
                 || eval(local_env, node_env, e2)?.as_bool()?,
         )),
-        Expr::Some(e) => Ok(Value::Option(Some(Box::new(eval(local_env, node_env, e)?)))),
+        Expr::Some(e) => Ok(Value::Option(Some(Arc::new(eval(local_env, node_env, e)?)))),
         Expr::Tuple(es) => {
             let vals: Result<Vector<_>, _> =
                 es.iter().map(|e| eval(local_env, node_env, e)).collect();
@@ -688,7 +689,7 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
             }
         }
         Expr::Unwrap(e) => match eval(local_env, node_env, e)? {
-            Value::Option(Some(v)) => Ok(*v),
+            Value::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v)),
             Value::Option(None) => Err(RuntimeError::UnwrapNone),
             other => Err(RuntimeError::TypeError {
                 expected: "option",
@@ -696,15 +697,15 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
             }),
         },
         Expr::Coalesce(opt, default) => match eval(local_env, node_env, opt)? {
-            Value::Option(Some(v)) => Ok(*v),
+            Value::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v)),
             Value::Option(None) => eval(local_env, node_env, default),
             other => Err(RuntimeError::CoalesceNonOption {
                 got: other.type_name(),
             }),
         },
-        Expr::IntToString(e) => Ok(Value::String(
+        Expr::IntToString(e) => Ok(Value::String(ArcStr::from(
             eval(local_env, node_env, e)?.as_int()?.to_string(),
-        )),
+        ))),
         Expr::Store(col, key, val) => update_collection(
             eval(local_env, node_env, col)?,
             eval(local_env, node_env, key)?,
