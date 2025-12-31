@@ -95,6 +95,7 @@ pub enum TypedExprKind {
     Recv(Box<TypedExpr>),
 
     CreateLock,
+    SetTimer,
 
     Index(Box<TypedExpr>, Box<TypedExpr>),
     Slice(Box<TypedExpr>, Box<TypedExpr>, Box<TypedExpr>),

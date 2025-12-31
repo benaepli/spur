@@ -236,6 +236,7 @@ pub enum ResolvedExprKind {
     Recv(Box<ResolvedExpr>),
 
     CreateLock,
+    SetTimer,
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
@@ -918,6 +919,7 @@ impl Resolver {
             ),
             ExprKind::Recv(ch) => ResolvedExprKind::Recv(Box::new(self.resolve_expr(*ch)?)),
             ExprKind::CreateLock => ResolvedExprKind::CreateLock,
+            ExprKind::SetTimer => ResolvedExprKind::SetTimer,
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)?),
                 Box::new(self.resolve_expr(*i)?),

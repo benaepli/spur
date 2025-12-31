@@ -439,9 +439,10 @@ fn pretty_expr(prog: &Program, expr: &Expr) -> String {
         Expr::Nil => "nil".into(),
         Expr::Unwrap(e) => format!("{}!", pretty_expr(prog, e)),
         Expr::Coalesce(l, r) => format!("{} ?? {}", pretty_expr(prog, l), pretty_expr(prog, r)),
-        Expr::CreateLock => "createLock()".into(),
+        Expr::CreateLock => "create_lock()".into(),
+        Expr::SetTimer => "set_timer()".into(),
         Expr::Some(e) => format!("Some({})", pretty_expr(prog, e)),
-        Expr::IntToString(e) => format!("intToString({})", pretty_expr(prog, e)),
+        Expr::IntToString(e) => format!("int_to_string({})", pretty_expr(prog, e)),
     }
 }
 

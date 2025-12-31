@@ -1124,6 +1124,11 @@ impl TypeChecker {
                 ty: Type::Lock,
                 span,
             }),
+            ResolvedExprKind::SetTimer => Ok(TypedExpr {
+                kind: TypedExprKind::SetTimer,
+                ty: Type::Chan(Box::new(Type::Tuple(vec![]))),
+                span,
+            }),
             ResolvedExprKind::Index(target, index) => self.infer_index(*target, *index, span),
             ResolvedExprKind::Slice(target, start, end) => {
                 let typed_target = self.infer_expr(*target)?;

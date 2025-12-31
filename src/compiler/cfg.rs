@@ -49,6 +49,7 @@ pub enum Expr {
     Unwrap(Box<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
     CreateLock,
+    SetTimer,
     Some(Box<Expr>),
     IntToString(Box<Expr>),
 }
@@ -1082,6 +1083,10 @@ impl Compiler {
                 let label = Label::Instr(Instr::Assign(target, Expr::CreateLock), next_vertex);
                 self.add_label(label)
             }
+            TypedExprKind::SetTimer => {
+                let label = Label::Instr(Instr::Assign(target, Expr::SetTimer), next_vertex);
+                self.add_label(label)
+            }
 
             _ => {
                 // Desugar the simple expression
@@ -1373,6 +1378,7 @@ impl Compiler {
             ),
 
             TypedExprKind::CreateLock => Expr::CreateLock,
+            TypedExprKind::SetTimer => Expr::SetTimer,
 
             // --- Panic on complex expressions ---
             TypedExprKind::FuncCall(_)

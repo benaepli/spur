@@ -717,6 +717,7 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
             eval(local_env, node_env, key)?,
             eval(local_env, node_env, val)?,
         ),
+        Expr::SetTimer => todo!()
     }
 }
 

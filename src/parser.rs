@@ -233,6 +233,7 @@ pub enum ExprKind {
     Send(Box<Expr>, Box<Expr>),
     Recv(Box<Expr>),
     CreateLock,
+    SetTimer,
 
     // Postfix operations
     Index(Box<Expr>, Box<Expr>),
@@ -580,6 +581,7 @@ where
             two_arg_builtin(TokenKind::Send, ExprKind::Send),
             one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
             zero_arg_builtin(TokenKind::CreateLock, ExprKind::CreateLock),
+            zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
             func_call.clone().map(ExprKind::FuncCall),
             ident.clone().map(ExprKind::Var),
             tuple_lit,
