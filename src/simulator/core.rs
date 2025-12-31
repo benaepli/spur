@@ -1,5 +1,5 @@
 use crate::analysis::resolver::NameId;
-use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex};
+use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex, SELF_NAME};
 use crate::simulator::coverage::{GlobalCoverage, LocalCoverage};
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
@@ -391,6 +391,8 @@ pub struct ChannelState {
 pub enum OpKind {
     Invocation,
     Response,
+    Crash,
+    Recover,
 }
 
 #[derive(Clone, Debug)]
@@ -441,9 +443,6 @@ impl State {
         id
     }
 }
-
-/// Special NameId for "self" - uses max usize to avoid collision with normal IDs
-pub const SELF_NAME_ID: NameId = NameId(usize::MAX);
 
 /// Creates a special NameId for for-loop iterator state based on the PC.
 /// Uses high bit range to avoid collision with normal IDs.
@@ -753,7 +752,9 @@ fn exec_sync_inner(
     let mut prev_pc = pc;
     loop {
         if pc != prev_pc {
-            let rarity = global_coverage.map(|gc| gc.novelty_score(pc)).unwrap_or(1.0);
+            let rarity = global_coverage
+                .map(|gc| gc.novelty_score(pc))
+                .unwrap_or(1.0);
             state.coverage.record_with_rarity(prev_pc, pc, rarity);
             prev_pc = pc;
         }
@@ -796,8 +797,8 @@ fn exec_sync_inner(
                             callee_local.insert(*name, eval(local_env, node_env, expr)?);
                         }
 
-                        if let Some(s) = local_env.get(&SELF_NAME_ID) {
-                            callee_local.insert(SELF_NAME_ID, s.clone());
+                        if let Some(s) = local_env.get(&SELF_NAME) {
+                            callee_local.insert(SELF_NAME, s.clone());
                         }
 
                         // Pass node_env directly (it's already mutable borrowed from caller)
@@ -821,8 +822,8 @@ fn exec_sync_inner(
                         let arg_vals = arg_vals?;
 
                         let origin_node = local_env
-                            .get(&SELF_NAME_ID)
-                            .ok_or_else(|| RuntimeError::VariableNotFound(SELF_NAME_ID))?
+                            .get(&SELF_NAME)
+                            .ok_or_else(|| RuntimeError::VariableNotFound(SELF_NAME))?
                             .as_node()?;
 
                         let chan_id = ChannelId {
@@ -905,8 +906,8 @@ fn exec_sync_inner(
             }
             Label::MakeChannel(lhs, cap, next) => {
                 let origin_node = local_env
-                    .get(&SELF_NAME_ID)
-                    .ok_or_else(|| RuntimeError::VariableNotFound(SELF_NAME_ID))?
+                    .get(&SELF_NAME)
+                    .ok_or_else(|| RuntimeError::VariableNotFound(SELF_NAME))?
                     .as_node()?;
                 let cid = ChannelId {
                     node: origin_node,
@@ -1021,15 +1022,19 @@ pub fn exec(
     let mut local_env = record.env;
     let node_env = Rc::clone(&state.nodes[record.node]);
 
-    local_env.insert(SELF_NAME_ID, Value::Node(record.node));
+    local_env.insert(SELF_NAME, Value::Node(record.node));
 
     let mut prev_pc = record.pc;
 
     loop {
         let current_pc = record.pc;
         if current_pc != prev_pc {
-            let rarity = global_coverage.map(|gc| gc.novelty_score(current_pc)).unwrap_or(1.0);
-            state.coverage.record_with_rarity(prev_pc, current_pc, rarity);
+            let rarity = global_coverage
+                .map(|gc| gc.novelty_score(current_pc))
+                .unwrap_or(1.0);
+            state
+                .coverage
+                .record_with_rarity(prev_pc, current_pc, rarity);
             prev_pc = current_pc;
         }
 
@@ -1074,8 +1079,8 @@ pub fn exec(
                             callee_local.insert(*name, eval(&local_env, &node_env.borrow(), expr)?);
                         }
 
-                        if let Some(s) = local_env.get(&SELF_NAME_ID) {
-                            callee_local.insert(SELF_NAME_ID, s.clone());
+                        if let Some(s) = local_env.get(&SELF_NAME) {
+                            callee_local.insert(SELF_NAME, s.clone());
                         }
 
                         // Pass node_env directly

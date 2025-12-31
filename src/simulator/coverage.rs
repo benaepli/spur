@@ -1,6 +1,5 @@
 use crate::compiler::cfg::Vertex;
 use crate::simulator::plan::PlannedEvent;
-use crossbeam::epoch::Atomic;
 use dashmap::DashMap;
 use nauty_pet::prelude::CanonGraph;
 use rand::SeedableRng;

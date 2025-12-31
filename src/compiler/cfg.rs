@@ -9,6 +9,8 @@ use ecow::EcoString;
 use serde::Serialize;
 use std::collections::HashMap;
 
+pub const SELF_NAME: NameId = NameId(usize::MAX);
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Expr {
     Var(NameId),
@@ -223,12 +225,6 @@ impl Compiler {
         vertex
     }
 
-    /// Registers a variable NameId from the typed AST and returns it.
-    /// Also stores the original name for debugging.
-    fn register_var_name(&mut self, name_id: NameId, original_name: &str) -> NameId {
-        self.id_to_name.insert(name_id, original_name.to_string());
-        name_id
-    }
 
     /// Allocates a new NameId for a function and registers it.
     fn alloc_func_name_id(&mut self, qualified_name: String) -> NameId {
@@ -241,6 +237,8 @@ impl Compiler {
     pub fn compile_program(mut self, program: TypedProgram) -> Program {
         let next_name_id = program.next_name_id;
         self.next_name_id = next_name_id;
+        // Initialize id_to_name from the resolver's map
+        self.id_to_name = program.id_to_name;
 
         // Build func_sync_map and compile all top-level definitions
         for def in &program.top_level_defs {
@@ -295,9 +293,8 @@ impl Compiler {
         let mut next_vertex = final_vertex;
         // Build the init chain backwards
         for init in inits.iter().rev() {
-            let var_id = self.register_var_name(init.name, &init.original_name);
             next_vertex =
-                self.compile_expr_to_value(&mut locals, &init.value, Lhs::Var(var_id), next_vertex);
+                self.compile_expr_to_value(&mut locals, &init.value, Lhs::Var(init.name), next_vertex);
         }
 
         let entry = self.add_label(Label::Instr(
@@ -334,11 +331,7 @@ impl Compiler {
             return_var_id,
         );
 
-        let formals = func
-            .params
-            .into_iter()
-            .map(|p| self.register_var_name(p.name, &p.original_name))
-            .collect();
+        let formals = func.params.into_iter().map(|p| p.name).collect();
 
         if let Some(local) = locals.iter_mut().find(|(n, _)| *n == return_var_id) {
             local.1 = Expr::Unit;
@@ -354,12 +347,13 @@ impl Compiler {
             .get(&func.name)
             .expect("Function qualifier should exist in map");
 
+        // Use the existing func.name NameId from the resolver, not a new one
         let qualified_name = format!("{}.{}", qualifier, func.original_name);
-        let func_name_id = self.alloc_func_name_id(qualified_name);
+        self.func_name_to_id.insert(qualified_name, func.name);
 
         FunctionInfo {
             entry,
-            name: func_name_id,
+            name: func.name,
             formals,
             locals,
             is_sync: func.is_sync,
@@ -404,8 +398,7 @@ impl Compiler {
         let result = match &stmt.kind {
             TypedStatementKind::VarInit(init) => {
                 // Compile the value, assigning to the new variable
-                let var_id = self.register_var_name(init.name, &init.original_name);
-                self.compile_expr_to_value(locals, &init.value, Lhs::Var(var_id), next_vertex)
+                self.compile_expr_to_value(locals, &init.value, Lhs::Var(init.name), next_vertex)
             }
             TypedStatementKind::Assignment(assign) => {
                 // Compile the value, assigning to the target LHS
@@ -509,8 +502,7 @@ impl Compiler {
 
         match &loop_stmt.init {
             Some(TypedForLoopInit::VarInit(vi)) => {
-                let var_id = self.register_var_name(vi.name, &vi.original_name);
-                self.compile_expr_to_value(locals, &vi.value, Lhs::Var(var_id), loop_head_vertex)
+                self.compile_expr_to_value(locals, &vi.value, Lhs::Var(vi.name), loop_head_vertex)
             }
             Some(TypedForLoopInit::Assignment(assign)) => {
                 let lhs = self.convert_lhs(&assign.target);
@@ -1194,8 +1186,7 @@ impl Compiler {
                         sync_call_vertex,
                     )
                 } else {
-                    // Use a special SELF_NAME_ID that will be defined in the simulator
-                    let node_expr = Expr::Var(NameId(usize::MAX));
+                    let node_expr = Expr::Var(SELF_NAME);
                     self.compile_async_call_internal(
                         locals,
                         node_expr,
@@ -1280,10 +1271,7 @@ impl Compiler {
     /// Panics if it encounters a complex (side-effecting) expression.
     fn convert_simple_expr(&mut self, expr: &TypedExpr) -> Expr {
         match &expr.kind {
-            TypedExprKind::Var(id, name) => {
-                self.register_var_name(*id, name);
-                Expr::Var(*id)
-            }
+            TypedExprKind::Var(id, _name) => Expr::Var(*id),
             TypedExprKind::IntLit(i) => Expr::Int(i.clone()),
             TypedExprKind::StringLit(s) => Expr::String(EcoString::from(s.as_str())),
             TypedExprKind::BoolLit(b) => Expr::Bool(b.clone()),
@@ -1402,30 +1390,21 @@ impl Compiler {
 
     fn convert_lhs(&mut self, expr: &TypedExpr) -> Lhs {
         match &expr.kind {
-            TypedExprKind::Var(id, name) => {
-                self.register_var_name(*id, name);
-                Lhs::Var(*id)
-            }
+            TypedExprKind::Var(id, _name) => Lhs::Var(*id),
             _ => panic!("Invalid assignment target: {:?}", expr),
         }
     }
 
     fn convert_pattern(&mut self, locals: &mut Vec<(NameId, Expr)>, pat: &TypedPattern) -> Lhs {
         match &pat.kind {
-            TypedPatternKind::Var(id, name) => {
-                self.register_var_name(*id, name);
-                Lhs::Var(*id)
-            }
+            TypedPatternKind::Var(id, _name) => Lhs::Var(*id),
             TypedPatternKind::Wildcard => Lhs::Var(self.new_temp_var(locals)),
             TypedPatternKind::Tuple(pats) => {
                 let names = pats
                     .iter()
                     .map(|p| {
                         match &p.kind {
-                            TypedPatternKind::Var(id, name) => {
-                                self.register_var_name(*id, name);
-                                *id
-                            }
+                            TypedPatternKind::Var(id, _name) => *id,
                             _ => self.new_temp_var(locals), // Use dummy var for wildcard/unit
                         }
                     })
@@ -1453,9 +1432,8 @@ impl Compiler {
         match &stmt.kind {
             TypedStatementKind::VarInit(init) => {
                 // `let x = ...` adds a local
-                let var_id = self.register_var_name(init.name, &init.original_name);
                 locals.push((
-                    var_id,
+                    init.name,
                     Expr::Nil, // Use placeholder, actual init is handled by CFG
                 ));
             }
@@ -1471,9 +1449,8 @@ impl Compiler {
             TypedStatementKind::ForLoop(fl) => {
                 // This is the C-style loop, which might have an init
                 if let Some(TypedForLoopInit::VarInit(init)) = &fl.init {
-                    let var_id = self.register_var_name(init.name, &init.original_name);
                     locals.push((
-                        var_id,
+                        init.name,
                         Expr::Nil, // Use placeholder
                     ));
                 }
@@ -1491,10 +1468,9 @@ impl Compiler {
 
     fn scan_pattern_for_locals(&mut self, pat: &TypedPattern, locals: &mut Vec<(NameId, Expr)>) {
         match &pat.kind {
-            TypedPatternKind::Var(id, name) => {
+            TypedPatternKind::Var(id, _name) => {
                 // `ENil` is just a placeholder default
-                let var_id = self.register_var_name(*id, name);
-                locals.push((var_id, Expr::Nil));
+                locals.push((*id, Expr::Nil));
             }
             TypedPatternKind::Tuple(pats) => {
                 for p in pats {

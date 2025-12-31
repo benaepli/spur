@@ -1,5 +1,6 @@
 use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::parser::{BinOp, Span};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
@@ -211,6 +212,7 @@ pub enum TypedPatternKind {
 pub struct TypedProgram {
     pub top_level_defs: Vec<TypedTopLevelDef>,
     pub next_name_id: usize,
+    pub id_to_name: HashMap<NameId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

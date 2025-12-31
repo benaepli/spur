@@ -1,6 +1,6 @@
-use crate::compiler::cfg::Program;
+use crate::compiler::cfg::{Program, SELF_NAME};
 use crate::simulator::core::{
-    Env, RuntimeError, SELF_NAME_ID, State, Value, eval, exec_sync_on_node,
+    Env, RuntimeError, State, Value, eval, exec_sync_on_node,
 };
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
@@ -179,7 +179,7 @@ fn initialize_state(
         for i in 0..num_clients {
             let client_id = num_servers + i;
             let mut env = Env::default();
-            env.insert(SELF_NAME_ID, Value::Node(client_id));
+            env.insert(SELF_NAME, Value::Node(client_id));
             let node_env = state.nodes[client_id].borrow();
             for (name, expr) in &init_fn.locals {
                 env.insert(*name, eval(&env, &node_env, expr)?);
@@ -192,7 +192,7 @@ fn initialize_state(
     if let Some(init_fn) = program.get_func_by_name("Node.BASE_NODE_INIT") {
         for node_id in 0..num_servers {
             let mut env = Env::default();
-            env.insert(SELF_NAME_ID, Value::Node(node_id));
+            env.insert(SELF_NAME, Value::Node(node_id));
             let node_env = state.nodes[node_id].borrow();
             for (name, expr) in &init_fn.locals {
                 env.insert(*name, eval(&env, &node_env, expr)?);

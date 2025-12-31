@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use spur::compiler;
 use spur::compiler::cfg::Program;
 use spur::simulator::explorer::run_explorer_genetic;
-use spur::visualization::{render_html_heatmap, vertex_coverage_to_byte_coverage};
+use spur::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -127,12 +127,24 @@ fn main() {
                 eprintln!("Failed to write coverage heatmap: {}", e);
             }
 
+            // Generate CFG SVG
+            let cfg_path = output_path.join("cfg.svg");
+            match render_svg(&program) {
+                Ok(svg) => {
+                    if let Err(e) = fs::write(&cfg_path, svg) {
+                        eprintln!("Failed to write CFG SVG: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("Failed to write CFG SVG: {}", e),
+            };
+
             println!(
                 "Explorer finished in {:.2?}. Results saved to {}",
                 elapsed, output_dir
             );
             println!("  - Database: {}", db_path.display());
             println!("  - Coverage heatmap: {}", heatmap_path.display());
+            println!("  - CFG: {}", cfg_path.display());
         }
     }
 }

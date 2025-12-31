@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::analysis::resolver::NameId;
-use crate::compiler::cfg::Program;
+use crate::compiler::cfg::{Program, SELF_NAME};
 use crate::simulator::core::{
-    Continuation, Env, OpKind, Operation, Record, RuntimeError, SELF_NAME_ID, State, UpdatePolicy,
+    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy,
     Value, eval, exec, exec_sync_on_node, schedule_record,
 };
 use crate::simulator::coverage::GlobalState;
@@ -134,7 +134,7 @@ fn reinit_node(
         .expect("BASE_NODE_INIT not found");
 
     let mut env = Env::default();
-    env.insert(SELF_NAME_ID, Value::Node(node_id));
+    env.insert(SELF_NAME, Value::Node(node_id));
     let node_env = state.nodes[node_id].borrow();
     for (name, expr) in &init_fn.locals {
         env.insert(*name, eval(&env, &node_env, expr)?);
@@ -153,6 +153,14 @@ fn crash_node(state: &mut State, node_id: usize) {
         warn!("Node {} is already crashed", node_id);
         return;
     }
+
+    state.history.push(Operation {
+        client_id: -1,
+        op_action: "System.Crash".to_string(),
+        kind: OpKind::Crash,
+        payload: vec![Value::Node(node_id)],
+        unique_id: -1,
+    });
 
     let (crashed, alive): (Vec<_>, Vec<_>) = state
         .runnable_records
@@ -182,6 +190,14 @@ fn recover_crashed_node(
         warn!("Node {} is not crashed", node_id);
         return Ok(());
     }
+
+    state.history.push(Operation {
+        client_id: -1,
+        op_action: "System.Recover".to_string(),
+        kind: OpKind::Recover,
+        payload: vec![Value::Node(node_id)],
+        unique_id: -1,
+    });
 
     state.nodes[node_id] = Rc::new(RefCell::new(Env::default()));
     reinit_node(topology, state, prog, node_id, global_state)?;
@@ -310,7 +326,13 @@ pub fn exec_plan(
                     engine.mark_event_completed(node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
-                    recover_crashed_node(state, &program, &topology, *node_id as usize, &global_state)?;
+                    recover_crashed_node(
+                        state,
+                        &program,
+                        &topology,
+                        *node_id as usize,
+                        &global_state,
+                    )?;
                     engine.mark_event_completed(node_idx);
                 }
             }

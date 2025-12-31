@@ -120,6 +120,8 @@ pub fn serialize_history(history: &[Operation]) -> Vec<PersistableOp> {
             kind: match op.kind {
                 OpKind::Response => "Response",
                 OpKind::Invocation => "Invocation",
+                OpKind::Crash => "Crash",
+                OpKind::Recover => "Recover",
             },
             action: op.op_action.clone(),
             payload_json: payload_to_json_string(&op.payload),
@@ -140,6 +142,8 @@ pub fn save_history_to_csv<P: AsRef<Path>>(
         let kind = match op.kind {
             OpKind::Response => "Response",
             OpKind::Invocation => "Invocation",
+            OpKind::Crash => "Crash",
+            OpKind::Recover => "Recover",
         };
 
         let payload_str = payload_to_json_string(&op.payload);

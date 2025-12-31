@@ -44,6 +44,7 @@ pub enum ResolutionError {
 pub struct ResolvedProgram {
     pub top_level_defs: Vec<ResolvedTopLevelDef>,
     pub next_name_id: usize,
+    pub id_to_name: HashMap<NameId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -278,6 +279,7 @@ pub struct Resolver {
     current_role: Option<NameId>,
 
     pre_populated_types: PrepopulatedTypes,
+    id_to_name: HashMap<NameId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -292,20 +294,22 @@ pub struct PrepopulatedTypes {
 impl Resolver {
     pub fn new() -> Self {
         let mut next_id = 0;
-        let mut new_name_id = || {
+        let mut id_to_name = HashMap::new();
+        let mut new_name_id = |name: &str| {
             let id = NameId(next_id);
             next_id += 1;
+            id_to_name.insert(id, name.to_string());
             id
         };
 
         // Pre-populate the global scope with built-in types.
         let mut type_scope = HashMap::new();
 
-        let int_type = new_name_id();
-        let string_type = new_name_id();
-        let bool_type = new_name_id();
-        let unit_type = new_name_id();
-        let lock_type = new_name_id();
+        let int_type = new_name_id("int");
+        let string_type = new_name_id("string");
+        let bool_type = new_name_id("bool");
+        let unit_type = new_name_id("unit");
+        let lock_type = new_name_id("lock");
 
         type_scope.insert("int".to_string(), int_type);
         type_scope.insert("string".to_string(), string_type);
@@ -328,6 +332,7 @@ impl Resolver {
                 unit: unit_type,
                 lock: lock_type,
             },
+            id_to_name,
         }
     }
 
@@ -335,9 +340,10 @@ impl Resolver {
         &self.pre_populated_types
     }
 
-    fn new_name_id(&mut self) -> NameId {
+    fn new_name_id(&mut self, name: &str) -> NameId {
         let id = NameId(self.next_id);
         self.next_id += 1;
+        self.id_to_name.insert(id, name.to_string());
         id
     }
 
@@ -364,19 +370,19 @@ impl Resolver {
     }
 
     fn declare_var(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        let id = self.new_name_id();
+        let id = self.new_name_id(name);
         Self::declare_in_scope(self.var_scopes.last_mut().unwrap(), name, id, span)?;
         Ok(id)
     }
 
     fn declare_type(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        let id = self.new_name_id();
+        let id = self.new_name_id(name);
         Self::declare_in_scope(self.type_scopes.last_mut().unwrap(), name, id, span)?;
         Ok(id)
     }
 
     fn declare_role(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        let id = self.new_name_id();
+        let id = self.new_name_id(name);
         Self::declare_in_scope(&mut self.role_scope, name, id, span)?;
         Self::declare_in_scope(self.type_scopes.last_mut().unwrap(), name, id, span)?;
         self.role_func_scopes.insert(id, HashMap::new());
@@ -458,7 +464,7 @@ impl Resolver {
                 let role_id = self.lookup_role(&role_def.name, role_def.span)?;
 
                 for func in &role_def.func_defs {
-                    let id = self.new_name_id();
+                    let id = self.new_name_id(&func.name);
                     let scope = self.role_func_scopes.get_mut(&role_id).unwrap();
                     Self::declare_in_scope(scope, &func.name, id, func.span)?;
                 }
@@ -475,6 +481,7 @@ impl Resolver {
         Ok(ResolvedProgram {
             top_level_defs: resolved_top_levels,
             next_name_id: self.next_id,
+            id_to_name: self.id_to_name.clone(),
         })
     }
 

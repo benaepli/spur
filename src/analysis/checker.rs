@@ -188,6 +188,7 @@ impl TypeChecker {
         self.collect_definitions(&program)?;
 
         let next_name_id = program.next_name_id;
+        let id_to_name = program.id_to_name;
         let mut typed_top_levels = Vec::new();
         for top_level_def in program.top_level_defs {
             match top_level_def {
@@ -202,6 +203,7 @@ impl TypeChecker {
         Ok(TypedProgram {
             top_level_defs: typed_top_levels,
             next_name_id,
+            id_to_name,
         })
     }
 
