@@ -5,14 +5,19 @@ use std::rc::Rc;
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, SELF_NAME};
 use crate::simulator::core::{
-    Continuation, Env, OpKind, Operation, Record, RuntimeError, State, UpdatePolicy,
-    Value, eval, exec, exec_sync_on_node, schedule_record,
+    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, RuntimeError, State,
+    UpdatePolicy, Value, eval, exec, exec_sync_on_node, schedule_record,
 };
 use crate::simulator::coverage::GlobalState;
-use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent};
+use crate::simulator::path::plan::{
+    ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
+};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
+
+pub mod generator;
+pub mod plan;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topology {
@@ -23,6 +28,36 @@ pub enum Topology {
 pub struct TopologyInfo {
     pub topology: Topology,
     pub num_servers: i32,
+}
+
+/// Newtype wrapper for log entries that implements Logger.
+#[derive(Debug, Default)]
+pub struct Logs(pub Vec<LogEntry>);
+
+impl Logger for Logs {
+    fn log(&mut self, entry: LogEntry) {
+        self.0.push(entry);
+    }
+}
+
+/// Wrapper around State that adds path-execution tracking fields.
+#[derive(Debug)]
+pub struct PathState {
+    pub state: State,
+    pub logs: Logs,
+    pub history: Vec<Operation>,
+    pub free_clients: Vec<i32>,
+}
+
+impl PathState {
+    pub fn new(node_count: usize) -> Self {
+        Self {
+            state: State::new(node_count),
+            logs: Logs::default(),
+            history: Vec::new(),
+            free_clients: Vec::new(),
+        }
+    }
 }
 
 fn create_env(
@@ -49,36 +84,10 @@ fn create_env(
     Ok(env)
 }
 
-#[derive(Debug)]
-struct RecoverContinuation;
-
-impl Continuation for RecoverContinuation {
-    fn call(&self, _state: &mut State, _val: Value) {}
-}
-
-#[derive(Debug)]
-struct ClientOpContinuation {
-    client_id: i32,
-    op_name: String,
-    unique_id: i32,
-}
-
-impl Continuation for ClientOpContinuation {
-    fn call(&self, state: &mut State, value: Value) {
-        state.free_clients.push(self.client_id);
-        state.history.push(Operation {
-            client_id: self.client_id,
-            op_action: self.op_name.clone(),
-            kind: OpKind::Response,
-            payload: vec![value],
-            unique_id: self.unique_id,
-        });
-    }
-}
-
-fn recover_node(
+fn recover_node<L: Logger>(
     topology: &TopologyInfo,
     state: &mut State,
+    logger: &mut L,
     prog: &Program,
     node_id: usize,
     global_state: &GlobalState,
@@ -112,19 +121,20 @@ fn recover_node(
         pc: recover_fn.entry,
         node: node_id,
         origin_node: node_id,
-        continuation: Rc::new(RecoverContinuation),
+        continuation: Continuation::Recover,
         env,
-        id: -1,
         x: 0.0,
         policy: UpdatePolicy::Identity,
     };
 
-    exec(state, &prog, record, Some(&global_state.coverage))
+    exec(state, logger, prog, record, Some(&global_state.coverage))?;
+    Ok(())
 }
 
-fn reinit_node(
+fn reinit_node<L: Logger>(
     topology: &TopologyInfo,
     state: &mut State,
+    logger: &mut L,
     prog: &Program,
     node_id: usize,
     global_state: &GlobalState,
@@ -141,12 +151,12 @@ fn reinit_node(
     }
     drop(node_env);
 
-    exec_sync_on_node(state, prog, &mut env, node_id, init_fn.entry)?;
+    exec_sync_on_node(state, logger, prog, &mut env, node_id, init_fn.entry)?;
 
-    recover_node(topology, state, prog, node_id, global_state)
+    recover_node(topology, state, logger, prog, node_id, global_state)
 }
 
-fn crash_node(state: &mut State, node_id: usize) {
+fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
     let ci = &mut state.crash_info;
 
     if !ci.currently_crashed.insert(node_id) {
@@ -154,7 +164,7 @@ fn crash_node(state: &mut State, node_id: usize) {
         return;
     }
 
-    state.history.push(Operation {
+    history.push(Operation {
         client_id: -1,
         op_action: "System.Crash".to_string(),
         kind: OpKind::Crash,
@@ -179,8 +189,10 @@ fn crash_node(state: &mut State, node_id: usize) {
     }
 }
 
-fn recover_crashed_node(
+fn recover_crashed_node<L: Logger>(
     state: &mut State,
+    logger: &mut L,
+    history: &mut Vec<Operation>,
     prog: &Program,
     topology: &TopologyInfo,
     node_id: usize,
@@ -191,7 +203,7 @@ fn recover_crashed_node(
         return Ok(());
     }
 
-    state.history.push(Operation {
+    history.push(Operation {
         client_id: -1,
         op_action: "System.Recover".to_string(),
         kind: OpKind::Recover,
@@ -200,7 +212,7 @@ fn recover_crashed_node(
     });
 
     state.nodes[node_id] = Rc::new(RefCell::new(Env::default()));
-    reinit_node(topology, state, prog, node_id, global_state)?;
+    reinit_node(topology, state, logger, prog, node_id, global_state)?;
 
     let mut queued_for_node = Vec::new();
     let mut remaining = Vec::new();
@@ -218,6 +230,7 @@ fn recover_crashed_node(
 
 fn schedule_client_op(
     state: &mut State,
+    history: &mut Vec<Operation>,
     prog: &Program,
     op_id: i32,
     op_spec: &ClientOpSpec,
@@ -255,7 +268,7 @@ fn schedule_client_op(
         &op_func.locals,
     )?;
 
-    state.history.push(Operation {
+    history.push(Operation {
         client_id,
         op_action: op_name.to_string(),
         kind: OpKind::Invocation,
@@ -267,13 +280,12 @@ fn schedule_client_op(
         pc: op_func.entry,
         node: client_id as usize,
         origin_node: client_id as usize,
-        continuation: Rc::new(ClientOpContinuation {
+        continuation: Continuation::ClientOp {
             client_id,
             op_name: op_name.to_string(),
             unique_id: op_id,
-        }),
+        },
         env,
-        id: op_id,
         x: 0.4,
         policy: UpdatePolicy::Identity,
     });
@@ -281,7 +293,7 @@ fn schedule_client_op(
 }
 
 pub fn exec_plan(
-    state: &mut State,
+    path_state: &mut PathState,
     program: Program,
     plan: ExecutionPlan,
     max_iterations: i32,
@@ -299,7 +311,7 @@ pub fn exec_plan(
             return Ok(());
         }
 
-        state.crash_info.current_step = step;
+        path_state.state.crash_info.current_step = step;
 
         // Dispatch ready events
         let ready_events: Vec<(NodeIndex, PlannedEvent)> = engine
@@ -311,10 +323,17 @@ pub fn exec_plan(
         for (node_idx, event) in ready_events {
             match &event.action {
                 EventAction::ClientRequest(op_spec) => {
-                    if let Some(client_id) = state.free_clients.pop() {
+                    if let Some(client_id) = path_state.free_clients.pop() {
                         op_id_counter += 1;
                         in_progress.insert(op_id_counter, node_idx);
-                        schedule_client_op(state, &program, op_id_counter, op_spec, client_id)?;
+                        schedule_client_op(
+                            &mut path_state.state,
+                            &mut path_state.history,
+                            &program,
+                            op_id_counter,
+                            op_spec,
+                            client_id,
+                        )?;
                     } else {
                         engine
                             .mark_as_ready(node_idx)
@@ -322,12 +341,14 @@ pub fn exec_plan(
                     }
                 }
                 EventAction::CrashNode(node_id) => {
-                    crash_node(state, *node_id as usize);
+                    crash_node(&mut path_state.state, &mut path_state.history, *node_id as usize);
                     engine.mark_event_completed(node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
                     recover_crashed_node(
-                        state,
+                        &mut path_state.state,
+                        &mut path_state.logs,
+                        &mut path_state.history,
                         &program,
                         &topology,
                         *node_id as usize,
@@ -338,12 +359,13 @@ pub fn exec_plan(
             }
         }
 
-        let history_start_len = state.history.len();
+        let history_start_len = path_state.history.len();
 
         // Execute one simulation step
-        if !state.runnable_records.is_empty() {
-            schedule_record(
-                state,
+        if !path_state.state.runnable_records.is_empty() {
+            let result = schedule_record(
+                &mut path_state.state,
+                &mut path_state.logs,
                 &program,
                 false,
                 false,
@@ -352,10 +374,21 @@ pub fn exec_plan(
                 randomly_delay_msgs,
                 Some(&global_state.coverage),
             )?;
+
+            if let Some(result) = result {
+                path_state.free_clients.push(result.client_id);
+                path_state.history.push(Operation {
+                    client_id: result.client_id,
+                    op_action: result.op_name,
+                    kind: OpKind::Response,
+                    payload: vec![result.value],
+                    unique_id: result.unique_id,
+                });
+            }
         }
 
         // Only scan new history entries added during this step
-        let completed: Vec<i32> = state.history[history_start_len..]
+        let completed: Vec<i32> = path_state.history[history_start_len..]
             .iter()
             .filter(|op| matches!(op.kind, OpKind::Response))
             .filter_map(|op| {

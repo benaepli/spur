@@ -1,5 +1,5 @@
 use crate::analysis::resolver::NameId;
-use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex as CfgVertex, SELF_NAME};
+use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, SELF_NAME, Vertex as CfgVertex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
@@ -164,7 +164,12 @@ fn generate_html_label(prog: &Program, v: usize, label: &Label) -> (String, Stri
                 Instr::SyncCall(lhs, func, args) => {
                     header_color = "#E1BEE7";
                     let args_str: Vec<_> = args.iter().map(|a| pretty_expr(prog, a)).collect();
-                    format!("{} = call {}({})", pretty_lhs(prog, lhs), func, args_str.join(", "))
+                    format!(
+                        "{} = call {}({})",
+                        pretty_lhs(prog, lhs),
+                        func,
+                        args_str.join(", ")
+                    )
                 }
             };
             content = format!("<B>Instr</B><BR ALIGN=\"LEFT\"/>{}", html_escape(&body));

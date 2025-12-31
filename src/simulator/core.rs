@@ -1,5 +1,5 @@
 use crate::analysis::resolver::NameId;
-use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex, SELF_NAME};
+use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, SELF_NAME, Vertex};
 use crate::simulator::coverage::{GlobalCoverage, LocalCoverage};
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
@@ -90,6 +90,19 @@ pub struct LogEntry {
     pub node: usize,
     pub content: String,
     pub step: i32,
+}
+
+/// Trait for handling Print statement output during execution.
+pub trait Logger {
+    fn log(&mut self, entry: LogEntry);
+}
+
+/// A no-op logger that discards all log entries.
+#[derive(Debug, Default)]
+pub struct NoOpLogger;
+
+impl Logger for NoOpLogger {
+    fn log(&mut self, _entry: LogEntry) {}
 }
 
 #[derive(Clone, Debug)]
@@ -350,9 +363,8 @@ pub struct Record {
     pub pc: Vertex,
     pub node: usize,
     pub origin_node: usize,
-    pub continuation: Rc<dyn Continuation>,
+    pub continuation: Continuation,
     pub env: Env, // Just local env, node env is in State
-    pub id: i32,
     pub x: f64,
     pub policy: UpdatePolicy,
 }
@@ -372,6 +384,7 @@ impl UpdatePolicy {
     }
 }
 
+#[derive(Debug)]
 pub struct CrashInfo {
     pub currently_crashed: HashSet<usize>,
     pub queued_messages: Vec<(usize, Record)>, // (dest_node, record)
@@ -404,13 +417,11 @@ pub struct Operation {
     pub unique_id: i32,
 }
 
+#[derive(Debug)]
 pub struct State {
     pub nodes: Vec<Rc<RefCell<Env>>>, // Index is node_id
     pub runnable_records: Vec<Record>,
     pub channels: HashMap<ChannelId, ChannelState>,
-    pub history: Vec<Operation>,
-    pub logs: Vec<LogEntry>,
-    pub free_clients: Vec<i32>,
     pub crash_info: CrashInfo,
     pub coverage: LocalCoverage,
     next_channel_id: usize,
@@ -424,9 +435,6 @@ impl State {
                 .collect(),
             runnable_records: Vec::new(),
             channels: HashMap::new(),
-            history: Vec::new(),
-            logs: Vec::new(),
-            free_clients: Vec::new(),
             crash_info: CrashInfo {
                 currently_crashed: HashSet::new(),
                 queued_messages: Vec::new(),
@@ -453,14 +461,30 @@ fn iter_name_id(pc: Vertex) -> NameId {
 
 pub type Env = FxHashMap<NameId, Value>;
 
-pub trait Continuation: Debug {
-    fn call(&self, state: &mut State, val: Value);
+/// Continuation representing what to do when an execution completes.
+#[derive(Debug, Clone)]
+pub enum Continuation {
+    /// No action needed
+    NoOp,
+    /// Node recovery continuation
+    Recover,
+    /// Async message delivery continuation
+    Async { chan_id: ChannelId },
+    /// Client operation completion - returns data for caller to handle
+    ClientOp {
+        client_id: i32,
+        op_name: String,
+        unique_id: i32,
+    },
 }
 
-#[derive(Debug)]
-pub struct NoOpContinuation;
-impl Continuation for NoOpContinuation {
-    fn call(&self, _state: &mut State, _val: Value) {}
+/// Result returned when a ClientOp continuation completes.
+#[derive(Debug, Clone)]
+pub struct ClientOpResult {
+    pub client_id: i32,
+    pub op_name: String,
+    pub unique_id: i32,
+    pub value: Value,
 }
 
 fn load(var: NameId, local_env: &Env, node_env: &Env) -> Result<Value, RuntimeError> {
@@ -510,6 +534,37 @@ fn store(
                     got: val.type_name(),
                 })
             }
+        }
+    }
+}
+
+impl Continuation {
+    /// Execute the continuation and return any client operation result.
+    pub fn call(self, state: &mut State, val: Value) -> Option<ClientOpResult> {
+        match self {
+            Continuation::NoOp | Continuation::Recover => None,
+            Continuation::Async { chan_id } => {
+                let chan = state.channels.get_mut(&chan_id).unwrap();
+                if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                    let node_env: Rc<RefCell<Env>> = Rc::clone(&state.nodes[reader.node]);
+                    // Note: store errors in continuations are ignored (fire-and-forget)
+                    let _ = store(&lhs, val, &mut reader.env, &mut node_env.borrow_mut());
+                    state.runnable_records.push(reader);
+                } else {
+                    chan.buffer.push_back(val);
+                }
+                None
+            }
+            Continuation::ClientOp {
+                client_id,
+                op_name,
+                unique_id,
+            } => Some(ClientOpResult {
+                client_id,
+                op_name,
+                unique_id,
+                value: val,
+            }),
         }
     }
 }
@@ -717,12 +772,13 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
             eval(local_env, node_env, key)?,
             eval(local_env, node_env, val)?,
         ),
-        Expr::SetTimer => todo!()
+        Expr::SetTimer => todo!(),
     }
 }
 
-pub fn exec_sync_on_node(
+pub fn exec_sync_on_node<L: Logger>(
     state: &mut State,
+    logger: &mut L,
     program: &Program,
     local_env: &mut Env,
     node_id: usize,
@@ -731,6 +787,7 @@ pub fn exec_sync_on_node(
     let node_env = Rc::clone(&state.nodes[node_id]);
     exec_sync_inner(
         state,
+        logger,
         program,
         local_env,
         &mut node_env.borrow_mut(),
@@ -740,8 +797,9 @@ pub fn exec_sync_on_node(
     )
 }
 
-fn exec_sync_inner(
+fn exec_sync_inner<L: Logger>(
     state: &mut State,
+    logger: &mut L,
     program: &Program,
     local_env: &mut Env,
     node_env: &mut Env,
@@ -805,6 +863,7 @@ fn exec_sync_inner(
                         // Pass node_env directly (it's already mutable borrowed from caller)
                         let val = exec_sync_inner(
                             state,
+                            logger,
                             program,
                             &mut callee_local,
                             node_env,
@@ -859,37 +918,12 @@ fn exec_sync_inner(
                             callee_locals.insert(*name, eval(local_env, node_env, expr)?);
                         }
 
-                        #[derive(Debug)]
-                        struct AsyncContinuation {
-                            chan_id: ChannelId,
-                        }
-                        impl Continuation for AsyncContinuation {
-                            fn call(&self, state: &mut State, val: Value) {
-                                let chan = state.channels.get_mut(&self.chan_id).unwrap();
-                                if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                                    let node_env: Rc<RefCell<Env>> =
-                                        Rc::clone(&state.nodes[reader.node]);
-                                    // Note: store errors in continuations are ignored (fire-and-forget)
-                                    let _ = store(
-                                        &lhs,
-                                        val,
-                                        &mut reader.env,
-                                        &mut node_env.borrow_mut(),
-                                    );
-                                    state.runnable_records.push(reader);
-                                } else {
-                                    chan.buffer.push_back(val);
-                                }
-                            }
-                        }
-
                         let new_record = Record {
                             pc: func_info.entry,
                             node: target_node,
                             origin_node,
-                            continuation: Rc::new(AsyncContinuation { chan_id }),
+                            continuation: Continuation::Async { chan_id },
                             env: callee_locals,
-                            id: -1,
                             x: 0.5,
                             policy: UpdatePolicy::Identity,
                         };
@@ -938,7 +972,7 @@ fn exec_sync_inner(
             }
             Label::Print(expr, next) => {
                 let val = eval(local_env, node_env, &expr)?;
-                state.logs.push(LogEntry {
+                logger.log(LogEntry {
                     node: node_id,
                     content: val.to_string(),
                     step: state.crash_info.current_step,
@@ -1014,12 +1048,13 @@ fn exec_sync_inner(
     }
 }
 
-pub fn exec(
+pub fn exec<L: Logger>(
     state: &mut State,
+    logger: &mut L,
     program: &Program,
     mut record: Record,
     global_coverage: Option<&GlobalCoverage>,
-) -> Result<(), RuntimeError> {
+) -> Result<Option<ClientOpResult>, RuntimeError> {
     let mut local_env = record.env;
     let node_env = Rc::clone(&state.nodes[record.node]);
 
@@ -1087,6 +1122,7 @@ pub fn exec(
                         // Pass node_env directly
                         let ret_val = exec_sync_inner(
                             state,
+                            logger,
                             program,
                             &mut callee_local,
                             &mut node_env.borrow_mut(),
@@ -1146,38 +1182,12 @@ pub fn exec(
                                 .insert(*name, eval(&local_env, &node_env.borrow(), expr)?);
                         }
 
-                        // Continuation for the async call
-                        #[derive(Debug)]
-                        struct AsyncContinuation {
-                            chan_id: ChannelId,
-                        }
-                        impl Continuation for AsyncContinuation {
-                            fn call(&self, state: &mut State, val: Value) {
-                                let chan = state.channels.get_mut(&self.chan_id).unwrap();
-                                if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                                    // Direct handoff
-                                    let node_env = Rc::clone(&state.nodes[reader.node]);
-                                    // Note: store errors in continuations are ignored (fire-and-forget)
-                                    let _ = store(
-                                        &lhs,
-                                        val,
-                                        &mut reader.env,
-                                        &mut node_env.borrow_mut(),
-                                    );
-                                    state.runnable_records.push(reader);
-                                } else {
-                                    chan.buffer.push_back(val);
-                                }
-                            }
-                        }
-
                         let new_record = Record {
                             pc: func_info.entry,
                             node: target_node,
                             origin_node: record.node,
-                            continuation: Rc::new(AsyncContinuation { chan_id }),
+                            continuation: Continuation::Async { chan_id },
                             env: callee_locals,
-                            id: -1,
                             x: 0.5,
                             policy: UpdatePolicy::Identity,
                         };
@@ -1236,7 +1246,7 @@ pub fn exec(
                     record.env = local_env;
                     record.pc = next;
                     chan.waiting_writers.push_back((record, val));
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             Label::Recv(lhs, chan_expr, next) => {
@@ -1264,21 +1274,20 @@ pub fn exec(
                     record.env = local_env;
                     record.pc = next; // When woke, proceed to next
                     chan.waiting_readers.push_back((record, lhs));
-                    return Ok(()); // Stop execution
+                    return Ok(None); // Stop execution
                 }
             }
             Label::Return(expr) => {
                 let val = eval(&local_env, &node_env.borrow(), &expr)?;
-                record.env = local_env;
-                // Call continuation
-                record.continuation.call(state, val);
-                return Ok(()); // End thread
+                // Call continuation and return the result
+                let result = record.continuation.call(state, val);
+                return Ok(result);
             }
             Label::Pause(next) => {
                 record.env = local_env;
                 record.pc = next;
                 state.runnable_records.push(record);
-                return Ok(()); // Yield
+                return Ok(None); // Yield
             }
             Label::Cond(cond, bthen, belse) => {
                 if eval(&local_env, &node_env.borrow(), &cond)?.as_bool()? {
@@ -1289,7 +1298,7 @@ pub fn exec(
             }
             Label::Print(expr, next) => {
                 let val = eval(&local_env, &node_env.borrow(), &expr)?;
-                state.logs.push(LogEntry {
+                logger.log(LogEntry {
                     node: record.node,
                     content: val.to_string(),
                     step: state.crash_info.current_step,
@@ -1302,7 +1311,7 @@ pub fn exec(
                 } else {
                     record.env = local_env;
                     state.runnable_records.push(record);
-                    return Ok(()); // Yield
+                    return Ok(None); // Yield
                 }
             }
             Label::ForLoopIn(lhs, expr, body_pc, next_pc) => {
@@ -1380,7 +1389,7 @@ pub fn exec(
                 } else {
                     record.env = local_env;
                     state.runnable_records.push(record);
-                    return Ok(()); // Yield
+                    return Ok(None); // Yield
                 }
             }
             Label::Unlock(lock_expr, next) => {
@@ -1400,19 +1409,20 @@ pub fn exec(
     }
 }
 
-pub fn schedule_record(
+pub fn schedule_record<L: Logger>(
     state: &mut State,
+    logger: &mut L,
     program: &Program,
     randomly_drop_msgs: bool,
     cut_tail_from_mid: bool,
     sever_all_but_mid: bool,
     partition_away_nodes: &[usize],
     randomly_delay_msgs: bool,
-    global_coverage: Option<&crate::simulator::coverage::GlobalCoverage>,
-) -> Result<(), RuntimeError> {
+    global_coverage: Option<&GlobalCoverage>,
+) -> Result<Option<ClientOpResult>, RuntimeError> {
     let len = state.runnable_records.len();
     if len == 0 {
-        return Ok(()); // Halt equivalent
+        return Ok(None); // Halt equivalent
     }
 
     use rand::Rng;
@@ -1451,7 +1461,7 @@ pub fn schedule_record(
         if state.crash_info.currently_crashed.contains(&dest_node) {
             // Queue message
             state.crash_info.queued_messages.push((dest_node, r));
-            return Ok(());
+            return Ok(None);
         } else {
             let mut should_execute = true;
             if randomly_drop_msgs && rng.random::<f64>() < 0.3 {
@@ -1482,19 +1492,21 @@ pub fn schedule_record(
                     r.x = r.policy.update(r.x);
                     should_execute = false;
                     state.runnable_records.push(r);
-                    return Ok(());
+                    return Ok(None);
                 }
             }
 
             if should_execute {
-                exec(state, program, r, global_coverage)?;
+                let result = exec(state, logger, program, r, global_coverage)?;
+                return Ok(result);
             }
         }
     } else {
         if state.crash_info.currently_crashed.contains(&r.node) {
-            return Ok(());
+            return Ok(None);
         }
-        exec(state, program, r, global_coverage)?;
+        let result = exec(state, logger, program, r, global_coverage)?;
+        return Ok(result);
     }
-    Ok(())
+    Ok(None)
 }

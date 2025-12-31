@@ -226,7 +226,6 @@ impl Compiler {
         vertex
     }
 
-
     /// Allocates a new NameId for a function and registers it.
     fn alloc_func_name_id(&mut self, qualified_name: String) -> NameId {
         let id = self.alloc_name_id(qualified_name.clone());
@@ -294,8 +293,12 @@ impl Compiler {
         let mut next_vertex = final_vertex;
         // Build the init chain backwards
         for init in inits.iter().rev() {
-            next_vertex =
-                self.compile_expr_to_value(&mut locals, &init.value, Lhs::Var(init.name), next_vertex);
+            next_vertex = self.compile_expr_to_value(
+                &mut locals,
+                &init.value,
+                Lhs::Var(init.name),
+                next_vertex,
+            );
         }
 
         let entry = self.add_label(Label::Instr(

@@ -3,7 +3,7 @@ use rand::prelude::*;
 use rand::rng;
 use std::collections::HashMap;
 
-use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlannedEvent};
+use crate::simulator::path::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlannedEvent};
 
 #[derive(Debug, Clone)]
 enum ActionStub {

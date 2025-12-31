@@ -1,11 +1,9 @@
 use crate::compiler::cfg::{Program, SELF_NAME};
-use crate::simulator::core::{
-    Env, RuntimeError, State, Value, eval, exec_sync_on_node,
-};
+use crate::simulator::core::{Env, Logger, RuntimeError, State, Value, eval, exec_sync_on_node};
 use crate::simulator::coverage::GlobalState;
-use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
-use crate::simulator::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
+use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
+use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
 use crossbeam::channel;
 use log::{debug, error, info, warn};
 use nauty_pet::graph::CanonGraph;
@@ -167,13 +165,13 @@ impl SingleRunConfig {
     }
 }
 
-fn initialize_state(
+fn initialize_state<L: Logger>(
     program: &Program,
+    logger: &mut L,
     num_servers: usize,
     num_clients: usize,
 ) -> Result<State, RuntimeError> {
     let mut state = State::new(num_servers + num_clients);
-    state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
 
     if let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
         for i in 0..num_clients {
@@ -185,7 +183,7 @@ fn initialize_state(
                 env.insert(*name, eval(&env, &node_env, expr)?);
             }
             drop(node_env);
-            exec_sync_on_node(&mut state, program, &mut env, client_id, init_fn.entry)?;
+            exec_sync_on_node(&mut state, logger, program, &mut env, client_id, init_fn.entry)?;
         }
     }
 
@@ -198,15 +196,16 @@ fn initialize_state(
                 env.insert(*name, eval(&env, &node_env, expr)?);
             }
             drop(node_env);
-            exec_sync_on_node(&mut state, program, &mut env, node_id, init_fn.entry)?;
+            exec_sync_on_node(&mut state, logger, program, &mut env, node_id, init_fn.entry)?;
         }
     }
 
     Ok(state)
 }
 
-fn init_topology(
+fn init_topology<L: Logger>(
     state: &mut State,
+    logger: &mut L,
     program: &Program,
     num_servers: usize,
 ) -> Result<(), RuntimeError> {
@@ -226,7 +225,7 @@ fn init_topology(
             env.insert(*formal, actuals[i].clone());
         }
 
-        exec_sync_on_node(state, program, &mut env, node_id, init_fn.entry)?;
+        exec_sync_on_node(state, logger, program, &mut env, node_id, init_fn.entry)?;
     }
     Ok(())
 }
@@ -259,20 +258,24 @@ pub fn run_single_simulation(
         None
     };
 
-    let mut state = initialize_state(
-        program,
-        config.num_servers as usize,
-        config.num_clients as usize,
-    )?;
+    // Create PathState with free_clients initialized
+    let num_servers = config.num_servers as usize;
+    let num_clients = config.num_clients as usize;
+    let mut path_state = PathState::new(num_servers + num_clients);
+    path_state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
+
+    // Initialize state
+    path_state.state = initialize_state(program, &mut path_state.logs, num_servers, num_clients)?;
 
     let topology_info = TopologyInfo {
         topology: Topology::Full,
         num_servers: config.num_servers,
     };
-    init_topology(&mut state, program, config.num_servers as usize)?;
+
+    init_topology(&mut path_state.state, &mut path_state.logs, program, num_servers)?;
 
     exec_plan(
-        &mut state,
+        &mut path_state,
         program.clone(),
         plan,
         config.max_iterations,
@@ -281,13 +284,13 @@ pub fn run_single_simulation(
         global_state,
     )?;
 
-    let plan_score = state.coverage.plan_score();
+    let plan_score = path_state.state.coverage.plan_score();
 
-    global_state.coverage.merge(&state.coverage);
+    global_state.coverage.merge(&path_state.state.coverage);
     canonical.as_ref().map(|x| global_state.insert(x));
 
-    let serialized = serialize_history(&state.history);
-    let serialized_logs = serialize_logs(&state.logs);
+    let serialized = serialize_history(&path_state.history);
+    let serialized_logs = serialize_logs(&path_state.logs.0);
     writer.write(run_id, serialized, serialized_logs);
 
     Ok(plan_score)
@@ -309,7 +312,7 @@ pub fn run_explorer(
         fs::remove_file(output_path)?;
     }
 
-    let writer = std::sync::Arc::new(HistoryWriter::new(output_path)?);
+    let writer = Arc::new(HistoryWriter::new(output_path)?);
 
     let (sender, receiver) = channel::bounded::<(i64, SingleRunConfig)>(100);
 
