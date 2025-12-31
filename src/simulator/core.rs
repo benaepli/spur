@@ -1,5 +1,6 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex};
+use crate::simulator::coverage::LocalCoverage;
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
 use rustc_hash::FxHashMap;
@@ -413,6 +414,7 @@ pub struct State {
     pub logs: Vec<LogEntry>,
     pub free_clients: Vec<i32>,
     pub crash_info: CrashInfo,
+    pub coverage: LocalCoverage,
     next_channel_id: usize,
 }
 
@@ -433,6 +435,7 @@ impl State {
                 queued_messages: Vec::new(),
                 current_step: 0,
             },
+            coverage: LocalCoverage::new(),
             next_channel_id: 0,
         }
     }
@@ -1379,6 +1382,7 @@ pub fn schedule_record(
     sever_all_but_mid: bool,
     partition_away_nodes: &[usize],
     randomly_delay_msgs: bool,
+    global_coverage: Option<&crate::simulator::coverage::GlobalCoverage>,
 ) -> Result<(), RuntimeError> {
     let len = state.runnable_records.len();
     if len == 0 {
@@ -1387,14 +1391,32 @@ pub fn schedule_record(
 
     use rand::Rng;
     let mut rng = rand::rng();
-    let idx = rng.random_range(0..len);
+
+    // Select record index using either tournament selection or random
+    let idx = if let Some(coverage) = global_coverage {
+        if len > 1 {
+            // Tournament selection with K=3
+            const K: usize = 3;
+            let mut best_idx = rng.random_range(0..len);
+            let mut best_score = coverage.novelty_score(state.runnable_records[best_idx].pc);
+
+            for _ in 1..K.min(len) {
+                let candidate_idx = rng.random_range(0..len);
+                let score = coverage.novelty_score(state.runnable_records[candidate_idx].pc);
+                if score > best_score {
+                    best_idx = candidate_idx;
+                    best_score = score;
+                }
+            }
+            best_idx
+        } else {
+            0
+        }
+    } else {
+        rng.random_range(0..len)
+    };
 
     let mut r = state.runnable_records.swap_remove(idx);
-
-    if state.crash_info.currently_crashed.contains(&r.node) {
-        // log_err!("Failure: source {} for dst {}", r.origin_node, r.node);
-        return Ok(());
-    }
 
     let src_node = r.origin_node;
     let dest_node = r.node;
@@ -1443,6 +1465,9 @@ pub fn schedule_record(
             }
         }
     } else {
+        if state.crash_info.currently_crashed.contains(&r.node) {
+            return Ok(());
+        }
         exec(state, program, r)?;
     }
     Ok(())

@@ -4,6 +4,7 @@ use spur::compiler::cfg::Program;
 use spur::simulator::explorer::run_explorer;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "spur-frontend")]
@@ -47,15 +48,20 @@ fn main() {
             config,
             output,
         } => {
-            let mut program = match compile_spec_to_program(&spec) {
+            let program = match compile_spec_to_program(&spec) {
                 Some(p) => p,
                 None => std::process::exit(1),
             };
+            let start = Instant::now();
             if let Err(e) = run_explorer(&program, &config, &output) {
                 eprintln!("Explorer failed: {}", e);
                 std::process::exit(1);
             }
-            println!("Explorer finished. Results saved to {}", output);
+            let elapsed = start.elapsed();
+            println!(
+                "Explorer finished in {:.2?}. Results saved to {}",
+                elapsed, output
+            );
         }
     }
 }

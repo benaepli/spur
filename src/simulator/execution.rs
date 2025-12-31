@@ -8,9 +8,11 @@ use crate::simulator::core::{
     Continuation, Env, OpKind, Operation, Record, RuntimeError, SELF_NAME_ID, State, UpdatePolicy,
     Value, eval, exec, exec_sync_on_node, schedule_record,
 };
-use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine};
+use crate::simulator::coverage::GlobalCoverage;
+use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent};
 use ecow::EcoString;
 use log::{info, warn};
+use petgraph::graph::NodeIndex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topology {
@@ -261,15 +263,16 @@ fn schedule_client_op(
 
 pub fn exec_plan(
     state: &mut State,
-    mut program: Program,
+    program: Program,
     plan: ExecutionPlan,
     max_iterations: i32,
     topology: TopologyInfo,
     randomly_delay_msgs: bool,
+    global_coverage: Option<&GlobalCoverage>,
 ) -> Result<(), RuntimeError> {
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
-    let mut in_progress: HashMap<i32, EcoString> = HashMap::new();
+    let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
 
     for step in 0..max_iterations {
         if engine.is_complete() {
@@ -279,31 +282,33 @@ pub fn exec_plan(
 
         state.crash_info.current_step = step;
 
-        // 1. Dispatch ready events
-        for event in engine.get_ready_events().expect("Plan error") {
+        // Dispatch ready events
+        let ready_events: Vec<(NodeIndex, PlannedEvent)> = engine
+            .get_ready_events()
+            .into_iter()
+            .map(|(idx, e)| (idx, e.clone()))
+            .collect();
+
+        for (node_idx, event) in ready_events {
             match &event.action {
                 EventAction::ClientRequest(op_spec) => {
                     if let Some(client_id) = state.free_clients.pop() {
                         op_id_counter += 1;
-                        in_progress.insert(op_id_counter, event.id.clone());
+                        in_progress.insert(op_id_counter, node_idx);
                         schedule_client_op(state, &program, op_id_counter, op_spec, client_id)?;
                     } else {
                         engine
-                            .mark_as_ready(&event.id)
+                            .mark_as_ready(node_idx)
                             .expect("Failed to defer event");
                     }
                 }
                 EventAction::CrashNode(node_id) => {
                     crash_node(state, *node_id as usize);
-                    engine
-                        .mark_event_completed(&event.id)
-                        .expect("Failed to complete crash");
+                    engine.mark_event_completed(node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
                     recover_crashed_node(state, &program, &topology, *node_id as usize)?;
-                    engine
-                        .mark_event_completed(&event.id)
-                        .expect("Failed to complete recover");
+                    engine.mark_event_completed(node_idx);
                 }
             }
         }
@@ -320,6 +325,7 @@ pub fn exec_plan(
                 false,
                 &[],
                 randomly_delay_msgs,
+                global_coverage,
             )?;
         }
 
@@ -328,8 +334,8 @@ pub fn exec_plan(
             .iter()
             .filter(|op| matches!(op.kind, OpKind::Response))
             .filter_map(|op| {
-                in_progress.get(&op.unique_id).map(|event_id| {
-                    let _ = engine.mark_event_completed(event_id);
+                in_progress.get(&op.unique_id).map(|&node_idx| {
+                    engine.mark_event_completed(node_idx);
                     op.unique_id
                 })
             })

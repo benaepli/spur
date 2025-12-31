@@ -1,17 +1,21 @@
-use ecow::EcoString;
+use petgraph::graph::{DiGraph, NodeIndex};
 use rand::prelude::*;
 use rand::rng;
-use std::collections::{HashMap, HashSet};
-use thiserror::Error;
+use std::collections::HashMap;
 
-use crate::simulator::plan::{
-    ClientOpSpec, Dependency, EventAction, EventId, ExecutionPlan, PlannedEvent,
-};
+use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlannedEvent};
 
-#[derive(Debug, Error)]
-pub enum GeneratorError {
-    #[error("recover event in group {0} has no matching crash")]
-    MissingCrashPair(i32),
+#[derive(Debug, Clone)]
+enum ActionStub {
+    Single(EventAction),
+    // e.g., Crash followed by Recover
+    Paired(EventAction, EventAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairPos {
+    First,
+    Second,
 }
 
 /// Configuration for the plan generator.
@@ -28,27 +32,6 @@ pub struct GeneratorConfig {
     pub dependency_density: f64, // Probability (0.0 to 1.0)
 }
 
-#[derive(Debug, Clone)]
-enum ActionStub {
-    Single(EventAction),
-    // e.g., Crash followed by Recover
-    Paired(EventAction, EventAction),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PairPos {
-    First,
-    Second,
-}
-
-#[derive(Debug, Clone)]
-struct IntermediateEvent {
-    id: EventId,
-    action: EventAction,
-    pair_group: Option<(i32, PairPos)>,
-    extra_dependencies: Vec<EventId>,
-}
-
 /// Generates a bag of action stubs based on the config.
 fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
     let mut actions = Vec::new();
@@ -60,14 +43,14 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
     for _ in 0..config.num_write_ops {
         let action = ClientOpSpec::Write(
             rand_server(),
-            EcoString::from(rand_key()),
-            EcoString::from(rand_val()),
+            ecow::EcoString::from(rand_key()),
+            ecow::EcoString::from(rand_val()),
         );
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
     for _ in 0..config.num_read_ops {
-        let action = ClientOpSpec::Read(rand_server(), EcoString::from(rand_key()));
+        let action = ClientOpSpec::Read(rand_server(), ecow::EcoString::from(rand_key()));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
@@ -87,148 +70,76 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
     actions
 }
 
-/// Converts action stubs into a flat, shuffled list of intermediate_events.
-/// Handles ID generation and serialization constraints (e.g. Crash(A) -> Recover(A) -> Crash(A)).
-fn create_intermediate_list(stubs: Vec<ActionStub>) -> Vec<IntermediateEvent> {
+/// Main entry point: Generates a single, randomized execution plan as a DiGraph.
+pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
+    let mut graph: DiGraph<PlannedEvent, ()> = DiGraph::new();
     let mut rng = rng();
-    let mut intermediate_events = Vec::new();
 
-    let mut event_id_counter = 0;
+    // Track crash/recover pairs and serialization
+    let mut last_recovery: HashMap<i32, NodeIndex> = HashMap::new(); // server_id -> last recover node
+
+    let stubs = generate_base_actions(&config);
+
+    // First pass: add all nodes and mandatory edges
+    let mut nodes: Vec<(NodeIndex, Option<(i32, PairPos)>)> = Vec::new();
     let mut pair_group_counter = 0;
 
-    // Maps server_id -> event_id of the last recovery on that server
-    let mut last_recovery_map: HashMap<i32, EcoString> = HashMap::new();
-
-    let mut next_id = || {
-        event_id_counter += 1;
-        EcoString::from(format!("e{}", event_id_counter))
-    };
-
-    for stub in stubs {
+    for stub in &stubs {
         match stub {
             ActionStub::Single(action) => {
-                let id = next_id();
-                intermediate_events.push(IntermediateEvent {
-                    id,
-                    action,
-                    pair_group: None,
-                    extra_dependencies: vec![],
+                let idx = graph.add_node(PlannedEvent {
+                    action: action.clone(),
                 });
+                nodes.push((idx, None));
             }
             ActionStub::Paired(action1, action2) => {
-                let id1 = next_id();
-                let id2 = next_id();
-
                 pair_group_counter += 1;
-                let group_id = pair_group_counter;
+                let idx1 = graph.add_node(PlannedEvent {
+                    action: action1.clone(),
+                });
+                let idx2 = graph.add_node(PlannedEvent {
+                    action: action2.clone(),
+                });
 
-                // Check for serialization dependencies
-                // If this is a CrashNode, it might depend on a previous RecoverNode for the same server
-                let extra_deps = if let EventAction::CrashNode(s) = action1 {
-                    if let Some(prev_id) = last_recovery_map.get(&s) {
-                        vec![prev_id.clone()]
-                    } else {
-                        vec![]
+                // Crash -> Recover edge (mandatory)
+                graph.add_edge(idx1, idx2, ());
+
+                // Serialization: this crash depends on previous recovery of same server
+                if let EventAction::CrashNode(s) = action1 {
+                    if let Some(&prev_recover) = last_recovery.get(s) {
+                        graph.add_edge(prev_recover, idx1, ());
                     }
-                } else {
-                    vec![]
-                };
-
-                // Update last recovery map if action2 is a RecoverNode
+                }
                 if let EventAction::RecoverNode(s) = action2 {
-                    last_recovery_map.insert(s, id2.clone());
+                    last_recovery.insert(*s, idx2);
                 }
 
-                let event1 = IntermediateEvent {
-                    id: id1,
-                    action: action1,
-                    pair_group: Some((group_id, PairPos::First)),
-                    extra_dependencies: extra_deps,
-                };
-
-                let event2 = IntermediateEvent {
-                    id: id2,
-                    action: action2,
-                    pair_group: Some((group_id, PairPos::Second)),
-                    extra_dependencies: vec![],
-                };
-
-                intermediate_events.push(event1);
-                intermediate_events.push(event2);
+                nodes.push((idx1, Some((pair_group_counter, PairPos::First))));
+                nodes.push((idx2, Some((pair_group_counter, PairPos::Second))));
             }
         }
     }
 
-    intermediate_events.shuffle(&mut rng);
-    intermediate_events
-}
+    // Shuffle node order for dependency generation
+    nodes.shuffle(&mut rng);
 
-/// Iterates through the shuffled list, adding logical and probabilistic dependencies.
-fn finalize_plan(
-    config: &GeneratorConfig,
-    events: Vec<IntermediateEvent>,
-) -> Result<ExecutionPlan, GeneratorError> {
-    let mut rng = rng();
-
-    // Build a map of {group_id -> crash_event_id} to link Recovers to Crashes
-    let mut crash_pair_map: HashMap<i32, EventId> = HashMap::new();
-    for event in &events {
-        if let Some((group_id, PairPos::First)) = event.pair_group {
-            crash_pair_map.insert(group_id, event.id.clone());
-        }
-    }
-
-    let mut final_plan = Vec::new();
-    let mut seen_events: Vec<IntermediateEvent> = Vec::new();
-
-    for current_event in events {
-        let mut dependencies = HashSet::new();
-        if let Some((group_id, PairPos::Second)) = current_event.pair_group {
-            let crash_id = crash_pair_map
-                .get(&group_id)
-                .ok_or(GeneratorError::MissingCrashPair(group_id))?;
-            dependencies.insert(crash_id.clone());
-        }
-
-        for dep_id in &current_event.extra_dependencies {
-            dependencies.insert(dep_id.clone());
-        }
-
-        for prev_event in &seen_events {
-            let is_cycle = match (current_event.pair_group, prev_event.pair_group) {
+    // Second pass: add probabilistic dependencies
+    let mut seen: Vec<(NodeIndex, Option<(i32, PairPos)>)> = Vec::new();
+    for (current_idx, current_pair) in &nodes {
+        for (prev_idx, prev_pair) in &seen {
+            // Skip cycle-forming edges within same pair
+            let is_cycle = match (current_pair, prev_pair) {
                 (Some((g1, PairPos::First)), Some((g2, PairPos::Second))) => g1 == g2,
-                // Current is Recover (Second), Prev is Crash (First) of same group
-                // (This is redundant as we added it in step 1, but treated as cycle prevention in logic)
                 (Some((g1, PairPos::Second)), Some((g2, PairPos::First))) => g1 == g2,
                 _ => false,
             };
 
             if !is_cycle && rng.random::<f64>() < config.dependency_density {
-                dependencies.insert(prev_event.id.clone());
+                graph.add_edge(*prev_idx, *current_idx, ());
             }
         }
-
-        let planned_event = PlannedEvent {
-            id: current_event.id.clone(),
-            action: current_event.action.clone(),
-            dependencies: dependencies
-                .into_iter()
-                .map(|id| Dependency {
-                    event_completed: id,
-                })
-                .collect(),
-        };
-
-        final_plan.push(planned_event);
-        seen_events.push(current_event);
+        seen.push((*current_idx, *current_pair));
     }
 
-    Ok(final_plan)
-}
-
-/// Main entry point: Generates a single, randomized execution_plan.
-pub fn generate_plan(config: GeneratorConfig) -> Result<ExecutionPlan, GeneratorError> {
-    let stubs = generate_base_actions(&config);
-    let intermediate = create_intermediate_list(stubs);
-    finalize_plan(&config, intermediate)
+    graph
 }

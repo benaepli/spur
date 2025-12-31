@@ -2,6 +2,7 @@ use crate::compiler::cfg::Program;
 use crate::simulator::core::{
     Env, RuntimeError, SELF_NAME_ID, State, Value, eval, exec_sync_on_node,
 };
+use crate::simulator::coverage::GlobalState;
 use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
 use crate::simulator::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
@@ -11,6 +12,7 @@ use rayon::iter::ParallelIterator;
 use rayon::prelude::ParallelBridge;
 use serde::Deserialize;
 use std::error::Error;
+use std::sync::Arc;
 use std::{fs, thread};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,8 +61,14 @@ pub struct ExplorerConfig {
 
     #[serde(default)]
     pub randomly_delay_msgs: bool,
+    #[serde(default = "default_use_coverage_scheduling")]
+    pub use_coverage_scheduling: bool,
     pub num_runs_per_config: i32,
     pub max_iterations: i32,
+}
+
+fn default_use_coverage_scheduling() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +81,7 @@ pub struct SingleRunConfig {
     pub num_crashes: i32,
     pub dependency_density: f64,
     pub randomly_delay_msgs: bool,
+    pub use_coverage_scheduling: bool,
     pub max_iterations: i32,
 }
 
@@ -144,6 +153,7 @@ fn init_topology(
 pub fn run_single_simulation(
     program: &Program,
     writer: &HistoryWriter,
+    global_state: &GlobalState,
     run_id: i64,
     config: &SingleRunConfig,
 ) -> Result<(), Box<dyn Error>> {
@@ -169,7 +179,13 @@ pub fn run_single_simulation(
         dependency_density: config.dependency_density,
     };
 
-    let plan = generate_plan(gen_config)?;
+    let plan = generate_plan(gen_config);
+
+    let coverage_ref = if config.use_coverage_scheduling {
+        Some(&global_state.coverage)
+    } else {
+        None
+    };
 
     exec_plan(
         &mut state,
@@ -178,7 +194,10 @@ pub fn run_single_simulation(
         config.max_iterations,
         topology_info,
         config.randomly_delay_msgs,
+        coverage_ref,
     )?;
+
+    global_state.coverage.merge(&state.coverage);
 
     let serialized = serialize_history(&state.history);
     let serialized_logs = serialize_logs(&state.logs);
@@ -251,6 +270,7 @@ pub fn run_explorer(
                                         num_crashes,
                                         dependency_density: density,
                                         randomly_delay_msgs: config.randomly_delay_msgs,
+                                        use_coverage_scheduling: config.use_coverage_scheduling,
                                         max_iterations: config.max_iterations,
                                     };
 
@@ -286,12 +306,14 @@ pub fn run_explorer(
 
     info!("Starting parallel simulation...");
 
+    let global_state = Arc::new(GlobalState::new());
+
     receiver
         .into_iter()
         .par_bridge()
         .for_each(|(run_id, run_config)| {
             let start = std::time::Instant::now();
-            match run_single_simulation(program, &writer, run_id, &run_config) {
+            match run_single_simulation(program, &writer, &global_state, run_id, &run_config) {
                 Ok(_) => {
                     debug!(
                         "Run {} Success ({:.4}s)",
@@ -304,7 +326,7 @@ pub fn run_explorer(
         });
 
     // Shutdown the writer, waiting for all pending writes to complete
-    if let Ok(w) = std::sync::Arc::try_unwrap(writer) {
+    if let Ok(w) = Arc::try_unwrap(writer) {
         w.shutdown();
     }
 

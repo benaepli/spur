@@ -24,3 +24,5 @@ rustc-hash = "2.1.1"
 crossbeam = "0.8.4"
 ecow = { version = "0.2.6", features = ["serde"] }
 dashmap = "6.1.0"
+petgraph = "0.8.3"
+scalable_cuckoo_filter = "0.5.1"
