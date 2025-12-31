@@ -1,21 +1,21 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    eval, exec_sync_on_node, Env, RuntimeError, State, Value, SELF_NAME_ID,
+    Env, RuntimeError, SELF_NAME_ID, State, Value, eval, exec_sync_on_node,
 };
 use crate::simulator::coverage::GlobalState;
-use crate::simulator::execution::{exec_plan, Topology, TopologyInfo};
-use crate::simulator::generator::{generate_plan, GeneratorConfig};
-use crate::simulator::history::{serialize_history, serialize_logs, HistoryWriter};
+use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
+use crate::simulator::generator::{GeneratorConfig, generate_plan};
+use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
 use crossbeam::channel;
 use log::{debug, error, info, warn};
-use nauty_pet::graph::{CanonGraph};
+use nauty_pet::graph::CanonGraph;
 use rand::prelude::*;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rayon::prelude::ParallelBridge;
 use serde::Deserialize;
 use std::error::Error;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::{fs, thread};
 
 const CANON_LIMIT: usize = 8;
@@ -107,13 +107,28 @@ impl SingleRunConfig {
     pub fn random(constraints: &ExplorerConfig) -> Self {
         let mut rng = rand::rng();
         SingleRunConfig {
-            num_servers: rng.random_range(constraints.num_servers_range.min..=constraints.num_servers_range.max),
-            num_clients: rng.random_range(constraints.num_clients_range.min..=constraints.num_clients_range.max),
-            num_write_ops: rng.random_range(constraints.num_write_ops_range.min..=constraints.num_write_ops_range.max),
-            num_read_ops: rng.random_range(constraints.num_read_ops_range.min..=constraints.num_read_ops_range.max),
-            num_timeouts: rng.random_range(constraints.num_timeouts_range.min..=constraints.num_timeouts_range.max),
-            num_crashes: rng.random_range(constraints.num_crashes_range.min..=constraints.num_crashes_range.max),
-            dependency_density: *constraints.dependency_density_values.choose(&mut rng).unwrap_or(&0.5),
+            num_servers: rng.random_range(
+                constraints.num_servers_range.min..=constraints.num_servers_range.max,
+            ),
+            num_clients: rng.random_range(
+                constraints.num_clients_range.min..=constraints.num_clients_range.max,
+            ),
+            num_write_ops: rng.random_range(
+                constraints.num_write_ops_range.min..=constraints.num_write_ops_range.max,
+            ),
+            num_read_ops: rng.random_range(
+                constraints.num_read_ops_range.min..=constraints.num_read_ops_range.max,
+            ),
+            num_timeouts: rng.random_range(
+                constraints.num_timeouts_range.min..=constraints.num_timeouts_range.max,
+            ),
+            num_crashes: rng.random_range(
+                constraints.num_crashes_range.min..=constraints.num_crashes_range.max,
+            ),
+            dependency_density: *constraints
+                .dependency_density_values
+                .choose(&mut rng)
+                .unwrap_or(&0.5),
             randomly_delay_msgs: constraints.randomly_delay_msgs,
             use_coverage_scheduling: constraints.use_coverage_scheduling,
             max_iterations: constraints.max_iterations,
@@ -234,16 +249,15 @@ pub fn run_single_simulation(
         dependency_density: config.dependency_density,
     };
     let plan = generate_plan(gen_config);
-    let canonical =
-        if plan.node_count() < CANON_LIMIT {
-            let canonical = CanonGraph::from(plan.clone());
-            if global_state.contains(&canonical) {
-                return Ok(0.0)
-            }
-            Some(canonical)
-        } else {
-            None
-        };
+    let canonical = if plan.node_count() < CANON_LIMIT {
+        let canonical = CanonGraph::from(plan.clone());
+        if global_state.contains(&canonical) {
+            return Ok(0.0);
+        }
+        Some(canonical)
+    } else {
+        None
+    };
 
     let mut state = initialize_state(
         program,
@@ -408,11 +422,12 @@ pub fn run_explorer(
 }
 
 /// Runs the genetic algorithm-based explorer.
+/// Returns the GlobalState containing accumulated coverage data.
 pub fn run_explorer_genetic(
     program: &Program,
     config_json_path: &str,
     output_path: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Arc<GlobalState>, Box<dyn Error>> {
     info!("Starting Genetic Execution Explorer...");
     info!("Config: {}", config_json_path);
 
@@ -442,14 +457,9 @@ pub fn run_explorer_genetic(
             .par_iter()
             .map(|run_config| {
                 let run_id = run_counter.fetch_add(1, Ordering::Relaxed);
-                let score = run_single_simulation(
-                    program,
-                    &writer,
-                    &global_state,
-                    run_id,
-                    run_config,
-                )
-                .unwrap_or(0.0);
+                let score =
+                    run_single_simulation(program, &writer, &global_state, run_id, run_config)
+                        .unwrap_or(0.0);
                 (run_config.clone(), score)
             })
             .collect();
@@ -490,5 +500,5 @@ pub fn run_explorer_genetic(
     }
 
     info!("Genetic explorer finished.");
-    Ok(())
+    Ok(global_state)
 }

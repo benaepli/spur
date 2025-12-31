@@ -1,8 +1,11 @@
 use clap::{Parser, Subcommand};
 use spur::compiler;
 use spur::compiler::cfg::Program;
-use spur::simulator::explorer::{run_explorer, run_explorer_genetic};
+use spur::simulator::explorer::run_explorer_genetic;
+use spur::visualization::{render_html_heatmap, vertex_coverage_to_byte_coverage};
+use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -29,8 +32,11 @@ enum Commands {
         spec: String,
         /// Explorer configuration JSON file
         config: String,
-        /// SQLite output file for results
-        output: String,
+        /// Output directory for results
+        output_dir: String,
+        /// Skip confirmation prompt for directory deletion
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -46,22 +52,87 @@ fn main() {
         Commands::Explore {
             spec,
             config,
-            output,
+            output_dir,
+            yes,
         } => {
-            let program = match compile_spec_to_program(&spec) {
+            let source_code = match read_spec_file(&spec) {
+                Some(s) => s,
+                None => std::process::exit(1),
+            };
+            let program = match compile_spec_to_program_with_source(&source_code, &spec) {
                 Some(p) => p,
                 None => std::process::exit(1),
             };
-            let start = Instant::now();
-            if let Err(e) = run_explorer_genetic(&program, &config, &output) {
-                eprintln!("Explorer failed: {}", e);
+
+            // Handle output directory
+            let output_path = Path::new(&output_dir);
+            if output_path.exists() {
+                if !yes {
+                    print!(
+                        "Output directory '{}' already exists and will be deleted. Continue? [y/N] ",
+                        output_dir
+                    );
+                    io::stdout().flush().unwrap();
+
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input).unwrap();
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        println!("Aborted.");
+                        std::process::exit(0);
+                    }
+                }
+                if let Err(e) = fs::remove_dir_all(output_path) {
+                    eprintln!("Failed to remove directory '{}': {}", output_dir, e);
+                    std::process::exit(1);
+                }
+            }
+
+            if let Err(e) = fs::create_dir_all(output_path) {
+                eprintln!("Failed to create directory '{}': {}", output_dir, e);
                 std::process::exit(1);
             }
+
+            let db_path = output_path.join("results.db");
+            let start = Instant::now();
+
+            let global_state =
+                match run_explorer_genetic(&program, &config, db_path.to_str().unwrap()) {
+                    Ok(state) => state,
+                    Err(e) => {
+                        eprintln!("Explorer failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
             let elapsed = start.elapsed();
+
+            // Generate coverage heatmap
+            let vertex_coverage: HashMap<usize, u64> = global_state
+                .coverage
+                .vertices()
+                .iter()
+                .map(|entry| (*entry.key(), *entry.value()))
+                .collect();
+
+            let byte_hits = vertex_coverage_to_byte_coverage(
+                &vertex_coverage,
+                &program.vertex_to_span,
+                source_code.len(),
+            );
+
+            let html = render_html_heatmap(&source_code, &byte_hits);
+            let heatmap_path = output_path.join("coverage.html");
+
+            if let Err(e) = fs::write(&heatmap_path, html) {
+                eprintln!("Failed to write coverage heatmap: {}", e);
+            }
+
             println!(
                 "Explorer finished in {:.2?}. Results saved to {}",
-                elapsed, output
+                elapsed, output_dir
             );
+            println!("  - Database: {}", db_path.display());
+            println!("  - Coverage heatmap: {}", heatmap_path.display());
         }
     }
 }
@@ -83,10 +154,8 @@ fn read_spec_file(spec: &str) -> Option<String> {
     }
 }
 
-fn compile_spec_to_program(spec: &str) -> Option<Program> {
-    let content = read_spec_file(spec)?;
-
-    match compiler::compile(&content, spec) {
+fn compile_spec_to_program_with_source(content: &str, spec: &str) -> Option<Program> {
+    match compiler::compile(content, spec) {
         Ok(program) => {
             println!("Successfully compiled {}", spec);
             Some(program)
@@ -101,7 +170,12 @@ fn compile_spec_to_program(spec: &str) -> Option<Program> {
 fn compile_spec(spec: &str, output: &str) {
     println!("Input spec: {}, Output location: {}", spec, output);
 
-    let program = match compile_spec_to_program(spec) {
+    let content = match read_spec_file(spec) {
+        Some(c) => c,
+        None => std::process::exit(1),
+    };
+
+    let program = match compile_spec_to_program_with_source(&content, spec) {
         Some(p) => p,
         None => std::process::exit(1),
     };

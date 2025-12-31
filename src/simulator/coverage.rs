@@ -1,14 +1,14 @@
 use crate::compiler::cfg::Vertex;
 use crate::simulator::plan::PlannedEvent;
+use crossbeam::epoch::Atomic;
 use dashmap::DashMap;
 use nauty_pet::prelude::CanonGraph;
-use rand::prelude::SmallRng;
 use rand::SeedableRng;
+use rand::prelude::SmallRng;
 use scalable_cuckoo_filter::{DefaultHasher, ScalableCuckooFilter, ScalableCuckooFilterBuilder};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use crossbeam::epoch::Atomic;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const STEP_PENALTY: f64 = 0.0001;
 
@@ -111,15 +111,20 @@ impl GlobalCoverage {
     /// Calculates the novelty score for a vertex using global stats.
     /// Returns 1.0 if never seen, otherwise 1.0 - (count/total).
     pub fn novelty_score(&self, vertex: Vertex) -> f64 {
-       let count =  match self.vertices.get(&vertex) {
+        let count = match self.vertices.get(&vertex) {
             None => return 1.0,
-            Some(count) => *count as f64
+            Some(count) => *count as f64,
         };
         let total = self.total();
         if total == 0 {
             return 1.0;
         }
         1.0 - (count / total as f64)
+    }
+
+    /// Access to vertices for coverage visualization.
+    pub fn vertices(&self) -> &DashMap<usize, u64> {
+        &self.vertices
     }
 }
 
