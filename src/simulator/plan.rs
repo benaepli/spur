@@ -1,4 +1,3 @@
-
 use ecow::EcoString;
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -13,21 +12,21 @@ pub enum PlanError {
     NotInProgress(NodeIndex),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum ClientOpSpec {
     Write(i32, EcoString, EcoString),
     Read(i32, EcoString),
     SimulateTimeout(i32),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum EventAction {
     ClientRequest(ClientOpSpec),
     CrashNode(i32),
     RecoverNode(i32),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub struct PlannedEvent {
     pub action: EventAction,
 }

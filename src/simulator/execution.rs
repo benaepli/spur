@@ -8,7 +8,7 @@ use crate::simulator::core::{
     Continuation, Env, OpKind, Operation, Record, RuntimeError, SELF_NAME_ID, State, UpdatePolicy,
     Value, eval, exec, exec_sync_on_node, schedule_record,
 };
-use crate::simulator::coverage::GlobalCoverage;
+use crate::simulator::coverage::GlobalState;
 use crate::simulator::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent};
 use ecow::EcoString;
 use log::{info, warn};
@@ -81,6 +81,7 @@ fn recover_node(
     state: &mut State,
     prog: &Program,
     node_id: usize,
+    global_state: &GlobalState,
 ) -> Result<(), RuntimeError> {
     let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
         return Ok(());
@@ -118,7 +119,7 @@ fn recover_node(
         policy: UpdatePolicy::Identity,
     };
 
-    exec(state, &prog, record)
+    exec(state, &prog, record, Some(&global_state.coverage))
 }
 
 fn reinit_node(
@@ -126,6 +127,7 @@ fn reinit_node(
     state: &mut State,
     prog: &Program,
     node_id: usize,
+    global_state: &GlobalState,
 ) -> Result<(), RuntimeError> {
     let init_fn = prog
         .get_func_by_name("Node.BASE_NODE_INIT")
@@ -141,7 +143,7 @@ fn reinit_node(
 
     exec_sync_on_node(state, prog, &mut env, node_id, init_fn.entry)?;
 
-    recover_node(topology, state, prog, node_id)
+    recover_node(topology, state, prog, node_id, global_state)
 }
 
 fn crash_node(state: &mut State, node_id: usize) {
@@ -174,6 +176,7 @@ fn recover_crashed_node(
     prog: &Program,
     topology: &TopologyInfo,
     node_id: usize,
+    global_state: &GlobalState,
 ) -> Result<(), RuntimeError> {
     if !state.crash_info.currently_crashed.remove(&node_id) {
         warn!("Node {} is not crashed", node_id);
@@ -181,7 +184,7 @@ fn recover_crashed_node(
     }
 
     state.nodes[node_id] = Rc::new(RefCell::new(Env::default()));
-    reinit_node(topology, state, prog, node_id)?;
+    reinit_node(topology, state, prog, node_id, global_state)?;
 
     let mut queued_for_node = Vec::new();
     let mut remaining = Vec::new();
@@ -268,7 +271,7 @@ pub fn exec_plan(
     max_iterations: i32,
     topology: TopologyInfo,
     randomly_delay_msgs: bool,
-    global_coverage: Option<&GlobalCoverage>,
+    global_state: &GlobalState,
 ) -> Result<(), RuntimeError> {
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
@@ -307,7 +310,7 @@ pub fn exec_plan(
                     engine.mark_event_completed(node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
-                    recover_crashed_node(state, &program, &topology, *node_id as usize)?;
+                    recover_crashed_node(state, &program, &topology, *node_id as usize, &global_state)?;
                     engine.mark_event_completed(node_idx);
                 }
             }
@@ -325,7 +328,7 @@ pub fn exec_plan(
                 false,
                 &[],
                 randomly_delay_msgs,
-                global_coverage,
+                Some(&global_state.coverage),
             )?;
         }
 

@@ -4,7 +4,7 @@ use crate::analysis::types::{
     TypedFuncCall, TypedFuncDef, TypedPattern, TypedPatternKind, TypedProgram, TypedStatement,
     TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
 };
-use crate::parser::BinOp;
+use crate::parser::{BinOp, Span};
 use ecow::EcoString;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -131,6 +131,13 @@ pub struct Program {
 
     // The next available NameId for generating new names
     pub next_name_id: usize,
+
+    /// Maps vertices to their source statement spans.
+    /// Not all vertices have spans - compiler-generated vertices
+    /// (function entry/exit, etc.) will not appear in this map.
+    /// All vertices generated from compiling a statement share that statement's span.
+    #[serde(skip)]
+    pub vertex_to_span: HashMap<Vertex, Span>,
 }
 
 impl Program {
@@ -162,6 +169,11 @@ pub struct Compiler {
 
     /// Counter for generating new NameIds for temp variables
     next_name_id: usize,
+
+    /// Tracks the span of the statement currently being compiled
+    current_span: Option<Span>,
+    /// Maps each vertex to its source statement span
+    vertex_to_span: HashMap<Vertex, Span>,
 }
 
 impl Compiler {
@@ -175,6 +187,8 @@ impl Compiler {
             func_name_to_id: HashMap::new(),
             id_to_name: HashMap::new(),
             next_name_id: 0,
+            current_span: None,
+            vertex_to_span: HashMap::new(),
         }
     }
 
@@ -196,9 +210,16 @@ impl Compiler {
     }
 
     /// Adds a new label to the CFG and returns its Vertex index.
+    /// If current_span is set, associates this vertex with that span.
     fn add_label(&mut self, label: Label) -> Vertex {
         let vertex = self.cfg.len();
         self.cfg.push(label);
+
+        // Associate vertex with current statement span if available
+        if let Some(span) = self.current_span {
+            self.vertex_to_span.insert(vertex, span);
+        }
+
         vertex
     }
 
@@ -258,6 +279,7 @@ impl Compiler {
             func_name_to_id: self.func_name_to_id,
             id_to_name: self.id_to_name,
             next_name_id,
+            vertex_to_span: self.vertex_to_span,
         }
     }
 
@@ -375,7 +397,11 @@ impl Compiler {
         return_target: Vertex,
         return_var: NameId,
     ) -> Vertex {
-        match &stmt.kind {
+        // Save previous span and set current span
+        let prev_span = self.current_span;
+        self.current_span = Some(stmt.span);
+
+        let result = match &stmt.kind {
             TypedStatementKind::VarInit(init) => {
                 // Compile the value, assigning to the new variable
                 let var_id = self.register_var_name(init.name, &init.original_name);
@@ -421,7 +447,12 @@ impl Compiler {
                 return_target,
                 return_var,
             ),
-        }
+        };
+
+        // Restore previous span
+        self.current_span = prev_span;
+
+        result
     }
 
     fn compile_for_loop(

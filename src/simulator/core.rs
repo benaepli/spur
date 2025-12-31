@@ -1,6 +1,6 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, Vertex};
-use crate::simulator::coverage::LocalCoverage;
+use crate::simulator::coverage::{GlobalCoverage, LocalCoverage};
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
 use rustc_hash::FxHashMap;
@@ -52,9 +52,6 @@ pub enum RuntimeError {
 
     #[error("instruction not allowed in sync function: {0}")]
     UnsupportedSyncInstruction(String),
-
-    #[error("for-loop collection must be a variable")]
-    ForLoopCollectionNotVariable,
 
     #[error("for-loop over map expects tuple LHS")]
     ForLoopMapExpectsTupleLhs,
@@ -408,7 +405,6 @@ pub struct Operation {
 pub struct State {
     pub nodes: Vec<Rc<RefCell<Env>>>, // Index is node_id
     pub runnable_records: Vec<Record>,
-    pub waiting_records: Vec<Record>, // Generic waiting (timeouts etc, logic simplified here)
     pub channels: HashMap<ChannelId, ChannelState>,
     pub history: Vec<Operation>,
     pub logs: Vec<LogEntry>,
@@ -425,7 +421,6 @@ impl State {
                 .map(|_| Rc::new(RefCell::new(Env::default())))
                 .collect(),
             runnable_records: Vec::new(),
-            waiting_records: Vec::new(),
             channels: HashMap::new(),
             history: Vec::new(),
             logs: Vec::new(),
@@ -741,6 +736,7 @@ pub fn exec_sync_on_node(
         &mut node_env.borrow_mut(),
         start_pc,
         node_id,
+        None,
     )
 }
 
@@ -751,9 +747,17 @@ fn exec_sync_inner(
     node_env: &mut Env,
     start_pc: usize,
     node_id: usize,
+    global_coverage: Option<&GlobalCoverage>,
 ) -> Result<Value, RuntimeError> {
     let mut pc = start_pc;
+    let mut prev_pc = pc;
     loop {
+        if pc != prev_pc {
+            let rarity = global_coverage.map(|gc| gc.novelty_score(pc)).unwrap_or(1.0);
+            state.coverage.record_with_rarity(prev_pc, pc, rarity);
+            prev_pc = pc;
+        }
+
         let label = program.cfg.get_label(pc).clone();
         match label {
             Label::Instr(instr, next) => {
@@ -804,6 +808,7 @@ fn exec_sync_inner(
                             node_env,
                             func_info.entry,
                             node_id,
+                            global_coverage,
                         )?;
 
                         store(&lhs, val, local_env, node_env)?;
@@ -1007,13 +1012,27 @@ fn exec_sync_inner(
     }
 }
 
-pub fn exec(state: &mut State, program: &Program, mut record: Record) -> Result<(), RuntimeError> {
+pub fn exec(
+    state: &mut State,
+    program: &Program,
+    mut record: Record,
+    global_coverage: Option<&GlobalCoverage>,
+) -> Result<(), RuntimeError> {
     let mut local_env = record.env;
     let node_env = Rc::clone(&state.nodes[record.node]);
 
     local_env.insert(SELF_NAME_ID, Value::Node(record.node));
 
+    let mut prev_pc = record.pc;
+
     loop {
+        let current_pc = record.pc;
+        if current_pc != prev_pc {
+            let rarity = global_coverage.map(|gc| gc.novelty_score(current_pc)).unwrap_or(1.0);
+            state.coverage.record_with_rarity(prev_pc, current_pc, rarity);
+            prev_pc = current_pc;
+        }
+
         let label = program.cfg.get_label(record.pc).clone();
 
         match label {
@@ -1067,6 +1086,7 @@ pub fn exec(state: &mut State, program: &Program, mut record: Record) -> Result<
                             &mut node_env.borrow_mut(),
                             func_info.entry,
                             record.node,
+                            global_coverage,
                         )?;
 
                         store(&lhs, ret_val, &mut local_env, &mut node_env.borrow_mut())?;
@@ -1461,14 +1481,14 @@ pub fn schedule_record(
             }
 
             if should_execute {
-                exec(state, program, r)?;
+                exec(state, program, r, global_coverage)?;
             }
         }
     } else {
         if state.crash_info.currently_crashed.contains(&r.node) {
             return Ok(());
         }
-        exec(state, program, r)?;
+        exec(state, program, r, global_coverage)?;
     }
     Ok(())
 }

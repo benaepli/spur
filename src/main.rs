@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use spur::compiler;
 use spur::compiler::cfg::Program;
-use spur::simulator::explorer::run_explorer;
+use spur::simulator::explorer::{run_explorer, run_explorer_genetic};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -53,7 +53,7 @@ fn main() {
                 None => std::process::exit(1),
             };
             let start = Instant::now();
-            if let Err(e) = run_explorer(&program, &config, &output) {
+            if let Err(e) = run_explorer_genetic(&program, &config, &output) {
                 eprintln!("Explorer failed: {}", e);
                 std::process::exit(1);
             }

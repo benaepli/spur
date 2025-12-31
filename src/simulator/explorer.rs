@@ -1,19 +1,24 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Env, RuntimeError, SELF_NAME_ID, State, Value, eval, exec_sync_on_node,
+    eval, exec_sync_on_node, Env, RuntimeError, State, Value, SELF_NAME_ID,
 };
 use crate::simulator::coverage::GlobalState;
-use crate::simulator::execution::{Topology, TopologyInfo, exec_plan};
-use crate::simulator::generator::{GeneratorConfig, generate_plan};
-use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
+use crate::simulator::execution::{exec_plan, Topology, TopologyInfo};
+use crate::simulator::generator::{generate_plan, GeneratorConfig};
+use crate::simulator::history::{serialize_history, serialize_logs, HistoryWriter};
 use crossbeam::channel;
 use log::{debug, error, info, warn};
-use rayon::iter::ParallelIterator;
+use nauty_pet::graph::{CanonGraph};
+use rand::prelude::*;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rayon::prelude::ParallelBridge;
 use serde::Deserialize;
 use std::error::Error;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::{fs, thread};
+
+const CANON_LIMIT: usize = 8;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Range {
@@ -65,6 +70,19 @@ pub struct ExplorerConfig {
     pub use_coverage_scheduling: bool,
     pub num_runs_per_config: i32,
     pub max_iterations: i32,
+
+    #[serde(default = "default_population_size")]
+    pub population_size: usize,
+    #[serde(default = "default_num_generations")]
+    pub num_generations: usize,
+}
+
+fn default_population_size() -> usize {
+    50
+}
+
+fn default_num_generations() -> usize {
+    100
 }
 
 fn default_use_coverage_scheduling() -> bool {
@@ -83,6 +101,55 @@ pub struct SingleRunConfig {
     pub randomly_delay_msgs: bool,
     pub use_coverage_scheduling: bool,
     pub max_iterations: i32,
+}
+
+impl SingleRunConfig {
+    pub fn random(constraints: &ExplorerConfig) -> Self {
+        let mut rng = rand::rng();
+        SingleRunConfig {
+            num_servers: rng.random_range(constraints.num_servers_range.min..=constraints.num_servers_range.max),
+            num_clients: rng.random_range(constraints.num_clients_range.min..=constraints.num_clients_range.max),
+            num_write_ops: rng.random_range(constraints.num_write_ops_range.min..=constraints.num_write_ops_range.max),
+            num_read_ops: rng.random_range(constraints.num_read_ops_range.min..=constraints.num_read_ops_range.max),
+            num_timeouts: rng.random_range(constraints.num_timeouts_range.min..=constraints.num_timeouts_range.max),
+            num_crashes: rng.random_range(constraints.num_crashes_range.min..=constraints.num_crashes_range.max),
+            dependency_density: *constraints.dependency_density_values.choose(&mut rng).unwrap_or(&0.5),
+            randomly_delay_msgs: constraints.randomly_delay_msgs,
+            use_coverage_scheduling: constraints.use_coverage_scheduling,
+            max_iterations: constraints.max_iterations,
+        }
+    }
+
+    pub fn mutate(&self, constraints: &ExplorerConfig) -> Self {
+        let mut new_config = self.clone();
+        let mut rng = rand::rng();
+
+        let mutate_int = |val: i32, range: &Range| -> i32 {
+            let mut rng = rand::rng();
+            if rng.random_bool(0.3) {
+                let delta = if rng.random_bool(0.5) { 1 } else { -1 };
+                (val + delta).clamp(range.min, range.max)
+            } else {
+                val
+            }
+        };
+
+        new_config.num_servers = mutate_int(self.num_servers, &constraints.num_servers_range);
+        new_config.num_clients = mutate_int(self.num_clients, &constraints.num_clients_range);
+        new_config.num_write_ops = mutate_int(self.num_write_ops, &constraints.num_write_ops_range);
+        new_config.num_read_ops = mutate_int(self.num_read_ops, &constraints.num_read_ops_range);
+        new_config.num_timeouts = mutate_int(self.num_timeouts, &constraints.num_timeouts_range);
+        new_config.num_crashes = mutate_int(self.num_crashes, &constraints.num_crashes_range);
+
+        if rng.random_bool(0.3) && !constraints.dependency_density_values.is_empty() {
+            new_config.dependency_density = *constraints
+                .dependency_density_values
+                .choose(&mut rng)
+                .unwrap();
+        }
+
+        new_config
+    }
 }
 
 fn initialize_state(
@@ -149,14 +216,35 @@ fn init_topology(
     Ok(())
 }
 
-/// Runs a single simulation configuration.
+/// Runs a single simulation configuration and returns the plan score.
 pub fn run_single_simulation(
     program: &Program,
     writer: &HistoryWriter,
     global_state: &GlobalState,
     run_id: i64,
     config: &SingleRunConfig,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<f64, Box<dyn Error>> {
+    let gen_config = GeneratorConfig {
+        num_servers: config.num_servers,
+        num_clients: config.num_clients,
+        num_write_ops: config.num_write_ops,
+        num_read_ops: config.num_read_ops,
+        num_timeouts: config.num_timeouts,
+        num_crashes: config.num_crashes,
+        dependency_density: config.dependency_density,
+    };
+    let plan = generate_plan(gen_config);
+    let canonical =
+        if plan.node_count() < CANON_LIMIT {
+            let canonical = CanonGraph::from(plan.clone());
+            if global_state.contains(&canonical) {
+                return Ok(0.0)
+            }
+            Some(canonical)
+        } else {
+            None
+        };
+
     let mut state = initialize_state(
         program,
         config.num_servers as usize,
@@ -169,24 +257,6 @@ pub fn run_single_simulation(
     };
     init_topology(&mut state, program, config.num_servers as usize)?;
 
-    let gen_config = GeneratorConfig {
-        num_servers: config.num_servers,
-        num_clients: config.num_clients,
-        num_write_ops: config.num_write_ops,
-        num_read_ops: config.num_read_ops,
-        num_timeouts: config.num_timeouts,
-        num_crashes: config.num_crashes,
-        dependency_density: config.dependency_density,
-    };
-
-    let plan = generate_plan(gen_config);
-
-    let coverage_ref = if config.use_coverage_scheduling {
-        Some(&global_state.coverage)
-    } else {
-        None
-    };
-
     exec_plan(
         &mut state,
         program.clone(),
@@ -194,16 +264,19 @@ pub fn run_single_simulation(
         config.max_iterations,
         topology_info,
         config.randomly_delay_msgs,
-        coverage_ref,
+        global_state,
     )?;
 
+    let plan_score = state.coverage.plan_score();
+
     global_state.coverage.merge(&state.coverage);
+    canonical.as_ref().map(|x| global_state.insert(x));
 
     let serialized = serialize_history(&state.history);
     let serialized_logs = serialize_logs(&state.logs);
     writer.write(run_id, serialized, serialized_logs);
 
-    Ok(())
+    Ok(plan_score)
 }
 
 /// Runs a single simulation configuration.
@@ -306,7 +379,7 @@ pub fn run_explorer(
 
     info!("Starting parallel simulation...");
 
-    let global_state = Arc::new(GlobalState::new());
+    let global_state = Arc::new(GlobalState::new(1_000_000));
 
     receiver
         .into_iter()
@@ -331,5 +404,91 @@ pub fn run_explorer(
     }
 
     info!("Execution explorer finished.");
+    Ok(())
+}
+
+/// Runs the genetic algorithm-based explorer.
+pub fn run_explorer_genetic(
+    program: &Program,
+    config_json_path: &str,
+    output_path: &str,
+) -> Result<(), Box<dyn Error>> {
+    info!("Starting Genetic Execution Explorer...");
+    info!("Config: {}", config_json_path);
+
+    let config_json = fs::read_to_string(config_json_path)?;
+    let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+
+    if std::path::Path::new(output_path).exists() {
+        fs::remove_file(output_path)?;
+    }
+
+    let writer = Arc::new(HistoryWriter::new(output_path)?);
+    let global_state = Arc::new(GlobalState::new(1_000_000));
+    let run_counter = Arc::new(AtomicI64::new(0));
+
+    let mut population: Vec<SingleRunConfig> = (0..config.population_size)
+        .map(|_| SingleRunConfig::random(&config))
+        .collect();
+
+    for generation in 0..config.num_generations {
+        info!(
+            "=== Generation {}/{} ===",
+            generation + 1,
+            config.num_generations
+        );
+
+        let scored: Vec<(SingleRunConfig, f64)> = population
+            .par_iter()
+            .map(|run_config| {
+                let run_id = run_counter.fetch_add(1, Ordering::Relaxed);
+                let score = run_single_simulation(
+                    program,
+                    &writer,
+                    &global_state,
+                    run_id,
+                    run_config,
+                )
+                .unwrap_or(0.0);
+                (run_config.clone(), score)
+            })
+            .collect();
+
+        let mut scored = scored;
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let pop_size = config.population_size;
+        let elite_count = pop_size / 10;
+        let mutate_count = (pop_size * 6) / 10;
+        let random_count = pop_size - elite_count - mutate_count;
+
+        let mut next_gen = Vec::with_capacity(pop_size);
+
+        next_gen.extend(scored.iter().take(elite_count).map(|(c, _)| c.clone()));
+
+        let mut rng = rand::rng();
+        for _ in 0..mutate_count {
+            let parent = &scored[rng.random_range(0..elite_count.max(1))].0;
+            next_gen.push(parent.mutate(&config));
+        }
+
+        for _ in 0..random_count {
+            next_gen.push(SingleRunConfig::random(&config));
+        }
+
+        population = next_gen;
+
+        info!(
+            "Generation {} complete. Best score: {:.4}",
+            generation + 1,
+            scored.first().map(|(_, s)| *s).unwrap_or(0.0)
+        );
+    }
+
+    if let Ok(w) = Arc::try_unwrap(writer) {
+        w.shutdown();
+    }
+
+    info!("Genetic explorer finished.");
     Ok(())
 }
