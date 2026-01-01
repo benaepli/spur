@@ -2,12 +2,13 @@ use crate::compiler::cfg::{
     Expr, FunctionInfo, Instr, Label, Lhs, Program, SELF_SLOT, VarSlot, Vertex,
 };
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
+use crate::simulator::hash_utils::{compute_hash, mix};
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use std::fmt::Debug;
 use std::{
     cmp::Ordering,
-    hash::{Hash, Hasher},
+    hash::{DefaultHasher, Hash, Hasher},
     sync::Arc,
 };
 use thiserror::Error;
@@ -88,8 +89,9 @@ pub trait Logger {
     fn log(&mut self, entry: LogEntry);
 }
 
+/// The inner representation of a value, without cached signature.
 #[derive(Clone, Debug)]
-pub enum Value {
+pub enum ValueKind {
     Int(i64),
     Bool(bool),
     Map(ImHashMap<Value, Value>),
@@ -102,19 +104,185 @@ pub enum Value {
     Tuple(Vector<Value>),
 }
 
+#[derive(Clone, Debug)]
+pub struct Value {
+    pub kind: ValueKind,
+    pub sig: u64,
+}
+
+impl Value {
+    /// Create a new Value with computed signature.
+    pub fn new(kind: ValueKind) -> Self {
+        let sig = Self::compute_sig(&kind);
+        Self { kind, sig }
+    }
+
+    /// Compute signature for a ValueKind.
+    fn compute_sig(kind: &ValueKind) -> u64 {
+        match kind {
+            ValueKind::Int(i) => {
+                let mut h = DefaultHasher::new();
+                0u8.hash(&mut h); // discriminant
+                i.hash(&mut h);
+                h.finish()
+            }
+            ValueKind::Bool(b) => {
+                let mut h = DefaultHasher::new();
+                1u8.hash(&mut h);
+                b.hash(&mut h);
+                h.finish()
+            }
+            ValueKind::String(s) => {
+                let mut h = DefaultHasher::new();
+                2u8.hash(&mut h);
+                s.hash(&mut h);
+                h.finish()
+            }
+            ValueKind::Node(n) => {
+                let mut h = DefaultHasher::new();
+                3u8.hash(&mut h);
+                n.hash(&mut h);
+                h.finish()
+            }
+            ValueKind::Unit => {
+                let mut h = DefaultHasher::new();
+                4u8.hash(&mut h);
+                h.finish()
+            }
+            ValueKind::Channel(c) => {
+                let mut h = DefaultHasher::new();
+                5u8.hash(&mut h);
+                c.hash(&mut h);
+                h.finish()
+            }
+            ValueKind::Option(o) => {
+                let mut h = DefaultHasher::new();
+                6u8.hash(&mut h);
+                match o {
+                    None => 0u8.hash(&mut h),
+                    Some(v) => {
+                        1u8.hash(&mut h);
+                        v.sig.hash(&mut h);
+                    }
+                }
+                h.finish()
+            }
+            ValueKind::Tuple(v) => {
+                // Position-dependent XOR for order sensitivity
+                let mut sig = 0u64;
+                let mut h = DefaultHasher::new();
+                7u8.hash(&mut h);
+                v.len().hash(&mut h);
+                sig ^= h.finish();
+                for (i, val) in v.iter().enumerate() {
+                    sig ^= mix(val.sig, i as u32);
+                }
+                sig
+            }
+            ValueKind::List(v) => {
+                // Position-dependent XOR for order sensitivity
+                let mut sig = 0u64;
+                let mut h = DefaultHasher::new();
+                8u8.hash(&mut h);
+                v.len().hash(&mut h);
+                sig ^= h.finish();
+                for (i, val) in v.iter().enumerate() {
+                    sig ^= mix(val.sig, i as u32);
+                }
+                sig
+            }
+            ValueKind::Map(m) => {
+                // Order-independent XOR for maps
+                let mut sig = 0u64;
+                let mut h = DefaultHasher::new();
+                9u8.hash(&mut h);
+                m.len().hash(&mut h);
+                sig ^= h.finish();
+                for (k, v) in m.iter() {
+                    // Combine key and value sigs in a way that's order-independent
+                    sig ^= k.sig.wrapping_mul(0x9E3779B97F4A7C15) ^ v.sig;
+                }
+                sig
+            }
+        }
+    }
+
+    // Convenience constructors
+    #[inline]
+    pub fn int(i: i64) -> Self {
+        Self::new(ValueKind::Int(i))
+    }
+
+    #[inline]
+    pub fn bool(b: bool) -> Self {
+        Self::new(ValueKind::Bool(b))
+    }
+
+    #[inline]
+    pub fn string(s: EcoString) -> Self {
+        Self::new(ValueKind::String(s))
+    }
+
+    #[inline]
+    pub fn node(n: usize) -> Self {
+        Self::new(ValueKind::Node(n))
+    }
+
+    #[inline]
+    pub fn unit() -> Self {
+        Self::new(ValueKind::Unit)
+    }
+
+    #[inline]
+    pub fn channel(c: ChannelId) -> Self {
+        Self::new(ValueKind::Channel(c))
+    }
+
+    #[inline]
+    pub fn option(o: Option<Arc<Value>>) -> Self {
+        Self::new(ValueKind::Option(o))
+    }
+
+    #[inline]
+    pub fn option_some(v: Value) -> Self {
+        Self::new(ValueKind::Option(Some(Arc::new(v))))
+    }
+
+    #[inline]
+    pub fn option_none() -> Self {
+        Self::new(ValueKind::Option(None))
+    }
+
+    #[inline]
+    pub fn tuple(v: Vector<Value>) -> Self {
+        Self::new(ValueKind::Tuple(v))
+    }
+
+    #[inline]
+    pub fn list(v: Vector<Value>) -> Self {
+        Self::new(ValueKind::List(v))
+    }
+
+    #[inline]
+    pub fn map(m: ImHashMap<Value, Value>) -> Self {
+        Self::new(ValueKind::Map(m))
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Node(a), Value::Node(b)) => a == b,
-            (Value::Unit, Value::Unit) => true,
-            (Value::Option(a), Value::Option(b)) => a == b,
-            (Value::Tuple(a), Value::Tuple(b)) => a == b,
-            (Value::List(a), Value::List(b)) => a == b,
-            (Value::Map(a), Value::Map(b)) => a == b,
-            (Value::Channel(a), Value::Channel(b)) => a == b,
+        use ValueKind::*;
+        match (&self.kind, &other.kind) {
+            (Int(a), Int(b)) => a == b,
+            (Bool(a), Bool(b)) => a == b,
+            (String(a), String(b)) => a == b,
+            (Node(a), Node(b)) => a == b,
+            (Unit, Unit) => true,
+            (Option(a), Option(b)) => a == b,
+            (Tuple(a), Tuple(b)) => a == b,
+            (List(a), List(b)) => a == b,
+            (Map(a), Map(b)) => a == b,
+            (Channel(a), Channel(b)) => a == b,
             _ => false,
         }
     }
@@ -128,8 +296,8 @@ impl PartialOrd for Value {
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
-        use Value::*;
-        match (self, other) {
+        use ValueKind::*;
+        match (&self.kind, &other.kind) {
             (Int(a), Int(b)) => a.cmp(b),
             (Bool(a), Bool(b)) => a.cmp(b),
             (String(a), String(b)) => a.cmp(b),
@@ -172,42 +340,23 @@ impl Ord for Value {
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Value::Int(i) => i.hash(state),
-            Value::Bool(b) => b.hash(state),
-            Value::String(s) => s.hash(state),
-            Value::Node(n) => n.hash(state),
-            Value::Unit => 0.hash(state),
-            Value::Option(o) => o.hash(state),
-            Value::Tuple(v) => v.hash(state),
-            Value::List(v) => v.hash(state),
-            Value::Map(m) => {
-                // Hash map by hashing sorted entries
-                let mut entries: Vec<_> = m.iter().collect();
-                entries.sort_by(|x, y| x.0.cmp(y.0));
-                entries.len().hash(state);
-                for (k, v) in entries {
-                    k.hash(state);
-                    v.hash(state);
-                }
-            }
-            Value::Channel(c) => c.hash(state),
-        }
+        self.sig.hash(state);
     }
 }
 
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Value::Int(n) => write!(f, "{}", n),
-            Value::Bool(b) => write!(f, "{}", b),
-            Value::String(s) => write!(f, "\"{}\"", s),
-            Value::Node(n) => write!(f, "node({})", n),
-            Value::Unit => write!(f, "()"),
-            Value::Option(None) => write!(f, "None"),
-            Value::Option(Some(v)) => write!(f, "Some({})", v),
-            Value::Channel(ch) => write!(f, "channel({}, {})", ch.node, ch.id),
-            Value::Tuple(items) => {
+        use ValueKind::*;
+        match &self.kind {
+            Int(n) => write!(f, "{}", n),
+            Bool(b) => write!(f, "{}", b),
+            String(s) => write!(f, "\"{}\"", s),
+            Node(n) => write!(f, "node({})", n),
+            Unit => write!(f, "()"),
+            Option(None) => write!(f, "None"),
+            Option(Some(v)) => write!(f, "Some({})", v),
+            Channel(ch) => write!(f, "channel({}, {})", ch.node, ch.id),
+            Tuple(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
@@ -217,7 +366,7 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::List(items) => {
+            List(items) => {
                 write!(f, "[")?;
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
@@ -227,7 +376,7 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, "]")
             }
-            Value::Map(map) => {
+            Map(map) => {
                 write!(f, "{{")?;
                 for (i, (k, v)) in map.iter().enumerate() {
                     if i > 0 {
@@ -243,31 +392,33 @@ impl std::fmt::Display for Value {
 
 impl Value {
     fn type_name(&self) -> &'static str {
-        match self {
-            Value::Int(_) => "int",
-            Value::Bool(_) => "bool",
-            Value::Map(_) => "map",
-            Value::List(_) => "list",
-            Value::Option(_) => "option",
-            Value::Channel(_) => "channel",
-            Value::Node(_) => "node",
-            Value::String(_) => "string",
-            Value::Unit => "unit",
-            Value::Tuple(_) => "tuple",
+        use ValueKind::*;
+        match &self.kind {
+            Int(_) => "int",
+            Bool(_) => "bool",
+            Map(_) => "map",
+            List(_) => "list",
+            Option(_) => "option",
+            Channel(_) => "channel",
+            Node(_) => "node",
+            String(_) => "string",
+            Unit => "unit",
+            Tuple(_) => "tuple",
         }
     }
 
     fn as_int(&self) -> Result<i64, RuntimeError> {
-        match self {
-            Value::Int(i) => Ok(*i),
-            _ => Err(RuntimeError::TypeError {
+        if let ValueKind::Int(i) = &self.kind {
+            Ok(*i)
+        } else {
+            Err(RuntimeError::TypeError {
                 expected: "int",
                 got: self.type_name(),
-            }),
+            })
         }
     }
     fn as_bool(&self) -> Result<bool, RuntimeError> {
-        if let Value::Bool(b) = self {
+        if let ValueKind::Bool(b) = &self.kind {
             Ok(*b)
         } else {
             Err(RuntimeError::TypeError {
@@ -277,16 +428,17 @@ impl Value {
         }
     }
     fn as_node(&self) -> Result<usize, RuntimeError> {
-        match self {
-            Value::Node(n) => Ok(*n),
-            _ => Err(RuntimeError::TypeError {
+        if let ValueKind::Node(n) = &self.kind {
+            Ok(*n)
+        } else {
+            Err(RuntimeError::TypeError {
                 expected: "node",
                 got: self.type_name(),
-            }),
+            })
         }
     }
     fn as_map(&self) -> Result<&ImHashMap<Value, Value>, RuntimeError> {
-        if let Value::Map(m) = self {
+        if let ValueKind::Map(m) = &self.kind {
             Ok(m)
         } else {
             Err(RuntimeError::TypeError {
@@ -296,7 +448,7 @@ impl Value {
         }
     }
     fn as_list(&self) -> Result<&Vector<Value>, RuntimeError> {
-        if let Value::List(l) = self {
+        if let ValueKind::List(l) = &self.kind {
             Ok(l)
         } else {
             Err(RuntimeError::TypeError {
@@ -306,7 +458,7 @@ impl Value {
         }
     }
     fn as_channel(&self) -> Result<ChannelId, RuntimeError> {
-        if let Value::Channel(c) = self {
+        if let ValueKind::Channel(c) = &self.kind {
             Ok(*c)
         } else {
             Err(RuntimeError::TypeError {
@@ -423,7 +575,7 @@ impl State {
             nodes: (0..node_count)
                 .map(|i| {
                     let mut env = Env::with_slots(node_slot_count);
-                    env.set(0, Value::Node(i)); // Slot 0 = self
+                    env.set(0, Value::node(i)); // Slot 0 = self
                     env
                 })
                 .collect(),
@@ -443,23 +595,38 @@ impl State {
         self.next_channel_id += 1;
         id
     }
+
+    /// Compute state signature by aggregating component signatures.
+    pub fn signature(&self) -> u64 {
+        let mut h: u64 = 0;
+
+        // Nodes: XOR of positioned Env signatures
+        for (i, env) in self.nodes.iter().enumerate() {
+            h ^= mix(env.sig, i as u32);
+        }
+
+        // Records: Hash each Record and mix
+        for (i, record) in self.runnable_records.iter().enumerate() {
+            h ^= mix(compute_hash(record), (1000 + i) as u32);
+        }
+
+        // Channels: Order-independent XOR
+        for (chan_id, chan_state) in self.channels.iter() {
+            let chan_hash = compute_hash(&(chan_id, chan_state));
+            h ^= chan_hash;
+        }
+
+        // crash_info
+        h ^= compute_hash(&self.crash_info);
+
+        h
+    }
 }
 
 impl Hash for State {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.nodes.hash(state);
-        self.runnable_records.hash(state);
-
-        // Hash channels in deterministic order
-        let mut channels_vec: Vec<_> = self.channels.iter().collect();
-        channels_vec.sort_by_key(|(k, _)| *k);
-        for (chan_id, chan_state) in channels_vec {
-            chan_id.hash(state);
-            chan_state.hash(state);
-        }
-
-        self.crash_info.hash(state);
-        // Deliberately exclude next_channel_id
+        // Use precomputed signature for O(1) hashing
+        self.signature().hash(state);
     }
 }
 
@@ -471,17 +638,31 @@ impl PartialEq for Env {
 
 impl Eq for Env {}
 
-#[derive(Clone, Debug, Default, Hash)]
+#[derive(Clone, Debug, Default)]
 pub struct Env {
     slots: Vec<Value>,
+    pub sig: u64,
+}
+
+impl Hash for Env {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.sig.hash(state);
+    }
 }
 
 impl Env {
     /// Create an environment with `n` slots, all initialized to Unit
     pub fn with_slots(n: usize) -> Self {
-        Self {
-            slots: vec![Value::Unit; n],
+        let unit_val = Value::unit();
+        let unit_sig = unit_val.sig;
+        let slots: Vec<Value> = (0..n).map(|_| Value::unit()).collect();
+
+        let mut sig = 0u64;
+        for i in 0..n {
+            sig ^= mix(unit_sig, i as u32);
         }
+
+        Self { slots, sig }
     }
 
     #[inline(always)]
@@ -491,10 +672,22 @@ impl Env {
 
     #[inline(always)]
     pub fn set(&mut self, slot: u32, value: Value) {
-        if slot as usize >= self.slots.len() {
-            self.slots.resize(slot as usize + 1, Value::Unit);
+        let idx = slot as usize;
+        if idx >= self.slots.len() {
+            // Extending requires recomputing signature
+            let old_len = self.slots.len();
+            self.slots.resize(idx + 1, Value::unit());
+            let unit_sig = Value::unit().sig;
+            for i in old_len..idx {
+                self.sig ^= mix(unit_sig, i as u32);
+            }
+            self.sig ^= mix(value.sig, slot);
+            self.slots[idx] = value;
+        } else {
+            let old_sig = self.slots[idx].sig;
+            self.sig ^= mix(old_sig, slot) ^ mix(value.sig, slot);
+            self.slots[idx] = value;
         }
-        self.slots[slot as usize] = value;
     }
 
     #[inline]
@@ -505,7 +698,12 @@ impl Env {
     /// Ensure we have at least `n` slots
     pub fn ensure_slots(&mut self, n: usize) {
         if self.slots.len() < n {
-            self.slots.resize(n, Value::Unit);
+            let old_len = self.slots.len();
+            self.slots.resize(n, Value::unit());
+            let unit_sig = Value::unit().sig;
+            for i in old_len..n {
+                self.sig ^= mix(unit_sig, i as u32);
+            }
         }
     }
 }
@@ -562,7 +760,7 @@ fn store(
             Ok(())
         }
         Lhs::Tuple(slots) => {
-            if let Value::Tuple(vals) = val {
+            if let ValueKind::Tuple(vals) = val.kind {
                 if slots.len() != vals.len() {
                     return Err(RuntimeError::TupleLengthMismatch {
                         expected: slots.len(),
@@ -641,9 +839,10 @@ impl Continuation {
 }
 
 fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, RuntimeError> {
-    match col {
-        Value::Map(m) => Ok(Value::Map(m.update(key, val))),
-        Value::List(l) => {
+    use ValueKind::*;
+    match col.kind {
+        Map(m) => Ok(Value::map(m.update(key, val))),
+        List(l) => {
             let idx = key.as_int()? as usize;
             if idx >= l.len() {
                 return Err(RuntimeError::IndexOutOfBounds {
@@ -651,7 +850,7 @@ fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, Runtim
                     len: l.len(),
                 });
             }
-            Ok(Value::List(l.update(idx, val)))
+            Ok(Value::list(l.update(idx, val)))
         }
         _ => Err(RuntimeError::NotACollection {
             got: col.type_name(),
@@ -661,89 +860,92 @@ fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, Runtim
 
 pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, RuntimeError> {
     match expr {
-        Expr::Int(i) => Ok(Value::Int(*i)),
-        Expr::Bool(b) => Ok(Value::Bool(*b)),
-        Expr::String(s) => Ok(Value::String(s.clone())),
-        Expr::Unit => Ok(Value::Unit),
-        Expr::Nil => Ok(Value::Option(None)),
+        Expr::Int(i) => Ok(Value::int(*i)),
+        Expr::Bool(b) => Ok(Value::bool(*b)),
+        Expr::String(s) => Ok(Value::string(s.clone())),
+        Expr::Unit => Ok(Value::unit()),
+        Expr::Nil => Ok(Value::option_none()),
         Expr::Var(s) => Ok(load(*s, local_env, node_env)),
-        Expr::Plus(e1, e2) => Ok(Value::Int(
+        Expr::Plus(e1, e2) => Ok(Value::int(
             eval(local_env, node_env, e1)?.as_int()? + eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::Minus(e1, e2) => Ok(Value::Int(
+        Expr::Minus(e1, e2) => Ok(Value::int(
             eval(local_env, node_env, e1)?.as_int()? - eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::Times(e1, e2) => Ok(Value::Int(
+        Expr::Times(e1, e2) => Ok(Value::int(
             eval(local_env, node_env, e1)?.as_int()? * eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::Div(e1, e2) => Ok(Value::Int(
+        Expr::Div(e1, e2) => Ok(Value::int(
             eval(local_env, node_env, e1)?.as_int()? / eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::Mod(e1, e2) => Ok(Value::Int(
+        Expr::Mod(e1, e2) => Ok(Value::int(
             eval(local_env, node_env, e1)?.as_int()? % eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::LessThan(e1, e2) => Ok(Value::Bool(
+        Expr::LessThan(e1, e2) => Ok(Value::bool(
             eval(local_env, node_env, e1)? < eval(local_env, node_env, e2)?,
         )),
-        Expr::EqualsEquals(e1, e2) => Ok(Value::Bool(
+        Expr::EqualsEquals(e1, e2) => Ok(Value::bool(
             eval(local_env, node_env, e1)? == eval(local_env, node_env, e2)?,
         )),
-        Expr::Not(e) => Ok(Value::Bool(!eval(local_env, node_env, e)?.as_bool()?)),
-        Expr::And(e1, e2) => Ok(Value::Bool(
+        Expr::Not(e) => Ok(Value::bool(!eval(local_env, node_env, e)?.as_bool()?)),
+        Expr::And(e1, e2) => Ok(Value::bool(
             eval(local_env, node_env, e1)?.as_bool()?
                 && eval(local_env, node_env, e2)?.as_bool()?,
         )),
-        Expr::Or(e1, e2) => Ok(Value::Bool(
+        Expr::Or(e1, e2) => Ok(Value::bool(
             eval(local_env, node_env, e1)?.as_bool()?
                 || eval(local_env, node_env, e2)?.as_bool()?,
         )),
-        Expr::Some(e) => Ok(Value::Option(Some(Arc::new(eval(local_env, node_env, e)?)))),
+        Expr::Some(e) => Ok(Value::option_some(eval(local_env, node_env, e)?)),
         Expr::Tuple(es) => {
             let vals: Result<Vector<_>, _> =
                 es.iter().map(|e| eval(local_env, node_env, e)).collect();
-            Ok(Value::Tuple(vals?))
+            Ok(Value::tuple(vals?))
         }
         Expr::List(es) => {
             let vals: Result<Vector<_>, _> =
                 es.iter().map(|e| eval(local_env, node_env, e)).collect();
-            Ok(Value::List(vals?))
+            Ok(Value::list(vals?))
         }
         Expr::Map(kv) => {
             let mut m = ImHashMap::new();
             for (k, v) in kv {
                 m.insert(eval(local_env, node_env, k)?, eval(local_env, node_env, v)?);
             }
-            Ok(Value::Map(m))
+            Ok(Value::map(m))
         }
-        Expr::Find(col, key) => match eval(local_env, node_env, col)? {
-            Value::Map(m) => {
-                let k = eval(local_env, node_env, key)?;
-                m.get(&k).cloned().ok_or(RuntimeError::KeyNotFound)
+        Expr::Find(col, key) => {
+            let col_val = eval(local_env, node_env, col)?;
+            match &col_val.kind {
+                ValueKind::Map(m) => {
+                    let k = eval(local_env, node_env, key)?;
+                    m.get(&k).cloned().ok_or(RuntimeError::KeyNotFound)
+                }
+                ValueKind::List(l) => {
+                    let idx = eval(local_env, node_env, key)?.as_int()? as usize;
+                    l.get(idx).cloned().ok_or(RuntimeError::IndexOutOfBounds {
+                        index: idx,
+                        len: l.len(),
+                    })
+                }
+                _ => Err(RuntimeError::NotACollection {
+                    got: col_val.type_name(),
+                }),
             }
-            Value::List(l) => {
-                let idx = eval(local_env, node_env, key)?.as_int()? as usize;
-                l.get(idx).cloned().ok_or(RuntimeError::IndexOutOfBounds {
-                    index: idx,
-                    len: l.len(),
-                })
-            }
-            other => Err(RuntimeError::NotACollection {
-                got: other.type_name(),
-            }),
-        },
+        }
         Expr::ListPrepend(head, tail) => {
             let h = eval(local_env, node_env, head)?;
             let t = eval(local_env, node_env, tail)?.as_list()?.clone();
             let mut new_list = Vector::new();
             new_list.push_back(h);
             new_list.append(t);
-            Ok(Value::List(new_list))
+            Ok(Value::list(new_list))
         }
         Expr::ListAppend(list, item) => {
             let mut l = eval(local_env, node_env, list)?.as_list()?.clone();
             let i = eval(local_env, node_env, item)?;
             l.push_back(i);
-            Ok(Value::List(l))
+            Ok(Value::list(l))
         }
         Expr::ListSubsequence(list, start, end) => {
             let l = eval(local_env, node_env, list)?;
@@ -757,34 +959,37 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
                     len: vec.len(),
                 });
             }
-            Ok(Value::List(vec.clone().slice(s..e)))
+            Ok(Value::list(vec.clone().slice(s..e)))
         }
-        Expr::LessThanEquals(e1, e2) => Ok(Value::Bool(
+        Expr::LessThanEquals(e1, e2) => Ok(Value::bool(
             eval(local_env, node_env, e1)? <= eval(local_env, node_env, e2)?,
         )),
-        Expr::GreaterThan(e1, e2) => Ok(Value::Bool(
+        Expr::GreaterThan(e1, e2) => Ok(Value::bool(
             eval(local_env, node_env, e1)? > eval(local_env, node_env, e2)?,
         )),
-        Expr::GreaterThanEquals(e1, e2) => Ok(Value::Bool(
+        Expr::GreaterThanEquals(e1, e2) => Ok(Value::bool(
             eval(local_env, node_env, e1)? >= eval(local_env, node_env, e2)?,
         )),
         Expr::KeyExists(key, map) => {
             let k = eval(local_env, node_env, key)?;
             let m = eval(local_env, node_env, map)?;
-            Ok(Value::Bool(m.as_map()?.contains_key(&k)))
+            Ok(Value::bool(m.as_map()?.contains_key(&k)))
         }
         Expr::MapErase(key, map) => {
             let k = eval(local_env, node_env, key)?;
             let m = eval(local_env, node_env, map)?.as_map()?.clone();
-            Ok(Value::Map(m.without(&k)))
+            Ok(Value::map(m.without(&k)))
         }
-        Expr::ListLen(list) => match eval(local_env, node_env, list)? {
-            Value::List(l) => Ok(Value::Int(l.len() as i64)),
-            Value::Map(m) => Ok(Value::Int(m.len() as i64)),
-            other => Err(RuntimeError::NotACollection {
-                got: other.type_name(),
-            }),
-        },
+        Expr::ListLen(list) => {
+            let list_val = eval(local_env, node_env, list)?;
+            match &list_val.kind {
+                ValueKind::List(l) => Ok(Value::int(l.len() as i64)),
+                ValueKind::Map(m) => Ok(Value::int(m.len() as i64)),
+                _ => Err(RuntimeError::NotACollection {
+                    got: list_val.type_name(),
+                }),
+            }
+        }
         Expr::ListAccess(list, idx) => {
             let l = eval(local_env, node_env, list)?;
             let vec = l.as_list()?;
@@ -800,11 +1005,11 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
         Expr::Min(e1, e2) => {
             let v1 = eval(local_env, node_env, e1)?.as_int()?;
             let v2 = eval(local_env, node_env, e2)?.as_int()?;
-            Ok(Value::Int(v1.min(v2)))
+            Ok(Value::int(v1.min(v2)))
         }
         Expr::TupleAccess(tuple, idx) => {
             let t = eval(local_env, node_env, tuple)?;
-            if let Value::Tuple(vec) = t {
+            if let ValueKind::Tuple(vec) = &t.kind {
                 if *idx >= vec.len() {
                     return Err(RuntimeError::IndexOutOfBounds {
                         index: *idx,
@@ -819,22 +1024,28 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
                 })
             }
         }
-        Expr::Unwrap(e) => match eval(local_env, node_env, e)? {
-            Value::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v)),
-            Value::Option(None) => Err(RuntimeError::UnwrapNone),
-            other => Err(RuntimeError::TypeError {
-                expected: "option",
-                got: other.type_name(),
-            }),
-        },
-        Expr::Coalesce(opt, default) => match eval(local_env, node_env, opt)? {
-            Value::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v)),
-            Value::Option(None) => eval(local_env, node_env, default),
-            other => Err(RuntimeError::CoalesceNonOption {
-                got: other.type_name(),
-            }),
-        },
-        Expr::IntToString(e) => Ok(Value::String(EcoString::from(
+        Expr::Unwrap(e) => {
+            let val = eval(local_env, node_env, e)?;
+            match &val.kind {
+                ValueKind::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v.clone())),
+                ValueKind::Option(None) => Err(RuntimeError::UnwrapNone),
+                _ => Err(RuntimeError::TypeError {
+                    expected: "option",
+                    got: val.type_name(),
+                }),
+            }
+        }
+        Expr::Coalesce(opt, default) => {
+            let val = eval(local_env, node_env, opt)?;
+            match &val.kind {
+                ValueKind::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v.clone())),
+                ValueKind::Option(None) => eval(local_env, node_env, default),
+                _ => Err(RuntimeError::CoalesceNonOption {
+                    got: val.type_name(),
+                }),
+            }
+        }
+        Expr::IntToString(e) => Ok(Value::string(EcoString::from(
             eval(local_env, node_env, e)?.as_int()?.to_string(),
         ))),
         Expr::Store(col, key, val) => update_collection(
@@ -959,7 +1170,7 @@ fn exec_sync_inner<L: Logger>(
                         };
 
                         state.channels.insert(chan_id, ChannelState::new(1));
-                        store(&lhs, Value::Channel(chan_id), local_env, node_env)?;
+                        store(&lhs, Value::channel(chan_id), local_env, node_env)?;
 
                         let func_name_id = program
                             .func_name_to_id
@@ -1003,7 +1214,7 @@ fn exec_sync_inner<L: Logger>(
                     id: state.alloc_channel_id(),
                 };
                 state.channels.insert(cid, ChannelState::new(cap as i32));
-                store(&lhs, Value::Channel(cid), local_env, node_env)?;
+                store(&lhs, Value::channel(cid), local_env, node_env)?;
                 pc = next;
             }
             Label::Cond(cond, bthen, belse) => {
@@ -1037,7 +1248,7 @@ fn exec_sync_inner<L: Logger>(
 
                 let col_val = {
                     let current = local_env.get(iter_slot_idx).clone();
-                    if matches!(current, Value::Unit) {
+                    if matches!(current.kind, ValueKind::Unit) {
                         // First iteration: initialize with collection
                         let original_collection = eval(local_env, node_env, &expr)?;
                         local_env.set(iter_slot_idx, original_collection.clone());
@@ -1047,23 +1258,23 @@ fn exec_sync_inner<L: Logger>(
                     }
                 };
 
-                match col_val {
-                    Value::List(l) => {
+                match col_val.kind {
+                    ValueKind::List(l) => {
                         if l.is_empty() {
-                            local_env.set(iter_slot_idx, Value::Unit);
+                            local_env.set(iter_slot_idx, Value::unit());
                             pc = next;
                         } else {
                             let item = l.head().unwrap().clone();
-                            let new_l = Value::List(l.skip(1));
+                            let new_l = Value::list(l.skip(1));
                             local_env.set(iter_slot_idx, new_l);
 
                             store(&lhs, item, local_env, node_env)?;
                             pc = body;
                         }
                     }
-                    Value::Map(m) => {
+                    ValueKind::Map(m) => {
                         if m.is_empty() {
-                            local_env.set(iter_slot_idx, Value::Unit);
+                            local_env.set(iter_slot_idx, Value::unit());
                             pc = next;
                         } else {
                             let (k, v) = m.iter().next().unwrap();
@@ -1071,7 +1282,7 @@ fn exec_sync_inner<L: Logger>(
                             let v = v.clone();
 
                             let new_m = m.without(&k);
-                            local_env.set(iter_slot_idx, Value::Map(new_m));
+                            local_env.set(iter_slot_idx, Value::map(new_m));
 
                             match lhs {
                                 Lhs::Tuple(vars) if vars.len() == 2 => {
@@ -1083,9 +1294,9 @@ fn exec_sync_inner<L: Logger>(
                             }
                         }
                     }
-                    other => {
+                    _ => {
                         return Err(RuntimeError::ForLoopNotCollection {
-                            got: other.type_name(),
+                            got: col_val.type_name(),
                         });
                     }
                 }
@@ -1188,7 +1399,7 @@ pub fn exec<L: Logger>(
                             id: state.alloc_channel_id(),
                         };
                         state.channels.insert(chan_id, ChannelState::new(1));
-                        store(&lhs, Value::Channel(chan_id), &mut local_env, &mut node_env)?;
+                        store(&lhs, Value::channel(chan_id), &mut local_env, &mut node_env)?;
 
                         // Setup Callee Record
                         let func_name_id = program
@@ -1229,7 +1440,7 @@ pub fn exec<L: Logger>(
                     id: state.alloc_channel_id(),
                 };
                 state.channels.insert(cid, ChannelState::new(cap as i32));
-                store(&lhs, Value::Channel(cid), &mut local_env, &mut node_env)?;
+                store(&lhs, Value::channel(cid), &mut local_env, &mut node_env)?;
                 record.pc = next;
             }
             Label::Send(chan_expr, val_expr, next) => {
@@ -1345,7 +1556,7 @@ pub fn exec<L: Logger>(
 
                 let col_val = {
                     let current = local_env.get(iter_slot_idx).clone();
-                    if matches!(current, Value::Unit) {
+                    if matches!(current.kind, ValueKind::Unit) {
                         // First iteration: initialize with collection
                         let original_collection = eval(&local_env, &node_env, &expr)?;
                         local_env.set(iter_slot_idx, original_collection.clone());
@@ -1355,23 +1566,23 @@ pub fn exec<L: Logger>(
                     }
                 };
 
-                match col_val {
-                    Value::List(l) => {
+                match col_val.kind {
+                    ValueKind::List(l) => {
                         if l.is_empty() {
-                            local_env.set(iter_slot_idx, Value::Unit);
+                            local_env.set(iter_slot_idx, Value::unit());
                             record.pc = next_pc;
                         } else {
                             let item = l.head().unwrap().clone();
-                            let new_l = Value::List(l.skip(1));
+                            let new_l = Value::list(l.skip(1));
                             local_env.set(iter_slot_idx, new_l);
 
                             store(&lhs, item, &mut local_env, &mut node_env)?;
                             record.pc = body_pc;
                         }
                     }
-                    Value::Map(m) => {
+                    ValueKind::Map(m) => {
                         if m.is_empty() {
-                            local_env.set(iter_slot_idx, Value::Unit);
+                            local_env.set(iter_slot_idx, Value::unit());
                             record.pc = next_pc;
                         } else {
                             let (k, v) = m.iter().next().unwrap();
@@ -1379,7 +1590,7 @@ pub fn exec<L: Logger>(
                             let v = v.clone();
 
                             let new_m = m.without(&k);
-                            local_env.set(iter_slot_idx, Value::Map(new_m));
+                            local_env.set(iter_slot_idx, Value::map(new_m));
 
                             match lhs {
                                 Lhs::Tuple(vars) if vars.len() == 2 => {
@@ -1391,9 +1602,9 @@ pub fn exec<L: Logger>(
                             }
                         }
                     }
-                    other => {
+                    _ => {
                         return Err(RuntimeError::ForLoopNotCollection {
-                            got: other.type_name(),
+                            got: col_val.type_name(),
                         });
                     }
                 }

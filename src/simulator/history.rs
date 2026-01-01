@@ -1,4 +1,4 @@
-use crate::simulator::core::{ChannelId, LogEntry, OpKind, Operation, Value};
+use crate::simulator::core::{ChannelId, LogEntry, OpKind, Operation, Value, ValueKind};
 use log::error;
 use rayon::prelude::*;
 use rusqlite::{Connection, params};
@@ -35,28 +35,28 @@ pub fn serialize_logs(logs: &[LogEntry]) -> Vec<PersistableLog> {
 }
 
 fn json_of_value(v: &Value) -> JsonValue {
-    match v {
-        Value::Int(i) => json!({
+    match &v.kind {
+        ValueKind::Int(i) => json!({
         "type": "VInt",
         "value": i
         }),
-        Value::Bool(b) => json!({
+        ValueKind::Bool(b) => json!({
         "type": "VBool",
         "value": b
         }),
-        Value::String(s) => json!({
+        ValueKind::String(s) => json!({
         "type": "VString",
         "value": s
         }),
-        Value::Node(n) => json!({
+        ValueKind::Node(n) => json!({
         "type": "VNode",
         "value": n
         }),
-        Value::Channel(ChannelId { node, id }) => json!({
+        ValueKind::Channel(ChannelId { node, id }) => json!({
         "type": "VChannel",
         "value": { "node": node, "id": id }
         }),
-        Value::Map(m) => {
+        ValueKind::Map(m) => {
             let json_pairs: Vec<JsonValue> = m
                 .iter()
                 .map(|(k, v)| json!([json_of_value(k), json_of_value(v)]))
@@ -66,28 +66,28 @@ fn json_of_value(v: &Value) -> JsonValue {
             "value": json_pairs
             })
         }
-        Value::Option(opt) => {
+        ValueKind::Option(opt) => {
             let value_json = match opt {
                 Some(inner) => json_of_value(inner),
-                None => JsonValue::Null, //
+                None => JsonValue::Null,
             };
             json!({
             "type": "VOption",
             "value": value_json
             })
         }
-        Value::List(l) => {
+        ValueKind::List(l) => {
             let items: Vec<JsonValue> = l.iter().map(json_of_value).collect();
             json!({
             "type": "VList",
             "value": items
             })
         }
-        Value::Unit => json!({
+        ValueKind::Unit => json!({
         "type": "VUnit",
         "value": null
         }),
-        Value::Tuple(t) => {
+        ValueKind::Tuple(t) => {
             let items: Vec<JsonValue> = t.iter().map(json_of_value).collect();
             json!({
             "type": "VTuple",

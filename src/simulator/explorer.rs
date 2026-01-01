@@ -229,10 +229,10 @@ fn init_topology<L: Logger>(
         return Ok(());
     };
 
-    let peer_list = Value::List((0..num_servers).map(|j| Value::Node(j)).collect());
+    let peer_list = Value::list((0..num_servers).map(|j| Value::node(j)).collect());
 
     for node_id in 0..num_servers {
-        let actuals = vec![Value::Int(node_id as i64), peer_list.clone()];
+        let actuals = vec![Value::int(node_id as i64), peer_list.clone()];
         let node_env = &state.nodes[node_id];
         let mut env = make_local_env(init_fn, actuals, &Env::default(), node_env);
 

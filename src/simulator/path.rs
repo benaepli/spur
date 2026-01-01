@@ -76,10 +76,10 @@ fn recover_node<L: Logger>(
 
     let actuals = match topology.topology {
         Topology::Full => vec![
-            Value::Int(node_id as i64),
-            Value::List(
+            Value::int(node_id as i64),
+            Value::list(
                 (0..topology.num_servers)
-                    .map(|j| Value::Node(j as usize))
+                    .map(|j| Value::node(j as usize))
                     .collect(),
             ),
         ],
@@ -119,7 +119,7 @@ fn reinit_node<L: Logger>(
     let node_env = &state.nodes[node_id];
     let mut env = make_local_env(init_fn, vec![], &Env::default(), node_env);
     if let VarSlot::Local(self_idx, _) = SELF_SLOT {
-        env.set(self_idx, Value::Node(node_id));
+        env.set(self_idx, Value::node(node_id));
     }
 
     exec_sync_on_node(
@@ -156,7 +156,7 @@ fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
         client_id: -1,
         op_action: "System.Crash".to_string(),
         kind: OpKind::Crash,
-        payload: vec![Value::Node(node_id)],
+        payload: vec![Value::node(node_id)],
         unique_id: -1,
     });
 
@@ -201,7 +201,7 @@ fn recover_crashed_node<L: Logger>(
         client_id: -1,
         op_action: "System.Recover".to_string(),
         kind: OpKind::Recover,
-        payload: vec![Value::Node(node_id)],
+        payload: vec![Value::node(node_id)],
         unique_id: -1,
     });
 
@@ -240,21 +240,21 @@ fn schedule_client_op(
         ClientOpSpec::Write(target, key, val) => (
             "ClientInterface.Write",
             vec![
-                Value::Node(*target as usize),
-                Value::String(EcoString::from(key.as_str())),
-                Value::String(EcoString::from(val.as_str())),
+                Value::node(*target as usize),
+                Value::string(EcoString::from(key.as_str())),
+                Value::string(EcoString::from(val.as_str())),
             ],
         ),
         ClientOpSpec::Read(target, key) => (
             "ClientInterface.Read",
             vec![
-                Value::Node(*target as usize),
-                Value::String(EcoString::from(key.as_str())),
+                Value::node(*target as usize),
+                Value::string(EcoString::from(key.as_str())),
             ],
         ),
         ClientOpSpec::SimulateTimeout(target) => (
             "ClientInterface.SimulateTimeout",
-            vec![Value::Node(*target as usize)],
+            vec![Value::node(*target as usize)],
         ),
     };
 

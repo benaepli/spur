@@ -59,9 +59,7 @@ impl ModelChecker {
     }
 
     fn hash_state(state: &State) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        state.hash(&mut hasher);
-        hasher.finish()
+        state.signature()
     }
 
     fn should_visit(&mut self, node: &SearchNode) -> bool {
@@ -219,7 +217,7 @@ impl ModelChecker {
                         client_id: -1,
                         op_action: "System.Crash".to_string(),
                         kind: OpKind::Crash,
-                        payload: vec![Value::Node(node_id)],
+                        payload: vec![Value::node(node_id)],
                         unique_id: -1,
                     });
                     succ.best_budget.crashes -= 1;
@@ -243,7 +241,7 @@ impl ModelChecker {
                     client_id: -1,
                     op_action: "System.Recover".to_string(),
                     kind: OpKind::Recover,
-                    payload: vec![Value::Node(node_id)],
+                    payload: vec![Value::node(node_id)],
                     unique_id: -1,
                 });
                 succ.logs.extend(logger.logs);
@@ -266,9 +264,9 @@ impl ModelChecker {
                             op_action: "ClientInterface.Write".to_string(),
                             kind: OpKind::Invocation,
                             payload: vec![
-                                Value::Node(0),
-                                Value::String(key.clone()),
-                                Value::String(EcoString::from("val1")),
+                                Value::node(0),
+                                Value::string(key.clone()),
+                                Value::string(EcoString::from("val1")),
                             ],
                             unique_id: op_id,
                         });
@@ -293,7 +291,7 @@ impl ModelChecker {
                             client_id: client_id as i32,
                             op_action: "ClientInterface.Read".to_string(),
                             kind: OpKind::Invocation,
-                            payload: vec![Value::Node(0), Value::String(key.clone())],
+                            payload: vec![Value::node(0), Value::string(key.clone())],
                             unique_id: op_id,
                         });
                         succ.next_op_id += 1;
@@ -354,7 +352,7 @@ impl ModelChecker {
         if let Some(init_fn) = self.program.get_func_by_name("Node.BASE_NODE_INIT") {
             let mut env = make_local_env(init_fn, vec![], &Env::default(), &state.nodes[node_id]);
             if let VarSlot::Local(self_idx, _) = SELF_SLOT {
-                env.set(self_idx, Value::Node(node_id));
+                env.set(self_idx, Value::node(node_id));
             }
             let _ = exec_sync_on_node(
                 state,
@@ -371,10 +369,10 @@ impl ModelChecker {
         // Schedule Node.RecoverInit if exists
         if let Some(recover_fn) = self.program.get_func_by_name("Node.RecoverInit") {
             let actuals = vec![
-                Value::Int(node_id as i64),
-                Value::List(
+                Value::int(node_id as i64),
+                Value::list(
                     (0..self.config.num_servers)
-                        .map(|j| Value::Node(j))
+                        .map(|j| Value::node(j))
                         .collect(),
                 ),
             ];
@@ -413,9 +411,9 @@ impl ModelChecker {
     ) -> bool {
         if let Some(func) = self.program.get_func_by_name("ClientInterface.Write") {
             let actuals = vec![
-                Value::Node(target_server),
-                Value::String(key.clone()),
-                Value::String(EcoString::from(val)),
+                Value::node(target_server),
+                Value::string(key.clone()),
+                Value::string(EcoString::from(val)),
             ];
             let env = make_local_env(func, actuals, &Env::default(), &state.nodes[client_id]);
             let record = Record {
@@ -448,8 +446,8 @@ impl ModelChecker {
     ) -> bool {
         if let Some(func) = self.program.get_func_by_name("ClientInterface.Read") {
             let actuals = vec![
-                Value::Node(target_server),
-                Value::String(key.clone()),
+                Value::node(target_server),
+                Value::string(key.clone()),
             ];
             let env = make_local_env(func, actuals, &Env::default(), &state.nodes[client_id]);
             let record = Record {
