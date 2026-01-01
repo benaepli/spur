@@ -1,5 +1,7 @@
-use crate::compiler::cfg::{Program, SELF_NAME};
-use crate::simulator::core::{Env, Logger, RuntimeError, State, Value, eval, exec_sync_on_node};
+use crate::compiler::cfg::{Instr, Label, Lhs, Program, Vertex};
+use crate::simulator::core::{
+    Env, Logger, RuntimeError, State, Value, eval, exec_sync_on_node, make_local_env,
+};
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
@@ -172,17 +174,13 @@ fn initialize_state<L: Logger>(
     num_clients: usize,
     local_coverage: &mut LocalCoverage,
 ) -> Result<State, RuntimeError> {
-    let mut state = State::new(num_servers + num_clients);
+    let mut state = State::new(num_servers + num_clients, program.max_node_slots as usize);
 
     if let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
         for i in 0..num_clients {
             let client_id = num_servers + i;
-            let mut env = Env::default();
-            env.insert(SELF_NAME, Value::Node(client_id));
             let node_env = &state.nodes[client_id];
-            for (name, expr) in &init_fn.locals {
-                env.insert(*name, eval(&env, node_env, expr)?);
-            }
+            let mut env = make_local_env(init_fn, vec![], &Env::default(), node_env);
             exec_sync_on_node(
                 &mut state,
                 logger,
@@ -197,12 +195,8 @@ fn initialize_state<L: Logger>(
 
     if let Some(init_fn) = program.get_func_by_name("Node.BASE_NODE_INIT") {
         for node_id in 0..num_servers {
-            let mut env = Env::default();
-            env.insert(SELF_NAME, Value::Node(node_id));
             let node_env = &state.nodes[node_id];
-            for (name, expr) in &init_fn.locals {
-                env.insert(*name, eval(&env, node_env, expr)?);
-            }
+            let mut env = make_local_env(init_fn, vec![], &Env::default(), node_env);
             exec_sync_on_node(
                 &mut state,
                 logger,
@@ -235,13 +229,18 @@ fn init_topology<L: Logger>(
 
     for node_id in 0..num_servers {
         let actuals = vec![Value::Int(node_id as i64), peer_list.clone()];
-        let mut env = Env::default();
+        let node_env = &state.nodes[node_id];
+        let mut env = make_local_env(init_fn, actuals, &Env::default(), node_env);
 
-        for (i, formal) in init_fn.formals.iter().enumerate() {
-            env.insert(*formal, actuals[i].clone());
-        }
-
-        exec_sync_on_node(state, logger, program, &mut env, node_id, init_fn.entry, local_coverage)?;
+        exec_sync_on_node(
+            state,
+            logger,
+            program,
+            &mut env,
+            node_id,
+            init_fn.entry,
+            local_coverage,
+        )?;
     }
     Ok(())
 }
@@ -277,11 +276,17 @@ pub fn run_single_simulation(
     // Create PathState with free_clients initialized
     let num_servers = config.num_servers as usize;
     let num_clients = config.num_clients as usize;
-    let mut path_state = PathState::new(num_servers + num_clients);
+    let mut path_state = PathState::new(num_servers + num_clients, program.max_node_slots as usize);
     path_state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
 
     // Initialize state
-    path_state.state = initialize_state(program, &mut path_state.logs, num_servers, num_clients, &mut path_state.coverage)?;
+    path_state.state = initialize_state(
+        program,
+        &mut path_state.logs,
+        num_servers,
+        num_clients,
+        &mut path_state.coverage,
+    )?;
 
     let topology_info = TopologyInfo {
         topology: Topology::Full,

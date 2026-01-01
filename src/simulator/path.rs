@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
-use crate::analysis::resolver::NameId;
-use crate::compiler::cfg::{Program, SELF_NAME};
+use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, RuntimeError, State,
-    UpdatePolicy, Value, eval, exec, exec_sync_on_node, schedule_record,
+    UpdatePolicy, Value, eval, exec, exec_sync_on_node, make_local_env, schedule_record,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use crate::simulator::path::plan::{
@@ -49,38 +48,15 @@ pub struct PathState {
 }
 
 impl PathState {
-    pub fn new(node_count: usize) -> Self {
+    pub fn new(node_count: usize, node_slot_count: usize) -> Self {
         Self {
-            state: State::new(node_count),
+            state: State::new(node_count, node_slot_count),
             coverage: LocalCoverage::new(),
             logs: Logs::default(),
             history: Vec::new(),
             free_clients: Vec::new(),
         }
     }
-}
-
-fn create_env(
-    node_env: &Env,
-    formals: &[NameId],
-    actuals: Vec<Value>,
-    locals: &[(NameId, crate::compiler::cfg::Expr)],
-) -> Result<Env, RuntimeError> {
-    assert_eq!(
-        formals.len(),
-        actuals.len(),
-        "Argument count mismatch: expected {}, got {}",
-        formals.len(),
-        actuals.len()
-    );
-
-    let mut env: Env = formals.iter().copied().zip(actuals).collect();
-
-    for (name, default_expr) in locals {
-        env.insert(*name, eval(&env, node_env, default_expr)?);
-    }
-
-    Ok(env)
 }
 
 fn recover_node<L: Logger>(
@@ -107,14 +83,8 @@ fn recover_node<L: Logger>(
         ],
     };
 
-    let mut env = Env::default();
-    for (i, formal) in recover_fn.formals.iter().enumerate() {
-        env.insert(*formal, actuals[i].clone());
-    }
     let node_env = &state.nodes[node_id];
-    for (name, expr) in &recover_fn.locals {
-        env.insert(*name, eval(&env, node_env, expr)?);
-    }
+    let env = make_local_env(recover_fn, actuals, &Env::default(), node_env);
 
     let record = Record {
         pc: recover_fn.entry,
@@ -126,7 +96,14 @@ fn recover_node<L: Logger>(
         policy: UpdatePolicy::Identity,
     };
 
-    exec(state, logger, prog, record, Some(&global_state.coverage), local_coverage)?;
+    exec(
+        state,
+        logger,
+        prog,
+        record,
+        Some(&global_state.coverage),
+        local_coverage,
+    )?;
     Ok(())
 }
 
@@ -143,16 +120,31 @@ fn reinit_node<L: Logger>(
         .get_func_by_name("Node.BASE_NODE_INIT")
         .expect("BASE_NODE_INIT not found");
 
-    let mut env = Env::default();
-    env.insert(SELF_NAME, Value::Node(node_id));
     let node_env = &state.nodes[node_id];
-    for (name, expr) in &init_fn.locals {
-        env.insert(*name, eval(&env, node_env, expr)?);
+    let mut env = make_local_env(init_fn, vec![], &Env::default(), node_env);
+    if let VarSlot::Local(self_idx, _) = SELF_SLOT {
+        env.set(self_idx, Value::Node(node_id));
     }
 
-    exec_sync_on_node(state, logger, prog, &mut env, node_id, init_fn.entry, local_coverage)?;
+    exec_sync_on_node(
+        state,
+        logger,
+        prog,
+        &mut env,
+        node_id,
+        init_fn.entry,
+        local_coverage,
+    )?;
 
-    recover_node(topology, state, logger, prog, node_id, global_state, local_coverage)
+    recover_node(
+        topology,
+        state,
+        logger,
+        prog,
+        node_id,
+        global_state,
+        local_coverage,
+    )
 }
 
 fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
@@ -174,9 +166,15 @@ fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
     for record in records {
         if record.node == node_id {
             let is_external = record.origin_node != record.node;
-            let origin_alive = !state.crash_info.currently_crashed.contains(&record.origin_node);
+            let origin_alive = !state
+                .crash_info
+                .currently_crashed
+                .contains(&record.origin_node);
             if is_external && origin_alive {
-                state.crash_info.queued_messages.push_back((node_id, record));
+                state
+                    .crash_info
+                    .queued_messages
+                    .push_back((node_id, record));
             }
         } else {
             state.runnable_records.push_back(record);
@@ -209,7 +207,15 @@ fn recover_crashed_node<L: Logger>(
     });
 
     state.nodes[node_id] = Env::default();
-    reinit_node(topology, state, logger, prog, node_id, global_state, local_coverage)?;
+    reinit_node(
+        topology,
+        state,
+        logger,
+        prog,
+        node_id,
+        global_state,
+        local_coverage,
+    )?;
 
     let queued = std::mem::take(&mut state.crash_info.queued_messages);
     for (dest, record) in queued {
@@ -255,12 +261,12 @@ fn schedule_client_op(
     let op_func = prog
         .get_func_by_name(op_name)
         .expect("Client op function not found");
-    let env = create_env(
-        &state.nodes[client_id as usize],
-        &op_func.formals,
+    let env = make_local_env(
+        op_func,
         actuals.clone(),
-        &op_func.locals,
-    )?;
+        &Env::default(),
+        &state.nodes[client_id as usize],
+    );
 
     history.push(Operation {
         client_id,

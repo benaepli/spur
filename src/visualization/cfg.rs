@@ -1,5 +1,7 @@
 use crate::analysis::resolver::NameId;
-use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, SELF_NAME, Vertex as CfgVertex};
+use crate::compiler::cfg::{
+    Expr, Instr, Label, Lhs, Program, SELF_NAME, VarSlot, Vertex as CfgVertex,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
@@ -118,7 +120,7 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
                 edge(*then_v, Some("True"), None, Some("green4"))?;
                 edge(*else_v, Some("False"), None, Some("red3"))?;
             }
-            Label::ForLoopIn(_, _, body_v, next_v) => {
+            Label::ForLoopIn(_, _, _, body_v, next_v) => {
                 edge(*body_v, Some("Loop"), None, Some("green4"))?;
                 edge(*next_v, Some("Exit"), None, Some("#555555"))?;
             }
@@ -176,7 +178,7 @@ fn generate_html_label(prog: &Program, v: usize, label: &Label) -> (String, Stri
             header_color = "#FFF9C4"; // Yellow
             content = format!("<B>If</B><BR/>{}", html_escape(&pretty_expr(prog, expr)));
         }
-        Label::ForLoopIn(lhs, iter, _, _) => {
+        Label::ForLoopIn(lhs, iter, _, _, _) => {
             header_color = "#FFF9C4";
             content = format!(
                 "<B>For Loop</B><BR/>{} in {}",
@@ -346,11 +348,17 @@ fn resolve_name(prog: &Program, id: &NameId) -> String {
         .unwrap_or_else(|| format!("${}", id.0))
 }
 
+fn resolve_slot(prog: &Program, slot: &VarSlot) -> String {
+    match slot {
+        VarSlot::Local(_, id) | VarSlot::Node(_, id) => resolve_name(prog, id),
+    }
+}
+
 fn pretty_lhs(prog: &Program, lhs: &Lhs) -> String {
     match lhs {
-        Lhs::Var(id) => resolve_name(prog, id),
+        Lhs::Var(slot) => resolve_slot(prog, slot),
         Lhs::Tuple(ids) => {
-            let names: Vec<_> = ids.iter().map(|id| resolve_name(prog, id)).collect();
+            let names: Vec<_> = ids.iter().map(|slot| resolve_slot(prog, slot)).collect();
             format!("({})", names.join(", "))
         }
     }
@@ -358,7 +366,7 @@ fn pretty_lhs(prog: &Program, lhs: &Lhs) -> String {
 
 fn pretty_expr(prog: &Program, expr: &Expr) -> String {
     match expr {
-        Expr::Var(id) => resolve_name(prog, id),
+        Expr::Var(slot) => resolve_slot(prog, slot),
         Expr::Find(l, r) => format!("{}[{}]", pretty_expr(prog, l), pretty_expr(prog, r)),
         Expr::Int(i) => i.to_string(),
         Expr::Bool(b) => b.to_string(),
@@ -482,7 +490,7 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         | Label::SpinAwait(_, n)
         | Label::Print(_, n) => vec![*n],
         Label::Cond(_, t, e) => vec![*t, *e],
-        Label::ForLoopIn(_, _, body, next) => vec![*body, *next],
+        Label::ForLoopIn(_, _, _, body, next) => vec![*body, *next],
         Label::Break(t) => vec![*t],
         Label::Return(_) => vec![],
     }
