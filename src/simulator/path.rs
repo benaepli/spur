@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 
-use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
+use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot, Vertex};
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, RuntimeError, State,
     UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env, schedule_record,
 };
-use crate::simulator::coverage::{GlobalState, LocalCoverage};
+use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::path::plan::{
     ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
 use ecow::EcoString;
+use imbl::HashMap as ImMap;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
 
@@ -66,6 +67,7 @@ fn recover_node<L: Logger>(
     prog: &Program,
     node_id: usize,
     global_state: &GlobalState,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
     let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
@@ -96,14 +98,7 @@ fn recover_node<L: Logger>(
         policy: UpdatePolicy::Identity,
     };
 
-    exec(
-        state,
-        logger,
-        prog,
-        record,
-        Some(&global_state.coverage),
-        local_coverage,
-    )?;
+    exec(state, logger, prog, record, global_snapshot, local_coverage)?;
     Ok(())
 }
 
@@ -114,6 +109,7 @@ fn reinit_node<L: Logger>(
     prog: &Program,
     node_id: usize,
     global_state: &GlobalState,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
     let init_fn = prog
@@ -133,6 +129,7 @@ fn reinit_node<L: Logger>(
         &mut env,
         node_id,
         init_fn.entry,
+        global_snapshot,
         local_coverage,
     )?;
 
@@ -143,6 +140,7 @@ fn reinit_node<L: Logger>(
         prog,
         node_id,
         global_state,
+        global_snapshot,
         local_coverage,
     )
 }
@@ -190,6 +188,7 @@ fn recover_crashed_node<L: Logger>(
     topology: &TopologyInfo,
     node_id: usize,
     global_state: &GlobalState,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
     if !state.crash_info.currently_crashed.contains(&node_id) {
@@ -214,6 +213,7 @@ fn recover_crashed_node<L: Logger>(
         prog,
         node_id,
         global_state,
+        global_snapshot,
         local_coverage,
     )?;
 
@@ -300,6 +300,7 @@ pub fn exec_plan(
     topology: TopologyInfo,
     randomly_delay_msgs: bool,
     global_state: &GlobalState,
+    global_snapshot: Option<&VertexMap>,
 ) -> Result<(), RuntimeError> {
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
@@ -357,6 +358,7 @@ pub fn exec_plan(
                         &topology,
                         *node_id as usize,
                         &global_state,
+                        global_snapshot,
                         &mut path_state.coverage,
                     )?;
                     engine.mark_event_completed(node_idx);
@@ -377,7 +379,7 @@ pub fn exec_plan(
                 false,
                 &[],
                 randomly_delay_msgs,
-                Some(&global_state.coverage),
+                global_snapshot,
                 &mut path_state.coverage,
             )?;
 

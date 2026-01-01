@@ -1,15 +1,66 @@
 use crate::compiler::cfg::Vertex;
 use crate::simulator::path::plan::PlannedEvent;
 use dashmap::DashMap;
+use imbl::HashMap as ImMap;
+use imbl::shared_ptr::ArcK;
 use nauty_pet::prelude::CanonGraph;
 use rand::SeedableRng;
 use rand::prelude::SmallRng;
-use scalable_cuckoo_filter::{DefaultHasher, ScalableCuckooFilter, ScalableCuckooFilterBuilder};
+use scalable_cuckoo_filter::{
+    DefaultHasher as CuckooHasher, ScalableCuckooFilter, ScalableCuckooFilterBuilder,
+};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::hash::RandomState;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 const STEP_PENALTY: f64 = 0.0001;
+
+#[derive(Debug, Default, Clone)]
+pub struct VertexMap {
+    vertices: ImMap<Vertex, u64>,
+    total: u64,
+}
+
+impl VertexMap {
+    pub fn new() -> Self {
+        Self {
+            vertices: ImMap::new(),
+            total: 0,
+        }
+    }
+
+    pub fn novelty_score(&self, vertex: Vertex) -> f64 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        let count = self.vertices.get(&vertex).copied().unwrap_or(0) as f64;
+        1.0 - (count / self.total as f64)
+    }
+
+    pub fn get(&self, vertex: &Vertex) -> Option<u64> {
+        self.vertices.get(vertex).copied()
+    }
+
+    pub fn merge_from(&mut self, other: &HashMap<Vertex, u64>) {
+        for (v, count) in other {
+            self.vertices
+                .entry(*v)
+                .and_modify(|e| *e += count)
+                .or_insert(*count);
+            self.total += count;
+        }
+    }
+}
+
+impl IntoIterator for VertexMap {
+    type Item = (Vertex, u64);
+    type IntoIter = imbl::hashmap::ConsumingIter<(Vertex, u64), ArcK>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vertices.into_iter()
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct LocalCoverage {
@@ -79,7 +130,7 @@ impl LocalCoverage {
 #[derive(Debug, Default)]
 pub struct GlobalCoverage {
     edges: DashMap<(usize, usize), u64>,
-    vertices: DashMap<usize, u64>,
+    vertices: RwLock<VertexMap>,
     total: AtomicU64,
 }
 
@@ -87,50 +138,50 @@ impl GlobalCoverage {
     pub fn new() -> Self {
         Self {
             edges: DashMap::new(),
-            vertices: DashMap::new(),
+            vertices: RwLock::new(VertexMap::new()),
             total: AtomicU64::new(0),
         }
     }
 
+    pub fn snapshot(&self) -> VertexMap {
+        self.vertices.read().unwrap().clone()
+    }
+
     pub fn merge(&self, local: &LocalCoverage) {
-        let _ = self.total.fetch_add(local.total, Ordering::SeqCst);
+        let _ = self.total.fetch_add(local.total, Ordering::Relaxed);
         for ((from, to), count) in local.edges() {
             *self.edges.entry((*from, *to)).or_default() += count;
         }
-        for (v, count) in local.vertices() {
-            *self.vertices.entry(*v).or_default() += count;
-        }
+
+        let mut vertices = self.vertices.write().unwrap();
+        vertices.merge_from(local.vertices());
     }
 
     /// Returns the total number of vertex visits across all merged runs.
     pub fn total(&self) -> u64 {
-        self.total.load(Ordering::SeqCst)
+        self.total.load(Ordering::Relaxed)
     }
 
     /// Calculates the novelty score for a vertex using global stats.
     /// Returns 1.0 if never seen, otherwise 1.0 - (count/total).
     pub fn novelty_score(&self, vertex: Vertex) -> f64 {
-        let count = match self.vertices.get(&vertex) {
-            None => return 1.0,
-            Some(count) => *count as f64,
-        };
         let total = self.total();
         if total == 0 {
             return 1.0;
         }
-        1.0 - (count / total as f64)
+        self.vertices.read().unwrap().novelty_score(vertex)
     }
 
     /// Access to vertices for coverage visualization.
-    pub fn vertices(&self) -> &DashMap<usize, u64> {
-        &self.vertices
+    pub fn vertices_snapshot(&self) -> VertexMap {
+        self.vertices.read().unwrap().clone()
     }
 }
 
 const FALSE_POSITIVE_PROBABILITY: f64 = 0.001;
 
 type Canonical = CanonGraph<PlannedEvent, ()>;
-type CuckooFilter = ScalableCuckooFilter<Canonical, DefaultHasher, SmallRng>;
+type CuckooFilter = ScalableCuckooFilter<Canonical, CuckooHasher, SmallRng>;
 
 /// Global state shared across all simulation runs.
 #[derive(Debug)]

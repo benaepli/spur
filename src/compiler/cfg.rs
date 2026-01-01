@@ -65,7 +65,7 @@ pub enum Expr {
     IntToString(Box<Expr>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Hash)]
 pub enum Lhs {
     Var(VarSlot),
     Tuple(Vec<VarSlot>),

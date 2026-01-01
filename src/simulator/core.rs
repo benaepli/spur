@@ -1,9 +1,9 @@
 use crate::compiler::cfg::{
     Expr, FunctionInfo, Instr, Label, Lhs, Program, SELF_SLOT, VarSlot, Vertex,
 };
-use crate::simulator::coverage::{GlobalCoverage, LocalCoverage};
+use crate::simulator::coverage::{LocalCoverage, VertexMap};
 use ecow::EcoString;
-use imbl::{HashMap as ImHashMap, HashSet as ImHashSet, Vector};
+use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use std::fmt::Debug;
 use std::{
     cmp::Ordering,
@@ -317,7 +317,7 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     pub pc: Vertex,
     pub node: usize,
@@ -328,7 +328,18 @@ pub struct Record {
     pub policy: UpdatePolicy,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl Hash for Record {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.pc.hash(state);
+        self.node.hash(state);
+        self.origin_node.hash(state);
+        self.continuation.hash(state);
+        self.env.hash(state);
+        self.policy.hash(state);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum UpdatePolicy {
     Identity,
     Halve,
@@ -345,12 +356,22 @@ impl UpdatePolicy {
 
 #[derive(Debug, Clone)]
 pub struct CrashInfo {
-    pub currently_crashed: ImHashSet<usize>,
+    pub currently_crashed: OrdSet<usize>,
     pub queued_messages: Vector<(usize, Record)>, // (dest_node, record)
     pub current_step: i32,
 }
 
-#[derive(Debug, Clone)]
+impl Hash for CrashInfo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // OrdSet has deterministic ordering, collect to Vec for safety
+        let crashed_vec: Vec<_> = self.currently_crashed.iter().copied().collect();
+        crashed_vec.hash(state);
+        self.queued_messages.hash(state);
+        self.current_step.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, Hash)]
 pub struct ChannelState {
     pub capacity: i32,
     pub buffer: Vector<Value>,
@@ -409,7 +430,7 @@ impl State {
             runnable_records: Vector::new(),
             channels: ImHashMap::new(),
             crash_info: CrashInfo {
-                currently_crashed: ImHashSet::new(),
+                currently_crashed: OrdSet::new(),
                 queued_messages: Vector::new(),
                 current_step: 0,
             },
@@ -424,7 +445,33 @@ impl State {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+impl Hash for State {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.nodes.hash(state);
+        self.runnable_records.hash(state);
+
+        // Hash channels in deterministic order
+        let mut channels_vec: Vec<_> = self.channels.iter().collect();
+        channels_vec.sort_by_key(|(k, _)| *k);
+        for (chan_id, chan_state) in channels_vec {
+            chan_id.hash(state);
+            chan_state.hash(state);
+        }
+
+        self.crash_info.hash(state);
+        // Deliberately exclude next_channel_id
+    }
+}
+
+impl PartialEq for Env {
+    fn eq(&self, other: &Self) -> bool {
+        self.slots == other.slots
+    }
+}
+
+impl Eq for Env {}
+
+#[derive(Clone, Debug, Default, Hash)]
 pub struct Env {
     slots: Vec<Value>,
 }
@@ -464,7 +511,7 @@ impl Env {
 }
 
 /// Continuation representing what to do when an execution completes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Continuation {
     /// Node recovery continuation
     Recover,
@@ -806,6 +853,7 @@ pub fn exec_sync_on_node<L: Logger>(
     local_env: &mut Env,
     node_id: usize,
     start_pc: usize,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Value, RuntimeError> {
     let mut node_env = state.nodes[node_id].clone();
@@ -817,7 +865,7 @@ pub fn exec_sync_on_node<L: Logger>(
         &mut node_env,
         start_pc,
         node_id,
-        None,
+        global_snapshot,
         local_coverage,
     );
     state.nodes[node_id] = node_env;
@@ -832,16 +880,14 @@ fn exec_sync_inner<L: Logger>(
     node_env: &mut Env,
     start_pc: usize,
     node_id: usize,
-    global_coverage: Option<&GlobalCoverage>,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Value, RuntimeError> {
     let mut pc = start_pc;
     let mut prev_pc = pc;
     loop {
         if pc != prev_pc {
-            let rarity = global_coverage
-                .map(|gc| gc.novelty_score(pc))
-                .unwrap_or(1.0);
+            let rarity = global_snapshot.map_or(1.0, |s| s.novelty_score(pc));
             local_coverage.record_with_rarity(prev_pc, pc, rarity);
             prev_pc = pc;
         }
@@ -889,7 +935,7 @@ fn exec_sync_inner<L: Logger>(
                             node_env,
                             func_info.entry,
                             node_id,
-                            global_coverage,
+                            global_snapshot,
                             local_coverage,
                         )?;
 
@@ -1059,7 +1105,7 @@ pub fn exec<L: Logger>(
     logger: &mut L,
     program: &Program,
     mut record: Record,
-    global_coverage: Option<&GlobalCoverage>,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Option<ClientOpResult>, RuntimeError> {
     let mut local_env = record.env;
@@ -1070,9 +1116,7 @@ pub fn exec<L: Logger>(
     loop {
         let current_pc = record.pc;
         if current_pc != prev_pc {
-            let rarity = global_coverage
-                .map(|gc| gc.novelty_score(current_pc))
-                .unwrap_or(1.0);
+            let rarity = global_snapshot.map_or(1.0, |s| s.novelty_score(current_pc));
             local_coverage.record_with_rarity(prev_pc, current_pc, rarity);
             prev_pc = current_pc;
         }
@@ -1123,7 +1167,7 @@ pub fn exec<L: Logger>(
                             &mut node_env,
                             func_info.entry,
                             record.node,
-                            global_coverage,
+                            global_snapshot,
                             local_coverage,
                         )?;
 
@@ -1370,7 +1414,7 @@ pub fn schedule_record<L: Logger>(
     sever_all_but_mid: bool,
     partition_away_nodes: &[usize],
     randomly_delay_msgs: bool,
-    global_coverage: Option<&GlobalCoverage>,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Option<ClientOpResult>, RuntimeError> {
     let len = state.runnable_records.len();
@@ -1382,16 +1426,16 @@ pub fn schedule_record<L: Logger>(
     let mut rng = rand::rng();
 
     // Select record index using either tournament selection or random
-    let idx = if let Some(coverage) = global_coverage {
+    let idx = if let Some(snapshot) = global_snapshot {
         if len > 1 {
             // Tournament selection with K=3
             const K: usize = 3;
             let mut best_idx = rng.random_range(0..len);
-            let mut best_score = coverage.novelty_score(state.runnable_records[best_idx].pc);
+            let mut best_score = snapshot.novelty_score(state.runnable_records[best_idx].pc);
 
             for _ in 1..K.min(len) {
                 let candidate_idx = rng.random_range(0..len);
-                let score = coverage.novelty_score(state.runnable_records[candidate_idx].pc);
+                let score = snapshot.novelty_score(state.runnable_records[candidate_idx].pc);
                 if score > best_score {
                     best_idx = candidate_idx;
                     best_score = score;
@@ -1449,7 +1493,7 @@ pub fn schedule_record<L: Logger>(
             }
 
             if should_execute {
-                let result = exec(state, logger, program, r, global_coverage, local_coverage)?;
+                let result = exec(state, logger, program, r, global_snapshot, local_coverage)?;
                 return Ok(result);
             }
         }
@@ -1457,7 +1501,7 @@ pub fn schedule_record<L: Logger>(
         if state.crash_info.currently_crashed.contains(&r.node) {
             return Ok(None);
         }
-        let result = exec(state, logger, program, r, global_coverage, local_coverage)?;
+        let result = exec(state, logger, program, r, global_snapshot, local_coverage)?;
         return Ok(result);
     }
     Ok(None)

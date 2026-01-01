@@ -1,22 +1,24 @@
-use crate::simulator::core::State;
+use crate::simulator::core::{LogEntry, Operation, State};
 use std::cmp::Ordering;
 
-#[derive(Debug)]
-struct Budget {
-    crashes: u32,
-    writes: u32,
-    reads: u32,
+#[derive(Debug, Clone)]
+pub struct Budget {
+    pub crashes: u32,
+    pub recovers: u32,
+    pub writes: u32,
+    pub reads: u32,
 }
 
-#[derive(Debug)]
-struct SearchNode {
-    state: State,
-    cost: f64, // Lower is better
-    steps: u32,
-
-    best_budget: Budget,
+#[derive(Debug, Clone)]
+pub struct SearchNode {
+    pub state: State,
+    pub cost: f64,
+    pub steps: u32,
+    pub best_budget: Budget,
+    pub history: Vec<Operation>,
+    pub logs: Vec<LogEntry>,
+    pub next_op_id: i32,
 }
-
 impl PartialEq for SearchNode {
     fn eq(&self, other: &Self) -> bool {
         self.cost == other.cost

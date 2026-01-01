@@ -109,9 +109,8 @@ fn main() {
             // Generate coverage heatmap
             let vertex_coverage: HashMap<usize, u64> = global_state
                 .coverage
-                .vertices()
-                .iter()
-                .map(|entry| (*entry.key(), *entry.value()))
+                .vertices_snapshot()
+                .into_iter()
                 .collect();
 
             let byte_hits = vertex_coverage_to_byte_coverage(

@@ -2,7 +2,7 @@ use crate::compiler::cfg::Program;
 use crate::simulator::core::{
     Env, Logger, RuntimeError, State, Value, exec_sync_on_node, make_local_env,
 };
-use crate::simulator::coverage::{GlobalState, LocalCoverage};
+use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
@@ -172,6 +172,7 @@ fn initialize_state<L: Logger>(
     logger: &mut L,
     num_servers: usize,
     num_clients: usize,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<State, RuntimeError> {
     let mut state = State::new(num_servers + num_clients, program.max_node_slots as usize);
@@ -188,6 +189,7 @@ fn initialize_state<L: Logger>(
                 &mut env,
                 client_id,
                 init_fn.entry,
+                global_snapshot,
                 local_coverage,
             )?;
         }
@@ -204,6 +206,7 @@ fn initialize_state<L: Logger>(
                 &mut env,
                 node_id,
                 init_fn.entry,
+                global_snapshot,
                 local_coverage,
             )?;
         }
@@ -217,6 +220,7 @@ fn init_topology<L: Logger>(
     logger: &mut L,
     program: &Program,
     num_servers: usize,
+    global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
     let init_fn_name = "Node.Init";
@@ -239,6 +243,7 @@ fn init_topology<L: Logger>(
             &mut env,
             node_id,
             init_fn.entry,
+            global_snapshot,
             local_coverage,
         )?;
     }
@@ -253,6 +258,7 @@ pub fn run_single_simulation(
     run_id: i64,
     config: &SingleRunConfig,
 ) -> Result<f64, Box<dyn Error>> {
+    let global_snapshot = global_state.coverage.snapshot();
     let gen_config = GeneratorConfig {
         num_servers: config.num_servers,
         num_clients: config.num_clients,
@@ -285,6 +291,7 @@ pub fn run_single_simulation(
         &mut path_state.logs,
         num_servers,
         num_clients,
+        Some(&global_snapshot),
         &mut path_state.coverage,
     )?;
 
@@ -298,6 +305,7 @@ pub fn run_single_simulation(
         &mut path_state.logs,
         program,
         num_servers,
+        Some(&global_snapshot),
         &mut path_state.coverage,
     )?;
 
@@ -309,6 +317,7 @@ pub fn run_single_simulation(
         topology_info,
         config.randomly_delay_msgs,
         global_state,
+        Some(&global_snapshot),
     )?;
 
     let plan_score = path_state.coverage.plan_score();
