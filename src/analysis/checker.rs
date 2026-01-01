@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod test;
+
 use crate::analysis::resolver::{
     BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedCondStmts, ResolvedExpr,
     ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall, ResolvedFuncDef,

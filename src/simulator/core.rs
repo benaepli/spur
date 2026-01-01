@@ -199,8 +199,8 @@ impl Value {
                 m.len().hash(&mut h);
                 sig ^= h.finish();
                 for (k, v) in m.iter() {
-                    // Combine key and value sigs in a way that's order-independent
-                    sig ^= k.sig.wrapping_mul(0x9E3779B97F4A7C15) ^ v.sig;
+                    // Use hash_map_entry for consistent entry hashing
+                    sig ^= hash_map_entry(k.sig, v.sig);
                 }
                 sig
             }
@@ -266,6 +266,12 @@ impl Value {
     #[inline]
     pub fn map(m: ImHashMap<Value, Value>) -> Self {
         Self::new(ValueKind::Map(m))
+    }
+
+    /// Create a Value with a pre-computed signature (for incremental updates)
+    #[inline]
+    pub fn with_sig(kind: ValueKind, sig: u64) -> Self {
+        Self { kind, sig }
     }
 }
 
@@ -838,10 +844,48 @@ impl Continuation {
     }
 }
 
+/// Helper to securely combine K and V without needing map position.
+/// Uses mix with different tags (0 for key, 1 for value) to bind them tightly
+/// and avoid collisions from key/value swaps.
+#[inline]
+fn hash_map_entry(k_sig: u64, v_sig: u64) -> u64 {
+    mix(k_sig, 0) ^ mix(v_sig, 1)
+}
+
 fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, RuntimeError> {
     use ValueKind::*;
     match col.kind {
-        Map(m) => Ok(Value::map(m.update(key, val))),
+        Map(m) => {
+            let mut new_sig = col.sig; // Start with existing signature
+
+            // Remove the old entry's contribution (if it exists)
+            if let Some(old_val) = m.get(&key) {
+                let old_entry_hash = hash_map_entry(key.sig, old_val.sig);
+                new_sig ^= old_entry_hash; // XOR removes it
+            // Also remove old length contribution and add adjusted length
+            // (length stays the same, so no change needed)
+            } else {
+                // Key doesn't exist, length will increase by 1
+                // Remove old length hash, add new length hash
+                let mut h = DefaultHasher::new();
+                9u8.hash(&mut h);
+                m.len().hash(&mut h);
+                new_sig ^= h.finish();
+
+                let mut h = DefaultHasher::new();
+                9u8.hash(&mut h);
+                (m.len() + 1).hash(&mut h);
+                new_sig ^= h.finish();
+            }
+
+            // Add the new entry's contribution
+            let new_entry_hash = hash_map_entry(key.sig, val.sig);
+            new_sig ^= new_entry_hash;
+
+            let new_map = m.update(key, val);
+
+            Ok(Value::with_sig(ValueKind::Map(new_map), new_sig))
+        }
         List(l) => {
             let idx = key.as_int()? as usize;
             if idx >= l.len() {

@@ -1,4 +1,4 @@
-use crate::compiler::cfg::{Program, VarSlot, SELF_SLOT};
+use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::checker::state::{Budget, SearchNode};
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, State, UpdatePolicy, Value,
@@ -228,7 +228,13 @@ impl ModelChecker {
 
         // Recovery
         if node.best_budget.recovers > 0 {
-            let crashed: Vec<usize> = node.state.crash_info.currently_crashed.iter().copied().collect();
+            let crashed: Vec<usize> = node
+                .state
+                .crash_info
+                .currently_crashed
+                .iter()
+                .copied()
+                .collect();
             for node_id in crashed {
                 let mut next_state = node.state.clone();
                 let mut logger = SearchLogger::default();
@@ -252,12 +258,15 @@ impl ModelChecker {
 
         // Writes
         if node.best_budget.writes > 0 {
-            for client_id in self.config.num_servers..self.config.num_servers + self.config.num_clients {
+            for client_id in
+                self.config.num_servers..self.config.num_servers + self.config.num_clients
+            {
                 for key in &self.config.keys {
                     let mut next_state = node.state.clone();
                     let op_id = node.next_op_id;
 
-                    if self.schedule_client_write(&mut next_state, client_id, op_id, 0, key, "val1") {
+                    if self.schedule_client_write(&mut next_state, client_id, op_id, 0, key, "val1")
+                    {
                         let mut succ = self.make_successor(&node, next_state, 1.0);
                         succ.history.push(Operation {
                             client_id: client_id as i32,
@@ -280,7 +289,9 @@ impl ModelChecker {
 
         // Reads
         if node.best_budget.reads > 0 {
-            for client_id in self.config.num_servers..self.config.num_servers + self.config.num_clients {
+            for client_id in
+                self.config.num_servers..self.config.num_servers + self.config.num_clients
+            {
                 for key in &self.config.keys {
                     let mut next_state = node.state.clone();
                     let op_id = node.next_op_id;
@@ -305,12 +316,7 @@ impl ModelChecker {
         successors
     }
 
-    fn make_successor(
-        &self,
-        parent: &SearchNode,
-        state: State,
-        cost_delta: f64,
-    ) -> SearchNode {
+    fn make_successor(&self, parent: &SearchNode, state: State, cost_delta: f64) -> SearchNode {
         SearchNode {
             state,
             cost: parent.cost + cost_delta + 0.1,
@@ -445,10 +451,7 @@ impl ModelChecker {
         key: &EcoString,
     ) -> bool {
         if let Some(func) = self.program.get_func_by_name("ClientInterface.Read") {
-            let actuals = vec![
-                Value::node(target_server),
-                Value::string(key.clone()),
-            ];
+            let actuals = vec![Value::node(target_server), Value::string(key.clone())];
             let env = make_local_env(func, actuals, &Env::default(), &state.nodes[client_id]);
             let record = Record {
                 pc: func.entry,
