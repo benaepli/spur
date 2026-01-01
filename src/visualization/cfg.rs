@@ -67,7 +67,7 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
 
         for &v in &sorted_vertices {
             let label_data = &prog.cfg.graph[v];
-            let (header_color, html) = generate_html_label(prog, v, label_data);
+            let (_, html) = generate_html_label(prog, v, label_data);
 
             w.node(
                 &format!("node_{}", v),
@@ -134,7 +134,7 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
     w.end_digraph()
 }
 
-fn generate_html_label(prog: &Program, v: usize, label: &Label) -> (String, String) {
+fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, String) {
     let mut header_color;
     let content;
 

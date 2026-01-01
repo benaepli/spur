@@ -181,8 +181,6 @@ impl Program {
 pub struct Compiler {
     /// The CFG being built. New labels are pushed here.
     cfg: Vec<Label>,
-    /// Counter for generating fresh temporary variable NameIds.
-    temp_counter: usize,
 
     rpc_map: HashMap<NameId, FunctionInfo>,
 
@@ -214,6 +212,9 @@ pub struct Compiler {
     /// Debug names for current function's slots
     current_slot_names: Vec<String>,
 
+    /// Default values for current function's local slots
+    current_local_defaults: Vec<Expr>,
+
     /// Maximum number of node-level slots encountered so far
     max_node_slots: u32,
 }
@@ -222,7 +223,6 @@ impl Compiler {
     pub fn new() -> Self {
         Compiler {
             cfg: Vec::new(),
-            temp_counter: 0,
             rpc_map: HashMap::new(),
             func_sync_map: HashMap::new(),
             func_qualifier_map: HashMap::new(),
@@ -236,6 +236,7 @@ impl Compiler {
             node_slots: HashMap::new(),
             next_node_slot: 1, // Slot 0 reserved for 'self'
             current_slot_names: Vec::new(),
+            current_local_defaults: Vec::new(),
             max_node_slots: 1,
         }
     }
@@ -260,20 +261,23 @@ impl Compiler {
         self.local_slots.clear();
         self.next_local_slot = 0;
         self.current_slot_names.clear();
+        self.current_local_defaults.clear();
 
         for (name_id, name_str) in params {
             self.local_slots.insert(*name_id, self.next_local_slot);
             self.current_slot_names.push(name_str.clone());
             self.next_local_slot += 1;
+            // Parameters don't need defaults as they are provided by caller
         }
     }
 
     /// Allocate a local slot for a variable declaration
-    fn alloc_local_slot(&mut self, name_id: NameId, name_str: &str) -> u32 {
+    fn alloc_local_slot(&mut self, name_id: NameId, name_str: &str, default: Expr) -> u32 {
         let slot = self.next_local_slot;
         self.next_local_slot += 1;
         self.local_slots.insert(name_id, slot);
         self.current_slot_names.push(name_str.to_string());
+        self.current_local_defaults.push(default);
         slot
     }
 
@@ -284,6 +288,7 @@ impl Compiler {
         let name_str = format!("_tmp{}", slot);
         let name_id = self.alloc_name_id(name_str);
         self.current_slot_names.push(format!("_tmp{}", slot));
+        self.current_local_defaults.push(Expr::Unit);
         VarSlot::Local(slot, name_id)
     }
 
@@ -306,15 +311,6 @@ impl Compiler {
         let id = NameId(self.next_name_id);
         self.next_name_id += 1;
         self.id_to_name.insert(id, display_name);
-        id
-    }
-
-    /// Allocates a new, unique temporary variable NameId.
-    fn new_temp_var(&mut self, locals: &mut Vec<(NameId, Expr)>) -> NameId {
-        let name = format!("_tmp{}", self.temp_counter);
-        self.temp_counter += 1;
-        let id = self.alloc_name_id(name);
-        locals.push((id, Expr::Nil));
         id
     }
 
@@ -423,7 +419,7 @@ impl Compiler {
             name: func_name_id,
             param_count: 0,
             local_slot_count: self.next_local_slot,
-            local_defaults: vec![Expr::Unit], // Just the return slot default
+            local_defaults: self.current_local_defaults.clone(),
             is_sync: true,
             debug_slot_names: self.current_slot_names.clone(),
         }
@@ -442,8 +438,7 @@ impl Compiler {
         self.begin_function(&params);
 
         // Scan the body for all local variable declarations and assign them slots
-        // This also collects default values for each slot
-        let local_defaults = self.scan_and_assign_slots(&func.body);
+        self.scan_and_assign_slots(&func.body);
 
         // Allocate a temp slot for the return value
         let return_slot = self.alloc_temp_slot();
@@ -471,33 +466,25 @@ impl Compiler {
         let qualified_name = format!("{}.{}", qualifier, func.original_name);
         self.func_name_to_id.insert(qualified_name, func.name);
 
-        // Collect local defaults (excluding params, which don't have defaults)
-        // Add Unit for the return slot
-        let mut all_defaults = local_defaults;
-        all_defaults.push(Expr::Unit); // return slot default
-
         FunctionInfo {
             entry,
             name: func.name,
             param_count,
             local_slot_count: self.next_local_slot,
-            local_defaults: all_defaults,
+            local_defaults: self.current_local_defaults.clone(),
             is_sync: func.is_sync,
             debug_slot_names: self.current_slot_names.clone(),
         }
     }
 
     /// Scan the function body for all local variable declarations and assign them slots.
-    /// Returns default values for each local slot (excluding params).
-    fn scan_and_assign_slots(&mut self, body: &[TypedStatement]) -> Vec<Expr> {
-        let mut defaults = Vec::new();
+    fn scan_and_assign_slots(&mut self, body: &[TypedStatement]) {
         for stmt in body {
-            self.scan_stmt_and_assign_slots(stmt, &mut defaults);
+            self.scan_stmt_and_assign_slots(stmt);
         }
-        defaults
     }
 
-    fn scan_stmt_and_assign_slots(&mut self, stmt: &TypedStatement, defaults: &mut Vec<Expr>) {
+    fn scan_stmt_and_assign_slots(&mut self, stmt: &TypedStatement) {
         match &stmt.kind {
             TypedStatementKind::VarInit(init) => {
                 let name_str = self
@@ -505,16 +492,15 @@ impl Compiler {
                     .get(&init.name)
                     .cloned()
                     .unwrap_or_else(|| format!("var_{}", init.name.0));
-                self.alloc_local_slot(init.name, &name_str);
-                defaults.push(Expr::Nil); // Placeholder, actual init handled by CFG
+                self.alloc_local_slot(init.name, &name_str, Expr::Nil);
             }
             TypedStatementKind::Conditional(cond) => {
-                self.scan_body_and_assign_slots(&cond.if_branch.body, defaults);
+                self.scan_body_and_assign_slots(&cond.if_branch.body);
                 for branch in &cond.elseif_branches {
-                    self.scan_body_and_assign_slots(&branch.body, defaults);
+                    self.scan_body_and_assign_slots(&branch.body);
                 }
                 if let Some(body) = &cond.else_branch {
-                    self.scan_body_and_assign_slots(body, defaults);
+                    self.scan_body_and_assign_slots(body);
                 }
             }
             TypedStatementKind::ForLoop(fl) => {
@@ -524,34 +510,32 @@ impl Compiler {
                         .get(&init.name)
                         .cloned()
                         .unwrap_or_else(|| format!("var_{}", init.name.0));
-                    self.alloc_local_slot(init.name, &name_str);
-                    defaults.push(Expr::Nil);
+                    self.alloc_local_slot(init.name, &name_str, Expr::Nil);
                 }
-                self.scan_body_and_assign_slots(&fl.body, defaults);
+                self.scan_body_and_assign_slots(&fl.body);
             }
             TypedStatementKind::ForInLoop(loop_stmt) => {
-                self.scan_pattern_and_assign_slots(&loop_stmt.pattern, defaults);
-                self.scan_body_and_assign_slots(&loop_stmt.body, defaults);
+                self.scan_pattern_and_assign_slots(&loop_stmt.pattern);
+                self.scan_body_and_assign_slots(&loop_stmt.body);
             }
             _ => {}
         }
     }
 
-    fn scan_body_and_assign_slots(&mut self, body: &[TypedStatement], defaults: &mut Vec<Expr>) {
+    fn scan_body_and_assign_slots(&mut self, body: &[TypedStatement]) {
         for stmt in body {
-            self.scan_stmt_and_assign_slots(stmt, defaults);
+            self.scan_stmt_and_assign_slots(stmt);
         }
     }
 
-    fn scan_pattern_and_assign_slots(&mut self, pat: &TypedPattern, defaults: &mut Vec<Expr>) {
+    fn scan_pattern_and_assign_slots(&mut self, pat: &TypedPattern) {
         match &pat.kind {
             TypedPatternKind::Var(id, name) => {
-                self.alloc_local_slot(*id, name);
-                defaults.push(Expr::Nil);
+                self.alloc_local_slot(*id, name, Expr::Nil);
             }
             TypedPatternKind::Tuple(pats) => {
                 for p in pats {
-                    self.scan_pattern_and_assign_slots(p, defaults);
+                    self.scan_pattern_and_assign_slots(p);
                 }
             }
             _ => {} // Wildcard doesn't add a named local
@@ -777,27 +761,21 @@ impl Compiler {
         let lhs = self.convert_pattern(&loop_stmt.pattern);
         // Allocate a slot for the iterator state (the remaining collection)
         let iter_state_slot = self.alloc_temp_slot();
+        let iterable_expr = self.convert_simple_expr(&loop_stmt.iterable);
+
         let for_label = Label::ForLoopIn(
             lhs,
-            Expr::Var(iter_state_slot), // The collection being iterated
-            iter_state_slot,            // Iterator state slot
-            body_vertex,                // On iteration, go to body
-            next_vertex,                // When done, exit loop
+            iterable_expr,   // The collection expression
+            iter_state_slot, // Iterator state slot
+            body_vertex,     // On iteration, go to body
+            next_vertex,     // When done, exit loop
         );
 
         // Replace the dummy label with the real one.
         self.cfg[for_vertex] = for_label;
 
-        // Compile the [Iterable] expression.
-        // This `Copy` instruction runs once, then goes to the [ForLoopIn] label.
-        let iterable_expr = self.convert_simple_expr(&loop_stmt.iterable);
-        let copy_vertex = self.add_label(Label::Instr(
-            Instr::Copy(Lhs::Var(iter_state_slot), iterable_expr),
-            for_vertex, // After copy, go to the loop head
-        ));
-
-        // The entry point to the whole statement is the `Copy` instruction.
-        copy_vertex
+        // The entry point to the whole statement is the for_vertex.
+        for_vertex
     }
 
     // Helper to generate temp slots and Expr::Var expressions for a list
@@ -1499,82 +1477,13 @@ impl Compiler {
             TypedPatternKind::Tuple(pats) => {
                 let names = pats
                     .iter()
-                    .map(|p| {
-                        match &p.kind {
-                            TypedPatternKind::Var(id, _name) => self.resolve_slot(*id),
-                            _ => self.alloc_temp_slot(), // Use dummy var for wildcard/unit
-                        }
+                    .map(|p| match &p.kind {
+                        TypedPatternKind::Var(id, _name) => self.resolve_slot(*id),
+                        _ => self.alloc_temp_slot(), // Use dummy var for wildcard/unit
                     })
                     .collect();
                 Lhs::Tuple(names)
             }
-        }
-    }
-
-    fn scan_body(&mut self, body: &[TypedStatement]) -> Vec<(NameId, Expr)> {
-        let mut locals = Vec::new();
-        for stmt in body {
-            self.scan_stmt_for_locals(stmt, &mut locals);
-        }
-        locals
-    }
-
-    fn scan_body_for_locals(&mut self, body: &[TypedStatement], locals: &mut Vec<(NameId, Expr)>) {
-        for stmt in body {
-            self.scan_stmt_for_locals(stmt, locals);
-        }
-    }
-
-    fn scan_stmt_for_locals(&mut self, stmt: &TypedStatement, locals: &mut Vec<(NameId, Expr)>) {
-        match &stmt.kind {
-            TypedStatementKind::VarInit(init) => {
-                // `let x = ...` adds a local
-                locals.push((
-                    init.name,
-                    Expr::Nil, // Use placeholder, actual init is handled by CFG
-                ));
-            }
-            TypedStatementKind::Conditional(cond) => {
-                self.scan_body_for_locals(&cond.if_branch.body, locals);
-                for branch in &cond.elseif_branches {
-                    self.scan_body_for_locals(&branch.body, locals);
-                }
-                if let Some(body) = &cond.else_branch {
-                    self.scan_body_for_locals(body, locals);
-                }
-            }
-            TypedStatementKind::ForLoop(fl) => {
-                // This is the C-style loop, which might have an init
-                if let Some(TypedForLoopInit::VarInit(init)) = &fl.init {
-                    locals.push((
-                        init.name,
-                        Expr::Nil, // Use placeholder
-                    ));
-                }
-                self.scan_body_for_locals(&fl.body, locals);
-            }
-            TypedStatementKind::ForInLoop(loop_stmt) => {
-                // `for (x, y) in ...` adds locals
-                self.scan_pattern_for_locals(&loop_stmt.pattern, locals);
-                self.scan_body_for_locals(&loop_stmt.body, locals);
-            }
-            // Other statements don't declare locals
-            _ => {}
-        }
-    }
-
-    fn scan_pattern_for_locals(&mut self, pat: &TypedPattern, locals: &mut Vec<(NameId, Expr)>) {
-        match &pat.kind {
-            TypedPatternKind::Var(id, _name) => {
-                // `ENil` is just a placeholder default
-                locals.push((*id, Expr::Nil));
-            }
-            TypedPatternKind::Tuple(pats) => {
-                for p in pats {
-                    self.scan_pattern_for_locals(p, locals);
-                }
-            }
-            _ => {} // Wildcard, Unit don't add named locals
         }
     }
 }

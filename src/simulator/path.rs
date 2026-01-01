@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, RuntimeError, State,
-    UpdatePolicy, Value, eval, exec, exec_sync_on_node, make_local_env, schedule_record,
+    UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env, schedule_record,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use crate::simulator::path::plan::{

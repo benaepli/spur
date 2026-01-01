@@ -1,6 +1,6 @@
-use crate::compiler::cfg::{Instr, Label, Lhs, Program, Vertex};
+use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Env, Logger, RuntimeError, State, Value, eval, exec_sync_on_node, make_local_env,
+    Env, Logger, RuntimeError, State, Value, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
