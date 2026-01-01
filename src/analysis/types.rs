@@ -14,7 +14,6 @@ pub enum Type {
     Role(NameId, String),
     Optional(Box<Type>),
     Chan(Box<Type>),
-    Lock,
 
     // Placeholder types.
     EmptyList,
@@ -43,7 +42,6 @@ impl std::fmt::Display for Type {
             Type::Role(_, name) => write!(f, "{}", name),
             Type::Optional(t) => write!(f, "{}?", t),
             Type::Chan(t) => write!(f, "chan<{}>", t),
-            Type::Lock => write!(f, "lock"),
             Type::EmptyList => write!(f, "empty list"),
             Type::EmptyMap => write!(f, "empty map"),
             Type::UnknownChannel => write!(f, "unknown channel"),
@@ -94,7 +92,6 @@ pub enum TypedExprKind {
     Send(Box<TypedExpr>, Box<TypedExpr>),
     Recv(Box<TypedExpr>),
 
-    CreateLock,
     SetTimer,
 
     Index(Box<TypedExpr>, Box<TypedExpr>),
@@ -138,7 +135,6 @@ pub enum TypedStatementKind {
     ForLoop(TypedForLoop),
     ForInLoop(TypedForInLoop),
     Break,
-    Lock(Box<TypedExpr>, Vec<TypedStatement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

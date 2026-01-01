@@ -105,8 +105,6 @@ pub enum TokenKind {
     Make,
     Send,
     Recv,
-    Lock,
-    CreateLock,
     SetTimer,
     Store,
 }
@@ -180,8 +178,6 @@ impl fmt::Display for TokenKind {
             TokenKind::Make => write!(f, "make"),
             TokenKind::Send => write!(f, "send"),
             TokenKind::Recv => write!(f, "recv"),
-            TokenKind::Lock => write!(f, "lock"),
-            TokenKind::CreateLock => write!(f, "create_lock"),
             TokenKind::SetTimer => write!(f, "set_timer"),
             TokenKind::Store => write!(f, "store"),
         }
@@ -222,8 +218,6 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "make" => TokenKind::Make,
     "send" => TokenKind::Send,
     "recv" => TokenKind::Recv,
-    "lock" => TokenKind::Lock,
-    "create_lock" => TokenKind::CreateLock,
     "set_timer" => TokenKind::SetTimer,
     "store" => TokenKind::Store,
 };

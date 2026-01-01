@@ -80,7 +80,6 @@ pub enum TypeDefKind {
     Tuple(Vec<TypeDef>),
     Optional(Box<TypeDef>),
     Chan(Box<TypeDef>),
-    Lock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,7 +110,6 @@ pub enum StatementKind {
     ForLoop(ForLoop),
     ForInLoop(ForInLoop),
     Break,
-    Lock(Expr, Vec<Statement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -232,7 +230,6 @@ pub enum ExprKind {
     MakeChannel(Box<Expr>),
     Send(Box<Expr>, Box<Expr>),
     Recv(Box<Expr>),
-    CreateLock,
     SetTimer,
 
     // Postfix operations
@@ -374,11 +371,6 @@ where
             span: e.span(),
         });
 
-        let lock_type = just(TokenKind::Lock).map_with(|_, e| TypeDef {
-            kind: TypeDefKind::Lock,
-            span: e.span(),
-        });
-
         let map = just(TokenKind::Map)
             .ignore_then(
                 type_def
@@ -425,7 +417,7 @@ where
                 span: e.span(),
             });
 
-        let base_type = choice((named, lock_type, map, list, tuple, chan_type));
+        let base_type = choice((named, map, list, tuple, chan_type));
 
         base_type
             .clone()
@@ -580,7 +572,6 @@ where
             one_arg_builtin(TokenKind::Make, ExprKind::MakeChannel),
             two_arg_builtin(TokenKind::Send, ExprKind::Send),
             one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
-            zero_arg_builtin(TokenKind::CreateLock, ExprKind::CreateLock),
             zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
             func_call.clone().map(ExprKind::FuncCall),
             ident.clone().map(ExprKind::Var),
@@ -874,16 +865,6 @@ where
                 .map_with(move |expr, e| Statement::new(constructor(expr), e.span()))
         };
 
-        let lock_stmt = just(TokenKind::Lock)
-            .ignore_then(
-                expr.clone()
-                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-            )
-            .then(block())
-            .map_with(|(lock_expr, body), e| {
-                Statement::new(StatementKind::Lock(lock_expr, body), e.span())
-            });
-
         choice((
             cond_stmts,
             var_init_stmt,
@@ -896,7 +877,6 @@ where
             simple_stmt(TokenKind::Return, StatementKind::Return),
             for_loop,
             for_in_loop,
-            lock_stmt,
             just(TokenKind::Break)
                 .then_ignore(just(TokenKind::Semicolon).or_not())
                 .map_with(|_, e| Statement::new(StatementKind::Break, e.span())),

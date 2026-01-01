@@ -1,6 +1,4 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, SELF_NAME};
@@ -8,7 +6,7 @@ use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, RuntimeError, State,
     UpdatePolicy, Value, eval, exec, exec_sync_on_node, schedule_record,
 };
-use crate::simulator::coverage::GlobalState;
+use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use crate::simulator::path::plan::{
     ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
@@ -44,6 +42,7 @@ impl Logger for Logs {
 #[derive(Debug)]
 pub struct PathState {
     pub state: State,
+    pub coverage: LocalCoverage,
     pub logs: Logs,
     pub history: Vec<Operation>,
     pub free_clients: Vec<i32>,
@@ -53,6 +52,7 @@ impl PathState {
     pub fn new(node_count: usize) -> Self {
         Self {
             state: State::new(node_count),
+            coverage: LocalCoverage::new(),
             logs: Logs::default(),
             history: Vec::new(),
             free_clients: Vec::new(),
@@ -61,7 +61,7 @@ impl PathState {
 }
 
 fn create_env(
-    node_env: &Rc<RefCell<Env>>,
+    node_env: &Env,
     formals: &[NameId],
     actuals: Vec<Value>,
     locals: &[(NameId, crate::compiler::cfg::Expr)],
@@ -76,9 +76,8 @@ fn create_env(
 
     let mut env: Env = formals.iter().copied().zip(actuals).collect();
 
-    let node_env_ref = node_env.borrow();
     for (name, default_expr) in locals {
-        env.insert(*name, eval(&env, &node_env_ref, default_expr)?);
+        env.insert(*name, eval(&env, node_env, default_expr)?);
     }
 
     Ok(env)
@@ -91,6 +90,7 @@ fn recover_node<L: Logger>(
     prog: &Program,
     node_id: usize,
     global_state: &GlobalState,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
     let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
         return Ok(());
@@ -111,11 +111,10 @@ fn recover_node<L: Logger>(
     for (i, formal) in recover_fn.formals.iter().enumerate() {
         env.insert(*formal, actuals[i].clone());
     }
-    let node_env = state.nodes[node_id].borrow();
+    let node_env = &state.nodes[node_id];
     for (name, expr) in &recover_fn.locals {
-        env.insert(*name, eval(&env, &node_env, expr)?);
+        env.insert(*name, eval(&env, node_env, expr)?);
     }
-    drop(node_env);
 
     let record = Record {
         pc: recover_fn.entry,
@@ -127,7 +126,7 @@ fn recover_node<L: Logger>(
         policy: UpdatePolicy::Identity,
     };
 
-    exec(state, logger, prog, record, Some(&global_state.coverage))?;
+    exec(state, logger, prog, record, Some(&global_state.coverage), local_coverage)?;
     Ok(())
 }
 
@@ -138,6 +137,7 @@ fn reinit_node<L: Logger>(
     prog: &Program,
     node_id: usize,
     global_state: &GlobalState,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
     let init_fn = prog
         .get_func_by_name("Node.BASE_NODE_INIT")
@@ -145,24 +145,22 @@ fn reinit_node<L: Logger>(
 
     let mut env = Env::default();
     env.insert(SELF_NAME, Value::Node(node_id));
-    let node_env = state.nodes[node_id].borrow();
+    let node_env = &state.nodes[node_id];
     for (name, expr) in &init_fn.locals {
-        env.insert(*name, eval(&env, &node_env, expr)?);
+        env.insert(*name, eval(&env, node_env, expr)?);
     }
-    drop(node_env);
 
-    exec_sync_on_node(state, logger, prog, &mut env, node_id, init_fn.entry)?;
+    exec_sync_on_node(state, logger, prog, &mut env, node_id, init_fn.entry, local_coverage)?;
 
-    recover_node(topology, state, logger, prog, node_id, global_state)
+    recover_node(topology, state, logger, prog, node_id, global_state, local_coverage)
 }
 
 fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
-    let ci = &mut state.crash_info;
-
-    if !ci.currently_crashed.insert(node_id) {
+    if state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is already crashed", node_id);
         return;
     }
+    state.crash_info.currently_crashed.insert(node_id);
 
     history.push(Operation {
         client_id: -1,
@@ -172,19 +170,16 @@ fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
         unique_id: -1,
     });
 
-    let (crashed, alive): (Vec<_>, Vec<_>) = state
-        .runnable_records
-        .drain(..)
-        .partition(|r| r.node == node_id);
-
-    state.runnable_records = alive;
-
-    for record in crashed {
-        let is_external = record.origin_node != record.node;
-        let origin_alive = !ci.currently_crashed.contains(&record.origin_node);
-
-        if is_external && origin_alive {
-            ci.queued_messages.push((node_id, record));
+    let records = std::mem::take(&mut state.runnable_records);
+    for record in records {
+        if record.node == node_id {
+            let is_external = record.origin_node != record.node;
+            let origin_alive = !state.crash_info.currently_crashed.contains(&record.origin_node);
+            if is_external && origin_alive {
+                state.crash_info.queued_messages.push_back((node_id, record));
+            }
+        } else {
+            state.runnable_records.push_back(record);
         }
     }
 }
@@ -197,11 +192,13 @@ fn recover_crashed_node<L: Logger>(
     topology: &TopologyInfo,
     node_id: usize,
     global_state: &GlobalState,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
-    if !state.crash_info.currently_crashed.remove(&node_id) {
+    if !state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is not crashed", node_id);
         return Ok(());
     }
+    state.crash_info.currently_crashed.remove(&node_id);
 
     history.push(Operation {
         client_id: -1,
@@ -211,20 +208,17 @@ fn recover_crashed_node<L: Logger>(
         unique_id: -1,
     });
 
-    state.nodes[node_id] = Rc::new(RefCell::new(Env::default()));
-    reinit_node(topology, state, logger, prog, node_id, global_state)?;
+    state.nodes[node_id] = Env::default();
+    reinit_node(topology, state, logger, prog, node_id, global_state, local_coverage)?;
 
-    let mut queued_for_node = Vec::new();
-    let mut remaining = Vec::new();
-    for (dest, record) in std::mem::take(&mut state.crash_info.queued_messages) {
+    let queued = std::mem::take(&mut state.crash_info.queued_messages);
+    for (dest, record) in queued {
         if dest == node_id {
-            queued_for_node.push(record);
+            state.runnable_records.push_back(record);
         } else {
-            remaining.push((dest, record));
+            state.crash_info.queued_messages.push_back((dest, record));
         }
     }
-    state.crash_info.queued_messages = remaining;
-    state.runnable_records.extend(queued_for_node);
     Ok(())
 }
 
@@ -276,7 +270,7 @@ fn schedule_client_op(
         unique_id: op_id,
     });
 
-    state.runnable_records.push(Record {
+    state.runnable_records.push_back(Record {
         pc: op_func.entry,
         node: client_id as usize,
         origin_node: client_id as usize,
@@ -341,7 +335,11 @@ pub fn exec_plan(
                     }
                 }
                 EventAction::CrashNode(node_id) => {
-                    crash_node(&mut path_state.state, &mut path_state.history, *node_id as usize);
+                    crash_node(
+                        &mut path_state.state,
+                        &mut path_state.history,
+                        *node_id as usize,
+                    );
                     engine.mark_event_completed(node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
@@ -353,6 +351,7 @@ pub fn exec_plan(
                         &topology,
                         *node_id as usize,
                         &global_state,
+                        &mut path_state.coverage,
                     )?;
                     engine.mark_event_completed(node_idx);
                 }
@@ -373,6 +372,7 @@ pub fn exec_plan(
                 &[],
                 randomly_delay_msgs,
                 Some(&global_state.coverage),
+                &mut path_state.coverage,
             )?;
 
             if let Some(result) = result {

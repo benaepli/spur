@@ -1,6 +1,6 @@
 use crate::compiler::cfg::{Program, SELF_NAME};
 use crate::simulator::core::{Env, Logger, RuntimeError, State, Value, eval, exec_sync_on_node};
-use crate::simulator::coverage::GlobalState;
+use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
@@ -170,6 +170,7 @@ fn initialize_state<L: Logger>(
     logger: &mut L,
     num_servers: usize,
     num_clients: usize,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<State, RuntimeError> {
     let mut state = State::new(num_servers + num_clients);
 
@@ -178,12 +179,19 @@ fn initialize_state<L: Logger>(
             let client_id = num_servers + i;
             let mut env = Env::default();
             env.insert(SELF_NAME, Value::Node(client_id));
-            let node_env = state.nodes[client_id].borrow();
+            let node_env = &state.nodes[client_id];
             for (name, expr) in &init_fn.locals {
-                env.insert(*name, eval(&env, &node_env, expr)?);
+                env.insert(*name, eval(&env, node_env, expr)?);
             }
-            drop(node_env);
-            exec_sync_on_node(&mut state, logger, program, &mut env, client_id, init_fn.entry)?;
+            exec_sync_on_node(
+                &mut state,
+                logger,
+                program,
+                &mut env,
+                client_id,
+                init_fn.entry,
+                local_coverage,
+            )?;
         }
     }
 
@@ -191,12 +199,19 @@ fn initialize_state<L: Logger>(
         for node_id in 0..num_servers {
             let mut env = Env::default();
             env.insert(SELF_NAME, Value::Node(node_id));
-            let node_env = state.nodes[node_id].borrow();
+            let node_env = &state.nodes[node_id];
             for (name, expr) in &init_fn.locals {
-                env.insert(*name, eval(&env, &node_env, expr)?);
+                env.insert(*name, eval(&env, node_env, expr)?);
             }
-            drop(node_env);
-            exec_sync_on_node(&mut state, logger, program, &mut env, node_id, init_fn.entry)?;
+            exec_sync_on_node(
+                &mut state,
+                logger,
+                program,
+                &mut env,
+                node_id,
+                init_fn.entry,
+                local_coverage,
+            )?;
         }
     }
 
@@ -208,6 +223,7 @@ fn init_topology<L: Logger>(
     logger: &mut L,
     program: &Program,
     num_servers: usize,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
     let init_fn_name = "Node.Init";
     let Some(init_fn) = program.get_func_by_name(init_fn_name) else {
@@ -225,7 +241,7 @@ fn init_topology<L: Logger>(
             env.insert(*formal, actuals[i].clone());
         }
 
-        exec_sync_on_node(state, logger, program, &mut env, node_id, init_fn.entry)?;
+        exec_sync_on_node(state, logger, program, &mut env, node_id, init_fn.entry, local_coverage)?;
     }
     Ok(())
 }
@@ -265,14 +281,20 @@ pub fn run_single_simulation(
     path_state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
 
     // Initialize state
-    path_state.state = initialize_state(program, &mut path_state.logs, num_servers, num_clients)?;
+    path_state.state = initialize_state(program, &mut path_state.logs, num_servers, num_clients, &mut path_state.coverage)?;
 
     let topology_info = TopologyInfo {
         topology: Topology::Full,
         num_servers: config.num_servers,
     };
 
-    init_topology(&mut path_state.state, &mut path_state.logs, program, num_servers)?;
+    init_topology(
+        &mut path_state.state,
+        &mut path_state.logs,
+        program,
+        num_servers,
+        &mut path_state.coverage,
+    )?;
 
     exec_plan(
         &mut path_state,
@@ -284,9 +306,9 @@ pub fn run_single_simulation(
         global_state,
     )?;
 
-    let plan_score = path_state.state.coverage.plan_score();
+    let plan_score = path_state.coverage.plan_score();
 
-    global_state.coverage.merge(&path_state.state.coverage);
+    global_state.coverage.merge(&path_state.coverage);
     canonical.as_ref().map(|x| global_state.insert(x));
 
     let serialized = serialize_history(&path_state.history);

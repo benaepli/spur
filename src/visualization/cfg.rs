@@ -108,8 +108,6 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             | Label::MakeChannel(_, _, next)
             | Label::Send(_, _, next)
             | Label::Recv(_, _, next)
-            | Label::Lock(_, next)
-            | Label::Unlock(_, next)
             | Label::SpinAwait(_, next) => {
                 edge(*next, None, None, Some("#555555"))?;
             }
@@ -215,17 +213,6 @@ fn generate_html_label(prog: &Program, v: usize, label: &Label) -> (String, Stri
                 "<B>Recv</B><BR/>{} &lt;- {}",
                 html_escape(&pretty_lhs(prog, lhs)),
                 html_escape(&pretty_expr(prog, chan))
-            );
-        }
-        Label::Lock(expr, _) => {
-            header_color = "#FFECB3";
-            content = format!("<B>Lock</B><BR/>{}", html_escape(&pretty_expr(prog, expr)));
-        }
-        Label::Unlock(expr, _) => {
-            header_color = "#FFECB3";
-            content = format!(
-                "<B>Unlock</B><BR/>{}",
-                html_escape(&pretty_expr(prog, expr))
             );
         }
         Label::Pause(_) => {
@@ -444,7 +431,6 @@ fn pretty_expr(prog: &Program, expr: &Expr) -> String {
         Expr::Nil => "nil".into(),
         Expr::Unwrap(e) => format!("{}!", pretty_expr(prog, e)),
         Expr::Coalesce(l, r) => format!("{} ?? {}", pretty_expr(prog, l), pretty_expr(prog, r)),
-        Expr::CreateLock => "create_lock()".into(),
         Expr::SetTimer => "set_timer()".into(),
         Expr::Some(e) => format!("Some({})", pretty_expr(prog, e)),
         Expr::IntToString(e) => format!("int_to_string({})", pretty_expr(prog, e)),
@@ -494,9 +480,7 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         | Label::Send(_, _, n)
         | Label::Recv(_, _, n)
         | Label::SpinAwait(_, n)
-        | Label::Print(_, n)
-        | Label::Lock(_, n)
-        | Label::Unlock(_, n) => vec![*n],
+        | Label::Print(_, n) => vec![*n],
         Label::Cond(_, t, e) => vec![*t, *e],
         Label::ForLoopIn(_, _, body, next) => vec![*body, *next],
         Label::Break(t) => vec![*t],

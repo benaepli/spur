@@ -2,16 +2,12 @@ use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, Instr, Label, Lhs, Program, SELF_NAME, Vertex};
 use crate::simulator::coverage::{GlobalCoverage, LocalCoverage};
 use ecow::EcoString;
-use imbl::{HashMap as ImHashMap, Vector};
-use rustc_hash::FxHashMap;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use imbl::{OrdMap, HashMap as ImHashMap, HashSet as ImHashSet, Vector, HashMap};
 use std::fmt::Debug;
-use std::rc::Rc;
 use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use thiserror::Error;
 
@@ -59,9 +55,6 @@ pub enum RuntimeError {
     #[error("for-loop requires collection, got {got}")]
     ForLoopNotCollection { got: &'static str },
 
-    #[error("attempted to unlock an already-unlocked lock")]
-    UnlockAlreadyUnlocked,
-
     #[error("cannot read remote channel directly")]
     RemoteChannelRead,
 
@@ -97,14 +90,6 @@ pub trait Logger {
     fn log(&mut self, entry: LogEntry);
 }
 
-/// A no-op logger that discards all log entries.
-#[derive(Debug, Default)]
-pub struct NoOpLogger;
-
-impl Logger for NoOpLogger {
-    fn log(&mut self, _entry: LogEntry) {}
-}
-
 #[derive(Clone, Debug)]
 pub enum Value {
     Int(i64),
@@ -113,7 +98,6 @@ pub enum Value {
     List(Vector<Value>),
     Option(Option<Arc<Value>>),
     Channel(ChannelId),
-    Lock(Arc<Mutex<bool>>),
     Node(usize),
     String(EcoString),
     Unit,
@@ -133,7 +117,6 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
             (Value::Channel(a), Value::Channel(b)) => a == b,
-            (Value::Lock(a), Value::Lock(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -166,13 +149,6 @@ impl Ord for Value {
                 a_vec.cmp(&b_vec)
             }
             (Channel(a), Channel(b)) => a.cmp(b),
-            (Lock(a), Lock(b)) => {
-                if Arc::ptr_eq(a, b) {
-                    Ordering::Equal
-                } else {
-                    Ordering::Less
-                }
-            } // Arbitrary
             // Cross-type comparisons (simple deterministic ordering)
             (Int(_), _) => Ordering::Less,
             (_, Int(_)) => Ordering::Greater,
@@ -192,8 +168,6 @@ impl Ord for Value {
             (_, List(_)) => Ordering::Greater,
             (Map(_), _) => Ordering::Less,
             (_, Map(_)) => Ordering::Greater,
-            (Channel(_), _) => Ordering::Less,
-            (_, Channel(_)) => Ordering::Greater,
         }
     }
 }
@@ -220,7 +194,6 @@ impl Hash for Value {
                 }
             }
             Value::Channel(c) => c.hash(state),
-            Value::Lock(l) => (Arc::as_ptr(l) as usize).hash(state),
         }
     }
 }
@@ -236,7 +209,6 @@ impl std::fmt::Display for Value {
             Value::Option(None) => write!(f, "None"),
             Value::Option(Some(v)) => write!(f, "Some({})", v),
             Value::Channel(ch) => write!(f, "channel({}, {})", ch.node, ch.id),
-            Value::Lock(_) => write!(f, "<lock>"),
             Value::Tuple(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
@@ -280,7 +252,6 @@ impl Value {
             Value::List(_) => "list",
             Value::Option(_) => "option",
             Value::Channel(_) => "channel",
-            Value::Lock(_) => "lock",
             Value::Node(_) => "node",
             Value::String(_) => "string",
             Value::Unit => "unit",
@@ -346,19 +317,9 @@ impl Value {
             })
         }
     }
-    fn as_lock(&self) -> Result<&Arc<Mutex<bool>>, RuntimeError> {
-        if let Value::Lock(l) = self {
-            Ok(l)
-        } else {
-            Err(RuntimeError::TypeError {
-                expected: "lock",
-                got: self.type_name(),
-            })
-        }
-    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Record {
     pub pc: Vertex,
     pub node: usize,
@@ -384,20 +345,31 @@ impl UpdatePolicy {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CrashInfo {
-    pub currently_crashed: HashSet<usize>,
-    pub queued_messages: Vec<(usize, Record)>, // (dest_node, record)
+    pub currently_crashed: ImHashSet<usize>,
+    pub queued_messages: Vector<(usize, Record)>, // (dest_node, record)
     pub current_step: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChannelState {
     pub capacity: i32,
-    pub buffer: VecDeque<Value>,
+    pub buffer: Vector<Value>,
     // We move Record out of Runnable and into Waiting.
-    pub waiting_readers: VecDeque<(Record, Lhs)>,
-    pub waiting_writers: VecDeque<(Record, Value)>,
+    pub waiting_readers: Vector<(Record, Lhs)>,
+    pub waiting_writers: Vector<(Record, Value)>,
+}
+
+impl ChannelState {
+    pub fn new(capacity: i32) -> Self {
+        Self {
+            capacity,
+            buffer: Vector::new(),
+            waiting_readers: Vector::new(),
+            waiting_writers: Vector::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -417,30 +389,26 @@ pub struct Operation {
     pub unique_id: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct State {
-    pub nodes: Vec<Rc<RefCell<Env>>>, // Index is node_id
-    pub runnable_records: Vec<Record>,
-    pub channels: HashMap<ChannelId, ChannelState>,
+    pub nodes: Vector<Env>, // Index is node_id
+    pub runnable_records: Vector<Record>,
+    pub channels: ImHashMap<ChannelId, ChannelState>,
     pub crash_info: CrashInfo,
-    pub coverage: LocalCoverage,
     next_channel_id: usize,
 }
 
 impl State {
     pub fn new(node_count: usize) -> Self {
         Self {
-            nodes: (0..node_count)
-                .map(|_| Rc::new(RefCell::new(Env::default())))
-                .collect(),
-            runnable_records: Vec::new(),
-            channels: HashMap::new(),
+            nodes: (0..node_count).map(|_| Env::default()).collect(),
+            runnable_records: Vector::new(),
+            channels: ImHashMap::new(),
             crash_info: CrashInfo {
-                currently_crashed: HashSet::new(),
-                queued_messages: Vec::new(),
+                currently_crashed: ImHashSet::new(),
+                queued_messages: Vector::new(),
                 current_step: 0,
             },
-            coverage: LocalCoverage::new(),
             next_channel_id: 0,
         }
     }
@@ -459,13 +427,11 @@ fn iter_name_id(pc: Vertex) -> NameId {
     NameId(usize::MAX - 1 - pc)
 }
 
-pub type Env = FxHashMap<NameId, Value>;
+pub type Env = OrdMap<NameId, Value>;
 
 /// Continuation representing what to do when an execution completes.
 #[derive(Debug, Clone)]
 pub enum Continuation {
-    /// No action needed
-    NoOp,
     /// Node recovery continuation
     Recover,
     /// Async message delivery continuation
@@ -542,17 +508,19 @@ impl Continuation {
     /// Execute the continuation and return any client operation result.
     pub fn call(self, state: &mut State, val: Value) -> Option<ClientOpResult> {
         match self {
-            Continuation::NoOp | Continuation::Recover => None,
+            Continuation::Recover => None,
             Continuation::Async { chan_id } => {
-                let chan = state.channels.get_mut(&chan_id).unwrap();
+                let mut chan = state.channels.get(&chan_id).unwrap().clone();
                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                    let node_env: Rc<RefCell<Env>> = Rc::clone(&state.nodes[reader.node]);
+                    let mut node_env = state.nodes[reader.node].clone();
                     // Note: store errors in continuations are ignored (fire-and-forget)
-                    let _ = store(&lhs, val, &mut reader.env, &mut node_env.borrow_mut());
-                    state.runnable_records.push(reader);
+                    let _ = store(&lhs, val, &mut reader.env, &mut node_env);
+                    state.nodes[reader.node] = node_env;
+                    state.runnable_records.push_back(reader);
                 } else {
                     chan.buffer.push_back(val);
                 }
+                state.channels.insert(chan_id, chan);
                 None
             }
             Continuation::ClientOp {
@@ -660,7 +628,6 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
                 got: other.type_name(),
             }),
         },
-        Expr::CreateLock => Ok(Value::Lock(Arc::new(Mutex::new(false)))),
         Expr::ListPrepend(head, tail) => {
             let h = eval(local_env, node_env, head)?;
             let t = eval(local_env, node_env, tail)?.as_list()?.clone();
@@ -783,18 +750,22 @@ pub fn exec_sync_on_node<L: Logger>(
     local_env: &mut Env,
     node_id: usize,
     start_pc: usize,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<Value, RuntimeError> {
-    let node_env = Rc::clone(&state.nodes[node_id]);
-    exec_sync_inner(
+    let mut node_env = state.nodes[node_id].clone();
+    let result = exec_sync_inner(
         state,
         logger,
         program,
         local_env,
-        &mut node_env.borrow_mut(),
+        &mut node_env,
         start_pc,
         node_id,
         None,
-    )
+        local_coverage,
+    );
+    state.nodes[node_id] = node_env;
+    result
 }
 
 fn exec_sync_inner<L: Logger>(
@@ -806,6 +777,7 @@ fn exec_sync_inner<L: Logger>(
     start_pc: usize,
     node_id: usize,
     global_coverage: Option<&GlobalCoverage>,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<Value, RuntimeError> {
     let mut pc = start_pc;
     let mut prev_pc = pc;
@@ -814,7 +786,7 @@ fn exec_sync_inner<L: Logger>(
             let rarity = global_coverage
                 .map(|gc| gc.novelty_score(pc))
                 .unwrap_or(1.0);
-            state.coverage.record_with_rarity(prev_pc, pc, rarity);
+            local_coverage.record_with_rarity(prev_pc, pc, rarity);
             prev_pc = pc;
         }
 
@@ -870,6 +842,7 @@ fn exec_sync_inner<L: Logger>(
                             func_info.entry,
                             node_id,
                             global_coverage,
+                            local_coverage,
                         )?;
 
                         store(&lhs, val, local_env, node_env)?;
@@ -891,15 +864,7 @@ fn exec_sync_inner<L: Logger>(
                             id: state.alloc_channel_id(),
                         };
 
-                        state.channels.insert(
-                            chan_id,
-                            ChannelState {
-                                capacity: 1,
-                                buffer: VecDeque::new(),
-                                waiting_readers: VecDeque::new(),
-                                waiting_writers: VecDeque::new(),
-                            },
-                        );
+                        state.channels.insert(chan_id, ChannelState::new(1));
                         store(&lhs, Value::Channel(chan_id), local_env, node_env)?;
 
                         let func_name_id = program
@@ -932,9 +897,9 @@ fn exec_sync_inner<L: Logger>(
                             state
                                 .crash_info
                                 .queued_messages
-                                .push((target_node, new_record));
+                                .push_back((target_node, new_record));
                         } else {
-                            state.runnable_records.push(new_record);
+                            state.runnable_records.push_back(new_record);
                         }
                     }
                 }
@@ -950,12 +915,7 @@ fn exec_sync_inner<L: Logger>(
                 };
                 state.channels.insert(
                     cid,
-                    ChannelState {
-                        capacity: cap as i32,
-                        buffer: VecDeque::new(),
-                        waiting_readers: VecDeque::new(),
-                        waiting_writers: VecDeque::new(),
-                    },
+                    ChannelState::new(cap as i32),
                 );
                 store(&lhs, Value::Channel(cid), local_env, node_env)?;
                 pc = next;
@@ -1054,9 +1014,10 @@ pub fn exec<L: Logger>(
     program: &Program,
     mut record: Record,
     global_coverage: Option<&GlobalCoverage>,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<Option<ClientOpResult>, RuntimeError> {
     let mut local_env = record.env;
-    let node_env = Rc::clone(&state.nodes[record.node]);
+    let mut node_env = state.nodes[record.node].clone();
 
     local_env.insert(SELF_NAME, Value::Node(record.node));
 
@@ -1068,9 +1029,7 @@ pub fn exec<L: Logger>(
             let rarity = global_coverage
                 .map(|gc| gc.novelty_score(current_pc))
                 .unwrap_or(1.0);
-            state
-                .coverage
-                .record_with_rarity(prev_pc, current_pc, rarity);
+            local_coverage.record_with_rarity(prev_pc, current_pc, rarity);
             prev_pc = current_pc;
         }
 
@@ -1081,17 +1040,17 @@ pub fn exec<L: Logger>(
                 record.pc = next;
                 match instr {
                     Instr::Assign(lhs, rhs) => {
-                        let v = eval(&local_env, &node_env.borrow(), &rhs)?;
-                        store(&lhs, v, &mut local_env, &mut node_env.borrow_mut())?;
+                        let v = eval(&local_env, &node_env, &rhs)?;
+                        store(&lhs, v, &mut local_env, &mut node_env)?;
                     }
                     Instr::Copy(lhs, rhs) => {
-                        let v = eval(&local_env, &node_env.borrow(), &rhs)?;
-                        store(&lhs, v, &mut local_env, &mut node_env.borrow_mut())?;
+                        let v = eval(&local_env, &node_env, &rhs)?;
+                        store(&lhs, v, &mut local_env, &mut node_env)?;
                     }
                     Instr::SyncCall(lhs, func_name, args) => {
                         let arg_vals: Result<Vec<Value>, _> = args
                             .iter()
-                            .map(|a| eval(&local_env, &node_env.borrow(), a))
+                            .map(|a| eval(&local_env, &node_env, a))
                             .collect();
                         let arg_vals = arg_vals?;
                         let func_name_id = program
@@ -1112,7 +1071,7 @@ pub fn exec<L: Logger>(
                             callee_local.insert(*name, arg_vals[i].clone());
                         }
                         for (name, expr) in &func_info.locals {
-                            callee_local.insert(*name, eval(&local_env, &node_env.borrow(), expr)?);
+                            callee_local.insert(*name, eval(&local_env, &node_env, expr)?);
                         }
 
                         if let Some(s) = local_env.get(&SELF_NAME) {
@@ -1125,21 +1084,22 @@ pub fn exec<L: Logger>(
                             logger,
                             program,
                             &mut callee_local,
-                            &mut node_env.borrow_mut(),
+                            &mut node_env,
                             func_info.entry,
                             record.node,
                             global_coverage,
+                            local_coverage,
                         )?;
 
-                        store(&lhs, ret_val, &mut local_env, &mut node_env.borrow_mut())?;
+                        store(&lhs, ret_val, &mut local_env, &mut node_env)?;
                     }
                     Instr::Async(lhs, node_expr, func_name, args) => {
                         // Async logic
                         let target_node =
-                            eval(&local_env, &node_env.borrow(), &node_expr)?.as_node()?;
+                            eval(&local_env, &node_env, &node_expr)?.as_node()?;
                         let arg_vals: Result<Vec<Value>, _> = args
                             .iter()
-                            .map(|a| eval(&local_env, &node_env.borrow(), a))
+                            .map(|a| eval(&local_env, &node_env, a))
                             .collect();
                         let arg_vals = arg_vals?;
 
@@ -1148,20 +1108,12 @@ pub fn exec<L: Logger>(
                             node: record.node,
                             id: state.alloc_channel_id(),
                         };
-                        state.channels.insert(
-                            chan_id,
-                            ChannelState {
-                                capacity: 1,
-                                buffer: VecDeque::new(),
-                                waiting_readers: VecDeque::new(),
-                                waiting_writers: VecDeque::new(),
-                            },
-                        );
+                        state.channels.insert(chan_id, ChannelState::new(1));
                         store(
                             &lhs,
                             Value::Channel(chan_id),
                             &mut local_env,
-                            &mut node_env.borrow_mut(),
+                            &mut node_env,
                         )?;
 
                         // Setup Callee Record
@@ -1179,7 +1131,7 @@ pub fn exec<L: Logger>(
                         }
                         for (name, expr) in &func_info.locals {
                             callee_locals
-                                .insert(*name, eval(&local_env, &node_env.borrow(), expr)?);
+                                .insert(*name, eval(&local_env, &node_env, expr)?);
                         }
 
                         let new_record = Record {
@@ -1196,9 +1148,9 @@ pub fn exec<L: Logger>(
                             state
                                 .crash_info
                                 .queued_messages
-                                .push((target_node, new_record));
+                                .push_back((target_node, new_record));
                         } else {
-                            state.runnable_records.push(new_record);
+                            state.runnable_records.push_back(new_record);
                         }
                     }
                 }
@@ -1210,94 +1162,102 @@ pub fn exec<L: Logger>(
                 };
                 state.channels.insert(
                     cid,
-                    ChannelState {
-                        capacity: cap as i32,
-                        buffer: VecDeque::new(),
-                        waiting_readers: VecDeque::new(),
-                        waiting_writers: VecDeque::new(),
-                    },
+                    ChannelState::new(cap as i32),
                 );
                 store(
                     &lhs,
                     Value::Channel(cid),
                     &mut local_env,
-                    &mut node_env.borrow_mut(),
+                    &mut node_env,
                 )?;
                 record.pc = next;
             }
             Label::Send(chan_expr, val_expr, next) => {
-                let cid = eval(&local_env, &node_env.borrow(), &chan_expr)?.as_channel()?;
-                let val = eval(&local_env, &node_env.borrow(), &val_expr)?;
+                let cid = eval(&local_env, &node_env, &chan_expr)?.as_channel()?;
+                let val = eval(&local_env, &node_env, &val_expr)?;
                 if cid.node != record.node {
                     return Err(RuntimeError::NetworkedChannelUnsupported);
                 }
                 // Local Send
-                let chan = state.channels.get_mut(&cid).unwrap();
+                let mut chan = state.channels.get(&cid).unwrap().clone();
                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                     // Wakeup reader
-                    let r_node = Rc::clone(&state.nodes[reader.node]);
-                    store(&lhs, val, &mut reader.env, &mut r_node.borrow_mut())?;
-                    state.runnable_records.push(reader);
+                    let mut r_node_env = state.nodes[reader.node].clone();
+                    store(&lhs, val, &mut reader.env, &mut r_node_env)?;
+                    state.nodes[reader.node] = r_node_env;
+                    state.runnable_records.push_back(reader);
                     record.pc = next;
                 } else if (chan.buffer.len() as i32) < chan.capacity {
                     chan.buffer.push_back(val);
                     record.pc = next;
                 } else {
+                    let node_id = record.node;
                     record.env = local_env;
                     record.pc = next;
                     chan.waiting_writers.push_back((record, val));
+                    state.channels.insert(cid, chan);
+                    state.nodes[node_id] = node_env;
                     return Ok(None);
                 }
+                state.channels.insert(cid, chan);
             }
             Label::Recv(lhs, chan_expr, next) => {
-                let cid = eval(&local_env, &node_env.borrow(), &chan_expr)?.as_channel()?;
+                let cid = eval(&local_env, &node_env, &chan_expr)?.as_channel()?;
                 if cid.node != record.node {
                     return Err(RuntimeError::RemoteChannelRead);
                 }
 
-                let chan = state.channels.get_mut(&cid).unwrap();
+                let mut chan = state.channels.get(&cid).unwrap().clone();
 
                 if let Some(val) = chan.buffer.pop_front() {
-                    store(&lhs, val, &mut local_env, &mut node_env.borrow_mut())?;
+                    store(&lhs, val, &mut local_env, &mut node_env)?;
                     // Wake writer if any
                     if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
                         chan.buffer.push_back(w_val);
-                        state.runnable_records.push(writer);
+                        state.runnable_records.push_back(writer);
                     }
                     record.pc = next;
                 } else if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
-                    store(&lhs, w_val, &mut local_env, &mut node_env.borrow_mut())?;
-                    state.runnable_records.push(writer);
+                    store(&lhs, w_val, &mut local_env, &mut node_env)?;
+                    state.runnable_records.push_back(writer);
                     record.pc = next;
                 } else {
                     // Block Reader
+                    let node_id = record.node;
                     record.env = local_env;
                     record.pc = next; // When woke, proceed to next
                     chan.waiting_readers.push_back((record, lhs));
+                    state.channels.insert(cid, chan);
+                    state.nodes[node_id] = node_env;
                     return Ok(None); // Stop execution
                 }
+                state.channels.insert(cid, chan);
             }
             Label::Return(expr) => {
-                let val = eval(&local_env, &node_env.borrow(), &expr)?;
+                let val = eval(&local_env, &node_env, &expr)?;
                 // Call continuation and return the result
+                let node_id = record.node;
+                state.nodes[node_id] = node_env;
                 let result = record.continuation.call(state, val);
                 return Ok(result);
             }
             Label::Pause(next) => {
+                let node_id = record.node;
                 record.env = local_env;
                 record.pc = next;
-                state.runnable_records.push(record);
+                state.runnable_records.push_back(record);
+                state.nodes[node_id] = node_env;
                 return Ok(None); // Yield
             }
             Label::Cond(cond, bthen, belse) => {
-                if eval(&local_env, &node_env.borrow(), &cond)?.as_bool()? {
+                if eval(&local_env, &node_env, &cond)?.as_bool()? {
                     record.pc = bthen;
                 } else {
                     record.pc = belse;
                 }
             }
             Label::Print(expr, next) => {
-                let val = eval(&local_env, &node_env.borrow(), &expr)?;
+                let val = eval(&local_env, &node_env, &expr)?;
                 logger.log(LogEntry {
                     node: record.node,
                     content: val.to_string(),
@@ -1306,11 +1266,13 @@ pub fn exec<L: Logger>(
                 record.pc = next;
             }
             Label::SpinAwait(expr, next) => {
-                if eval(&local_env, &node_env.borrow(), &expr)?.as_bool()? {
+                if eval(&local_env, &node_env, &expr)?.as_bool()? {
                     record.pc = next;
                 } else {
+                    let node_id = record.node;
                     record.env = local_env;
-                    state.runnable_records.push(record);
+                    state.runnable_records.push_back(record);
+                    state.nodes[node_id] = node_env;
                     return Ok(None); // Yield
                 }
             }
@@ -1318,7 +1280,7 @@ pub fn exec<L: Logger>(
                 let iter_key = iter_name_id(record.pc);
 
                 if !local_env.contains_key(&iter_key) {
-                    let original_collection = eval(&local_env, &node_env.borrow(), &expr)?;
+                    let original_collection = eval(&local_env, &node_env, &expr)?;
                     local_env.insert(iter_key, original_collection);
                 }
 
@@ -1337,7 +1299,7 @@ pub fn exec<L: Logger>(
                             let new_l = Value::List(l.skip(1));
                             local_env.insert(iter_key, new_l);
 
-                            store(&lhs, item, &mut local_env, &mut node_env.borrow_mut())?;
+                            store(&lhs, item, &mut local_env, &mut node_env)?;
                             record.pc = body_pc;
                         }
                     }
@@ -1359,13 +1321,13 @@ pub fn exec<L: Logger>(
                                         &Lhs::Var(vars[0]),
                                         k,
                                         &mut local_env,
-                                        &mut node_env.borrow_mut(),
+                                        &mut node_env,
                                     )?;
                                     store(
                                         &Lhs::Var(vars[1]),
                                         v,
                                         &mut local_env,
-                                        &mut node_env.borrow_mut(),
+                                        &mut node_env,
                                     )?;
                                     record.pc = body_pc;
                                 }
@@ -1378,28 +1340,6 @@ pub fn exec<L: Logger>(
                             got: other.type_name(),
                         });
                     }
-                }
-            }
-            Label::Lock(lock_expr, next) => {
-                let lock_val = eval(&local_env, &node_env.borrow(), &lock_expr)?;
-                let lock = lock_val.as_lock()?;
-                if *lock.lock().unwrap() == false {
-                    *lock.lock().unwrap() = true;
-                    record.pc = next;
-                } else {
-                    record.env = local_env;
-                    state.runnable_records.push(record);
-                    return Ok(None); // Yield
-                }
-            }
-            Label::Unlock(lock_expr, next) => {
-                let lock_val = eval(&local_env, &node_env.borrow(), &lock_expr)?;
-                let lock = lock_val.as_lock()?;
-                if *lock.lock().unwrap() == true {
-                    *lock.lock().unwrap() = false;
-                    record.pc = next;
-                } else {
-                    return Err(RuntimeError::UnlockAlreadyUnlocked);
                 }
             }
             Label::Break(target) => {
@@ -1419,6 +1359,7 @@ pub fn schedule_record<L: Logger>(
     partition_away_nodes: &[usize],
     randomly_delay_msgs: bool,
     global_coverage: Option<&GlobalCoverage>,
+    local_coverage: &mut LocalCoverage,
 ) -> Result<Option<ClientOpResult>, RuntimeError> {
     let len = state.runnable_records.len();
     if len == 0 {
@@ -1452,7 +1393,7 @@ pub fn schedule_record<L: Logger>(
         rng.random_range(0..len)
     };
 
-    let mut r = state.runnable_records.swap_remove(idx);
+    let mut r = state.runnable_records.remove(idx);
 
     let src_node = r.origin_node;
     let dest_node = r.node;
@@ -1460,7 +1401,7 @@ pub fn schedule_record<L: Logger>(
     if src_node != dest_node {
         if state.crash_info.currently_crashed.contains(&dest_node) {
             // Queue message
-            state.crash_info.queued_messages.push((dest_node, r));
+            state.crash_info.queued_messages.push_back((dest_node, r));
             return Ok(None);
         } else {
             let mut should_execute = true;
@@ -1490,14 +1431,13 @@ pub fn schedule_record<L: Logger>(
             if randomly_delay_msgs {
                 if rng.random::<f64>() < r.x {
                     r.x = r.policy.update(r.x);
-                    should_execute = false;
-                    state.runnable_records.push(r);
+                    state.runnable_records.push_back(r);
                     return Ok(None);
                 }
             }
 
             if should_execute {
-                let result = exec(state, logger, program, r, global_coverage)?;
+                let result = exec(state, logger, program, r, global_coverage, local_coverage)?;
                 return Ok(result);
             }
         }
@@ -1505,7 +1445,7 @@ pub fn schedule_record<L: Logger>(
         if state.crash_info.currently_crashed.contains(&r.node) {
             return Ok(None);
         }
-        let result = exec(state, logger, program, r, global_coverage)?;
+        let result = exec(state, logger, program, r, global_coverage, local_coverage)?;
         return Ok(result);
     }
     Ok(None)

@@ -119,7 +119,6 @@ pub enum ResolvedTypeDef {
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
     Chan(Box<ResolvedTypeDef>),
-    Lock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,7 +137,6 @@ pub enum ResolvedStatementKind {
     ForLoop(ResolvedForLoop),
     ForInLoop(ResolvedForInLoop),
     Break,
-    Lock(Box<ResolvedExpr>, Vec<ResolvedStatement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -235,7 +233,6 @@ pub enum ResolvedExprKind {
     Send(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Recv(Box<ResolvedExpr>),
 
-    CreateLock,
     SetTimer,
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
@@ -289,7 +286,6 @@ pub struct PrepopulatedTypes {
     pub string: NameId,
     pub bool: NameId,
     pub unit: NameId,
-    pub lock: NameId,
 }
 
 impl Resolver {
@@ -310,13 +306,11 @@ impl Resolver {
         let string_type = new_name_id("string");
         let bool_type = new_name_id("bool");
         let unit_type = new_name_id("unit");
-        let lock_type = new_name_id("lock");
 
         type_scope.insert("int".to_string(), int_type);
         type_scope.insert("string".to_string(), string_type);
         type_scope.insert("bool".to_string(), bool_type);
         type_scope.insert("unit".to_string(), unit_type);
-        type_scope.insert("lock".to_string(), lock_type);
 
         Resolver {
             var_scopes: vec![HashMap::new()],
@@ -331,7 +325,6 @@ impl Resolver {
                 string: string_type,
                 bool: bool_type,
                 unit: unit_type,
-                lock: lock_type,
             },
             id_to_name,
         }
@@ -639,7 +632,6 @@ impl Resolver {
                 self.resolve_type_def(*t)?,
             ))),
             TypeDefKind::Chan(t) => Ok(ResolvedTypeDef::Chan(Box::new(self.resolve_type_def(*t)?))),
-            TypeDefKind::Lock => Ok(ResolvedTypeDef::Lock),
         }
     }
 
@@ -664,16 +656,6 @@ impl Resolver {
                 ResolvedStatementKind::ForInLoop(self.resolve_for_in_loop(fil)?)
             }
             StatementKind::Break => ResolvedStatementKind::Break,
-            StatementKind::Lock(lock_expr, body) => {
-                self.enter_scope();
-                let resolved_lock_expr = self.resolve_expr(lock_expr)?;
-                let resolved_body = body
-                    .into_iter()
-                    .map(|s| self.resolve_statement(s))
-                    .collect::<Result<_, _>>()?;
-                self.exit_scope();
-                ResolvedStatementKind::Lock(Box::new(resolved_lock_expr), resolved_body)
-            }
         };
         Ok(ResolvedStatement { kind, span })
     }
@@ -918,7 +900,6 @@ impl Resolver {
                 Box::new(self.resolve_expr(*val)?),
             ),
             ExprKind::Recv(ch) => ResolvedExprKind::Recv(Box::new(self.resolve_expr(*ch)?)),
-            ExprKind::CreateLock => ResolvedExprKind::CreateLock,
             ExprKind::SetTimer => ResolvedExprKind::SetTimer,
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)?),

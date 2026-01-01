@@ -94,13 +94,6 @@ fn json_of_value(v: &Value) -> JsonValue {
             "value": items
             })
         }
-        Value::Lock(l) => {
-            let val = *l.lock().unwrap();
-            json!({
-            "type": "VLock",
-            "value": val
-            })
-        }
     }
 }
 

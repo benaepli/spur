@@ -150,7 +150,6 @@ impl TypeChecker {
             prepopulated_types.unit,
             TypeDefinition::Builtin(unit_type.clone()),
         );
-        predefined.insert(prepopulated_types.lock, TypeDefinition::Builtin(Type::Lock));
 
         let mut builtin_signatures = HashMap::new();
         builtin_signatures.insert(
@@ -435,15 +434,6 @@ impl TypeChecker {
                     span,
                 };
                 Ok((typed_stmt, false))
-            }
-            ResolvedStatementKind::Lock(lock_expr, body) => {
-                let typed_lock_expr = self.check_expr(*lock_expr, &Type::Lock)?;
-                let (typed_body, body_returns) = self.check_block(body)?;
-                let typed_stmt = TypedStatement {
-                    kind: TypedStatementKind::Lock(Box::new(typed_lock_expr), typed_body),
-                    span,
-                };
-                Ok((typed_stmt, body_returns))
             }
         }
     }
@@ -1119,11 +1109,6 @@ impl TypeChecker {
                     })
                 }
             }
-            ResolvedExprKind::CreateLock => Ok(TypedExpr {
-                kind: TypedExprKind::CreateLock,
-                ty: Type::Lock,
-                span,
-            }),
             ResolvedExprKind::SetTimer => Ok(TypedExpr {
                 kind: TypedExprKind::SetTimer,
                 ty: Type::Chan(Box::new(Type::Tuple(vec![]))),
@@ -1699,7 +1684,6 @@ impl TypeChecker {
                 let base_type = self.resolve_type(t)?;
                 Ok(Type::Chan(Box::new(base_type)))
             }
-            ResolvedTypeDef::Lock => Ok(Type::Lock),
         }
     }
 

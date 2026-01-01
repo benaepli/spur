@@ -48,7 +48,6 @@ pub enum Expr {
     Nil,
     Unwrap(Box<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
-    CreateLock,
     SetTimer,
     Some(Box<Expr>),
     IntToString(Box<Expr>),
@@ -101,8 +100,6 @@ pub enum Label {
     ),
     Print(Expr, Vertex /* next_vertex */),
     Break(Vertex /* break_target_vertex */),
-    Lock(Expr, Vertex /* next_vertex */),
-    Unlock(Expr, Vertex /* next_vertex */),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -435,15 +432,6 @@ impl Compiler {
                 self.compile_for_in_loop(locals, loop_stmt, next_vertex, return_target, return_var)
             }
             TypedStatementKind::Break => self.add_label(Label::Break(break_target)),
-            TypedStatementKind::Lock(lock_expr, body) => self.compile_lock_statement(
-                locals,
-                lock_expr,
-                body,
-                next_vertex,
-                break_target,
-                return_target,
-                return_var,
-            ),
         };
 
         // Restore previous span
@@ -632,46 +620,6 @@ impl Compiler {
 
         // The entry point to the whole statement is the `Copy` instruction.
         copy_vertex
-    }
-
-    fn compile_lock_statement(
-        &mut self,
-        locals: &mut Vec<(NameId, Expr)>,
-        lock_expr: &TypedExpr,
-        body: &[TypedStatement],
-        next_vertex: Vertex,
-        break_target: Vertex,
-        return_target: Vertex,
-        return_var: NameId,
-    ) -> Vertex {
-        let lock_var = self.new_temp_var(locals);
-        let lock_var_expr = Expr::Var(lock_var);
-
-        let unlock_then_break_vertex =
-            self.add_label(Label::Unlock(lock_var_expr.clone(), break_target));
-
-        let unlock_then_return_vertex =
-            self.add_label(Label::Unlock(lock_var_expr.clone(), return_target));
-
-        let unlock_then_continue_vertex =
-            self.add_label(Label::Unlock(lock_var_expr.clone(), next_vertex));
-
-        let body_vertex = self.compile_block(
-            locals,
-            body,
-            unlock_then_continue_vertex, // next_vertex for the block
-            unlock_then_break_vertex,    // break_target for the block
-            unlock_then_return_vertex,   // return_target for the block
-            return_var,
-        );
-
-        // Create the Lock label, which runs before the body
-        let lock_vertex = self.add_label(Label::Lock(lock_var_expr, body_vertex));
-
-        let entry_vertex =
-            self.compile_expr_to_value(locals, lock_expr, Lhs::Var(lock_var), lock_vertex);
-
-        entry_vertex
     }
 
     // Helper to generate temp vars and EVar expressions for a list
@@ -1082,10 +1030,6 @@ impl Compiler {
             }
 
             // --- Truly simple, non-side-effecting cases ---
-            TypedExprKind::CreateLock => {
-                let label = Label::Instr(Instr::Assign(target, Expr::CreateLock), next_vertex);
-                self.add_label(label)
-            }
             TypedExprKind::SetTimer => {
                 let label = Label::Instr(Instr::Assign(target, Expr::SetTimer), next_vertex);
                 self.add_label(label)
@@ -1380,7 +1324,6 @@ impl Compiler {
                     .collect(),
             ),
 
-            TypedExprKind::CreateLock => Expr::CreateLock,
             TypedExprKind::SetTimer => Expr::SetTimer,
 
             // --- Panic on complex expressions ---
