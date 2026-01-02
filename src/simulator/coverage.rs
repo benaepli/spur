@@ -10,7 +10,6 @@ use scalable_cuckoo_filter::{
     DefaultHasher as CuckooHasher, ScalableCuckooFilter, ScalableCuckooFilterBuilder,
 };
 use std::collections::HashMap;
-use std::hash::RandomState;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 

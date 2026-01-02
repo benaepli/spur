@@ -8,7 +8,6 @@ use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use ecow::EcoString;
 use log::{info, warn};
 use std::collections::{BinaryHeap, HashMap};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 mod state;
@@ -378,7 +377,7 @@ impl ModelChecker {
                 Value::int(node_id as i64),
                 Value::list(
                     (0..self.config.num_servers)
-                        .map(|j| Value::node(j))
+                        .map(Value::node)
                         .collect(),
                 ),
             ];

@@ -13,7 +13,7 @@ pub const HASH_PRIME: u64 = 0x9E3779B97F4A7C15;
 /// positions produces different contributions to a combined hash.
 #[inline(always)]
 pub fn mix(hash: u64, index: u32) -> u64 {
-    hash.rotate_left((index % 63) as u32 + 1) ^ (index as u64).wrapping_mul(HASH_PRIME)
+    hash.rotate_left((index % 63) + 1) ^ (index as u64).wrapping_mul(HASH_PRIME)
 }
 
 /// Compute the default hash of any hashable value as a u64.

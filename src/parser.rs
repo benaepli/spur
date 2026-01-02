@@ -341,7 +341,7 @@ where
 
     pattern.define({
         let atom = choice((
-            ident.clone().map(PatternKind::Var),
+            ident.map(PatternKind::Var),
             just(TokenKind::Underscore).to(PatternKind::Wildcard),
         ))
         .map_with(|kind, e| Pattern::new(kind, e.span()));
@@ -366,7 +366,7 @@ where
     });
 
     type_def.define({
-        let named = ident.clone().map_with(|name, e| TypeDef {
+        let named = ident.map_with(|name, e| TypeDef {
             kind: TypeDefKind::Named(name),
             span: e.span(),
         });
@@ -452,7 +452,6 @@ where
         };
 
         let func_call = ident
-            .clone()
             .then(args())
             .map_with(|(name, args), e| FuncCall {
                 name,
@@ -500,10 +499,8 @@ where
         .map(ExprKind::TupleLit);
 
         let struct_lit = ident
-            .clone()
             .then(
                 ident
-                    .clone()
                     .then_ignore(just(TokenKind::Colon))
                     .then(expr.clone())
                     .separated_by(just(TokenKind::Comma))
@@ -574,7 +571,7 @@ where
             one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
             zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
             func_call.clone().map(ExprKind::FuncCall),
-            ident.clone().map(ExprKind::Var),
+            ident.map(ExprKind::Var),
             tuple_lit,
         ))
         .map_with(|kind, e| Expr::new(kind, e.span()));
@@ -613,7 +610,7 @@ where
                 .map_with(|idx, e| PostfixOp::TupleAccess(idx, e.span())),
             // Field Access: .ID
             just(TokenKind::Dot)
-                .ignore_then(ident.clone())
+                .ignore_then(ident)
                 .map_with(|name, e| PostfixOp::FieldAccess(name, e.span())),
             just(TokenKind::Bang).map_with(|_, e| PostfixOp::Unwrap(e.span())),
             // RPC Call: -> call()
@@ -719,16 +716,16 @@ where
         let and_expr = build_binary_op(comparison, just(TokenKind::And).to(BinOp::And));
         let or_expr = build_binary_op(and_expr, just(TokenKind::Or).to(BinOp::Or));
 
-        let coalescing_expr = build_binary_op(
+        
+
+        build_binary_op(
             or_expr,
             just(TokenKind::QuestionQuestion).to(BinOp::Coalesce),
-        );
-
-        coalescing_expr
+        )
     });
 
     let var_init_core = just(TokenKind::Var)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(
             just(TokenKind::Colon)
                 .ignore_then(type_def.clone())
@@ -753,7 +750,6 @@ where
         };
 
         let assignment = ident
-            .clone()
             .map_with(|name, e| Expr::new(ExprKind::Var(name), e.span()))
             .then_ignore(just(TokenKind::Equal))
             .then(expr.clone())
@@ -884,7 +880,7 @@ where
     });
 
     let var_init = just(TokenKind::Var)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(
             just(TokenKind::Colon)
                 .ignore_then(type_def.clone())
@@ -901,7 +897,6 @@ where
         });
 
     let func_param = ident
-        .clone()
         .then_ignore(just(TokenKind::Colon))
         .then(type_def.clone())
         .map_with(|(name, type_def), e| FuncParam {
@@ -917,7 +912,7 @@ where
     let func_def = just(TokenKind::Sync)
         .or_not()
         .then_ignore(just(TokenKind::Func))
-        .then(ident.clone())
+        .then(ident)
         .then(func_params.delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)))
         .then(
             just(TokenKind::Arrow)
@@ -943,7 +938,6 @@ where
         );
 
     let field_def = ident
-        .clone()
         .then_ignore(just(TokenKind::Colon))
         .then(type_def.clone())
         .map_with(|(name, type_def), e| FieldDef {
@@ -957,7 +951,7 @@ where
         .collect::<Vec<_>>();
 
     let type_def_stmt = just(TokenKind::Type)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(choice((
             field_defs
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
@@ -983,7 +977,7 @@ where
     };
 
     let role_def = just(TokenKind::Role)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(role_contents())
         .map_with(|(name, (var_inits, func_defs)), e| {
             TopLevelDef::Role(RoleDef {
@@ -1026,7 +1020,7 @@ fn make_input(
 
 pub fn parse_program(tokens: &'_ [Token]) -> ParseResult<Program, Rich<'_, TokenKind>> {
     let len = tokens.last().map(|t| t.span.end()).unwrap_or(0);
-    let input = make_input((0..len).into(), &tokens);
+    let input = make_input((0..len).into(), tokens);
 
     program().parse(input)
 }

@@ -105,11 +105,10 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
                 graph.add_edge(idx1, idx2, ());
 
                 // Serialization: this crash depends on previous recovery of same server
-                if let EventAction::CrashNode(s) = action1 {
-                    if let Some(&prev_recover) = last_recovery.get(s) {
+                if let EventAction::CrashNode(s) = action1
+                    && let Some(&prev_recover) = last_recovery.get(s) {
                         graph.add_edge(prev_recover, idx1, ());
                     }
-                }
                 if let EventAction::RecoverNode(s) = action2 {
                     last_recovery.insert(*s, idx2);
                 }

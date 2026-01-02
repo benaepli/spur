@@ -81,7 +81,7 @@ pub fn report_type_errors(
                 ]),
 
             TypeError::InvalidUnaryOp { op, ty, span } => Diagnostic::error()
-                .with_message(format!("invalid unary operation"))
+                .with_message("invalid unary operation".to_string())
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
                         .with_message(format!("operator `{}` cannot be applied to type `{}`", op, ty)),
@@ -91,7 +91,7 @@ pub fn report_type_errors(
                 ]),
 
             TypeError::InvalidBinOp { op, left, right, span } => Diagnostic::error()
-                .with_message(format!("invalid binary operation"))
+                .with_message("invalid binary operation".to_string())
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
                         .with_message(format!(

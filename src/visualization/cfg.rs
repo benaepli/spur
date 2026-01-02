@@ -28,8 +28,7 @@ pub fn render_svg(program: &Program) -> Result<Vec<u8>, std::io::Error> {
 
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("Graphviz failed: {}", err_msg),
         ));
     }

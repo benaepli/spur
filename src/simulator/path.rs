@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot, Vertex};
+use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, RuntimeError, State,
     UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env, schedule_record,
@@ -10,7 +10,6 @@ use crate::simulator::path::plan::{
     ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
 use ecow::EcoString;
-use imbl::HashMap as ImMap;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
 
@@ -357,7 +356,7 @@ pub fn exec_plan(
                         &program,
                         &topology,
                         *node_id as usize,
-                        &global_state,
+                        global_state,
                         global_snapshot,
                         &mut path_state.coverage,
                     )?;

@@ -288,6 +288,12 @@ pub struct PrepopulatedTypes {
     pub unit: NameId,
 }
 
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Resolver {
     pub fn new() -> Self {
         let mut next_id = 0;
@@ -492,7 +498,7 @@ impl Resolver {
     }
 
     fn resolve_role_def(&mut self, role: RoleDef) -> Result<ResolvedRoleDef, ResolutionError> {
-        let prev_role = self.current_role.clone();
+        let prev_role = self.current_role;
         let name_id = self.lookup_role(&role.name, role.span)?;
         self.current_role = Some(name_id);
 

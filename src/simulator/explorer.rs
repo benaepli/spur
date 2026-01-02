@@ -229,7 +229,7 @@ fn init_topology<L: Logger>(
         return Ok(());
     };
 
-    let peer_list = Value::list((0..num_servers).map(|j| Value::node(j)).collect());
+    let peer_list = Value::list((0..num_servers).map(Value::node).collect());
 
     for node_id in 0..num_servers {
         let actuals = vec![Value::int(node_id as i64), peer_list.clone()];
@@ -323,7 +323,7 @@ pub fn run_single_simulation(
     let plan_score = path_state.coverage.plan_score();
 
     global_state.coverage.merge(&path_state.coverage);
-    canonical.as_ref().map(|x| global_state.insert(x));
+    if let Some(x) = canonical.as_ref() { global_state.insert(x) }
 
     let serialized = serialize_history(&path_state.history);
     let serialized_logs = serialize_logs(&path_state.logs.0);

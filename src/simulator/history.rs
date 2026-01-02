@@ -129,7 +129,7 @@ pub fn save_history_to_csv<P: AsRef<Path>>(
 ) -> Result<(), Box<dyn Error>> {
     let mut wtr = csv::Writer::from_path(filename)?;
 
-    wtr.write_record(&["UniqueID", "ClientID", "Kind", "Action", "Payload"])?;
+    wtr.write_record(["UniqueID", "ClientID", "Kind", "Action", "Payload"])?;
 
     for op in history {
         let kind = match op.kind {

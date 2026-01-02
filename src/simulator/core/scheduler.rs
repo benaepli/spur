@@ -83,13 +83,12 @@ pub fn schedule_record<L: Logger>(
                 should_execute = false;
             }
 
-            if randomly_delay_msgs {
-                if rng.random::<f64>() < r.x {
+            if randomly_delay_msgs
+                && rng.random::<f64>() < r.x {
                     r.x = r.policy.update(r.x);
                     state.runnable_records.push_back(r);
                     return Ok(None);
                 }
-            }
 
             if should_execute {
                 let result = exec(state, logger, program, r, global_snapshot, local_coverage)?;

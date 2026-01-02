@@ -404,7 +404,7 @@ impl<'a> Lexer<'a> {
         KEYWORDS
             .get(&result as &str)
             .cloned()
-            .unwrap_or_else(|| TokenKind::Identifier(result))
+            .unwrap_or(TokenKind::Identifier(result))
     }
 }
 

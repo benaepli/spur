@@ -813,7 +813,7 @@ impl TypeChecker {
                     let sig = self
                         .func_signatures
                         .get(&user_call.name)
-                        .ok_or_else(|| TypeError::UndefinedType(user_call.span))?
+                        .ok_or(TypeError::UndefinedType(user_call.span))?
                         .clone();
 
                     let typed_call = self.check_user_func_call(user_call, &sig)?;
@@ -1287,7 +1287,7 @@ impl TypeChecker {
                     .map(|_| typed_expr);
             }
 
-            let span = typed_expr.span.clone();
+            let span = typed_expr.span;
             if self
                 .check_type_compatibility(expected_inner, actual, span)
                 .is_ok()
@@ -1577,7 +1577,7 @@ impl TypeChecker {
         for (field_name, field_expr) in fields {
             let field_def = field_defs
                 .iter()
-                .find(|f| &f.name == &field_name)
+                .find(|f| f.name == field_name)
                 .ok_or_else(|| TypeError::UndefinedStructField {
                     field_name: field_name.clone(),
                     span,
@@ -1639,8 +1639,7 @@ impl TypeChecker {
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(_)) => {
                             let name = self
                                 .struct_names
-                                .get(name_id)
-                                .map(|s| s.clone())
+                                .get(name_id).cloned()
                                 .unwrap_or_else(|| format!("struct_{}", name_id.0));
                             Ok(Type::Struct(*name_id, name))
                         }
@@ -1653,8 +1652,7 @@ impl TypeChecker {
                 } else {
                     let name = self
                         .struct_names
-                        .get(name_id)
-                        .map(|s| s.clone())
+                        .get(name_id).cloned()
                         .unwrap_or_else(|| format!("unknown_{}", name_id.0));
                     Ok(Type::Struct(*name_id, name))
                 }

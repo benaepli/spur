@@ -219,6 +219,12 @@ pub struct Compiler {
     max_node_slots: u32,
 }
 
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Compiler {
     pub fn new() -> Self {
         Compiler {
@@ -651,7 +657,7 @@ impl Compiler {
             next_vertex, // False -> Exit
         ));
 
-        let cond_expr = loop_stmt.condition.as_ref().cloned().unwrap_or_else(|| {
+        let cond_expr = loop_stmt.condition.as_ref().cloned().unwrap_or({
             // If no condition, default to true
             TypedExpr {
                 kind: TypedExprKind::BoolLit(true),
@@ -942,8 +948,8 @@ impl Compiler {
                         ));
                         let r_vertex =
                             self.compile_expr_to_value(r, Lhs::Var(r_tmp), assign_vertex);
-                        let l_vertex = self.compile_expr_to_value(l, Lhs::Var(l_tmp), r_vertex);
-                        l_vertex
+                        
+                        self.compile_expr_to_value(l, Lhs::Var(l_tmp), r_vertex)
                     }
                 }
             }
@@ -1296,7 +1302,7 @@ impl Compiler {
                 let print_label = Label::Print(Expr::Var(arg_var), assign_vertex);
                 let print_vertex = self.add_label(print_label);
 
-                let arg_expr = args.get(0).expect("Println should have 1 arg");
+                let arg_expr = args.first().expect("Println should have 1 arg");
                 self.compile_expr_to_value(arg_expr, Lhs::Var(arg_var), print_vertex)
             }
             BuiltinFn::IntToString => {
@@ -1305,7 +1311,7 @@ impl Compiler {
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
-                let arg_expr = args.get(0).expect("IntToString should have 1 arg");
+                let arg_expr = args.first().expect("IntToString should have 1 arg");
                 self.compile_expr_to_value(arg_expr, Lhs::Var(arg_var), assign_vertex)
             }
         }
@@ -1347,9 +1353,9 @@ impl Compiler {
     fn convert_simple_expr(&mut self, expr: &TypedExpr) -> Expr {
         match &expr.kind {
             TypedExprKind::Var(id, _name) => Expr::Var(self.resolve_slot(*id)),
-            TypedExprKind::IntLit(i) => Expr::Int(i.clone()),
+            TypedExprKind::IntLit(i) => Expr::Int(*i),
             TypedExprKind::StringLit(s) => Expr::String(EcoString::from(s.as_str())),
-            TypedExprKind::BoolLit(b) => Expr::Bool(b.clone()),
+            TypedExprKind::BoolLit(b) => Expr::Bool(*b),
             TypedExprKind::NilLit => Expr::Nil,
             TypedExprKind::BinOp(op, l, r) => {
                 let left = Box::new(self.convert_simple_expr(l));
