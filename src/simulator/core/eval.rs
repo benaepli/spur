@@ -327,3 +327,185 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
         Expr::SetTimer => todo!(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::resolver::NameId;
+
+    fn dummy_slot(idx: u32) -> VarSlot {
+        VarSlot::Local(idx, NameId(0))
+    }
+
+    fn node_slot(idx: u32) -> VarSlot {
+        VarSlot::Node(idx, NameId(0))
+    }
+
+    #[test]
+    fn test_eval_literals() {
+        let env = Env::with_slots(0);
+        assert_eq!(eval(&env, &env, &Expr::Int(42)).unwrap(), Value::int(42));
+        assert_eq!(eval(&env, &env, &Expr::Bool(true)).unwrap(), Value::bool(true));
+        assert_eq!(eval(&env, &env, &Expr::String("hello".into())).unwrap(), Value::string("hello".into()));
+        assert_eq!(eval(&env, &env, &Expr::Unit).unwrap(), Value::unit());
+        assert_eq!(eval(&env, &env, &Expr::Nil).unwrap(), Value::option_none());
+    }
+
+    #[test]
+    fn test_eval_arithmetic() {
+        let env = Env::with_slots(0);
+        let e1 = Box::new(Expr::Int(10));
+        let e2 = Box::new(Expr::Int(3));
+
+        assert_eq!(eval(&env, &env, &Expr::Plus(e1.clone(), e2.clone())).unwrap(), Value::int(13));
+        assert_eq!(eval(&env, &env, &Expr::Minus(e1.clone(), e2.clone())).unwrap(), Value::int(7));
+        assert_eq!(eval(&env, &env, &Expr::Times(e1.clone(), e2.clone())).unwrap(), Value::int(30));
+        assert_eq!(eval(&env, &env, &Expr::Div(e1.clone(), e2.clone())).unwrap(), Value::int(3));
+        assert_eq!(eval(&env, &env, &Expr::Mod(e1.clone(), e2.clone())).unwrap(), Value::int(1));
+    }
+
+    #[test]
+    fn test_eval_logical() {
+        let env = Env::with_slots(0);
+        let t = Box::new(Expr::Bool(true));
+        let f = Box::new(Expr::Bool(false));
+
+        assert_eq!(eval(&env, &env, &Expr::Not(t.clone())).unwrap(), Value::bool(false));
+        assert_eq!(eval(&env, &env, &Expr::And(t.clone(), f.clone())).unwrap(), Value::bool(false));
+        assert_eq!(eval(&env, &env, &Expr::Or(t.clone(), f.clone())).unwrap(), Value::bool(true));
+    }
+
+    #[test]
+    fn test_eval_comparison() {
+        let env = Env::with_slots(0);
+        let e1 = Box::new(Expr::Int(10));
+        let e2 = Box::new(Expr::Int(20));
+
+        assert_eq!(eval(&env, &env, &Expr::EqualsEquals(e1.clone(), e1.clone())).unwrap(), Value::bool(true));
+        assert_eq!(eval(&env, &env, &Expr::LessThan(e1.clone(), e2.clone())).unwrap(), Value::bool(true));
+        assert_eq!(eval(&env, &env, &Expr::LessThanEquals(e1.clone(), e1.clone())).unwrap(), Value::bool(true));
+        assert_eq!(eval(&env, &env, &Expr::GreaterThan(e2.clone(), e1.clone())).unwrap(), Value::bool(true));
+        assert_eq!(eval(&env, &env, &Expr::GreaterThanEquals(e1.clone(), e1.clone())).unwrap(), Value::bool(true));
+    }
+
+    #[test]
+    fn test_eval_vars() {
+        let mut local_env = Env::with_slots(2);
+        local_env.set(0, Value::int(100));
+        let mut node_env = Env::with_slots(1);
+        node_env.set(0, Value::int(200));
+
+        assert_eq!(eval(&local_env, &node_env, &Expr::Var(dummy_slot(0))).unwrap(), Value::int(100));
+        assert_eq!(eval(&local_env, &node_env, &Expr::Var(node_slot(0))).unwrap(), Value::int(200));
+    }
+
+    #[test]
+    fn test_eval_collections() {
+        let env = Env::with_slots(0);
+
+        // Tuple
+        let tuple_expr = Expr::Tuple(vec![Expr::Int(1), Expr::Bool(true)]);
+        let _tuple_val = eval(&env, &env, &tuple_expr).unwrap();
+        assert_eq!(eval(&env, &env, &Expr::TupleAccess(Box::new(tuple_expr), 1)).unwrap(), Value::bool(true));
+
+        // List
+        let list_expr = Expr::List(vec![Expr::Int(1), Expr::Int(2)]);
+        assert_eq!(eval(&env, &env, &Expr::ListLen(Box::new(list_expr.clone()))).unwrap(), Value::int(2));
+        assert_eq!(eval(&env, &env, &Expr::ListAccess(Box::new(list_expr.clone()), 0)).unwrap(), Value::int(1));
+
+        // List operations
+        let append_expr = Expr::ListAppend(Box::new(list_expr.clone()), Box::new(Expr::Int(3)));
+        let appended_val = eval(&env, &env, &append_expr).unwrap();
+        assert_eq!(appended_val.as_list().unwrap().len(), 3);
+
+        let prepend_expr = Expr::ListPrepend(Box::new(Expr::Int(0)), Box::new(list_expr.clone()));
+        let prepended_val = eval(&env, &env, &prepend_expr).unwrap();
+        assert_eq!(prepended_val.as_list().unwrap()[0], Value::int(0));
+
+        let sub_expr = Expr::ListSubsequence(Box::new(list_expr), Box::new(Expr::Int(0)), Box::new(Expr::Int(1)));
+        let sub_val = eval(&env, &env, &sub_expr).unwrap();
+        assert_eq!(sub_val.as_list().unwrap().len(), 1);
+
+        // Map
+        let map_expr = Expr::Map(vec![(Expr::String("key".into()), Expr::Int(42))]);
+        assert_eq!(eval(&env, &env, &Expr::Find(Box::new(map_expr.clone()), Box::new(Expr::String("key".into())))).unwrap(), Value::int(42));
+        assert_eq!(eval(&env, &env, &Expr::KeyExists(Box::new(Expr::String("key".into())), Box::new(map_expr.clone()))).unwrap(), Value::bool(true));
+
+        let erase_expr = Expr::MapErase(Box::new(Expr::String("key".into())), Box::new(map_expr));
+        let erased_val = eval(&env, &env, &erase_expr).unwrap();
+        assert_eq!(erased_val.as_map().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_eval_options() {
+        let env = Env::with_slots(0);
+        let some_expr = Expr::Some(Box::new(Expr::Int(42)));
+        assert_eq!(eval(&env, &env, &Expr::Unwrap(Box::new(some_expr.clone()))).unwrap(), Value::int(42));
+
+        let nil_expr = Expr::Nil;
+        assert_eq!(eval(&env, &env, &Expr::Coalesce(Box::new(nil_expr), Box::new(Expr::Int(100)))).unwrap(), Value::int(100));
+        assert_eq!(eval(&env, &env, &Expr::Coalesce(Box::new(some_expr), Box::new(Expr::Int(100)))).unwrap(), Value::int(42));
+    }
+
+    #[test]
+    fn test_eval_misc() {
+        let env = Env::with_slots(0);
+        assert_eq!(eval(&env, &env, &Expr::Min(Box::new(Expr::Int(10)), Box::new(Expr::Int(20)))).unwrap(), Value::int(10));
+        assert_eq!(eval(&env, &env, &Expr::IntToString(Box::new(Expr::Int(123)))).unwrap(), Value::string("123".into()));
+    }
+
+    #[test]
+    fn test_eval_store_update() {
+        let env = Env::with_slots(0);
+        let list_expr = Expr::List(vec![Expr::Int(1)]);
+        let store_expr = Expr::Store(Box::new(list_expr), Box::new(Expr::Int(0)), Box::new(Expr::Int(42)));
+        let updated_list = eval(&env, &env, &store_expr).unwrap();
+        assert_eq!(updated_list.as_list().unwrap()[0], Value::int(42));
+    }
+
+    #[test]
+    fn test_eval_errors() {
+        let env = Env::with_slots(0);
+        let res = eval(&env, &env, &Expr::Plus(Box::new(Expr::Bool(true)), Box::new(Expr::Int(1))));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_store() {
+        let mut local_env = Env::with_slots(1);
+        let mut node_env = Env::with_slots(1);
+
+        // Simple var store
+        store(&Lhs::Var(dummy_slot(0)), Value::int(42), &mut local_env, &mut node_env).unwrap();
+        assert_eq!(local_env.get(0), &Value::int(42));
+
+        // Tuple store
+        let lhs = Lhs::Tuple(vec![dummy_slot(0), node_slot(0)]);
+        let val = Value::tuple(Vector::from(vec![Value::int(1), Value::int(2)]));
+        store(&lhs, val, &mut local_env, &mut node_env).unwrap();
+        assert_eq!(local_env.get(0), &Value::int(1));
+        assert_eq!(node_env.get(0), &Value::int(2));
+
+        // Mismatched tuple length
+        let val_bad = Value::tuple(Vector::from(vec![Value::int(1)]));
+        assert!(store(&lhs, val_bad, &mut local_env, &mut node_env).is_err());
+    }
+
+    #[test]
+    fn test_make_local_env() {
+        let func = FunctionInfo {
+            entry: 0,
+            name: NameId(0),
+            param_count: 1,
+            local_slot_count: 2,
+            local_defaults: vec![Expr::Int(10)],
+            is_sync: true,
+            debug_slot_names: vec!["a".into(), "b".into()],
+        };
+        let args = vec![Value::int(5)];
+        let env = Env::with_slots(0);
+        let local = make_local_env(&func, args, &env, &env);
+        assert_eq!(local.get(0), &Value::int(5));
+        assert_eq!(local.get(1), &Value::int(10));
+    }
+}

@@ -483,3 +483,106 @@ impl Env {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn calculate_hash<T: Hash>(t: &T) -> u64 {
+        let mut s = DefaultHasher::new();
+        t.hash(&mut s);
+        s.finish()
+    }
+
+    // Strategy for ChannelId
+    prop_compose! {
+        fn arb_channel_id()(node in any::<usize>(), id in any::<usize>()) -> ChannelId {
+            ChannelId { node, id }
+        }
+    }
+
+    // Strategy for Value
+    fn arb_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            any::<i64>().prop_map(Value::int),
+            any::<bool>().prop_map(Value::bool),
+            any::<String>().prop_map(|s| Value::string(EcoString::from(s))),
+            any::<usize>().prop_map(Value::node),
+            Just(Value::unit()),
+            arb_channel_id().prop_map(Value::channel),
+        ];
+
+        leaf.prop_recursive(
+            4, // 4 levels deep
+            64, // max size 64 nodes
+            10, // 10 items per collection
+            |inner| {
+                prop_oneof![
+                    // Option
+                    prop::option::of(inner.clone()).prop_map(|opt| {
+                         match opt {
+                             Some(v) => Value::option_some(v),
+                             None => Value::option_none(),
+                         }
+                    }),
+                    // List
+                    prop::collection::vec(inner.clone(), 0..5).prop_map(|v| Value::list(v.into())),
+                    // Tuple
+                    prop::collection::vec(inner.clone(), 0..5).prop_map(|v| Value::tuple(v.into())),
+                    // Map
+                    prop::collection::hash_map(inner.clone(), inner.clone(), 0..5).prop_map(|m| Value::map(m.into())),
+                ]
+            },
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn test_value_hashing_consistency(v in arb_value()) {
+            let v_clone = v.clone();
+            prop_assert_eq!(&v, &v_clone);
+            prop_assert_eq!(calculate_hash(&v), calculate_hash(&v_clone));
+            prop_assert_eq!(v.sig, v_clone.sig);
+        }
+
+        #[test]
+        fn test_value_structural_equality(v1 in arb_value()) {
+            let v_clone = v1.clone();
+            prop_assert_eq!(v1.sig, v_clone.sig);
+        }
+
+        #[test]
+        fn test_env_hashing_consistency(v in prop::collection::vec(arb_value(), 0..10)) {
+            let mut env1 = Env::with_slots(v.len());
+            let mut env2 = Env::with_slots(v.len());
+
+            for (i, val) in v.iter().enumerate() {
+                env1.set(i as u32, val.clone());
+                env2.set(i as u32, val.clone());
+            }
+
+            prop_assert_eq!(&env1, &env2);
+            prop_assert_eq!(calculate_hash(&env1), calculate_hash(&env2));
+            prop_assert_eq!(env1.sig, env2.sig);
+        }
+        
+        #[test]
+        fn test_env_hashing_different(v in prop::collection::vec(arb_value(), 1..10), extra in arb_value()) {
+             let mut env1 = Env::with_slots(v.len());
+             for (i, val) in v.iter().enumerate() {
+                env1.set(i as u32, val.clone());
+             }
+             
+             let mut env2 = env1.clone();
+             env2.set(0, extra);
+             
+             if env1 != env2 {
+                 prop_assert_ne!(calculate_hash(&env1), calculate_hash(&env2));
+                 prop_assert_ne!(env1.sig, env2.sig);
+             }
+        }
+    }
+}
