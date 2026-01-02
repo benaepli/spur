@@ -1,11 +1,11 @@
 use crate::compiler::cfg::{Instr, Label, Lhs, Program, SELF_SLOT, VarSlot};
-use crate::simulator::coverage::{LocalCoverage, VertexMap};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{eval, make_local_env, store};
 use crate::simulator::core::state::{
     ChannelState, ClientOpResult, Continuation, LogEntry, Logger, Record, State, UpdatePolicy,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
+use crate::simulator::coverage::{LocalCoverage, VertexMap};
 
 pub fn exec_sync_on_node<L: Logger>(
     state: &mut State,
@@ -565,3 +565,6 @@ pub fn exec<L: Logger>(
         }
     }
 }
+
+#[cfg(test)]
+mod test;

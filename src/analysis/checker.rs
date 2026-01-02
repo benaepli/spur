@@ -1,6 +1,3 @@
-#[cfg(test)]
-mod test;
-
 use crate::analysis::resolver::{
     BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedCondStmts, ResolvedExpr,
     ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall, ResolvedFuncDef,
@@ -1639,7 +1636,8 @@ impl TypeChecker {
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(_)) => {
                             let name = self
                                 .struct_names
-                                .get(name_id).cloned()
+                                .get(name_id)
+                                .cloned()
                                 .unwrap_or_else(|| format!("struct_{}", name_id.0));
                             Ok(Type::Struct(*name_id, name))
                         }
@@ -1652,7 +1650,8 @@ impl TypeChecker {
                 } else {
                     let name = self
                         .struct_names
-                        .get(name_id).cloned()
+                        .get(name_id)
+                        .cloned()
                         .unwrap_or_else(|| format!("unknown_{}", name_id.0));
                     Ok(Type::Struct(*name_id, name))
                 }
@@ -1757,3 +1756,6 @@ impl TypeChecker {
         Err(TypeError::UndefinedType(span))
     }
 }
+
+#[cfg(test)]
+mod test;
