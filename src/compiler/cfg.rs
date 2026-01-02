@@ -1487,3 +1487,6 @@ impl Compiler {
         }
     }
 }
+
+#[cfg(test)]
+mod test;

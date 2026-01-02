@@ -400,7 +400,7 @@ impl Resolver {
     }
 
     fn lookup_var(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        Self::lookup_in_scopes(&self.var_scopes, name, span)
+        Self::lookup_in_scopes(self.var_scopes.iter().rev(), name, span)
     }
 
     fn lookup_func(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
@@ -422,7 +422,7 @@ impl Resolver {
     }
 
     fn lookup_type(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        match Self::lookup_in_scopes(&self.type_scopes, name, span) {
+        match Self::lookup_in_scopes(self.type_scopes.iter().rev(), name, span) {
             Ok(id) => Ok(id), // Found it as a type
             Err(ResolutionError::NameNotFound(_, _)) => {
                 // Not found as a type, fall back to checking if it's a role name.
@@ -949,3 +949,6 @@ impl Resolver {
         })
     }
 }
+
+#[cfg(test)]
+mod test;
