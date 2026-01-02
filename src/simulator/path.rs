@@ -113,7 +113,7 @@ fn reinit_node<L: Logger>(
 ) -> Result<(), RuntimeError> {
     let init_fn = prog
         .get_func_by_name("Node.BASE_NODE_INIT")
-        .expect("BASE_NODE_INIT not found");
+        .ok_or_else(|| RuntimeError::MissingRequiredFunction("Node.BASE_NODE_INIT".to_string()))?;
 
     let node_env = &state.nodes[node_id];
     let mut env = make_local_env(init_fn, vec![], &Env::default(), node_env);
@@ -259,7 +259,7 @@ fn schedule_client_op(
 
     let op_func = prog
         .get_func_by_name(op_name)
-        .expect("Client op function not found");
+        .ok_or_else(|| RuntimeError::MissingRequiredFunction(op_name.to_string()))?;
     let env = make_local_env(
         op_func,
         actuals.clone(),
@@ -335,9 +335,9 @@ pub fn exec_plan(
                             client_id,
                         )?;
                     } else {
-                        engine
-                            .mark_as_ready(node_idx)
-                            .expect("Failed to defer event");
+                        if let Err(e) = engine.mark_as_ready(node_idx) {
+                            warn!("Failed to mark event as ready: {}", e);
+                        }
                     }
                 }
                 EventAction::CrashNode(node_id) => {

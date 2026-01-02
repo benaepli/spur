@@ -33,10 +33,18 @@ fn default_step() -> i32 {
 }
 
 impl Range {
-    pub fn expand(&self) -> Vec<i32> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.step <= 0 {
-            panic!("Invalid range step: must be > 0");
+            return Err(format!(
+                "Invalid range step: {} (must be > 0)",
+                self.step
+            ));
         }
+        Ok(())
+    }
+
+    pub fn expand(&self) -> Vec<i32> {
+        assert!(self.step > 0, "Range must be validated before calling expand()");
         (self.min..=self.max).step_by(self.step as usize).collect()
     }
 }
@@ -75,6 +83,24 @@ pub struct ExplorerConfig {
     pub population_size: usize,
     #[serde(default = "default_num_generations")]
     pub num_generations: usize,
+}
+
+impl ExplorerConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        self.num_servers_range.validate()
+            .map_err(|e| format!("num_servers range error: {}", e))?;
+        self.num_clients_range.validate()
+            .map_err(|e| format!("num_clients range error: {}", e))?;
+        self.num_write_ops_range.validate()
+            .map_err(|e| format!("num_write_ops range error: {}", e))?;
+        self.num_read_ops_range.validate()
+            .map_err(|e| format!("num_read_ops range error: {}", e))?;
+        self.num_timeouts_range.validate()
+            .map_err(|e| format!("num_timeouts range error: {}", e))?;
+        self.num_crashes_range.validate()
+            .map_err(|e| format!("num_crashes range error: {}", e))?;
+        Ok(())
+    }
 }
 
 fn default_population_size() -> usize {
@@ -344,6 +370,9 @@ pub fn run_explorer(
     let config_json = fs::read_to_string(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
 
+    // Validate configuration before proceeding
+    config.validate().map_err(|e| format!("Configuration validation failed: {}", e))?;
+
     if std::path::Path::new(output_path).exists() {
         fs::remove_file(output_path)?;
     }
@@ -472,6 +501,9 @@ pub fn run_explorer_genetic(
 
     let config_json = fs::read_to_string(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+
+    // Validate configuration before proceeding
+    config.validate().map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     if std::path::Path::new(output_path).exists() {
         fs::remove_file(output_path)?;

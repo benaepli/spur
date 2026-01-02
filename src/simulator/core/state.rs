@@ -208,11 +208,19 @@ impl Continuation {
         match self {
             Continuation::Recover => None,
             Continuation::Async { chan_id } => {
-                let mut chan = state.channels.get(&chan_id).unwrap().clone();
+                let mut chan = match state.channels.get(&chan_id) {
+                    Some(c) => c.clone(),
+                    None => {
+                        log::error!("Channel not found in async continuation: {}", chan_id.id);
+                        return None;
+                    }
+                };
                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                     let mut node_env = state.nodes[reader.node].clone();
-                    // Note: store errors in continuations are ignored (fire-and-forget)
-                    let _ = store(&lhs, val, &mut reader.env, &mut node_env);
+                    // Note: store errors in continuations are logged but ignored (fire-and-forget)
+                    if let Err(e) = store(&lhs, val, &mut reader.env, &mut node_env) {
+                        log::warn!("Store failed in async continuation: {}", e);
+                    }
                     state.nodes[reader.node] = node_env;
                     state.runnable_records.push_back(reader);
                 } else {

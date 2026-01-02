@@ -143,7 +143,10 @@ impl GlobalCoverage {
     }
 
     pub fn snapshot(&self) -> VertexMap {
-        self.vertices.read().unwrap().clone()
+        self.vertices
+            .read()
+            .expect("RwLock poisoned - this indicates a panic occurred while holding the lock")
+            .clone()
     }
 
     pub fn merge(&self, local: &LocalCoverage) {
@@ -152,7 +155,10 @@ impl GlobalCoverage {
             *self.edges.entry((*from, *to)).or_default() += count;
         }
 
-        let mut vertices = self.vertices.write().unwrap();
+        let mut vertices = self
+            .vertices
+            .write()
+            .expect("RwLock poisoned - this indicates a panic occurred while holding the lock");
         vertices.merge_from(local.vertices());
     }
 
@@ -168,12 +174,18 @@ impl GlobalCoverage {
         if total == 0 {
             return 1.0;
         }
-        self.vertices.read().unwrap().novelty_score(vertex)
+        self.vertices
+            .read()
+            .expect("RwLock poisoned - this indicates a panic occurred while holding the lock")
+            .novelty_score(vertex)
     }
 
     /// Access to vertices for coverage visualization.
     pub fn vertices_snapshot(&self) -> VertexMap {
-        self.vertices.read().unwrap().clone()
+        self.vertices
+            .read()
+            .expect("RwLock poisoned - this indicates a panic occurred while holding the lock")
+            .clone()
     }
 }
 
@@ -204,10 +216,16 @@ impl GlobalState {
     }
 
     pub fn insert(&self, item: &Canonical) {
-        self.seen_states.lock().unwrap().insert(item)
+        self.seen_states
+            .lock()
+            .expect("Mutex poisoned - this indicates a panic occurred while holding the lock")
+            .insert(item)
     }
 
     pub fn contains(&self, item: &Canonical) -> bool {
-        self.seen_states.lock().unwrap().contains(item)
+        self.seen_states
+            .lock()
+            .expect("Mutex poisoned - this indicates a panic occurred while holding the lock")
+            .contains(item)
     }
 }

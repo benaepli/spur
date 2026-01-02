@@ -228,7 +228,16 @@ impl TypeChecker {
             if let ResolvedTopLevelDef::Role(role) = top_level_def {
                 for func in &role.func_defs {
                     let sig = self.build_function_signature(func)?;
-                    let role_funcs = self.role_func_signatures.get_mut(&role.name).unwrap();
+                    let role_funcs = self
+                        .role_func_signatures
+                        .get_mut(&role.name)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Role '{}' not found in signature map. \
+                                 This should have been initialized in the first pass.",
+                                role.original_name
+                            )
+                        });
 
                     self.func_signatures.insert(func.name, sig.clone());
                     role_funcs.insert(func.original_name.clone(), (func.name, sig));
@@ -292,7 +301,13 @@ impl TypeChecker {
         let sig = self
             .func_signatures
             .get(&func.name)
-            .expect("Function signature should be collected")
+            .unwrap_or_else(|| {
+                panic!(
+                    "Function signature not found for '{}'. \
+                     This should have been collected in the signature collection pass.",
+                    func.original_name
+                )
+            })
             .clone();
 
         self.enter_scope();
@@ -1423,7 +1438,13 @@ impl TypeChecker {
         let sig = self
             .builtin_signatures
             .get(&builtin)
-            .expect("Missing signature for builtin");
+            .unwrap_or_else(|| {
+                panic!(
+                    "Missing signature for builtin function '{:?}'. \
+                     This should have been initialized when the type checker was created.",
+                    builtin
+                )
+            });
 
         let typed_args = self.check_call_args(&sig.params, args, span)?;
 

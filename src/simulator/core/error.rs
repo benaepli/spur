@@ -56,4 +56,16 @@ pub enum RuntimeError {
         end: usize,
         len: usize,
     },
+
+    #[error("channel not found: {0}")]
+    ChannelNotFound(usize),
+
+    #[error("operation on empty collection")]
+    EmptyCollection,
+
+    #[error("required function not found: {0}")]
+    MissingRequiredFunction(String),
+
+    #[error("iterator state must be local")]
+    InvalidIteratorState,
 }

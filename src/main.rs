@@ -72,10 +72,16 @@ fn main() {
                         "Output directory '{}' already exists and will be deleted. Continue? [y/N] ",
                         output_dir
                     );
-                    io::stdout().flush().unwrap();
+                    if let Err(e) = io::stdout().flush() {
+                        eprintln!("Failed to flush stdout: {}", e);
+                        std::process::exit(1);
+                    }
 
                     let mut input = String::new();
-                    io::stdin().read_line(&mut input).unwrap();
+                    if let Err(e) = io::stdin().read_line(&mut input) {
+                        eprintln!("Failed to read from stdin: {}", e);
+                        std::process::exit(1);
+                    }
                     if !input.trim().eq_ignore_ascii_case("y") {
                         println!("Aborted.");
                         std::process::exit(0);
@@ -95,13 +101,20 @@ fn main() {
             let db_path = output_path.join("results.db");
             let start = Instant::now();
 
-            let global_state =
-                match run_explorer_genetic(&program, &config, db_path.to_str().unwrap()) {
-                    Ok(state) => state,
-                    Err(e) => {
-                        eprintln!("Explorer failed: {}", e);
-                        std::process::exit(1);
-                    }
+            let db_path_str = match db_path.to_str() {
+                Some(path) => path,
+                None => {
+                    eprintln!("Database path contains invalid UTF-8: {}", db_path.display());
+                    std::process::exit(1);
+                }
+            };
+
+            let global_state = match run_explorer_genetic(&program, &config, db_path_str) {
+                Ok(state) => state,
+                Err(e) => {
+                    eprintln!("Explorer failed: {}", e);
+                    std::process::exit(1);
+                }
                 };
 
             let elapsed = start.elapsed();
@@ -191,7 +204,13 @@ fn compile_spec(spec: &str, output: &str) {
         None => std::process::exit(1),
     };
 
-    let json = serde_json::to_string_pretty(&program).expect("Failed to serialize program");
+    let json = match serde_json::to_string_pretty(&program) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Failed to serialize program to JSON: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     if let Err(e) = fs::write(output, json) {
         eprintln!("Error: Failed to write output file '{}': {}", output, e);

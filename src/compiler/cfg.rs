@@ -309,7 +309,14 @@ impl Compiler {
         if let Some(&slot) = self.node_slots.get(&name_id) {
             return VarSlot::Node(slot, name_id);
         }
-        panic!("BUG: Variable {:?} not found in slot maps", name_id);
+        let var_name = self.id_to_name.get(&name_id)
+            .map(|s| s.as_str())
+            .unwrap_or("<unknown>");
+        panic!(
+            "Variable '{}' (NameId {:?}) not found in slot maps. \
+             This indicates a bug in the resolver or CFG builder.",
+            var_name, name_id
+        );
     }
 
     /// Allocates a new NameId and registers it with a display name.
@@ -466,7 +473,13 @@ impl Compiler {
         let qualifier = self
             .func_qualifier_map
             .get(&func.name)
-            .expect("Function qualifier should exist in map");
+            .unwrap_or_else(|| {
+                panic!(
+                    "Function qualifier not found for function '{}'. \
+                     This indicates a bug in the CFG builder initialization.",
+                    func.original_name
+                )
+            });
 
         // Use the existing func.name NameId from the resolver, not a new one
         let qualified_name = format!("{}.{}", qualifier, func.original_name);
@@ -1204,7 +1217,13 @@ impl Compiler {
         let qualifier = self
             .func_qualifier_map
             .get(&call.name)
-            .expect("Function qualifier should exist in map");
+            .unwrap_or_else(|| {
+                panic!(
+                    "Function qualifier not found for function '{}'. \
+                     This indicates a bug in the CFG builder initialization.",
+                    call.original_name
+                )
+            });
         let func_name = format!("{}.{}", qualifier, call.original_name);
 
         // Build the call chain backwards (Async -> next_vertex).
@@ -1255,7 +1274,13 @@ impl Compiler {
                     let qualifier = self
                         .func_qualifier_map
                         .get(&user_call.name)
-                        .expect("Function qualifier should exist in map");
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Function qualifier not found for function '{}'. \
+                                 This indicates a bug in the CFG builder initialization.",
+                                user_call.original_name
+                            )
+                        });
                     let func_name = format!("{}.{}", qualifier, user_call.original_name);
 
                     // Create the SyncCall instruction.
@@ -1332,7 +1357,13 @@ impl Compiler {
         let qualifier = self
             .func_qualifier_map
             .get(&call.name)
-            .expect("Function qualifier should exist in map");
+            .unwrap_or_else(|| {
+                panic!(
+                    "Function qualifier not found for function '{}'. \
+                     This indicates a bug in the CFG builder initialization.",
+                    call.original_name
+                )
+            });
         let func_name = format!("{}.{}", qualifier, call.original_name);
 
         // The simulator's Async handler automatically creates a channel/future and stores it in `target`.
@@ -1461,8 +1492,9 @@ impl Compiler {
             | TypedExprKind::MakeChannel(_)
             | TypedExprKind::Send(_, _)
             | TypedExprKind::Recv(_) => {
-                panic!(
-                    "Cannot have complex call inside a simple expression: {:?}",
+                unreachable!(
+                    "Cannot have complex call inside a simple expression. \
+                     This should have been caught by the type checker. Expression: {:?}",
                     expr
                 )
             }
@@ -1472,7 +1504,11 @@ impl Compiler {
     fn convert_lhs(&mut self, expr: &TypedExpr) -> Lhs {
         match &expr.kind {
             TypedExprKind::Var(id, _name) => Lhs::Var(self.resolve_slot(*id)),
-            _ => panic!("Invalid assignment target: {:?}", expr),
+            _ => unreachable!(
+                "Invalid assignment target. \
+                 This should have been caught by the type checker. Expression: {:?}",
+                expr
+            ),
         }
     }
 

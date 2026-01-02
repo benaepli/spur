@@ -319,18 +319,24 @@ impl HistoryWriter {
 
     /// Sends a pre-serialized history and logs write request to the background thread.
     pub fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>) {
-        let _ = self.sender.send(HistoryCommand::Write {
+        if let Err(e) = self.sender.send(HistoryCommand::Write {
             run_id,
             history,
             logs,
-        });
+        }) {
+            log::error!("Failed to send history write command for run {}: {}", run_id, e);
+        }
     }
 
     /// Shuts down the background writer, waiting for all pending writes to complete.
     pub fn shutdown(mut self) {
-        let _ = self.sender.send(HistoryCommand::Shutdown);
+        if let Err(e) = self.sender.send(HistoryCommand::Shutdown) {
+            log::error!("Failed to send shutdown command to history writer: {}", e);
+        }
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            if let Err(e) = h.join() {
+                log::error!("History writer thread panicked during shutdown: {:?}", e);
+            }
         }
     }
 }
