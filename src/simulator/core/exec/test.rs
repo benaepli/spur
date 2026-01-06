@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Cfg, Expr, Instr, Label, Lhs, Program, VarSlot};
@@ -340,8 +339,11 @@ fn test_pause_yields() {
     );
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
-    assert_eq!(state.runnable_records.len(), 1);
-    assert_eq!(state.runnable_records[0].pc, ret);
+    assert_eq!(state.runnable_tasks.len(), 1);
+    match &state.runnable_tasks[0] {
+        crate::simulator::core::state::Runnable::Record(r) => assert_eq!(r.pc, ret),
+        _ => panic!("Expected Record"),
+    }
 }
 
 #[test]

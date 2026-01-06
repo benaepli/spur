@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, RuntimeError, State,
-    UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env, schedule_record,
+    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, Runnable, RuntimeError, State,
+    UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env, schedule_runnable,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::path::plan::{
@@ -159,22 +159,32 @@ fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
         unique_id: -1,
     });
 
-    let records = std::mem::take(&mut state.runnable_records);
-    for record in records {
-        if record.node == node_id {
-            let is_external = record.origin_node != record.node;
-            let origin_alive = !state
-                .crash_info
-                .currently_crashed
-                .contains(&record.origin_node);
-            if is_external && origin_alive {
-                state
-                    .crash_info
-                    .queued_messages
-                    .push_back((node_id, record));
+    let tasks = std::mem::take(&mut state.runnable_tasks);
+    for task in tasks {
+        match task {
+            Runnable::Timer(timer) => {
+                // Drop timers for crashed nodes
+                if timer.node != node_id {
+                    state.runnable_tasks.push_back(Runnable::Timer(timer));
+                }
             }
-        } else {
-            state.runnable_records.push_back(record);
+            Runnable::Record(record) => {
+                if record.node == node_id {
+                    let is_external = record.origin_node != record.node;
+                    let origin_alive = !state
+                        .crash_info
+                        .currently_crashed
+                        .contains(&record.origin_node);
+                    if is_external && origin_alive {
+                        state
+                            .crash_info
+                            .queued_messages
+                            .push_back((node_id, record));
+                    }
+                } else {
+                    state.runnable_tasks.push_back(Runnable::Record(record));
+                }
+            }
         }
     }
 }
@@ -219,7 +229,7 @@ fn recover_crashed_node<L: Logger>(
     let queued = std::mem::take(&mut state.crash_info.queued_messages);
     for (dest, record) in queued {
         if dest == node_id {
-            state.runnable_records.push_back(record);
+            state.runnable_tasks.push_back(Runnable::Record(record));
         } else {
             state.crash_info.queued_messages.push_back((dest, record));
         }
@@ -275,7 +285,7 @@ fn schedule_client_op(
         unique_id: op_id,
     });
 
-    state.runnable_records.push_back(Record {
+    state.runnable_tasks.push_back(Runnable::Record(Record {
         pc: op_func.entry,
         node: client_id as usize,
         origin_node: client_id as usize,
@@ -287,7 +297,7 @@ fn schedule_client_op(
         env,
         x: 0.4,
         policy: UpdatePolicy::Identity,
-    });
+    }));
     Ok(())
 }
 
@@ -368,8 +378,8 @@ pub fn exec_plan(
         let history_start_len = path_state.history.len();
 
         // Execute one simulation step
-        if !path_state.state.runnable_records.is_empty() {
-            let result = schedule_record(
+        if !path_state.state.runnable_tasks.is_empty() {
+            let result = schedule_runnable(
                 &mut path_state.state,
                 &mut path_state.logs,
                 &program,

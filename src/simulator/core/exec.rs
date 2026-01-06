@@ -2,7 +2,8 @@ use crate::compiler::cfg::{Instr, Label, Lhs, Program, SELF_SLOT, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{eval, make_local_env, store};
 use crate::simulator::core::state::{
-    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, Record, State, UpdatePolicy,
+    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, Record, Runnable, State, Timer,
+    UpdatePolicy,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
@@ -130,7 +131,7 @@ fn execute_common_label<L: Logger>(
                         .queued_messages
                         .push_back((target_node, new_record));
                 } else {
-                    state.runnable_records.push_back(new_record);
+                    state.runnable_tasks.push_back(Runnable::Record(new_record));
                 }
                 Ok(Some(StepOutcome::Continue(*next)))
             }
@@ -142,6 +143,23 @@ fn execute_common_label<L: Logger>(
             };
             state.channels.insert(cid, ChannelState::new(*cap as i32));
             store(lhs, Value::channel(cid), local_env, node_env)?;
+            Ok(Some(StepOutcome::Continue(*next)))
+        }
+        Label::SetTimer(lhs, next) => {
+            let cid = ChannelId {
+                node: node_id,
+                id: state.alloc_channel_id(),
+            };
+            state.channels.insert(cid, ChannelState::new(1));
+            store(lhs, Value::channel(cid), local_env, node_env)?;
+
+            // Create a timer that will fire when scheduled
+            let timer = Timer {
+                pc: *next,
+                node: node_id,
+                channel: cid,
+            };
+            state.runnable_tasks.push_back(Runnable::Timer(timer));
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::Cond(cond, bthen, belse) => {
@@ -341,7 +359,7 @@ pub fn exec<L: Logger>(
                     let mut r_node_env = state.nodes[reader.node].clone();
                     store(&lhs, val, &mut reader.env, &mut r_node_env)?;
                     state.nodes[reader.node] = r_node_env;
-                    state.runnable_records.push_back(reader);
+                    state.runnable_tasks.push_back(Runnable::Record(reader));
                     record.pc = *next;
                 } else if (chan.buffer.len() as i32) < chan.capacity {
                     chan.buffer.push_back(val);
@@ -374,12 +392,12 @@ pub fn exec<L: Logger>(
                     // Wake writer if any
                     if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
                         chan.buffer.push_back(w_val);
-                        state.runnable_records.push_back(writer);
+                        state.runnable_tasks.push_back(Runnable::Record(writer));
                     }
                     record.pc = *next;
                 } else if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
                     store(lhs, w_val, &mut local_env, &mut node_env)?;
-                    state.runnable_records.push_back(writer);
+                    state.runnable_tasks.push_back(Runnable::Record(writer));
                     record.pc = *next;
                 } else {
                     // Block Reader
@@ -397,7 +415,7 @@ pub fn exec<L: Logger>(
                 let node_id = record.node;
                 record.env = local_env;
                 record.pc = *next;
-                state.runnable_records.push_back(record);
+                state.runnable_tasks.push_back(Runnable::Record(record));
                 state.nodes[node_id] = node_env;
                 return Ok(None); // Yield
             }
@@ -407,13 +425,14 @@ pub fn exec<L: Logger>(
                 } else {
                     let node_id = record.node;
                     record.env = local_env;
-                    state.runnable_records.push_back(record);
+                    state.runnable_tasks.push_back(Runnable::Record(record));
                     state.nodes[node_id] = node_env;
                     return Ok(None); // Yield
                 }
             }
             Label::Instr(_, _)
             | Label::MakeChannel(_, _, _)
+            | Label::SetTimer(_, _)
             | Label::Cond(_, _, _)
             | Label::Return(_)
             | Label::Print(_, _)

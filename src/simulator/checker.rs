@@ -1,8 +1,8 @@
 use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::checker::state::{Budget, SearchNode};
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, State, UpdatePolicy, Value,
-    exec, exec_sync_on_node, make_local_env,
+    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, Runnable, RuntimeError, State,
+    UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use ecow::EcoString;
@@ -145,9 +145,48 @@ impl ModelChecker {
         let mut successors = Vec::new();
 
         // Runnable items
-        for i in 0..node.state.runnable_records.len() {
+        for i in 0..node.state.runnable_tasks.len() {
             let mut next_state = node.state.clone();
-            let record = next_state.runnable_records.remove(i);
+            let runnable = next_state.runnable_tasks.remove(i);
+
+            // Handle timers - drop if node is crashed, otherwise execute
+            let record = match runnable {
+                Runnable::Timer(timer) => {
+                    if next_state
+                        .crash_info
+                        .currently_crashed
+                        .contains(&timer.node)
+                    {
+                        // Timer is dropped for crashed node
+                        continue;
+                    }
+                    // Execute timer: send unit value to its channel
+                    if let Some(mut chan) = next_state.channels.get(&timer.channel).cloned() {
+                        if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                            let mut r_node_env = next_state.nodes[reader.node].clone();
+                            if let Err(e) = crate::simulator::core::eval::store(
+                                &lhs,
+                                Value::unit(),
+                                &mut reader.env,
+                                &mut r_node_env,
+                            ) {
+                                log::warn!("Store failed in timer completion: {}", e);
+                            }
+                            next_state.nodes[reader.node] = r_node_env;
+                            next_state
+                                .runnable_tasks
+                                .push_back(Runnable::Record(reader));
+                        } else {
+                            chan.buffer.push_back(Value::unit());
+                        }
+                        next_state.channels.insert(timer.channel, chan);
+                    }
+                    let succ = self.make_successor(&node, next_state, 0.5);
+                    successors.push(succ);
+                    continue;
+                }
+                Runnable::Record(r) => r,
+            };
 
             // Handle crashed nodes (drop or queue message)
             if next_state
@@ -329,17 +368,27 @@ impl ModelChecker {
 
     fn apply_crash(&self, state: &mut State, node_id: usize) {
         state.crash_info.currently_crashed.insert(node_id);
-        let records = std::mem::take(&mut state.runnable_records);
-        for record in records {
-            if record.node == node_id {
-                if record.origin_node != record.node {
-                    state
-                        .crash_info
-                        .queued_messages
-                        .push_back((node_id, record));
+        let tasks = std::mem::take(&mut state.runnable_tasks);
+        for task in tasks {
+            match task {
+                Runnable::Timer(timer) => {
+                    // Drop timers for crashed nodes
+                    if timer.node != node_id {
+                        state.runnable_tasks.push_back(Runnable::Timer(timer));
+                    }
                 }
-            } else {
-                state.runnable_records.push_back(record);
+                Runnable::Record(record) => {
+                    if record.node == node_id {
+                        if record.origin_node != record.node {
+                            state
+                                .crash_info
+                                .queued_messages
+                                .push_back((node_id, record));
+                        }
+                    } else {
+                        state.runnable_tasks.push_back(Runnable::Record(record));
+                    }
+                }
             }
         }
     }
@@ -375,11 +424,7 @@ impl ModelChecker {
         if let Some(recover_fn) = self.program.get_func_by_name("Node.RecoverInit") {
             let actuals = vec![
                 Value::int(node_id as i64),
-                Value::list(
-                    (0..self.config.num_servers)
-                        .map(Value::node)
-                        .collect(),
-                ),
+                Value::list((0..self.config.num_servers).map(Value::node).collect()),
             ];
             let env = make_local_env(recover_fn, actuals, &Env::default(), &state.nodes[node_id]);
             let record = Record {
@@ -391,14 +436,14 @@ impl ModelChecker {
                 x: 0.0,
                 policy: UpdatePolicy::Identity,
             };
-            state.runnable_records.push_back(record);
+            state.runnable_tasks.push_back(Runnable::Record(record));
         }
 
         // Replay queued messages
         let queued = std::mem::take(&mut state.crash_info.queued_messages);
         for (dest, record) in queued {
             if dest == node_id {
-                state.runnable_records.push_back(record);
+                state.runnable_tasks.push_back(Runnable::Record(record));
             } else {
                 state.crash_info.queued_messages.push_back((dest, record));
             }
@@ -434,7 +479,7 @@ impl ModelChecker {
                 x: 0.5,
                 policy: UpdatePolicy::Identity,
             };
-            state.runnable_records.push_back(record);
+            state.runnable_tasks.push_back(Runnable::Record(record));
             true
         } else {
             false
@@ -465,7 +510,7 @@ impl ModelChecker {
                 x: 0.5,
                 policy: UpdatePolicy::Identity,
             };
-            state.runnable_records.push_back(record);
+            state.runnable_tasks.push_back(Runnable::Record(record));
             true
         } else {
             false

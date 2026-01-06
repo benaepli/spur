@@ -28,9 +28,7 @@ pub fn render_svg(program: &Program) -> Result<Vec<u8>, std::io::Error> {
 
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(
-            format!("Graphviz failed: {}", err_msg),
-        ));
+        return Err(io::Error::other(format!("Graphviz failed: {}", err_msg)));
     }
 
     Ok(output.stdout)
@@ -107,6 +105,7 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             Label::Instr(_, next)
             | Label::Print(_, next)
             | Label::MakeChannel(_, _, next)
+            | Label::SetTimer(_, next)
             | Label::Send(_, _, next)
             | Label::Recv(_, _, next)
             | Label::SpinAwait(_, next) => {
@@ -198,6 +197,13 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
                 "<B>Make Chan</B><BR/>{} (cap: {})",
                 html_escape(&pretty_lhs(prog, lhs)),
                 cap
+            );
+        }
+        Label::SetTimer(lhs, _) => {
+            header_color = "#C8E6C9"; // Green
+            content = format!(
+                "<B>Set Timer</B><BR/>{}",
+                html_escape(&pretty_lhs(prog, lhs))
             );
         }
         Label::Send(chan, val, _) => {
@@ -438,7 +444,6 @@ fn pretty_expr(prog: &Program, expr: &Expr) -> String {
         Expr::Nil => "nil".into(),
         Expr::Unwrap(e) => format!("{}!", pretty_expr(prog, e)),
         Expr::Coalesce(l, r) => format!("{} ?? {}", pretty_expr(prog, l), pretty_expr(prog, r)),
-        Expr::SetTimer => "set_timer()".into(),
         Expr::Some(e) => format!("Some({})", pretty_expr(prog, e)),
         Expr::IntToString(e) => format!("int_to_string({})", pretty_expr(prog, e)),
     }
@@ -484,6 +489,7 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         Label::Instr(_, n)
         | Label::Pause(n)
         | Label::MakeChannel(_, _, n)
+        | Label::SetTimer(_, n)
         | Label::Send(_, _, n)
         | Label::Recv(_, _, n)
         | Label::SpinAwait(_, n)

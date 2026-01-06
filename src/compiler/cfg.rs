@@ -60,7 +60,6 @@ pub enum Expr {
     Nil,
     Unwrap(Box<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
-    SetTimer,
     Some(Box<Expr>),
     IntToString(Box<Expr>),
 }
@@ -107,6 +106,7 @@ pub enum Label {
     Instr(Instr, Vertex /* next_vertex */),
     Pause(Vertex /* next_vertex */),
     MakeChannel(Lhs, usize, Vertex),
+    SetTimer(Lhs, Vertex),
     Send(Expr, Expr, Vertex),
     Recv(Lhs, Expr, Vertex),
     SpinAwait(Expr, Vertex /* next_vertex */),
@@ -309,7 +309,9 @@ impl Compiler {
         if let Some(&slot) = self.node_slots.get(&name_id) {
             return VarSlot::Node(slot, name_id);
         }
-        let var_name = self.id_to_name.get(&name_id)
+        let var_name = self
+            .id_to_name
+            .get(&name_id)
             .map(|s| s.as_str())
             .unwrap_or("<unknown>");
         panic!(
@@ -470,16 +472,13 @@ impl Compiler {
             body_entry,
         ));
 
-        let qualifier = self
-            .func_qualifier_map
-            .get(&func.name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Function qualifier not found for function '{}'. \
+        let qualifier = self.func_qualifier_map.get(&func.name).unwrap_or_else(|| {
+            panic!(
+                "Function qualifier not found for function '{}'. \
                      This indicates a bug in the CFG builder initialization.",
-                    func.original_name
-                )
-            });
+                func.original_name
+            )
+        });
 
         // Use the existing func.name NameId from the resolver, not a new one
         let qualified_name = format!("{}.{}", qualifier, func.original_name);
@@ -961,7 +960,7 @@ impl Compiler {
                         ));
                         let r_vertex =
                             self.compile_expr_to_value(r, Lhs::Var(r_tmp), assign_vertex);
-                        
+
                         self.compile_expr_to_value(l, Lhs::Var(l_tmp), r_vertex)
                     }
                 }
@@ -1182,11 +1181,7 @@ impl Compiler {
                 self.compile_expr_list_recursive(val_exprs.iter(), tmps, assign_vertex)
             }
 
-            // --- Truly simple, non-side-effecting cases ---
-            TypedExprKind::SetTimer => {
-                let label = Label::Instr(Instr::Assign(target, Expr::SetTimer), next_vertex);
-                self.add_label(label)
-            }
+            TypedExprKind::SetTimer => self.add_label(Label::SetTimer(target, next_vertex)),
 
             _ => {
                 // Desugar the simple expression
@@ -1214,16 +1209,13 @@ impl Compiler {
             })
             .unzip();
 
-        let qualifier = self
-            .func_qualifier_map
-            .get(&call.name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Function qualifier not found for function '{}'. \
+        let qualifier = self.func_qualifier_map.get(&call.name).unwrap_or_else(|| {
+            panic!(
+                "Function qualifier not found for function '{}'. \
                      This indicates a bug in the CFG builder initialization.",
-                    call.original_name
-                )
-            });
+                call.original_name
+            )
+        });
         let func_name = format!("{}.{}", qualifier, call.original_name);
 
         // Build the call chain backwards (Async -> next_vertex).
@@ -1271,16 +1263,16 @@ impl Compiler {
                             })
                             .unzip();
 
-                    let qualifier = self
-                        .func_qualifier_map
-                        .get(&user_call.name)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Function qualifier not found for function '{}'. \
+                    let qualifier =
+                        self.func_qualifier_map
+                            .get(&user_call.name)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Function qualifier not found for function '{}'. \
                                  This indicates a bug in the CFG builder initialization.",
-                                user_call.original_name
-                            )
-                        });
+                                    user_call.original_name
+                                )
+                            });
                     let func_name = format!("{}.{}", qualifier, user_call.original_name);
 
                     // Create the SyncCall instruction.
@@ -1354,16 +1346,13 @@ impl Compiler {
         let node_tmp = self.alloc_temp_slot();
         let node_expr = Expr::Var(node_tmp);
 
-        let qualifier = self
-            .func_qualifier_map
-            .get(&call.name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Function qualifier not found for function '{}'. \
+        let qualifier = self.func_qualifier_map.get(&call.name).unwrap_or_else(|| {
+            panic!(
+                "Function qualifier not found for function '{}'. \
                      This indicates a bug in the CFG builder initialization.",
-                    call.original_name
-                )
-            });
+                call.original_name
+            )
+        });
         let func_name = format!("{}.{}", qualifier, call.original_name);
 
         // The simulator's Async handler automatically creates a channel/future and stores it in `target`.
@@ -1484,7 +1473,13 @@ impl Compiler {
                     .collect(),
             ),
 
-            TypedExprKind::SetTimer => Expr::SetTimer,
+            TypedExprKind::SetTimer => {
+                unreachable!(
+                    "SetTimer should be compiled as a Label, not an Expr. \
+                     This should have been caught earlier. Expression: {:?}",
+                    expr
+                )
+            }
 
             // --- Panic on complex expressions ---
             TypedExprKind::FuncCall(_)

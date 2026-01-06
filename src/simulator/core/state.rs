@@ -108,10 +108,56 @@ pub struct Operation {
     pub unique_id: i32,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq)]
+pub struct Timer {
+    pub pc: Vertex,
+    pub node: usize,
+    pub channel: ChannelId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Runnable {
+    Timer(Timer),
+    Record(Record),
+}
+
+impl Hash for Runnable {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Runnable::Timer(t) => {
+                0u8.hash(state);
+                t.hash(state);
+            }
+            Runnable::Record(r) => {
+                1u8.hash(state);
+                r.hash(state);
+            }
+        }
+    }
+}
+
+impl Runnable {
+    /// Get the node this runnable belongs to.
+    pub fn node(&self) -> usize {
+        match self {
+            Runnable::Timer(t) => t.node,
+            Runnable::Record(r) => r.node,
+        }
+    }
+
+    /// Get the PC (program counter vertex) for this runnable.
+    pub fn pc(&self) -> Vertex {
+        match self {
+            Runnable::Timer(t) => t.pc,
+            Runnable::Record(r) => r.pc,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub nodes: Vector<Env>, // Index is node_id
-    pub runnable_records: Vector<Record>,
+    pub runnable_tasks: Vector<Runnable>,
     pub channels: ImHashMap<ChannelId, ChannelState>,
     pub crash_info: CrashInfo,
     next_channel_id: usize,
@@ -127,7 +173,7 @@ impl State {
                     env
                 })
                 .collect(),
-            runnable_records: Vector::new(),
+            runnable_tasks: Vector::new(),
             channels: ImHashMap::new(),
             crash_info: CrashInfo {
                 currently_crashed: OrdSet::new(),
@@ -153,9 +199,9 @@ impl State {
             h ^= mix(env.sig, i as u32);
         }
 
-        // Records: Hash each Record and mix
-        for (i, record) in self.runnable_records.iter().enumerate() {
-            h ^= mix(compute_hash(record), (1000 + i) as u32);
+        // Runnable tasks: Hash each task and mix
+        for (i, task) in self.runnable_tasks.iter().enumerate() {
+            h ^= mix(compute_hash(task), (1000 + i) as u32);
         }
 
         // Channels: Order-independent XOR
@@ -222,7 +268,7 @@ impl Continuation {
                         log::warn!("Store failed in async continuation: {}", e);
                     }
                     state.nodes[reader.node] = node_env;
-                    state.runnable_records.push_back(reader);
+                    state.runnable_tasks.push_back(Runnable::Record(reader));
                 } else {
                     chan.buffer.push_back(val);
                 }
