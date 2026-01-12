@@ -168,6 +168,14 @@ impl TypeChecker {
                 is_sync: true,
             },
         );
+        builtin_signatures.insert(
+            BuiltinFn::BoolToString,
+            FunctionSignature {
+                params: vec![Type::Bool],
+                return_type: Type::String,
+                is_sync: true,
+            },
+        );
 
         Self {
             scopes: vec![HashMap::new()],
@@ -1324,7 +1332,38 @@ impl TypeChecker {
         span: Span,
     ) -> Result<TypedExpr, TypeError> {
         match op {
-            BinOp::Add | BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {
+            BinOp::Add => {
+                // Infer types of both operands
+                let typed_left = self.infer_expr(left)?;
+                let typed_right = self.infer_expr(right)?;
+
+                // Both must be the same type (either Int or String)
+                match (&typed_left.ty, &typed_right.ty) {
+                    (Type::Int, Type::Int) => {
+                        Ok(TypedExpr {
+                            kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
+                            ty: Type::Int,
+                            span,
+                        })
+                    }
+                    (Type::String, Type::String) => {
+                        Ok(TypedExpr {
+                            kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
+                            ty: Type::String,
+                            span,
+                        })
+                    }
+                    _ => {
+                        Err(TypeError::InvalidBinOp {
+                            op: op.clone(),
+                            left: typed_left.ty.clone(),
+                            right: typed_right.ty.clone(),
+                            span,
+                        })
+                    }
+                }
+            }
+            BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {
                 let typed_left = self.check_expr(left, &Type::Int)?;
                 let typed_right = self.check_expr(right, &Type::Int)?;
                 Ok(TypedExpr {

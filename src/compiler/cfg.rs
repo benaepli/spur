@@ -62,6 +62,7 @@ pub enum Expr {
     Coalesce(Box<Expr>, Box<Expr>),
     Some(Box<Expr>),
     IntToString(Box<Expr>),
+    BoolToString(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Hash)]
@@ -1329,6 +1330,15 @@ impl Compiler {
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
                 let arg_expr = args.first().expect("IntToString should have 1 arg");
+                self.compile_expr_to_value(arg_expr, Lhs::Var(arg_var), assign_vertex)
+            }
+            BuiltinFn::BoolToString => {
+                let arg_var = self.alloc_temp_slot();
+                let final_expr = Expr::BoolToString(Box::new(Expr::Var(arg_var)));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+
+                let arg_expr = args.first().expect("BoolToString should have 1 arg");
                 self.compile_expr_to_value(arg_expr, Lhs::Var(arg_var), assign_vertex)
             }
         }

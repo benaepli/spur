@@ -18,6 +18,7 @@ impl std::fmt::Display for NameId {
 pub enum BuiltinFn {
     Println,
     IntToString,
+    BoolToString,
 }
 
 impl FromStr for BuiltinFn {
@@ -27,6 +28,7 @@ impl FromStr for BuiltinFn {
         match s {
             "println" => Ok(BuiltinFn::Println),
             "int_to_string" => Ok(BuiltinFn::IntToString),
+            "bool_to_string" => Ok(BuiltinFn::BoolToString),
             _ => Err(()),
         }
     }

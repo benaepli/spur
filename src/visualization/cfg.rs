@@ -446,6 +446,7 @@ fn pretty_expr(prog: &Program, expr: &Expr) -> String {
         Expr::Coalesce(l, r) => format!("{} ?? {}", pretty_expr(prog, l), pretty_expr(prog, r)),
         Expr::Some(e) => format!("Some({})", pretty_expr(prog, e)),
         Expr::IntToString(e) => format!("int_to_string({})", pretty_expr(prog, e)),
+        Expr::BoolToString(e) => format!("bool_to_string({})", pretty_expr(prog, e)),
     }
 }
 

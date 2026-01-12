@@ -1,8 +1,8 @@
-use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
+use crate::compiler::cfg::{Program, VarSlot, SELF_SLOT};
 use crate::simulator::checker::state::{Budget, SearchNode};
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, Runnable, RuntimeError, State,
-    UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env,
+    exec, exec_sync_on_node, make_local_env, Continuation, Env, LogEntry, Logger, OpKind, Operation, Record,
+    Runnable, State, UpdatePolicy, Value,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use ecow::EcoString;

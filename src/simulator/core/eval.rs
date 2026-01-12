@@ -137,9 +137,24 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
         Expr::Unit => Ok(Value::unit()),
         Expr::Nil => Ok(Value::option_none()),
         Expr::Var(s) => Ok(load(*s, local_env, node_env)),
-        Expr::Plus(e1, e2) => Ok(Value::int(
-            eval(local_env, node_env, e1)?.as_int()? + eval(local_env, node_env, e2)?.as_int()?,
-        )),
+        Expr::Plus(e1, e2) => {
+            let v1 = eval(local_env, node_env, e1)?;
+            let v2 = eval(local_env, node_env, e2)?;
+
+            match (&v1.kind, &v2.kind) {
+                (ValueKind::Int(i1), ValueKind::Int(i2)) => Ok(Value::int(i1 + i2)),
+                (ValueKind::String(s1), ValueKind::String(s2)) => {
+                    let mut result = String::new();
+                    result.push_str(s1.as_str());
+                    result.push_str(s2.as_str());
+                    Ok(Value::string(EcoString::from(result)))
+                }
+                _ => Err(RuntimeError::TypeError {
+                    expected: "int or string",
+                    got: v1.type_name(),
+                }),
+            }
+        }
         Expr::Minus(e1, e2) => Ok(Value::int(
             eval(local_env, node_env, e1)?.as_int()? - eval(local_env, node_env, e2)?.as_int()?,
         )),
@@ -319,6 +334,9 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
         Expr::IntToString(e) => Ok(Value::string(EcoString::from(
             eval(local_env, node_env, e)?.as_int()?.to_string(),
         ))),
+        Expr::BoolToString(e) => Ok(Value::string(EcoString::from(
+            eval(local_env, node_env, e)?.as_bool()?.to_string(),
+        ))),
         Expr::Store(col, key, val) => update_collection(
             eval(local_env, node_env, col)?,
             eval(local_env, node_env, key)?,
@@ -381,6 +399,39 @@ mod tests {
         assert_eq!(
             eval(&env, &env, &Expr::Mod(e1.clone(), e2.clone())).unwrap(),
             Value::int(1)
+        );
+    }
+
+    #[test]
+    fn test_eval_string_concat() {
+        let env = Env::with_slots(0);
+
+        // Basic concatenation
+        let s1 = Box::new(Expr::String(EcoString::from("hello")));
+        let s2 = Box::new(Expr::String(EcoString::from("world")));
+        assert_eq!(
+            eval(&env, &env, &Expr::Plus(s1, s2)).unwrap(),
+            Value::string(EcoString::from("helloworld"))
+        );
+
+        // Concatenation with spaces
+        let s3 = Box::new(Expr::String(EcoString::from("hello ")));
+        let s4 = Box::new(Expr::String(EcoString::from("world")));
+        assert_eq!(
+            eval(&env, &env, &Expr::Plus(s3, s4)).unwrap(),
+            Value::string(EcoString::from("hello world"))
+        );
+
+        // Empty strings
+        let s5 = Box::new(Expr::String(EcoString::from("")));
+        let s6 = Box::new(Expr::String(EcoString::from("test")));
+        assert_eq!(
+            eval(&env, &env, &Expr::Plus(s5.clone(), s6.clone())).unwrap(),
+            Value::string(EcoString::from("test"))
+        );
+        assert_eq!(
+            eval(&env, &env, &Expr::Plus(s6, s5)).unwrap(),
+            Value::string(EcoString::from("test"))
         );
     }
 
@@ -571,6 +622,14 @@ mod tests {
         assert_eq!(
             eval(&env, &env, &Expr::IntToString(Box::new(Expr::Int(123)))).unwrap(),
             Value::string("123".into())
+        );
+        assert_eq!(
+            eval(&env, &env, &Expr::BoolToString(Box::new(Expr::Bool(true)))).unwrap(),
+            Value::string("true".into())
+        );
+        assert_eq!(
+            eval(&env, &env, &Expr::BoolToString(Box::new(Expr::Bool(false)))).unwrap(),
+            Value::string("false".into())
         );
     }
 
