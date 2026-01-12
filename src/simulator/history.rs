@@ -1,7 +1,7 @@
 use crate::simulator::core::{ChannelId, LogEntry, OpKind, Operation, Value, ValueKind};
+use duckdb::{Connection, params};
 use log::error;
 use rayon::prelude::*;
-use rusqlite::{Connection, params};
 use serde_json::{Value as JsonValue, json};
 use std::error::Error;
 use std::path::Path;
@@ -153,116 +153,89 @@ pub fn save_history_to_csv<P: AsRef<Path>>(
     Ok(())
 }
 
-/// Initialize the SQLite database with the required tables.
-pub fn init_sqlite(conn: &Connection) -> Result<(), rusqlite::Error> {
-    // Performance: less durability, but should be OK
+/// Initialize the DuckDB database with the required tables.
+pub fn init_db(conn: &Connection) -> Result<(), duckdb::Error> {
     conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;",
-    )?;
-
-    conn.execute(
         "CREATE TABLE IF NOT EXISTS runs (
-run_id INTEGER PRIMARY KEY,
-start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-meta_info TEXT
-);",
-        [],
-    )?;
+            run_id INTEGER PRIMARY KEY,
+            start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            meta_info TEXT
+        );
 
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS executions (
-run_id INTEGER REFERENCES runs(run_id),
-seq_num INTEGER,
-unique_id INTEGER,
-client_id INTEGER,
-kind TEXT,
-action TEXT,
-payload JSON,
-PRIMARY KEY (run_id, seq_num)
-);",
-        [],
-    )?;
+        CREATE TABLE IF NOT EXISTS executions (
+            run_id INTEGER REFERENCES runs(run_id),
+            seq_num INTEGER,
+            unique_id INTEGER,
+            client_id INTEGER,
+            kind TEXT,
+            action TEXT,
+            payload TEXT,
+            PRIMARY KEY (run_id, seq_num)
+        );
 
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_run_execution ON executions(run_id, seq_num);",
-        [],
-    )?;
+        CREATE INDEX IF NOT EXISTS idx_run_execution ON executions(run_id, seq_num);
 
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS logs (
+        CREATE TABLE IF NOT EXISTS logs (
             run_id INTEGER REFERENCES runs(run_id),
             seq_num INTEGER,
             node_id INTEGER,
             step INTEGER,
             content TEXT,
             PRIMARY KEY (run_id, seq_num)
-        );",
-        [],
-    )?;
+        );
 
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_run_logs ON logs(run_id);",
-        [],
+        CREATE INDEX IF NOT EXISTS idx_run_logs ON logs(run_id);",
     )?;
 
     Ok(())
 }
 
-/// Saves pre-serialized history to the SQLite database.
-/// This is a fast I/O-only operation since serialization is already done.
-fn save_history_sqlite(
-    conn: &mut Connection,
+/// Saves pre-serialized history to the DuckDB database using bulk Appender API.
+fn save_history_db(
+    conn: &Connection,
     run_id: i64,
     history: &[PersistableOp],
 ) -> Result<(), Box<dyn Error>> {
     conn.execute("INSERT INTO runs (run_id) VALUES (?1)", params![run_id])?;
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO executions (run_id, seq_num, unique_id, client_id, kind, action, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
 
-        for (seq_num, op) in history.iter().enumerate() {
-            stmt.execute(params![
-                run_id,
-                seq_num as i64,
-                op.unique_id,
-                op.client_id,
-                op.kind,
-                op.action,
-                op.payload_json
-            ])?;
-        }
+    // Use DuckDB's Appender for fast bulk inserts
+    let mut appender = conn.appender("executions")?;
+
+    for (seq_num, op) in history.iter().enumerate() {
+        appender.append_row(params![
+            run_id,
+            seq_num as i64,
+            op.unique_id,
+            op.client_id,
+            op.kind,
+            &op.action,
+            &op.payload_json
+        ])?;
     }
-    tx.commit()?;
+
+    appender.flush()?;
     Ok(())
 }
 
-fn save_logs_sqlite(
-    conn: &mut Connection,
+fn save_logs_db(
+    conn: &Connection,
     run_id: i64,
     logs: &[PersistableLog],
 ) -> Result<(), Box<dyn Error>> {
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO logs (run_id, seq_num, node_id, step, content)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
+    // Use DuckDB's Appender for fast bulk inserts
+    let mut appender = conn.appender("logs")?;
 
-        for (seq_num, log) in logs.iter().enumerate() {
-            stmt.execute(params![
-                run_id,
-                seq_num as i64,
-                log.node_id,
-                log.step,
-                &log.content
-            ])?;
-        }
+    for (seq_num, log) in logs.iter().enumerate() {
+        appender.append_row(params![
+            run_id,
+            seq_num as i64,
+            log.node_id,
+            log.step,
+            &log.content
+        ])?;
     }
-    tx.commit()?;
+
+    appender.flush()?;
     Ok(())
 }
 
@@ -276,18 +249,18 @@ pub enum HistoryCommand {
     Shutdown,
 }
 
-/// A background writer that serializes all SQLite writes to a single thread.
+/// A background writer that serializes all DuckDB writes to a single thread.
 pub struct HistoryWriter {
     sender: Sender<HistoryCommand>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl HistoryWriter {
-    /// Creates a new HistoryWriter, opening and initializing the SQLite database.
+    /// Creates a new HistoryWriter, opening and initializing the DuckDB database.
     /// The connection is then moved to a background thread that processes write requests.
     pub fn new(db_path: &str) -> Result<Self, Box<dyn Error>> {
-        let mut conn = Connection::open(db_path)?;
-        init_sqlite(&conn)?;
+        let conn = Connection::open(db_path)?;
+        init_db(&conn)?;
 
         let (sender, receiver) = mpsc::channel::<HistoryCommand>();
 
@@ -299,10 +272,10 @@ impl HistoryWriter {
                         history,
                         logs,
                     } => {
-                        if let Err(e) = save_history_sqlite(&mut conn, run_id, &history) {
+                        if let Err(e) = save_history_db(&conn, run_id, &history) {
                             error!("failed to save history for run {}: {}", run_id, e);
                         }
-                        if let Err(e) = save_logs_sqlite(&mut conn, run_id, &logs) {
+                        if let Err(e) = save_logs_db(&conn, run_id, &logs) {
                             error!("failed to save logs for run {}: {}", run_id, e);
                         }
                     }
@@ -324,7 +297,11 @@ impl HistoryWriter {
             history,
             logs,
         }) {
-            log::error!("Failed to send history write command for run {}: {}", run_id, e);
+            log::error!(
+                "Failed to send history write command for run {}: {}",
+                run_id,
+                e
+            );
         }
     }
 

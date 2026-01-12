@@ -106,6 +106,7 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             | Label::Print(_, next)
             | Label::MakeChannel(_, _, next)
             | Label::SetTimer(_, next)
+            | Label::UniqueId(_, next)
             | Label::Send(_, _, next)
             | Label::Recv(_, _, next)
             | Label::SpinAwait(_, next) => {
@@ -203,6 +204,13 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
             header_color = "#C8E6C9"; // Green
             content = format!(
                 "<B>Set Timer</B><BR/>{}",
+                html_escape(&pretty_lhs(prog, lhs))
+            );
+        }
+        Label::UniqueId(lhs, _) => {
+            header_color = "#C8E6C9"; // Green
+            content = format!(
+                "<B>Unique ID</B><BR/>{}",
                 html_escape(&pretty_lhs(prog, lhs))
             );
         }
@@ -491,6 +499,7 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         | Label::Pause(n)
         | Label::MakeChannel(_, _, n)
         | Label::SetTimer(_, n)
+        | Label::UniqueId(_, n)
         | Label::Send(_, _, n)
         | Label::Recv(_, _, n)
         | Label::SpinAwait(_, n)

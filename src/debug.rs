@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result, params};
+use duckdb::{Connection, Result, params};
 use std::path::Path;
 
 pub struct SimulatorDebugger {

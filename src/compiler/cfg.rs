@@ -108,6 +108,7 @@ pub enum Label {
     Pause(Vertex /* next_vertex */),
     MakeChannel(Lhs, usize, Vertex),
     SetTimer(Lhs, Vertex),
+    UniqueId(Lhs, Vertex),
     Send(Expr, Expr, Vertex),
     Recv(Lhs, Expr, Vertex),
     SpinAwait(Expr, Vertex /* next_vertex */),
@@ -1340,6 +1341,9 @@ impl Compiler {
 
                 let arg_expr = args.first().expect("BoolToString should have 1 arg");
                 self.compile_expr_to_value(arg_expr, Lhs::Var(arg_var), assign_vertex)
+            }
+            BuiltinFn::UniqueId => {
+                self.add_label(Label::UniqueId(target, next_vertex))
             }
         }
     }

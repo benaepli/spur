@@ -162,6 +162,11 @@ fn execute_common_label<L: Logger>(
             state.runnable_tasks.push_back(Runnable::Timer(timer));
             Ok(Some(StepOutcome::Continue(*next)))
         }
+        Label::UniqueId(lhs, next) => {
+            let id = state.alloc_unique_id();
+            store(lhs, Value::int(id as i64), local_env, node_env)?;
+            Ok(Some(StepOutcome::Continue(*next)))
+        }
         Label::Cond(cond, bthen, belse) => {
             if eval(local_env, node_env, cond)?.as_bool()? {
                 Ok(Some(StepOutcome::Continue(*bthen)))
@@ -433,6 +438,7 @@ pub fn exec<L: Logger>(
             Label::Instr(_, _)
             | Label::MakeChannel(_, _, _)
             | Label::SetTimer(_, _)
+            | Label::UniqueId(_, _)
             | Label::Cond(_, _, _)
             | Label::Return(_)
             | Label::Print(_, _)

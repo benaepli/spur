@@ -161,6 +161,7 @@ pub struct State {
     pub channels: ImHashMap<ChannelId, ChannelState>,
     pub crash_info: CrashInfo,
     next_channel_id: usize,
+    next_unique_id: usize,
 }
 
 impl State {
@@ -181,12 +182,19 @@ impl State {
                 current_step: 0,
             },
             next_channel_id: 0,
+            next_unique_id: 0,
         }
     }
 
     pub fn alloc_channel_id(&mut self) -> usize {
         let id = self.next_channel_id;
         self.next_channel_id += 1;
+        id
+    }
+
+    pub fn alloc_unique_id(&mut self) -> usize {
+        let id = self.next_unique_id;
+        self.next_unique_id += 1;
         id
     }
 

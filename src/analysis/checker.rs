@@ -176,6 +176,14 @@ impl TypeChecker {
                 is_sync: true,
             },
         );
+        builtin_signatures.insert(
+            BuiltinFn::UniqueId,
+            FunctionSignature {
+                params: vec![],
+                return_type: Type::Int,
+                is_sync: true,
+            },
+        );
 
         Self {
             scopes: vec![HashMap::new()],
