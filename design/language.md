@@ -13,7 +13,7 @@ role_def ::= 'role' ID '{' var_inits func_defs '}'
 client_def ::= 'ClientInterface' '{' var_inits func_defs '}'
 
 func_defs ::= ( func_def )*
-func_def ::= ( 'sync' )? 'func' ID '(' func_params? ')' ( '->' type_def )? '{' statements '}'
+func_def ::= ( 'async' )? 'func' ID '(' func_params? ')' ( '->' type_def )? '{' statements '}'
 
 func_call ::= ID '(' args? ')'
 args ::= expr ( ',' expr )* ','?
@@ -195,30 +195,33 @@ var updated2 = my_map["outer"]["inner"] := value;
 ### Desugaring
 
 Update expressions are syntactic sugar for the `store` built-in function:
+
 - `x.field := value` desugars to `store(x, "field", value)`
 - `x[key] := value` desugars to `store(x, key, value)`
 - Nested updates like `x.a.b := v` desugar to `store(x, "a", store(x.a, "b", v))`
 
 ## Concurrency
 
-Spur supports two function types for concurrency: `async` (default) and `sync`.
+Spur supports two function types for concurrency: `sync` (default) and `async`.
 
-By default, all functions are asynchronous. 
-Calling a standard func does not block execution and immediately returns a `chan<T>`. 
-To get the actual return value, you must receive from the channel, which will pause the current task.
+By default, all functions are synchronous. A sync func is a blocking, atomic call that:
 
-A function can be explicitly marked as synchronous with the `sync` keyword:
+- Cannot make RPC calls
+- Cannot call async functions
+- Cannot use channel operations (`send` and `recv`)
+
+A function can be explicitly marked as asynchronous with the `async` keyword:
+
 ```
-sync func my_sync_call() -> int {
+async func my_async_call() -> int {
   return 10;
 }
 ```
-A `sync func` is a blocking, atomic call. They are restricted and cannot contain:
-- RPC calls
-- Calls to other `async` functions
-- Channel operations (`send` and `recv`)
 
-This async-first model, where most operations are non-blocking, can result in issues around synchronizing asynchronous code.\
+Calling an async func does not block execution and immediately returns a `chan<T>`.
+To get the actual return value, you must receive from the channel, which will pause the current task.
+
+This sync-first model, where most operations are blocking, can result in issues around concurrent processing.\
 To address this, we provide a `lock` type.
 
 ### RPCs
@@ -237,6 +240,7 @@ Channels provide a typed communication mechanism for passing values between conc
 #### Channel Type
 
 Channels have type `chan<T>` where `T` is the type of values sent through the channel:
+
 ```
 var my_chan: chan<int>;
 var msg_chan: chan<string>;
@@ -245,6 +249,7 @@ var msg_chan: chan<string>;
 #### Creating Channels
 
 Use the `make()` function to create a new channel with a specified buffer size:
+
 ```
 var ch = make(10);  // Creates a channel with buffer size 10
 ```
@@ -252,6 +257,7 @@ var ch = make(10);  // Creates a channel with buffer size 10
 #### Sending Values
 
 Send values to a channel using the `send()` function:
+
 ```
 send(ch, 42);       // Send the value 42 to channel ch
 send(msg_chan, "hello");  // Send a string to msg_chan
@@ -260,6 +266,7 @@ send(msg_chan, "hello");  // Send a string to msg_chan
 #### Receiving Values
 
 Receive values from a channel using either `recv()` or the `<-` operator:
+
 ```
 var value = recv(ch);      // Explicit recv call
 var value = <- ch;          // Syntactic sugar using <- operator
@@ -269,17 +276,19 @@ Both forms block until a value is available on the channel.
 
 #### Restrictions
 
-Channel operations (`send` and `recv`) cannot be used inside `sync` functions. Attempting to do so will result in a compile-time error. This ensures that synchronous functions remain non-blocking and atomic.
+Channel operations (`send` and `recv`) cannot be used inside sync functions (non-async). Attempting to do so will result in a compile-time error. This ensures that synchronous functions remain non-blocking and atomic.
 
 ## Additional Operators
 
 ### Unwrap
 
-The unwrap `!` operator is used for unwrapping an optional. 
+The unwrap `!` operator is used for unwrapping an optional.
 In other words, `o!` either retrieves the value or panics if the optional is `nil`.
 
 ## Built-in Functions
+
 We also have a variety of built-in functions.
 Right now, this includes:
+
 - `println: string -> ()`
 - `int_to_string: int -> string`

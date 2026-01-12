@@ -451,13 +451,11 @@ where
                 .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
         };
 
-        let func_call = ident
-            .then(args())
-            .map_with(|(name, args), e| FuncCall {
-                name,
-                args,
-                span: e.span(),
-            });
+        let func_call = ident.then(args()).map_with(|(name, args), e| FuncCall {
+            name,
+            args,
+            span: e.span(),
+        });
 
         let list_lit = expr
             .clone()
@@ -716,8 +714,6 @@ where
         let and_expr = build_binary_op(comparison, just(TokenKind::And).to(BinOp::And));
         let or_expr = build_binary_op(and_expr, just(TokenKind::Or).to(BinOp::Or));
 
-        
-
         build_binary_op(
             or_expr,
             just(TokenKind::QuestionQuestion).to(BinOp::Coalesce),
@@ -909,7 +905,7 @@ where
         .allow_trailing()
         .collect::<Vec<_>>();
 
-    let func_def = just(TokenKind::Sync)
+    let func_def = just(TokenKind::Async)
         .or_not()
         .then_ignore(just(TokenKind::Func))
         .then(ident)
@@ -927,9 +923,9 @@ where
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
         )
         .map_with(
-            |((((is_sync_opt, name), params), return_type), body), e| FuncDef {
+            |((((is_async_opt, name), params), return_type), body), e| FuncDef {
                 name,
-                is_sync: is_sync_opt.is_some(),
+                is_sync: is_async_opt.is_none(),
                 params,
                 return_type,
                 body,

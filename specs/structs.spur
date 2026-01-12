@@ -21,44 +21,44 @@ role Registry {
         }
     };
 
-    func UpdateCity(new_city: string) -> bool {
+    async func UpdateCity(new_city: string) -> bool {
         record = record.address.city := new_city;
         return true;
     }
 
-    func UpdateAge(new_age: int) -> bool {
+    async func UpdateAge(new_age: int) -> bool {
         record = record.age := new_age;
         return true;
     }
 
-    func UpdateZip(new_zip: int) -> bool {
+    async func UpdateZip(new_zip: int) -> bool {
         record = record.address.zip := new_zip;
         return true;
     }
 
-    func GetPerson() -> Person {
+    async func GetPerson() -> Person {
         return record;
     }
 
-    func GetCity() -> string {
+    async func GetCity() -> string {
         return record.address.city;
     }
 }
 
 ClientInterface {
-    func update_city(reg: Registry, city: string) {
+    async func update_city(reg: Registry, city: string) {
         <-reg->UpdateCity(city);
     }
 
-    func update_age(reg: Registry, age: int) {
+    async func update_age(reg: Registry, age: int) {
         <-reg->UpdateAge(age);
     }
 
-    func update_zip(reg: Registry, zip: int) {
+    async func update_zip(reg: Registry, zip: int) {
         <-reg->UpdateZip(zip);
     }
 
-    func get_city(reg: Registry) -> string {
+    async func get_city(reg: Registry) -> string {
         return <-reg->GetCity();
     }
 }

@@ -3,20 +3,20 @@ type Value = int;
 role Head {
     var db: map<string, Value> = {};
 
-    func headWrite(key: string, value: int) {
+    async func headWrite(key: string, value: int) {
         db = db[key] := value;
     }
 
-    func AsyncWrite(key: string, value: int) -> bool {
+    async func AsyncWrite(key: string, value: int) -> bool {
         headWrite(key, value);
         return true;
     }
 
-    func headRead(ch: chan<Value>, key: string) {
+    async func headRead(ch: chan<Value>, key: string) {
         send(ch, db[key]);
     }
 
-    func AsyncRead(key: string) -> Value {
+    async func AsyncRead(key: string) -> Value {
         var ch: chan<Value> = make(1);
         headRead(ch, key);
         return <-ch;
@@ -24,11 +24,11 @@ role Head {
 }
 
 ClientInterface {
-    func write(node: Head, key: string, value: Value) {
+    async func write(node: Head, key: string, value: Value) {
         <-node->AsyncWrite(key, value);
     }
 
-    func read(node: Head, key: string) -> Value {
+    async func read(node: Head, key: string) -> Value {
         return <-node->AsyncRead(key);
     }
 }
