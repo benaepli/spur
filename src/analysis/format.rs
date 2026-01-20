@@ -363,6 +363,76 @@ pub fn report_type_errors(
                     format!("help: RPC calls can only target async functions, but `{}` is marked as sync", func_name),
                     "note: consider removing the `sync` keyword from the target function".to_string(),
                 ]),
+
+            TypeError::EnumNotFound { name, span } => Diagnostic::error()
+                .with_message(format!("enum `{}` not found", name))
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message("unknown enum"),
+                ])
+                .with_notes(vec![
+                    "help: check that the enum is defined and in scope".to_string(),
+                ]),
+
+            TypeError::VariantNotFound { enum_name, variant, span } => Diagnostic::error()
+                .with_message(format!("variant `{}` not found on enum `{}`", variant, enum_name))
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("unknown variant `{}`", variant)),
+                ])
+                .with_notes(vec![
+                    format!("help: check the definition of `{}` for available variants", enum_name),
+                ]),
+
+            TypeError::VariantPayloadMismatch { variant, expected, found, span } => Diagnostic::error()
+                .with_message(format!("variant `{}` payload type mismatch", variant))
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected `{}`, found `{}`", expected, found)),
+                ])
+                .with_notes(vec![
+                    format!("help: variant `{}` expects a payload of type `{}`", variant, expected),
+                ]),
+
+            TypeError::VariantExpectsNoPayload { variant, span } => Diagnostic::error()
+                .with_message(format!("variant `{}` expects no payload", variant))
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message("unexpected payload"),
+                ])
+                .with_notes(vec![
+                    format!("help: use `{}` without parentheses", variant),
+                ]),
+
+            TypeError::VariantExpectsPayload { variant, span } => Diagnostic::error()
+                .with_message(format!("variant `{}` expects a payload", variant))
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message("missing payload"),
+                ])
+                .with_notes(vec![
+                    format!("help: use `{}(value)` with the expected payload", variant),
+                ]),
+
+            TypeError::MatchScrutineeNotEnum { ty, span } => Diagnostic::error()
+                .with_message("match scrutinee must be an enum")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected enum, found `{}`", ty)),
+                ])
+                .with_notes(vec![
+                    "help: match expressions can only match on enum types".to_string(),
+                ]),
+
+            TypeError::MatchArmTypeMismatch { expected, found, span } => Diagnostic::error()
+                .with_message("match arms have incompatible types")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("expected `{}`, found `{}`", expected, found)),
+                ])
+                .with_notes(vec![
+                    "help: all match arms must evaluate to the same type".to_string(),
+                ]),
         };
 
         term::emit_to_write_style(&mut writer_lock, &config, &files, &diagnostic)?;

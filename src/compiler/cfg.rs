@@ -1,8 +1,8 @@
 use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::analysis::types::{
     TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit,
-    TypedFuncCall, TypedFuncDef, TypedPattern, TypedPatternKind, TypedProgram, TypedStatement,
-    TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
+    TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram,
+    TypedStatement, TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
 };
 use crate::parser::{BinOp, Span};
 use ecow::EcoString;
@@ -63,6 +63,10 @@ pub enum Expr {
     Some(Box<Expr>),
     IntToString(Box<Expr>),
     BoolToString(Box<Expr>),
+    // Variant operations
+    Variant(u32, EcoString, Option<Box<Expr>>), // (enum_id, variant_name, payload)
+    IsVariant(Box<Expr>, EcoString),            // Check if value is a specific variant
+    VariantPayload(Box<Expr>),                  // Extract payload from variant
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Hash)]
@@ -843,6 +847,136 @@ impl Compiler {
         next
     }
 
+    /// Compile a match expression into a chain of conditional checks.
+    /// Each arm checks if the scrutinee matches a specific variant.
+    fn compile_match(
+        &mut self,
+        scrutinee: &TypedExpr,
+        arms: &[TypedMatchArm],
+        target: Lhs,
+        next_vertex: Vertex,
+    ) -> Vertex {
+        // Allocate a temp slot for the scrutinee value
+        let scrutinee_slot = self.alloc_temp_slot();
+
+        // Build the match arms from last to first (backwards chaining)
+        // The "else" for the last arm is just next_vertex (exhaustive match assumed)
+        let mut current_else_vertex = next_vertex;
+
+        for arm in arms.iter().rev() {
+            // Get variant info from pattern
+            let (variant_name, payload_pattern) = match &arm.pattern.kind {
+                TypedPatternKind::Variant(_, name, payload_pat) => {
+                    (name.clone(), payload_pat.clone())
+                }
+                _ => {
+                    // For non-variant patterns (e.g., wildcard), treat as default case
+                    let body_vertex =
+                        self.compile_match_arm_body(&arm.body, target.clone(), next_vertex);
+                    current_else_vertex = body_vertex;
+                    continue;
+                }
+            };
+
+            // Compile the arm body with optional payload binding
+            let body_start = if let Some(payload_pat) = payload_pattern {
+                // Extract payload and bind it
+                let payload_lhs = self.convert_pattern(&payload_pat);
+
+                // Body vertex (compiles arm body statements)
+                let body_vertex =
+                    self.compile_match_arm_body(&arm.body, target.clone(), next_vertex);
+
+                // Extract payload: payload_lhs = VariantPayload(scrutinee)
+                let extract_vertex = self.add_label(Label::Instr(
+                    Instr::Assign(
+                        payload_lhs,
+                        Expr::VariantPayload(Box::new(Expr::Var(scrutinee_slot))),
+                    ),
+                    body_vertex,
+                ));
+
+                extract_vertex
+            } else {
+                // No payload to bind, just compile the body
+                self.compile_match_arm_body(&arm.body, target.clone(), next_vertex)
+            };
+
+            // Create conditional: if IsVariant(scrutinee, variant_name) then body else next_arm
+            let cond_vertex = self.add_label(Label::Cond(
+                Expr::IsVariant(
+                    Box::new(Expr::Var(scrutinee_slot)),
+                    EcoString::from(variant_name.as_str()),
+                ),
+                body_start,
+                current_else_vertex,
+            ));
+
+            current_else_vertex = cond_vertex;
+        }
+
+        // Compile scrutinee evaluation -> first arm check
+        self.compile_expr_to_value(scrutinee, Lhs::Var(scrutinee_slot), current_else_vertex)
+    }
+
+    /// Helper to compile the body of a match arm.
+    /// The body is a list of statements; the last expression (if any) determines the result.
+    fn compile_match_arm_body(
+        &mut self,
+        body: &[TypedStatement],
+        target: Lhs,
+        next_vertex: Vertex,
+    ) -> Vertex {
+        if body.is_empty() {
+            // Empty body: assign unit to target
+            return self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+        }
+
+        // Pre-compute the return slot to avoid borrow issues
+        let return_slot = match &target {
+            Lhs::Var(slot) => *slot,
+            _ => self.alloc_temp_slot(),
+        };
+
+        // Check if the last statement is an expression (which becomes the match result)
+        let last_stmt = body.last().unwrap();
+        let (init_stmts, result_vertex) = if let TypedStatementKind::Expr(expr) = &last_stmt.kind {
+            // Last stmt is an expression: compile it as the result
+            let result_vertex = self.compile_expr_to_value(expr, target, next_vertex);
+            (&body[..body.len() - 1], result_vertex)
+        } else if let TypedStatementKind::Return(_) = &last_stmt.kind {
+            // Return statement: compile all statements (return will handle the jump)
+            // We use a placeholder for return target/slot, but proper handling
+            // requires access to the function's return context
+            let unit_vertex =
+                self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+            (body, unit_vertex)
+        } else {
+            // Last stmt is not an expression: result is unit
+            let unit_vertex =
+                self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+            (body, unit_vertex)
+        };
+
+        // Compile remaining statements in reverse order
+        let mut current_vertex = result_vertex;
+        for stmt in init_stmts.iter().rev() {
+            // Note: We use dummy break/return targets here since match arms
+            // shouldn't contain break statements (they're not in a loop).
+            // Return is also simplified - a full implementation would need
+            // to thread through the function's return context.
+            current_vertex = self.compile_statement(
+                stmt,
+                current_vertex,
+                next_vertex, // break_target (shouldn't be used)
+                next_vertex, // return_target (simplified)
+                return_slot,
+            );
+        }
+
+        current_vertex
+    }
+
     fn convert_simple_binop(&mut self, op: &BinOp, left: Box<Expr>, right: Box<Expr>) -> Expr {
         match op {
             BinOp::Add => Expr::Plus(left, right),
@@ -1183,6 +1317,33 @@ impl Compiler {
                 self.compile_expr_list_recursive(val_exprs.iter(), tmps, assign_vertex)
             }
 
+            TypedExprKind::VariantLit(enum_id, variant_name, payload) => {
+                if let Some(payload_expr) = payload {
+                    // Variant with payload - compile payload first
+                    let payload_tmp = self.alloc_temp_slot();
+                    let final_expr = Expr::Variant(
+                        enum_id.0 as u32,
+                        EcoString::from(variant_name.as_str()),
+                        Some(Box::new(Expr::Var(payload_tmp))),
+                    );
+                    let assign_vertex = self
+                        .add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                    self.compile_expr_to_value(payload_expr, Lhs::Var(payload_tmp), assign_vertex)
+                } else {
+                    // Variant without payload - simple assignment
+                    let final_expr = Expr::Variant(
+                        enum_id.0 as u32,
+                        EcoString::from(variant_name.as_str()),
+                        None,
+                    );
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex))
+                }
+            }
+
+            TypedExprKind::Match(scrutinee, arms) => {
+                self.compile_match(scrutinee, arms, target, next_vertex)
+            }
+
             TypedExprKind::SetTimer => self.add_label(Label::SetTimer(target, next_vertex)),
 
             _ => {
@@ -1498,9 +1659,11 @@ impl Compiler {
             | TypedExprKind::RpcCall(_, _)
             | TypedExprKind::MakeChannel(_)
             | TypedExprKind::Send(_, _)
-            | TypedExprKind::Recv(_) => {
+            | TypedExprKind::Recv(_)
+            | TypedExprKind::Match(_, _)
+            | TypedExprKind::VariantLit(_, _, _) => {
                 unreachable!(
-                    "Cannot have complex call inside a simple expression. \
+                    "Cannot have complex expression inside a simple expression. \
                      This should have been caught by the type checker. Expression: {:?}",
                     expr
                 )
@@ -1532,6 +1695,11 @@ impl Compiler {
                     })
                     .collect();
                 Lhs::Tuple(names)
+            }
+            TypedPatternKind::Variant(_, _, _) => {
+                // TODO: Implement variant pattern matching in CFG
+                // For now, we use a temp slot; match compilation needs to be added
+                Lhs::Var(self.alloc_temp_slot())
             }
         }
     }

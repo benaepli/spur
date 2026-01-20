@@ -455,6 +455,12 @@ fn pretty_expr(prog: &Program, expr: &Expr) -> String {
         Expr::Some(e) => format!("Some({})", pretty_expr(prog, e)),
         Expr::IntToString(e) => format!("int_to_string({})", pretty_expr(prog, e)),
         Expr::BoolToString(e) => format!("bool_to_string({})", pretty_expr(prog, e)),
+        Expr::Variant(_, name, payload) => match payload {
+            Some(p) => format!("{}({})", name, pretty_expr(prog, p)),
+            None => name.to_string(),
+        },
+        Expr::IsVariant(e, name) => format!("is_{}({})", name, pretty_expr(prog, e)),
+        Expr::VariantPayload(e) => format!("payload({})", pretty_expr(prog, e)),
     }
 }
 

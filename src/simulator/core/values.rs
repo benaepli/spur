@@ -26,6 +26,7 @@ pub enum ValueKind<H: HashPolicy> {
     String(EcoString),
     Unit,
     Tuple(Vector<Value<H>>),
+    Variant(u32, EcoString, Option<Arc<Value<H>>>), // (enum_id, variant_name, payload)
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +142,20 @@ impl<H: HashPolicy> Value<H> {
                 }
                 sig
             }
+            ValueKind::Variant(enum_id, name, payload) => {
+                let mut h = DefaultHasher::new();
+                10u8.hash(&mut h); // discriminant
+                enum_id.hash(&mut h);
+                name.hash(&mut h);
+                match payload {
+                    None => 0u8.hash(&mut h),
+                    Some(v) => {
+                        1u8.hash(&mut h);
+                        v.sig.hash(&mut h);
+                    }
+                }
+                h.finish()
+            }
         }
     }
 
@@ -205,6 +220,11 @@ impl<H: HashPolicy> Value<H> {
         Self::new(ValueKind::Map(m))
     }
 
+    #[inline]
+    pub fn variant(enum_id: u32, name: EcoString, payload: Option<Arc<Value<H>>>) -> Self {
+        Self::new(ValueKind::Variant(enum_id, name, payload))
+    }
+
     /// Create a Value with a pre-computed signature (for incremental updates)
     #[inline]
     pub fn with_sig(kind: ValueKind<H>, sig: u64) -> Self {
@@ -230,6 +250,9 @@ impl<H: HashPolicy> PartialEq for Value<H> {
             (List(a), List(b)) => a == b,
             (Map(a), Map(b)) => a == b,
             (Channel(a), Channel(b)) => a == b,
+            (Variant(id_a, name_a, p_a), Variant(id_b, name_b, p_b)) => {
+                id_a == id_b && name_a == name_b && p_a == p_b
+            }
             _ => false,
         }
     }
@@ -262,6 +285,9 @@ impl<H: HashPolicy> Ord for Value<H> {
                 a_vec.cmp(&b_vec)
             }
             (Channel(a), Channel(b)) => a.cmp(b),
+            (Variant(id_a, name_a, p_a), Variant(id_b, name_b, p_b)) => {
+                (id_a, name_a, p_a).cmp(&(id_b, name_b, p_b))
+            }
             // Cross-type comparisons (simple deterministic ordering)
             (Int(_), _) => Ordering::Less,
             (_, Int(_)) => Ordering::Greater,
@@ -281,6 +307,8 @@ impl<H: HashPolicy> Ord for Value<H> {
             (_, List(_)) => Ordering::Greater,
             (Map(_), _) => Ordering::Less,
             (_, Map(_)) => Ordering::Greater,
+            (Channel(_), _) => Ordering::Less,
+            (_, Channel(_)) => Ordering::Greater,
         }
     }
 }
@@ -333,6 +361,8 @@ impl<H: HashPolicy> std::fmt::Display for Value<H> {
                 }
                 write!(f, " }}")
             }
+            Variant(_, name, None) => write!(f, "{}", name),
+            Variant(_, name, Some(payload)) => write!(f, "{}({})", name, payload),
         }
     }
 }
@@ -351,6 +381,7 @@ impl<H: HashPolicy> Value<H> {
             String(_) => "string",
             Unit => "unit",
             Tuple(_) => "tuple",
+            Variant(_, _, _) => "variant",
         }
     }
 
@@ -410,6 +441,17 @@ impl<H: HashPolicy> Value<H> {
         } else {
             Err(RuntimeError::TypeError {
                 expected: "channel",
+                got: self.type_name(),
+            })
+        }
+    }
+
+    pub fn as_variant(&self) -> Result<(u32, &EcoString, Option<&Arc<Value<H>>>), RuntimeError> {
+        if let ValueKind::Variant(id, name, payload) = &self.kind {
+            Ok((*id, name, payload.as_ref()))
+        } else {
+            Err(RuntimeError::TypeError {
+                expected: "variant",
                 got: self.type_name(),
             })
         }

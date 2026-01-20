@@ -94,17 +94,35 @@ fn json_of_value<H: crate::simulator::hash_utils::HashPolicy>(v: &Value<H>) -> J
             "value": items
             })
         }
+        ValueKind::Variant(enum_id, name, payload) => {
+            let payload_json = match payload {
+                Some(inner) => json_of_value(inner),
+                None => JsonValue::Null,
+            };
+            json!({
+                "type": "VVariant",
+                "value": {
+                    "enum_id": enum_id,
+                    "name": name.as_str(),
+                    "payload": payload_json
+                }
+            })
+        }
     }
 }
 
-fn payload_to_json_string<H: crate::simulator::hash_utils::HashPolicy>(payload: &[Value<H>]) -> String {
+fn payload_to_json_string<H: crate::simulator::hash_utils::HashPolicy>(
+    payload: &[Value<H>],
+) -> String {
     let json_list: Vec<JsonValue> = payload.iter().map(json_of_value::<H>).collect();
     serde_json::to_string(&json_list).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Serializes a list of Operations into PersistableOps.
 /// This should be called from worker threads to distribute CPU work.
-pub fn serialize_history<H: crate::simulator::hash_utils::HashPolicy>(history: &[Operation<H>]) -> Vec<PersistableOp> {
+pub fn serialize_history<H: crate::simulator::hash_utils::HashPolicy>(
+    history: &[Operation<H>],
+) -> Vec<PersistableOp> {
     history
         .par_iter()
         .map(|op| PersistableOp {

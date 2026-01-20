@@ -105,7 +105,15 @@ pub struct ResolvedTypeDefStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedTypeDefStmtKind {
     Struct(Vec<ResolvedFieldDef>),
+    Enum(Vec<ResolvedEnumVariant>),
     Alias(ResolvedTypeDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedEnumVariant {
+    pub name: String,
+    pub payload: Option<ResolvedTypeDef>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +197,13 @@ pub struct ResolvedAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedMatchArm {
+    pub pattern: ResolvedPattern,
+    pub body: Vec<ResolvedStatement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedPattern {
     pub kind: ResolvedPatternKind,
     pub span: Span,
@@ -199,6 +214,7 @@ pub enum ResolvedPatternKind {
     Var(NameId, String),
     Wildcard,
     Tuple(Vec<ResolvedPattern>),
+    Variant(NameId, String, Option<Box<ResolvedPattern>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -232,6 +248,8 @@ pub enum ResolvedExprKind {
     Tail(Box<ResolvedExpr>),
     Len(Box<ResolvedExpr>),
     RpcCall(Box<ResolvedExpr>, ResolvedRpcCall),
+    Match(Box<ResolvedExpr>, Vec<ResolvedMatchArm>),
+    VariantLit(NameId, String, Option<Box<ResolvedExpr>>),
 
     MakeChannel(Box<ResolvedExpr>),
     Send(Box<ResolvedExpr>, Box<ResolvedExpr>),
@@ -601,6 +619,13 @@ impl Resolver {
                     .collect::<Result<_, _>>()?;
                 ResolvedTypeDefStmtKind::Struct(resolved_fields)
             }
+            TypeDefStmtKind::Enum(variants) => {
+                let resolved_variants = variants
+                    .into_iter()
+                    .map(|v| self.resolve_enum_variant(v))
+                    .collect::<Result<_, _>>()?;
+                ResolvedTypeDefStmtKind::Enum(resolved_variants)
+            }
             TypeDefStmtKind::Alias(td) => {
                 ResolvedTypeDefStmtKind::Alias(self.resolve_type_def(td)?)
             }
@@ -618,6 +643,20 @@ impl Resolver {
             name: field.name,
             type_def: self.resolve_type_def(field.type_def)?,
             span: field.span,
+        })
+    }
+
+    fn resolve_enum_variant(
+        &mut self,
+        variant: EnumVariant,
+    ) -> Result<ResolvedEnumVariant, ResolutionError> {
+        Ok(ResolvedEnumVariant {
+            name: variant.name,
+            payload: variant
+                .payload
+                .map(|t| self.resolve_type_def(t))
+                .transpose()?,
+            span: variant.span,
         })
     }
 
@@ -800,6 +839,14 @@ impl Resolver {
                     .collect::<Result<_, _>>()?;
                 ResolvedPatternKind::Tuple(resolved_pats)
             }
+            PatternKind::Variant(enum_name, variant_name, payload) => {
+                let type_id = self.lookup_type(&enum_name, span)?;
+                let resolved_payload = payload
+                    .map(|p| self.resolve_pattern(*p))
+                    .transpose()?
+                    .map(Box::new);
+                ResolvedPatternKind::Variant(type_id, variant_name, resolved_payload)
+            }
         };
         Ok(ResolvedPattern { kind, span })
     }
@@ -927,6 +974,44 @@ impl Resolver {
                 ResolvedExprKind::FieldAccess(Box::new(self.resolve_expr(*e)?), name)
             }
             ExprKind::Unwrap(e) => ResolvedExprKind::Unwrap(Box::new(self.resolve_expr(*e)?)),
+            ExprKind::Match(expr, arms) => {
+                let resolved_expr = Box::new(self.resolve_expr(*expr)?);
+                let resolved_arms = arms
+                    .into_iter()
+                    .map(|arm| self.resolve_match_arm(arm))
+                    .collect::<Result<_, _>>()?;
+                ResolvedExprKind::Match(resolved_expr, resolved_arms)
+            }
+            ExprKind::VariantLit(enum_name, variant_name, payload) => {
+                let type_id = self.lookup_type(&enum_name, span)?;
+                let resolved_payload = payload
+                    .map(|e| self.resolve_expr(*e))
+                    .transpose()?
+                    .map(Box::new);
+                ResolvedExprKind::VariantLit(type_id, variant_name, resolved_payload)
+            }
+            ExprKind::NamedDotAccess(first_name, second_name, payload) => {
+                // Try to resolve as a type first (variant literal)
+                if let Ok(type_id) = self.lookup_type(&first_name, span) {
+                    let resolved_payload = payload
+                        .map(|e| self.resolve_expr(*e))
+                        .transpose()?
+                        .map(Box::new);
+                    ResolvedExprKind::VariantLit(type_id, second_name, resolved_payload)
+                } else {
+                    // Must be a variable with field access
+                    if payload.is_some() {
+                        // Field access doesn't take arguments - this is an error
+                        return Err(ResolutionError::NameNotFound(first_name, span));
+                    }
+                    let var_id = self.lookup_var(&first_name, span)?;
+                    let var_expr = ResolvedExpr {
+                        kind: ResolvedExprKind::Var(var_id, first_name),
+                        span,
+                    };
+                    ResolvedExprKind::FieldAccess(Box::new(var_expr), second_name)
+                }
+            }
             ExprKind::StructLit(name, fields) => {
                 let type_id = self.lookup_type(&name, span)?;
                 let resolved_fields = fields
@@ -956,6 +1041,22 @@ impl Resolver {
             original_name: call.name,
             args,
             span: call.span,
+        })
+    }
+
+    fn resolve_match_arm(&mut self, arm: MatchArm) -> Result<ResolvedMatchArm, ResolutionError> {
+        self.enter_scope();
+        let pattern = self.resolve_pattern(arm.pattern)?;
+        let body = arm
+            .body
+            .into_iter()
+            .map(|s| self.resolve_statement(s))
+            .collect::<Result<_, _>>()?;
+        self.exit_scope();
+        Ok(ResolvedMatchArm {
+            pattern,
+            body,
+            span: arm.span,
         })
     }
 }

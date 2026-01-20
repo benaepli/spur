@@ -44,7 +44,7 @@ fn bool_lit(val: bool) -> ResolvedExpr {
 
 #[test]
 fn test_infer_literals() -> Result<(), TypeError> {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
 
     assert_eq!(checker.infer_expr(int_lit(42))?.ty, Type::Int);
     assert_eq!(checker.infer_expr(str_lit("hello"))?.ty, Type::String);
@@ -55,7 +55,7 @@ fn test_infer_literals() -> Result<(), TypeError> {
 
 #[test]
 fn test_binop_arithmetic_valid() -> Result<(), TypeError> {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
 
     let op = expr(ResolvedExprKind::BinOp(
         BinOp::Add,
@@ -71,7 +71,7 @@ fn test_binop_arithmetic_valid() -> Result<(), TypeError> {
 
 #[test]
 fn test_binop_type_mismatch() {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
 
     let op = expr(ResolvedExprKind::BinOp(
         BinOp::Add,
@@ -94,7 +94,7 @@ fn test_binop_type_mismatch() {
 
 #[test]
 fn test_binop_logic_valid() -> Result<(), TypeError> {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
 
     let op = expr(ResolvedExprKind::BinOp(
         BinOp::And,
@@ -108,7 +108,7 @@ fn test_binop_logic_valid() -> Result<(), TypeError> {
 
 #[test]
 fn test_list_inference_homogeneous() -> Result<(), TypeError> {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
 
     let list = expr(ResolvedExprKind::ListLit(vec![
         int_lit(1),
@@ -125,7 +125,7 @@ fn test_list_inference_homogeneous() -> Result<(), TypeError> {
 
 #[test]
 fn test_list_inference_heterogeneous_fail() {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
 
     let list = expr(ResolvedExprKind::ListLit(vec![int_lit(1), str_lit("two")]));
 
@@ -135,7 +135,7 @@ fn test_list_inference_heterogeneous_fail() {
 
 #[test]
 fn test_empty_list_inference() -> Result<(), TypeError> {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
 
     let list = expr(ResolvedExprKind::ListLit(vec![]));
     let typed = checker.infer_expr(list)?;
@@ -163,7 +163,7 @@ fn test_variable_scope_resolution() -> Result<(), TypeError> {
 
 #[test]
 fn test_undefined_variable() {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
     let var_id = id(999);
 
     let var_expr = expr(ResolvedExprKind::Var(var_id, "unknown".into()));
@@ -174,7 +174,7 @@ fn test_undefined_variable() {
 
 #[test]
 fn test_map_inference_valid() -> Result<(), TypeError> {
-    let checker = setup_checker();
+    let mut checker = setup_checker();
 
     let map = expr(ResolvedExprKind::MapLit(vec![
         (str_lit("a"), int_lit(1)),

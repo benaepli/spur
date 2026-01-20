@@ -356,6 +356,34 @@ pub fn eval<H: HashPolicy>(
             eval(local_env, node_env, key)?,
             eval(local_env, node_env, val)?,
         ),
+        Expr::Variant(enum_id, name, payload) => {
+            let payload_val = payload
+                .as_ref()
+                .map(|p| eval(local_env, node_env, p))
+                .transpose()?
+                .map(Arc::new);
+            Ok(Value::<H>::variant(*enum_id, name.clone(), payload_val))
+        }
+        Expr::IsVariant(expr, name) => {
+            let val = eval(local_env, node_env, expr)?;
+            match &val.kind {
+                ValueKind::Variant(_, variant_name, _) => {
+                    Ok(Value::<H>::bool(variant_name == name))
+                }
+                _ => Ok(Value::<H>::bool(false)),
+            }
+        }
+        Expr::VariantPayload(expr) => {
+            let val = eval(local_env, node_env, expr)?;
+            match &val.kind {
+                ValueKind::Variant(_, _, Some(payload)) => Ok((**payload).clone()),
+                ValueKind::Variant(_, _, None) => Err(RuntimeError::VariantHasNoPayload),
+                _ => Err(RuntimeError::TypeError {
+                    expected: "variant",
+                    got: val.type_name(),
+                }),
+            }
+        }
     }
 }
 

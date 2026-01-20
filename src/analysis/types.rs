@@ -11,6 +11,7 @@ pub enum Type {
     Map(Box<Type>, Box<Type>),
     Tuple(Vec<Type>),
     Struct(NameId, String),
+    Enum(NameId, String),
     Role(NameId, String),
     Optional(Box<Type>),
     Chan(Box<Type>),
@@ -20,6 +21,7 @@ pub enum Type {
     EmptyMap,
     UnknownChannel,
     Nil,
+    Never, // For diverging expressions (return, break, etc.)
 }
 
 impl std::fmt::Display for Type {
@@ -39,6 +41,7 @@ impl std::fmt::Display for Type {
                 write!(f, "({})", inner)
             }
             Type::Struct(_, name) => write!(f, "{}", name),
+            Type::Enum(_, name) => write!(f, "{}", name),
             Type::Role(_, name) => write!(f, "{}", name),
             Type::Optional(t) => write!(f, "{}?", t),
             Type::Chan(t) => write!(f, "chan<{}>", t),
@@ -46,6 +49,7 @@ impl std::fmt::Display for Type {
             Type::EmptyMap => write!(f, "empty map"),
             Type::UnknownChannel => write!(f, "unknown channel"),
             Type::Nil => write!(f, "nil"),
+            Type::Never => write!(f, "!"),
         }
     }
 }
@@ -86,6 +90,9 @@ pub enum TypedExprKind {
 
     RpcCall(Box<TypedExpr>, TypedUserFuncCall),
 
+    Match(Box<TypedExpr>, Vec<TypedMatchArm>),
+    VariantLit(NameId, String, Option<Box<TypedExpr>>),
+
     UnwrapOptional(Box<TypedExpr>), // T? -> T
 
     MakeChannel(Box<TypedExpr>),
@@ -116,6 +123,13 @@ pub struct TypedUserFuncCall {
     pub original_name: String,
     pub args: Vec<TypedExpr>,
     pub return_type: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedMatchArm {
+    pub pattern: TypedPattern,
+    pub body: Vec<TypedStatement>,
     pub span: Span,
 }
 
@@ -203,6 +217,7 @@ pub enum TypedPatternKind {
     Var(NameId, String),
     Wildcard,
     Tuple(Vec<TypedPattern>),
+    Variant(NameId, String, Option<Box<TypedPattern>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

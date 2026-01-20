@@ -68,4 +68,7 @@ pub enum RuntimeError {
 
     #[error("iterator state must be local")]
     InvalidIteratorState,
+
+    #[error("variant has no payload")]
+    VariantHasNoPayload,
 }

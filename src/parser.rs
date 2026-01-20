@@ -244,6 +244,7 @@ pub enum ExprKind {
     RpcCall(Box<Expr>, FuncCall),
     Match(Box<Expr>, Vec<MatchArm>),
     VariantLit(String, String, Option<Box<Expr>>),
+    NamedDotAccess(String, String, Option<Box<Expr>>), // Ambiguous: could be VariantLit or FieldAccess
 
     MakeChannel(Box<Expr>),
     Send(Box<Expr>, Box<Expr>),
@@ -341,6 +342,12 @@ fn unwind_update(lhs: Expr, key: Expr, value: Expr, span: Span) -> Expr {
         }
         ExprKind::Index(parent, index_expr) => {
             unwind_update(*parent, *index_expr, current_update, span)
+        }
+        ExprKind::NamedDotAccess(first, second, None) => {
+            // Treat as field access: first.second
+            let first_expr = Expr::new(ExprKind::Var(first), span);
+            let parent_key = Expr::new(ExprKind::StringLit(second), span);
+            unwind_update(first_expr, parent_key, current_update, span)
         }
         _ => current_update,
     }
@@ -490,7 +497,7 @@ where
             span: e.span(),
         });
 
-        let variant_lit = ident
+        let named_dot_access = ident
             .then_ignore(just(TokenKind::Dot))
             .then(ident)
             .then(
@@ -499,8 +506,8 @@ where
                     .map(Box::new)
                     .or_not(),
             )
-            .map(|((enum_name, variant_name), payload)| {
-                ExprKind::VariantLit(enum_name, variant_name, payload)
+            .map(|((first_name, second_name), payload)| {
+                ExprKind::NamedDotAccess(first_name, second_name, payload)
             });
 
         let match_arm = pattern
@@ -643,7 +650,7 @@ where
             zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
             func_call.clone().map(ExprKind::FuncCall),
             match_expr,
-            variant_lit,
+            named_dot_access,
             ident.map(ExprKind::Var),
             tuple_lit,
         ))
@@ -711,6 +718,12 @@ where
                     ExprKind::FieldAccess(parent, field_name) => {
                         let key = Expr::new(ExprKind::StringLit(field_name), span);
                         unwind_update(*parent, key, val, span)
+                    }
+                    ExprKind::NamedDotAccess(first, second, None) => {
+                        // Treat as field access: first.second
+                        let first_expr = Expr::new(ExprKind::Var(first), span);
+                        let key = Expr::new(ExprKind::StringLit(second), span);
+                        unwind_update(first_expr, key, val, span)
                     }
                     _ => lhs,
                 }
