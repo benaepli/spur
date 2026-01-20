@@ -83,9 +83,10 @@ fn test_binop_type_mismatch() {
 
     assert!(matches!(
         err,
-        TypeError::Mismatch {
-            expected: Type::Int,
-            found: Type::String,
+        TypeError::InvalidBinOp {
+            op: BinOp::Add,
+            left: Type::Int,
+            right: Type::String,
             ..
         }
     ));

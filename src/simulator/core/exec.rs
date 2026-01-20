@@ -1,4 +1,4 @@
-use crate::compiler::cfg::{Instr, Label, Lhs, Program, SELF_SLOT, VarSlot};
+use crate::compiler::cfg::{Instr, Label, Lhs, Program, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{eval, make_local_env, store};
 use crate::simulator::core::state::{
@@ -7,17 +7,18 @@ use crate::simulator::core::state::{
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
+use crate::simulator::hash_utils::HashPolicy;
 
-pub fn exec_sync_on_node<L: Logger>(
-    state: &mut State,
+pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
+    state: &mut State<H>,
     logger: &mut L,
     program: &Program,
-    local_env: &mut Env,
+    local_env: &mut Env<H>,
     node_id: usize,
     start_pc: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
-) -> Result<Value, RuntimeError> {
+) -> Result<Value<H>, RuntimeError> {
     let mut node_env = state.nodes[node_id].clone();
     let result = exec_sync_inner(
         state,
@@ -34,22 +35,22 @@ pub fn exec_sync_on_node<L: Logger>(
     result
 }
 
-enum StepOutcome {
+enum StepOutcome<H: HashPolicy> {
     Continue(usize),
-    Return(Value),
+    Return(Value<H>),
 }
 
-fn execute_common_label<L: Logger>(
+fn execute_common_label<H: HashPolicy, L: Logger>(
     label: &Label,
-    state: &mut State,
+    state: &mut State<H>,
     logger: &mut L,
     program: &Program,
-    local_env: &mut Env,
-    node_env: &mut Env,
+    local_env: &mut Env<H>,
+    node_env: &mut Env<H>,
     node_id: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
-) -> Result<Option<StepOutcome>, RuntimeError> {
+) -> Result<Option<StepOutcome<H>>, RuntimeError> {
     match label {
         Label::Instr(instr, next) => match instr {
             Instr::Assign(lhs, rhs) | Instr::Copy(lhs, rhs) => {
@@ -58,7 +59,7 @@ fn execute_common_label<L: Logger>(
                 Ok(Some(StepOutcome::Continue(*next)))
             }
             Instr::SyncCall(lhs, func_name, args) => {
-                let arg_vals: Result<Vec<Value>, _> =
+                let arg_vals: Result<Vec<Value<H>>, _> =
                     args.iter().map(|a| eval(local_env, node_env, a)).collect();
                 let arg_vals = arg_vals?;
                 let func_name_id = program
@@ -93,7 +94,7 @@ fn execute_common_label<L: Logger>(
             }
             Instr::Async(lhs, node_expr, func_name, args) => {
                 let target_node = eval(local_env, node_env, node_expr)?.as_node()?;
-                let arg_vals: Result<Vec<Value>, _> =
+                let arg_vals: Result<Vec<Value<H>>, _> =
                     args.iter().map(|a| eval(local_env, node_env, a)).collect();
                 let arg_vals = arg_vals?;
 
@@ -250,17 +251,17 @@ fn execute_common_label<L: Logger>(
     }
 }
 
-fn exec_sync_inner<L: Logger>(
-    state: &mut State,
+fn exec_sync_inner<H: HashPolicy, L: Logger>(
+    state: &mut State<H>,
     logger: &mut L,
     program: &Program,
-    local_env: &mut Env,
-    node_env: &mut Env,
+    local_env: &mut Env<H>,
+    node_env: &mut Env<H>,
     start_pc: usize,
     node_id: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
-) -> Result<Value, RuntimeError> {
+) -> Result<Value<H>, RuntimeError> {
     let mut pc = start_pc;
     let mut prev_pc = pc;
     loop {
@@ -298,14 +299,14 @@ fn exec_sync_inner<L: Logger>(
     }
 }
 
-pub fn exec<L: Logger>(
-    state: &mut State,
+pub fn exec<H: HashPolicy, L: Logger>(
+    state: &mut State<H>,
     logger: &mut L,
     program: &Program,
-    mut record: Record,
+    mut record: Record<H>,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
-) -> Result<Option<ClientOpResult>, RuntimeError> {
+) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let mut local_env = record.env;
     let mut node_env = state.nodes[record.node].clone();
 

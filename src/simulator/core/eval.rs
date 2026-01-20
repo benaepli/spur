@@ -1,13 +1,14 @@
 use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::values::{Env, Value, ValueKind, hash_map_entry};
+use crate::simulator::hash_utils::HashPolicy;
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 #[inline(always)]
-pub fn load(slot: VarSlot, local_env: &Env, node_env: &Env) -> Value {
+pub fn load<H: HashPolicy>(slot: VarSlot, local_env: &Env<H>, node_env: &Env<H>) -> Value<H> {
     match slot {
         VarSlot::Local(idx, _) => local_env.get(idx).clone(),
         VarSlot::Node(idx, _) => node_env.get(idx).clone(),
@@ -15,18 +16,23 @@ pub fn load(slot: VarSlot, local_env: &Env, node_env: &Env) -> Value {
 }
 
 #[inline(always)]
-pub fn store_slot(slot: VarSlot, val: Value, local_env: &mut Env, node_env: &mut Env) {
+pub fn store_slot<H: HashPolicy>(
+    slot: VarSlot,
+    val: Value<H>,
+    local_env: &mut Env<H>,
+    node_env: &mut Env<H>,
+) {
     match slot {
         VarSlot::Local(idx, _) => local_env.set(idx, val),
         VarSlot::Node(idx, _) => node_env.set(idx, val),
     }
 }
 
-pub fn store(
+pub fn store<H: HashPolicy>(
     lhs: &Lhs,
-    val: Value,
-    local_env: &mut Env,
-    node_env: &mut Env,
+    val: Value<H>,
+    local_env: &mut Env<H>,
+    node_env: &mut Env<H>,
 ) -> Result<(), RuntimeError> {
     match lhs {
         Lhs::Var(slot) => {
@@ -55,13 +61,13 @@ pub fn store(
 }
 
 /// Create a fresh local environment for calling a function
-pub fn make_local_env(
+pub fn make_local_env<H: HashPolicy>(
     func: &FunctionInfo,
-    args: Vec<Value>,
-    local_env: &Env,
-    node_env: &Env,
-) -> Env {
-    let mut env = Env::with_slots(func.local_slot_count as usize);
+    args: Vec<Value<H>>,
+    local_env: &Env<H>,
+    node_env: &Env<H>,
+) -> Env<H> {
+    let mut env = Env::<H>::with_slots(func.local_slot_count as usize);
 
     // Set arguments in parameter slots
     for (i, arg) in args.into_iter().enumerate() {
@@ -79,7 +85,11 @@ pub fn make_local_env(
     env
 }
 
-fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, RuntimeError> {
+fn update_collection<H: HashPolicy>(
+    col: Value<H>,
+    key: Value<H>,
+    val: Value<H>,
+) -> Result<Value<H>, RuntimeError> {
     use ValueKind::*;
     match col.kind {
         Map(m) => {
@@ -111,7 +121,7 @@ fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, Runtim
 
             let new_map = m.update(key, val);
 
-            Ok(Value::with_sig(ValueKind::Map(new_map), new_sig))
+            Ok(Value::<H>::with_sig(ValueKind::Map(new_map), new_sig))
         }
         List(l) => {
             let idx = key.as_int()? as usize;
@@ -121,7 +131,7 @@ fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, Runtim
                     len: l.len(),
                 });
             }
-            Ok(Value::list(l.update(idx, val)))
+            Ok(Value::<H>::list(l.update(idx, val)))
         }
         _ => Err(RuntimeError::NotACollection {
             got: col.type_name(),
@@ -129,25 +139,29 @@ fn update_collection(col: Value, key: Value, val: Value) -> Result<Value, Runtim
     }
 }
 
-pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, RuntimeError> {
+pub fn eval<H: HashPolicy>(
+    local_env: &Env<H>,
+    node_env: &Env<H>,
+    expr: &Expr,
+) -> Result<Value<H>, RuntimeError> {
     match expr {
-        Expr::Int(i) => Ok(Value::int(*i)),
-        Expr::Bool(b) => Ok(Value::bool(*b)),
-        Expr::String(s) => Ok(Value::string(s.clone())),
-        Expr::Unit => Ok(Value::unit()),
-        Expr::Nil => Ok(Value::option_none()),
+        Expr::Int(i) => Ok(Value::<H>::int(*i)),
+        Expr::Bool(b) => Ok(Value::<H>::bool(*b)),
+        Expr::String(s) => Ok(Value::<H>::string(s.clone())),
+        Expr::Unit => Ok(Value::<H>::unit()),
+        Expr::Nil => Ok(Value::<H>::option_none()),
         Expr::Var(s) => Ok(load(*s, local_env, node_env)),
         Expr::Plus(e1, e2) => {
             let v1 = eval(local_env, node_env, e1)?;
             let v2 = eval(local_env, node_env, e2)?;
 
             match (&v1.kind, &v2.kind) {
-                (ValueKind::Int(i1), ValueKind::Int(i2)) => Ok(Value::int(i1 + i2)),
+                (ValueKind::Int(i1), ValueKind::Int(i2)) => Ok(Value::<H>::int(i1 + i2)),
                 (ValueKind::String(s1), ValueKind::String(s2)) => {
                     let mut result = String::new();
                     result.push_str(s1.as_str());
                     result.push_str(s2.as_str());
-                    Ok(Value::string(EcoString::from(result)))
+                    Ok(Value::<H>::string(EcoString::from(result)))
                 }
                 _ => Err(RuntimeError::TypeError {
                     expected: "int or string",
@@ -155,50 +169,50 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
                 }),
             }
         }
-        Expr::Minus(e1, e2) => Ok(Value::int(
+        Expr::Minus(e1, e2) => Ok(Value::<H>::int(
             eval(local_env, node_env, e1)?.as_int()? - eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::Times(e1, e2) => Ok(Value::int(
+        Expr::Times(e1, e2) => Ok(Value::<H>::int(
             eval(local_env, node_env, e1)?.as_int()? * eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::Div(e1, e2) => Ok(Value::int(
+        Expr::Div(e1, e2) => Ok(Value::<H>::int(
             eval(local_env, node_env, e1)?.as_int()? / eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::Mod(e1, e2) => Ok(Value::int(
+        Expr::Mod(e1, e2) => Ok(Value::<H>::int(
             eval(local_env, node_env, e1)?.as_int()? % eval(local_env, node_env, e2)?.as_int()?,
         )),
-        Expr::LessThan(e1, e2) => Ok(Value::bool(
+        Expr::LessThan(e1, e2) => Ok(Value::<H>::bool(
             eval(local_env, node_env, e1)? < eval(local_env, node_env, e2)?,
         )),
-        Expr::EqualsEquals(e1, e2) => Ok(Value::bool(
+        Expr::EqualsEquals(e1, e2) => Ok(Value::<H>::bool(
             eval(local_env, node_env, e1)? == eval(local_env, node_env, e2)?,
         )),
-        Expr::Not(e) => Ok(Value::bool(!eval(local_env, node_env, e)?.as_bool()?)),
-        Expr::And(e1, e2) => Ok(Value::bool(
+        Expr::Not(e) => Ok(Value::<H>::bool(!eval(local_env, node_env, e)?.as_bool()?)),
+        Expr::And(e1, e2) => Ok(Value::<H>::bool(
             eval(local_env, node_env, e1)?.as_bool()?
                 && eval(local_env, node_env, e2)?.as_bool()?,
         )),
-        Expr::Or(e1, e2) => Ok(Value::bool(
+        Expr::Or(e1, e2) => Ok(Value::<H>::bool(
             eval(local_env, node_env, e1)?.as_bool()?
                 || eval(local_env, node_env, e2)?.as_bool()?,
         )),
-        Expr::Some(e) => Ok(Value::option_some(eval(local_env, node_env, e)?)),
+        Expr::Some(e) => Ok(Value::<H>::option_some(eval(local_env, node_env, e)?)),
         Expr::Tuple(es) => {
             let vals: Result<Vector<_>, _> =
                 es.iter().map(|e| eval(local_env, node_env, e)).collect();
-            Ok(Value::tuple(vals?))
+            Ok(Value::<H>::tuple(vals?))
         }
         Expr::List(es) => {
             let vals: Result<Vector<_>, _> =
                 es.iter().map(|e| eval(local_env, node_env, e)).collect();
-            Ok(Value::list(vals?))
+            Ok(Value::<H>::list(vals?))
         }
         Expr::Map(kv) => {
             let mut m = ImHashMap::new();
             for (k, v) in kv {
                 m.insert(eval(local_env, node_env, k)?, eval(local_env, node_env, v)?);
             }
-            Ok(Value::map(m))
+            Ok(Value::<H>::map(m))
         }
         Expr::Find(col, key) => {
             let col_val = eval(local_env, node_env, col)?;
@@ -225,13 +239,13 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
             let mut new_list = Vector::new();
             new_list.push_back(h);
             new_list.append(t);
-            Ok(Value::list(new_list))
+            Ok(Value::<H>::list(new_list))
         }
         Expr::ListAppend(list, item) => {
             let mut l = eval(local_env, node_env, list)?.as_list()?.clone();
             let i = eval(local_env, node_env, item)?;
             l.push_back(i);
-            Ok(Value::list(l))
+            Ok(Value::<H>::list(l))
         }
         Expr::ListSubsequence(list, start, end) => {
             let l = eval(local_env, node_env, list)?;
@@ -245,32 +259,32 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
                     len: vec.len(),
                 });
             }
-            Ok(Value::list(vec.clone().slice(s..e)))
+            Ok(Value::<H>::list(vec.clone().slice(s..e)))
         }
-        Expr::LessThanEquals(e1, e2) => Ok(Value::bool(
+        Expr::LessThanEquals(e1, e2) => Ok(Value::<H>::bool(
             eval(local_env, node_env, e1)? <= eval(local_env, node_env, e2)?,
         )),
-        Expr::GreaterThan(e1, e2) => Ok(Value::bool(
+        Expr::GreaterThan(e1, e2) => Ok(Value::<H>::bool(
             eval(local_env, node_env, e1)? > eval(local_env, node_env, e2)?,
         )),
-        Expr::GreaterThanEquals(e1, e2) => Ok(Value::bool(
+        Expr::GreaterThanEquals(e1, e2) => Ok(Value::<H>::bool(
             eval(local_env, node_env, e1)? >= eval(local_env, node_env, e2)?,
         )),
         Expr::KeyExists(key, map) => {
             let k = eval(local_env, node_env, key)?;
             let m = eval(local_env, node_env, map)?;
-            Ok(Value::bool(m.as_map()?.contains_key(&k)))
+            Ok(Value::<H>::bool(m.as_map()?.contains_key(&k)))
         }
         Expr::MapErase(key, map) => {
             let k = eval(local_env, node_env, key)?;
             let m = eval(local_env, node_env, map)?.as_map()?.clone();
-            Ok(Value::map(m.without(&k)))
+            Ok(Value::<H>::map(m.without(&k)))
         }
         Expr::ListLen(list) => {
             let list_val = eval(local_env, node_env, list)?;
             match &list_val.kind {
-                ValueKind::List(l) => Ok(Value::int(l.len() as i64)),
-                ValueKind::Map(m) => Ok(Value::int(m.len() as i64)),
+                ValueKind::List(l) => Ok(Value::<H>::int(l.len() as i64)),
+                ValueKind::Map(m) => Ok(Value::<H>::int(m.len() as i64)),
                 _ => Err(RuntimeError::NotACollection {
                     got: list_val.type_name(),
                 }),
@@ -291,7 +305,7 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
         Expr::Min(e1, e2) => {
             let v1 = eval(local_env, node_env, e1)?.as_int()?;
             let v2 = eval(local_env, node_env, e2)?.as_int()?;
-            Ok(Value::int(v1.min(v2)))
+            Ok(Value::<H>::int(v1.min(v2)))
         }
         Expr::TupleAccess(tuple, idx) => {
             let t = eval(local_env, node_env, tuple)?;
@@ -331,10 +345,10 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
                 }),
             }
         }
-        Expr::IntToString(e) => Ok(Value::string(EcoString::from(
+        Expr::IntToString(e) => Ok(Value::<H>::string(EcoString::from(
             eval(local_env, node_env, e)?.as_int()?.to_string(),
         ))),
-        Expr::BoolToString(e) => Ok(Value::string(EcoString::from(
+        Expr::BoolToString(e) => Ok(Value::<H>::string(EcoString::from(
             eval(local_env, node_env, e)?.as_bool()?.to_string(),
         ))),
         Expr::Store(col, key, val) => update_collection(
@@ -349,6 +363,7 @@ pub fn eval(local_env: &Env, node_env: &Env, expr: &Expr) -> Result<Value, Runti
 mod tests {
     use super::*;
     use crate::analysis::resolver::NameId;
+    use crate::simulator::hash_utils::WithHashing;
 
     fn dummy_slot(idx: u32) -> VarSlot {
         VarSlot::Local(idx, NameId(0))
@@ -360,58 +375,67 @@ mod tests {
 
     #[test]
     fn test_eval_literals() {
-        let env = Env::with_slots(0);
-        assert_eq!(eval(&env, &env, &Expr::Int(42)).unwrap(), Value::int(42));
+        let env = Env::<WithHashing>::with_slots(0);
+        assert_eq!(
+            eval(&env, &env, &Expr::Int(42)).unwrap(),
+            Value::<WithHashing>::int(42)
+        );
         assert_eq!(
             eval(&env, &env, &Expr::Bool(true)).unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
         assert_eq!(
             eval(&env, &env, &Expr::String("hello".into())).unwrap(),
-            Value::string("hello".into())
+            Value::<WithHashing>::string("hello".into())
         );
-        assert_eq!(eval(&env, &env, &Expr::Unit).unwrap(), Value::unit());
-        assert_eq!(eval(&env, &env, &Expr::Nil).unwrap(), Value::option_none());
+        assert_eq!(
+            eval(&env, &env, &Expr::Unit).unwrap(),
+            Value::<WithHashing>::unit()
+        );
+        assert_eq!(
+            eval(&env, &env, &Expr::Nil).unwrap(),
+            Value::<WithHashing>::option_none()
+        );
     }
 
     #[test]
     fn test_eval_arithmetic() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
         let e1 = Box::new(Expr::Int(10));
         let e2 = Box::new(Expr::Int(3));
 
         assert_eq!(
             eval(&env, &env, &Expr::Plus(e1.clone(), e2.clone())).unwrap(),
-            Value::int(13)
+            Value::<WithHashing>::int(13)
         );
         assert_eq!(
             eval(&env, &env, &Expr::Minus(e1.clone(), e2.clone())).unwrap(),
-            Value::int(7)
+            Value::<WithHashing>::int(7)
         );
         assert_eq!(
             eval(&env, &env, &Expr::Times(e1.clone(), e2.clone())).unwrap(),
-            Value::int(30)
+            Value::<WithHashing>::int(30)
         );
         assert_eq!(
             eval(&env, &env, &Expr::Div(e1.clone(), e2.clone())).unwrap(),
-            Value::int(3)
+            Value::<WithHashing>::int(3)
         );
         assert_eq!(
             eval(&env, &env, &Expr::Mod(e1.clone(), e2.clone())).unwrap(),
-            Value::int(1)
+            Value::<WithHashing>::int(1)
         );
     }
 
     #[test]
     fn test_eval_string_concat() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
 
         // Basic concatenation
         let s1 = Box::new(Expr::String(EcoString::from("hello")));
         let s2 = Box::new(Expr::String(EcoString::from("world")));
         assert_eq!(
             eval(&env, &env, &Expr::Plus(s1, s2)).unwrap(),
-            Value::string(EcoString::from("helloworld"))
+            Value::<WithHashing>::string(EcoString::from("helloworld"))
         );
 
         // Concatenation with spaces
@@ -419,7 +443,7 @@ mod tests {
         let s4 = Box::new(Expr::String(EcoString::from("world")));
         assert_eq!(
             eval(&env, &env, &Expr::Plus(s3, s4)).unwrap(),
-            Value::string(EcoString::from("hello world"))
+            Value::<WithHashing>::string(EcoString::from("hello world"))
         );
 
         // Empty strings
@@ -427,96 +451,96 @@ mod tests {
         let s6 = Box::new(Expr::String(EcoString::from("test")));
         assert_eq!(
             eval(&env, &env, &Expr::Plus(s5.clone(), s6.clone())).unwrap(),
-            Value::string(EcoString::from("test"))
+            Value::<WithHashing>::string(EcoString::from("test"))
         );
         assert_eq!(
             eval(&env, &env, &Expr::Plus(s6, s5)).unwrap(),
-            Value::string(EcoString::from("test"))
+            Value::<WithHashing>::string(EcoString::from("test"))
         );
     }
 
     #[test]
     fn test_eval_logical() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
         let t = Box::new(Expr::Bool(true));
         let f = Box::new(Expr::Bool(false));
 
         assert_eq!(
             eval(&env, &env, &Expr::Not(t.clone())).unwrap(),
-            Value::bool(false)
+            Value::<WithHashing>::bool(false)
         );
         assert_eq!(
             eval(&env, &env, &Expr::And(t.clone(), f.clone())).unwrap(),
-            Value::bool(false)
+            Value::<WithHashing>::bool(false)
         );
         assert_eq!(
             eval(&env, &env, &Expr::Or(t.clone(), f.clone())).unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
     }
 
     #[test]
     fn test_eval_comparison() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
         let e1 = Box::new(Expr::Int(10));
         let e2 = Box::new(Expr::Int(20));
 
         assert_eq!(
             eval(&env, &env, &Expr::EqualsEquals(e1.clone(), e1.clone())).unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
         assert_eq!(
             eval(&env, &env, &Expr::LessThan(e1.clone(), e2.clone())).unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
         assert_eq!(
             eval(&env, &env, &Expr::LessThanEquals(e1.clone(), e1.clone())).unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
         assert_eq!(
             eval(&env, &env, &Expr::GreaterThan(e2.clone(), e1.clone())).unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
         assert_eq!(
             eval(&env, &env, &Expr::GreaterThanEquals(e1.clone(), e1.clone())).unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
     }
 
     #[test]
     fn test_eval_vars() {
-        let mut local_env = Env::with_slots(2);
-        local_env.set(0, Value::int(100));
-        let mut node_env = Env::with_slots(1);
-        node_env.set(0, Value::int(200));
+        let mut local_env = Env::<WithHashing>::with_slots(2);
+        local_env.set(0, Value::<WithHashing>::int(100));
+        let mut node_env = Env::<WithHashing>::with_slots(1);
+        node_env.set(0, Value::<WithHashing>::int(200));
 
         assert_eq!(
             eval(&local_env, &node_env, &Expr::Var(dummy_slot(0))).unwrap(),
-            Value::int(100)
+            Value::<WithHashing>::int(100)
         );
         assert_eq!(
             eval(&local_env, &node_env, &Expr::Var(node_slot(0))).unwrap(),
-            Value::int(200)
+            Value::<WithHashing>::int(200)
         );
     }
 
     #[test]
     fn test_eval_collections() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
 
         // Tuple
         let tuple_expr = Expr::Tuple(vec![Expr::Int(1), Expr::Bool(true)]);
         let _tuple_val = eval(&env, &env, &tuple_expr).unwrap();
         assert_eq!(
             eval(&env, &env, &Expr::TupleAccess(Box::new(tuple_expr), 1)).unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
 
         // List
         let list_expr = Expr::List(vec![Expr::Int(1), Expr::Int(2)]);
         assert_eq!(
             eval(&env, &env, &Expr::ListLen(Box::new(list_expr.clone()))).unwrap(),
-            Value::int(2)
+            Value::<WithHashing>::int(2)
         );
         assert_eq!(
             eval(
@@ -525,7 +549,7 @@ mod tests {
                 &Expr::ListAccess(Box::new(list_expr.clone()), 0)
             )
             .unwrap(),
-            Value::int(1)
+            Value::<WithHashing>::int(1)
         );
 
         // List operations
@@ -535,7 +559,10 @@ mod tests {
 
         let prepend_expr = Expr::ListPrepend(Box::new(Expr::Int(0)), Box::new(list_expr.clone()));
         let prepended_val = eval(&env, &env, &prepend_expr).unwrap();
-        assert_eq!(prepended_val.as_list().unwrap()[0], Value::int(0));
+        assert_eq!(
+            prepended_val.as_list().unwrap()[0],
+            Value::<WithHashing>::int(0)
+        );
 
         let sub_expr = Expr::ListSubsequence(
             Box::new(list_expr),
@@ -557,7 +584,7 @@ mod tests {
                 )
             )
             .unwrap(),
-            Value::int(42)
+            Value::<WithHashing>::int(42)
         );
         assert_eq!(
             eval(
@@ -569,7 +596,7 @@ mod tests {
                 )
             )
             .unwrap(),
-            Value::bool(true)
+            Value::<WithHashing>::bool(true)
         );
 
         let erase_expr = Expr::MapErase(Box::new(Expr::String("key".into())), Box::new(map_expr));
@@ -579,11 +606,11 @@ mod tests {
 
     #[test]
     fn test_eval_options() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
         let some_expr = Expr::Some(Box::new(Expr::Int(42)));
         assert_eq!(
             eval(&env, &env, &Expr::Unwrap(Box::new(some_expr.clone()))).unwrap(),
-            Value::int(42)
+            Value::<WithHashing>::int(42)
         );
 
         let nil_expr = Expr::Nil;
@@ -594,7 +621,7 @@ mod tests {
                 &Expr::Coalesce(Box::new(nil_expr), Box::new(Expr::Int(100)))
             )
             .unwrap(),
-            Value::int(100)
+            Value::<WithHashing>::int(100)
         );
         assert_eq!(
             eval(
@@ -603,13 +630,13 @@ mod tests {
                 &Expr::Coalesce(Box::new(some_expr), Box::new(Expr::Int(100)))
             )
             .unwrap(),
-            Value::int(42)
+            Value::<WithHashing>::int(42)
         );
     }
 
     #[test]
     fn test_eval_misc() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
         assert_eq!(
             eval(
                 &env,
@@ -617,25 +644,25 @@ mod tests {
                 &Expr::Min(Box::new(Expr::Int(10)), Box::new(Expr::Int(20)))
             )
             .unwrap(),
-            Value::int(10)
+            Value::<WithHashing>::int(10)
         );
         assert_eq!(
             eval(&env, &env, &Expr::IntToString(Box::new(Expr::Int(123)))).unwrap(),
-            Value::string("123".into())
+            Value::<WithHashing>::string("123".into())
         );
         assert_eq!(
             eval(&env, &env, &Expr::BoolToString(Box::new(Expr::Bool(true)))).unwrap(),
-            Value::string("true".into())
+            Value::<WithHashing>::string("true".into())
         );
         assert_eq!(
             eval(&env, &env, &Expr::BoolToString(Box::new(Expr::Bool(false)))).unwrap(),
-            Value::string("false".into())
+            Value::<WithHashing>::string("false".into())
         );
     }
 
     #[test]
     fn test_eval_store_update() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
         let list_expr = Expr::List(vec![Expr::Int(1)]);
         let store_expr = Expr::Store(
             Box::new(list_expr),
@@ -643,12 +670,15 @@ mod tests {
             Box::new(Expr::Int(42)),
         );
         let updated_list = eval(&env, &env, &store_expr).unwrap();
-        assert_eq!(updated_list.as_list().unwrap()[0], Value::int(42));
+        assert_eq!(
+            updated_list.as_list().unwrap()[0],
+            Value::<WithHashing>::int(42)
+        );
     }
 
     #[test]
     fn test_eval_errors() {
-        let env = Env::with_slots(0);
+        let env = Env::<WithHashing>::with_slots(0);
         let res = eval(
             &env,
             &env,
@@ -659,28 +689,31 @@ mod tests {
 
     #[test]
     fn test_store() {
-        let mut local_env = Env::with_slots(1);
-        let mut node_env = Env::with_slots(1);
+        let mut local_env = Env::<WithHashing>::with_slots(1);
+        let mut node_env = Env::<WithHashing>::with_slots(1);
 
         // Simple var store
         store(
             &Lhs::Var(dummy_slot(0)),
-            Value::int(42),
+            Value::<WithHashing>::int(42),
             &mut local_env,
             &mut node_env,
         )
         .unwrap();
-        assert_eq!(local_env.get(0), &Value::int(42));
+        assert_eq!(local_env.get(0), &Value::<WithHashing>::int(42));
 
         // Tuple store
         let lhs = Lhs::Tuple(vec![dummy_slot(0), node_slot(0)]);
-        let val = Value::tuple(Vector::from(vec![Value::int(1), Value::int(2)]));
+        let val = Value::<WithHashing>::tuple(Vector::from(vec![
+            Value::<WithHashing>::int(1),
+            Value::<WithHashing>::int(2),
+        ]));
         store(&lhs, val, &mut local_env, &mut node_env).unwrap();
-        assert_eq!(local_env.get(0), &Value::int(1));
-        assert_eq!(node_env.get(0), &Value::int(2));
+        assert_eq!(local_env.get(0), &Value::<WithHashing>::int(1));
+        assert_eq!(node_env.get(0), &Value::<WithHashing>::int(2));
 
         // Mismatched tuple length
-        let val_bad = Value::tuple(Vector::from(vec![Value::int(1)]));
+        let val_bad = Value::<WithHashing>::tuple(Vector::from(vec![Value::<WithHashing>::int(1)]));
         assert!(store(&lhs, val_bad, &mut local_env, &mut node_env).is_err());
     }
 
@@ -695,10 +728,10 @@ mod tests {
             is_sync: true,
             debug_slot_names: vec!["a".into(), "b".into()],
         };
-        let args = vec![Value::int(5)];
-        let env = Env::with_slots(0);
+        let args = vec![Value::<WithHashing>::int(5)];
+        let env = Env::<WithHashing>::with_slots(0);
         let local = make_local_env(&func, args, &env, &env);
-        assert_eq!(local.get(0), &Value::int(5));
-        assert_eq!(local.get(1), &Value::int(10));
+        assert_eq!(local.get(0), &Value::<WithHashing>::int(5));
+        assert_eq!(local.get(1), &Value::<WithHashing>::int(10));
     }
 }

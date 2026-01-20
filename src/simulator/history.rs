@@ -34,7 +34,7 @@ pub fn serialize_logs(logs: &[LogEntry]) -> Vec<PersistableLog> {
         .collect()
 }
 
-fn json_of_value(v: &Value) -> JsonValue {
+fn json_of_value<H: crate::simulator::hash_utils::HashPolicy>(v: &Value<H>) -> JsonValue {
     match &v.kind {
         ValueKind::Int(i) => json!({
         "type": "VInt",
@@ -97,14 +97,14 @@ fn json_of_value(v: &Value) -> JsonValue {
     }
 }
 
-fn payload_to_json_string(payload: &[Value]) -> String {
-    let json_list: Vec<JsonValue> = payload.iter().map(json_of_value).collect();
+fn payload_to_json_string<H: crate::simulator::hash_utils::HashPolicy>(payload: &[Value<H>]) -> String {
+    let json_list: Vec<JsonValue> = payload.iter().map(json_of_value::<H>).collect();
     serde_json::to_string(&json_list).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Serializes a list of Operations into PersistableOps.
 /// This should be called from worker threads to distribute CPU work.
-pub fn serialize_history(history: &[Operation]) -> Vec<PersistableOp> {
+pub fn serialize_history<H: crate::simulator::hash_utils::HashPolicy>(history: &[Operation<H>]) -> Vec<PersistableOp> {
     history
         .par_iter()
         .map(|op| PersistableOp {
@@ -117,14 +117,14 @@ pub fn serialize_history(history: &[Operation]) -> Vec<PersistableOp> {
                 OpKind::Recover => "Recover",
             },
             action: op.op_action.clone(),
-            payload_json: payload_to_json_string(&op.payload),
+            payload_json: payload_to_json_string::<H>(&op.payload),
         })
         .collect()
 }
 
 /// Saves the simulation history to a CSV file.
-pub fn save_history_to_csv<P: AsRef<Path>>(
-    history: &[Operation],
+pub fn save_history_to_csv<H: crate::simulator::hash_utils::HashPolicy, P: AsRef<Path>>(
+    history: &[Operation<H>],
     filename: P,
 ) -> Result<(), Box<dyn Error>> {
     let mut wtr = csv::Writer::from_path(filename)?;
@@ -139,7 +139,7 @@ pub fn save_history_to_csv<P: AsRef<Path>>(
             OpKind::Recover => "Recover",
         };
 
-        let payload_str = payload_to_json_string(&op.payload);
+        let payload_str = payload_to_json_string::<H>(&op.payload);
         wtr.write_record(&[
             op.unique_id.to_string(),
             op.client_id.to_string(),

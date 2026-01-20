@@ -35,16 +35,16 @@ fn default_step() -> i32 {
 impl Range {
     pub fn validate(&self) -> Result<(), String> {
         if self.step <= 0 {
-            return Err(format!(
-                "Invalid range step: {} (must be > 0)",
-                self.step
-            ));
+            return Err(format!("Invalid range step: {} (must be > 0)", self.step));
         }
         Ok(())
     }
 
     pub fn expand(&self) -> Vec<i32> {
-        assert!(self.step > 0, "Range must be validated before calling expand()");
+        assert!(
+            self.step > 0,
+            "Range must be validated before calling expand()"
+        );
         (self.min..=self.max).step_by(self.step as usize).collect()
     }
 }
@@ -87,17 +87,23 @@ pub struct ExplorerConfig {
 
 impl ExplorerConfig {
     pub fn validate(&self) -> Result<(), String> {
-        self.num_servers_range.validate()
+        self.num_servers_range
+            .validate()
             .map_err(|e| format!("num_servers range error: {}", e))?;
-        self.num_clients_range.validate()
+        self.num_clients_range
+            .validate()
             .map_err(|e| format!("num_clients range error: {}", e))?;
-        self.num_write_ops_range.validate()
+        self.num_write_ops_range
+            .validate()
             .map_err(|e| format!("num_write_ops range error: {}", e))?;
-        self.num_read_ops_range.validate()
+        self.num_read_ops_range
+            .validate()
             .map_err(|e| format!("num_read_ops range error: {}", e))?;
-        self.num_timeouts_range.validate()
+        self.num_timeouts_range
+            .validate()
             .map_err(|e| format!("num_timeouts range error: {}", e))?;
-        self.num_crashes_range.validate()
+        self.num_crashes_range
+            .validate()
             .map_err(|e| format!("num_crashes range error: {}", e))?;
         Ok(())
     }
@@ -193,21 +199,21 @@ impl SingleRunConfig {
     }
 }
 
-fn initialize_state<L: Logger>(
+fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
     program: &Program,
     logger: &mut L,
     num_servers: usize,
     num_clients: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
-) -> Result<State, RuntimeError> {
-    let mut state = State::new(num_servers + num_clients, program.max_node_slots as usize);
+) -> Result<State<H>, RuntimeError> {
+    let mut state = State::<H>::new(num_servers + num_clients, program.max_node_slots as usize);
 
     if let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
         for i in 0..num_clients {
             let client_id = num_servers + i;
             let node_env = &state.nodes[client_id];
-            let mut env = make_local_env(init_fn, vec![], &Env::default(), node_env);
+            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
             exec_sync_on_node(
                 &mut state,
                 logger,
@@ -224,7 +230,7 @@ fn initialize_state<L: Logger>(
     if let Some(init_fn) = program.get_func_by_name("Node.BASE_NODE_INIT") {
         for node_id in 0..num_servers {
             let node_env = &state.nodes[node_id];
-            let mut env = make_local_env(init_fn, vec![], &Env::default(), node_env);
+            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
             exec_sync_on_node(
                 &mut state,
                 logger,
@@ -241,8 +247,8 @@ fn initialize_state<L: Logger>(
     Ok(state)
 }
 
-fn init_topology<L: Logger>(
-    state: &mut State,
+fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
+    state: &mut State<H>,
     logger: &mut L,
     program: &Program,
     num_servers: usize,
@@ -255,12 +261,12 @@ fn init_topology<L: Logger>(
         return Ok(());
     };
 
-    let peer_list = Value::list((0..num_servers).map(Value::node).collect());
+    let peer_list = Value::<H>::list((0..num_servers).map(Value::<H>::node).collect());
 
     for node_id in 0..num_servers {
-        let actuals = vec![Value::int(node_id as i64), peer_list.clone()];
+        let actuals = vec![Value::<H>::int(node_id as i64), peer_list.clone()];
         let node_env = &state.nodes[node_id];
-        let mut env = make_local_env(init_fn, actuals, &Env::default(), node_env);
+        let mut env = make_local_env(init_fn, actuals, &Env::<H>::default(), node_env);
 
         exec_sync_on_node(
             state,
@@ -306,13 +312,17 @@ pub fn run_single_simulation(
     };
 
     // Create PathState with free_clients initialized
+    // Use NoHashing for exec_plan mode (no state deduplication needed)
     let num_servers = config.num_servers as usize;
     let num_clients = config.num_clients as usize;
-    let mut path_state = PathState::new(num_servers + num_clients, program.max_node_slots as usize);
+    let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing>::new(
+        num_servers + num_clients,
+        program.max_node_slots as usize,
+    );
     path_state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
 
     // Initialize state
-    path_state.state = initialize_state(
+    path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _>(
         program,
         &mut path_state.logs,
         num_servers,
@@ -326,7 +336,7 @@ pub fn run_single_simulation(
         num_servers: config.num_servers,
     };
 
-    init_topology(
+    init_topology::<crate::simulator::hash_utils::NoHashing, _>(
         &mut path_state.state,
         &mut path_state.logs,
         program,
@@ -349,7 +359,9 @@ pub fn run_single_simulation(
     let plan_score = path_state.coverage.plan_score();
 
     global_state.coverage.merge(&path_state.coverage);
-    if let Some(x) = canonical.as_ref() { global_state.insert(x) }
+    if let Some(x) = canonical.as_ref() {
+        global_state.insert(x)
+    }
 
     let serialized = serialize_history(&path_state.history);
     let serialized_logs = serialize_logs(&path_state.logs.0);
@@ -371,7 +383,9 @@ pub fn run_explorer(
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
 
     // Validate configuration before proceeding
-    config.validate().map_err(|e| format!("Configuration validation failed: {}", e))?;
+    config
+        .validate()
+        .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     if std::path::Path::new(output_path).exists() {
         fs::remove_file(output_path)?;
@@ -503,7 +517,9 @@ pub fn run_explorer_genetic(
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
 
     // Validate configuration before proceeding
-    config.validate().map_err(|e| format!("Configuration validation failed: {}", e))?;
+    config
+        .validate()
+        .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     if std::path::Path::new(output_path).exists() {
         fs::remove_file(output_path)?;

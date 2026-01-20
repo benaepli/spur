@@ -6,6 +6,7 @@ use crate::simulator::core::{
     UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env, schedule_runnable,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
+use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
     ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
@@ -39,18 +40,18 @@ impl Logger for Logs {
 
 /// Wrapper around State that adds path-execution tracking fields.
 #[derive(Debug)]
-pub struct PathState {
-    pub state: State,
+pub struct PathState<H: HashPolicy> {
+    pub state: State<H>,
     pub coverage: LocalCoverage,
     pub logs: Logs,
-    pub history: Vec<Operation>,
+    pub history: Vec<Operation<H>>,
     pub free_clients: Vec<i32>,
 }
 
-impl PathState {
+impl<H: HashPolicy> PathState<H> {
     pub fn new(node_count: usize, node_slot_count: usize) -> Self {
         Self {
-            state: State::new(node_count, node_slot_count),
+            state: State::<H>::new(node_count, node_slot_count),
             coverage: LocalCoverage::new(),
             logs: Logs::default(),
             history: Vec::new(),
@@ -59,13 +60,13 @@ impl PathState {
     }
 }
 
-fn recover_node<L: Logger>(
+fn recover_node<H: HashPolicy, L: Logger>(
     topology: &TopologyInfo,
-    state: &mut State,
+    state: &mut State<H>,
     logger: &mut L,
     prog: &Program,
     node_id: usize,
-    global_state: &GlobalState,
+    _global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<(), RuntimeError> {
@@ -75,17 +76,17 @@ fn recover_node<L: Logger>(
 
     let actuals = match topology.topology {
         Topology::Full => vec![
-            Value::int(node_id as i64),
-            Value::list(
+            Value::<H>::int(node_id as i64),
+            Value::<H>::list(
                 (0..topology.num_servers)
-                    .map(|j| Value::node(j as usize))
+                    .map(|j| Value::<H>::node(j as usize))
                     .collect(),
             ),
         ],
     };
 
     let node_env = &state.nodes[node_id];
-    let env = make_local_env(recover_fn, actuals, &Env::default(), node_env);
+    let env = make_local_env(recover_fn, actuals, &Env::<H>::default(), node_env);
 
     let record = Record {
         pc: recover_fn.entry,
@@ -101,9 +102,9 @@ fn recover_node<L: Logger>(
     Ok(())
 }
 
-fn reinit_node<L: Logger>(
+fn reinit_node<H: HashPolicy, L: Logger>(
     topology: &TopologyInfo,
-    state: &mut State,
+    state: &mut State<H>,
     logger: &mut L,
     prog: &Program,
     node_id: usize,
@@ -116,9 +117,9 @@ fn reinit_node<L: Logger>(
         .ok_or_else(|| RuntimeError::MissingRequiredFunction("Node.BASE_NODE_INIT".to_string()))?;
 
     let node_env = &state.nodes[node_id];
-    let mut env = make_local_env(init_fn, vec![], &Env::default(), node_env);
+    let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
     if let VarSlot::Local(self_idx, _) = SELF_SLOT {
-        env.set(self_idx, Value::node(node_id));
+        env.set(self_idx, Value::<H>::node(node_id));
     }
 
     exec_sync_on_node(
@@ -144,7 +145,7 @@ fn reinit_node<L: Logger>(
     )
 }
 
-fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
+fn crash_node<H: HashPolicy>(state: &mut State<H>, history: &mut Vec<Operation<H>>, node_id: usize) {
     if state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is already crashed", node_id);
         return;
@@ -155,7 +156,7 @@ fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
         client_id: -1,
         op_action: "System.Crash".to_string(),
         kind: OpKind::Crash,
-        payload: vec![Value::node(node_id)],
+        payload: vec![Value::<H>::node(node_id)],
         unique_id: -1,
     });
 
@@ -189,10 +190,10 @@ fn crash_node(state: &mut State, history: &mut Vec<Operation>, node_id: usize) {
     }
 }
 
-fn recover_crashed_node<L: Logger>(
-    state: &mut State,
+fn recover_crashed_node<H: HashPolicy, L: Logger>(
+    state: &mut State<H>,
     logger: &mut L,
-    history: &mut Vec<Operation>,
+    history: &mut Vec<Operation<H>>,
     prog: &Program,
     topology: &TopologyInfo,
     node_id: usize,
@@ -210,11 +211,11 @@ fn recover_crashed_node<L: Logger>(
         client_id: -1,
         op_action: "System.Recover".to_string(),
         kind: OpKind::Recover,
-        payload: vec![Value::node(node_id)],
+        payload: vec![Value::<H>::node(node_id)],
         unique_id: -1,
     });
 
-    state.nodes[node_id] = Env::default();
+    state.nodes[node_id] = Env::<H>::default();
     reinit_node(
         topology,
         state,
@@ -237,9 +238,9 @@ fn recover_crashed_node<L: Logger>(
     Ok(())
 }
 
-fn schedule_client_op(
-    state: &mut State,
-    history: &mut Vec<Operation>,
+fn schedule_client_op<H: HashPolicy>(
+    state: &mut State<H>,
+    history: &mut Vec<Operation<H>>,
     prog: &Program,
     op_id: i32,
     op_spec: &ClientOpSpec,
@@ -249,21 +250,21 @@ fn schedule_client_op(
         ClientOpSpec::Write(target, key, val) => (
             "ClientInterface.Write",
             vec![
-                Value::node(*target as usize),
-                Value::string(EcoString::from(key.as_str())),
-                Value::string(EcoString::from(val.as_str())),
+                Value::<H>::node(*target as usize),
+                Value::<H>::string(EcoString::from(key.as_str())),
+                Value::<H>::string(EcoString::from(val.as_str())),
             ],
         ),
         ClientOpSpec::Read(target, key) => (
             "ClientInterface.Read",
             vec![
-                Value::node(*target as usize),
-                Value::string(EcoString::from(key.as_str())),
+                Value::<H>::node(*target as usize),
+                Value::<H>::string(EcoString::from(key.as_str())),
             ],
         ),
         ClientOpSpec::SimulateTimeout(target) => (
             "ClientInterface.SimulateTimeout",
-            vec![Value::node(*target as usize)],
+            vec![Value::<H>::node(*target as usize)],
         ),
     };
 
@@ -301,8 +302,8 @@ fn schedule_client_op(
     Ok(())
 }
 
-pub fn exec_plan(
-    path_state: &mut PathState,
+pub fn exec_plan<H: HashPolicy>(
+    path_state: &mut PathState<H>,
     program: Program,
     plan: ExecutionPlan,
     max_iterations: i32,

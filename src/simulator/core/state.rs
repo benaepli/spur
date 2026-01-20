@@ -1,7 +1,7 @@
 use crate::compiler::cfg::{Lhs, Vertex};
 use crate::simulator::core::eval::store;
 use crate::simulator::core::values::{ChannelId, Env, Value};
-use crate::simulator::hash_utils::{compute_hash, mix};
+use crate::simulator::hash_utils::{compute_hash, HashPolicy};
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use std::hash::{Hash, Hasher};
 
@@ -18,18 +18,18 @@ pub trait Logger {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Record {
+pub struct Record<H: HashPolicy> {
     pub pc: Vertex,
     pub node: usize,
     pub origin_node: usize,
-    pub continuation: Continuation,
-    pub env: Env, // Just local env, node env is in State
+    pub continuation: Continuation<H>,
+    pub env: Env<H>, // Just local env, node env is in State
     pub x: f64,
     pub policy: UpdatePolicy,
 }
 
-impl Hash for Record {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+impl<H: HashPolicy> Hash for Record<H> {
+    fn hash<Ha: Hasher>(&self, state: &mut Ha) {
         self.pc.hash(state);
         self.node.hash(state);
         self.origin_node.hash(state);
@@ -55,14 +55,14 @@ impl UpdatePolicy {
 }
 
 #[derive(Debug, Clone)]
-pub struct CrashInfo {
+pub struct CrashInfo<H: HashPolicy> {
     pub currently_crashed: OrdSet<usize>,
-    pub queued_messages: Vector<(usize, Record)>, // (dest_node, record)
+    pub queued_messages: Vector<(usize, Record<H>)>, // (dest_node, record)
     pub current_step: i32,
 }
 
-impl Hash for CrashInfo {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+impl<H: HashPolicy> Hash for CrashInfo<H> {
+    fn hash<Ha: Hasher>(&self, state: &mut Ha) {
         // OrdSet has deterministic ordering, collect to Vec for safety
         let crashed_vec: Vec<_> = self.currently_crashed.iter().copied().collect();
         crashed_vec.hash(state);
@@ -72,15 +72,15 @@ impl Hash for CrashInfo {
 }
 
 #[derive(Debug, Clone, Hash)]
-pub struct ChannelState {
+pub struct ChannelState<H: HashPolicy> {
     pub capacity: i32,
-    pub buffer: Vector<Value>,
+    pub buffer: Vector<Value<H>>,
     // We move Record out of Runnable and into Waiting.
-    pub waiting_readers: Vector<(Record, Lhs)>,
-    pub waiting_writers: Vector<(Record, Value)>,
+    pub waiting_readers: Vector<(Record<H>, Lhs)>,
+    pub waiting_writers: Vector<(Record<H>, Value<H>)>,
 }
 
-impl ChannelState {
+impl<H: HashPolicy> ChannelState<H> {
     pub fn new(capacity: i32) -> Self {
         Self {
             capacity,
@@ -100,11 +100,11 @@ pub enum OpKind {
 }
 
 #[derive(Clone, Debug)]
-pub struct Operation {
+pub struct Operation<H: HashPolicy> {
     pub client_id: i32,
     pub op_action: String,
     pub kind: OpKind,
-    pub payload: Vec<Value>,
+    pub payload: Vec<Value<H>>,
     pub unique_id: i32,
 }
 
@@ -116,13 +116,13 @@ pub struct Timer {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Runnable {
+pub enum Runnable<H: HashPolicy> {
     Timer(Timer),
-    Record(Record),
+    Record(Record<H>),
 }
 
-impl Hash for Runnable {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+impl<H: HashPolicy> Hash for Runnable<H> {
+    fn hash<Ha: Hasher>(&self, state: &mut Ha) {
         match self {
             Runnable::Timer(t) => {
                 0u8.hash(state);
@@ -136,7 +136,7 @@ impl Hash for Runnable {
     }
 }
 
-impl Runnable {
+impl<H: HashPolicy> Runnable<H> {
     /// Get the node this runnable belongs to.
     pub fn node(&self) -> usize {
         match self {
@@ -155,22 +155,22 @@ impl Runnable {
 }
 
 #[derive(Debug, Clone)]
-pub struct State {
-    pub nodes: Vector<Env>, // Index is node_id
-    pub runnable_tasks: Vector<Runnable>,
-    pub channels: ImHashMap<ChannelId, ChannelState>,
-    pub crash_info: CrashInfo,
+pub struct State<H: HashPolicy> {
+    pub nodes: Vector<Env<H>>, // Index is node_id
+    pub runnable_tasks: Vector<Runnable<H>>,
+    pub channels: ImHashMap<ChannelId, ChannelState<H>>,
+    pub crash_info: CrashInfo<H>,
     next_channel_id: usize,
     next_unique_id: usize,
 }
 
-impl State {
+impl<H: HashPolicy> State<H> {
     pub fn new(node_count: usize, node_slot_count: usize) -> Self {
         Self {
             nodes: (0..node_count)
                 .map(|i| {
-                    let mut env = Env::with_slots(node_slot_count);
-                    env.set(0, Value::node(i)); // Slot 0 = self
+                    let mut env = Env::<H>::with_slots(node_slot_count);
+                    env.set(0, Value::<H>::node(i)); // Slot 0 = self
                     env
                 })
                 .collect(),
@@ -204,12 +204,12 @@ impl State {
 
         // Nodes: XOR of positioned Env signatures
         for (i, env) in self.nodes.iter().enumerate() {
-            h ^= mix(env.sig, i as u32);
+            h ^= H::mix(env.sig, i as u32);
         }
 
         // Runnable tasks: Hash each task and mix
         for (i, task) in self.runnable_tasks.iter().enumerate() {
-            h ^= mix(compute_hash(task), (1000 + i) as u32);
+            h ^= H::mix(compute_hash(task), (1000 + i) as u32);
         }
 
         // Channels: Order-independent XOR
@@ -225,16 +225,16 @@ impl State {
     }
 }
 
-impl Hash for State {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+impl<H: HashPolicy> Hash for State<H> {
+    fn hash<Ha: Hasher>(&self, state: &mut Ha) {
         // Use precomputed signature for O(1) hashing
         self.signature().hash(state);
     }
 }
 
 /// Continuation representing what to do when an execution completes.
-#[derive(Debug, Clone, PartialEq, Hash)]
-pub enum Continuation {
+#[derive(Debug, Clone, PartialEq)]
+pub enum Continuation<H: HashPolicy> {
     /// Node recovery continuation
     Recover,
     /// Async message delivery continuation
@@ -245,20 +245,44 @@ pub enum Continuation {
         op_name: String,
         unique_id: i32,
     },
+    _Phantom(std::marker::PhantomData<H>),
+}
+
+impl<H: HashPolicy> Hash for Continuation<H> {
+    fn hash<Ha: Hasher>(&self, state: &mut Ha) {
+        match self {
+            Continuation::Recover => 0u8.hash(state),
+            Continuation::Async { chan_id } => {
+                1u8.hash(state);
+                chan_id.hash(state);
+            }
+            Continuation::ClientOp {
+                client_id,
+                op_name,
+                unique_id,
+            } => {
+                2u8.hash(state);
+                client_id.hash(state);
+                op_name.hash(state);
+                unique_id.hash(state);
+            }
+            Continuation::_Phantom(_) => 3u8.hash(state),
+        }
+    }
 }
 
 /// Result returned when a ClientOp continuation completes.
 #[derive(Debug, Clone)]
-pub struct ClientOpResult {
+pub struct ClientOpResult<H: HashPolicy> {
     pub client_id: i32,
     pub op_name: String,
     pub unique_id: i32,
-    pub value: Value,
+    pub value: Value<H>,
 }
 
-impl Continuation {
+impl<H: HashPolicy> Continuation<H> {
     /// Execute the continuation and return any client operation result.
-    pub fn call(self, state: &mut State, val: Value) -> Option<ClientOpResult> {
+    pub fn call(self, state: &mut State<H>, val: Value<H>) -> Option<ClientOpResult<H>> {
         match self {
             Continuation::Recover => None,
             Continuation::Async { chan_id } => {
@@ -293,6 +317,9 @@ impl Continuation {
                 unique_id,
                 value: val,
             }),
+            Continuation::_Phantom(_) => {
+                unreachable!("_Phantom variant should never be constructed")
+            }
         }
     }
 }

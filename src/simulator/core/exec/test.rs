@@ -4,6 +4,7 @@ use crate::compiler::cfg::{Cfg, Expr, Instr, Label, Lhs, Program, VarSlot};
 use crate::simulator::core::state::{Continuation, LogEntry, Logger, Record, State, UpdatePolicy};
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::LocalCoverage;
+use crate::simulator::hash_utils::WithHashing;
 use std::collections::HashMap;
 
 fn slot(idx: u32) -> VarSlot {
@@ -60,17 +61,21 @@ impl Logger for TestLogger {
     }
 }
 
-fn make_record(pc: usize, local_slots: usize) -> Record {
+fn make_record(pc: usize, local_slots: usize) -> Record<WithHashing> {
     make_record_with_cont(pc, local_slots, Continuation::Recover)
 }
 
-fn make_record_with_cont(pc: usize, local_slots: usize, continuation: Continuation) -> Record {
+fn make_record_with_cont(
+    pc: usize,
+    local_slots: usize,
+    continuation: Continuation<WithHashing>,
+) -> Record<WithHashing> {
     Record {
         pc,
         node: 0,
         origin_node: 0,
         continuation,
-        env: Env::with_slots(local_slots),
+        env: Env::<WithHashing>::with_slots(local_slots),
         x: 0.5,
         policy: UpdatePolicy::Identity,
     }
@@ -88,12 +93,12 @@ fn test_assign_then_cond_true() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -116,12 +121,12 @@ fn test_assign_then_cond_false() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -145,12 +150,12 @@ fn test_arithmetic_assignment() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -178,12 +183,12 @@ fn test_multiple_assigns() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign1, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -204,12 +209,12 @@ fn test_node_slot_assignment() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -218,7 +223,7 @@ fn test_node_slot_assignment() {
         &mut coverage,
     );
     assert!(result.is_ok());
-    assert_eq!(state.nodes[0].get(1), &Value::int(42));
+    assert_eq!(state.nodes[0].get(1), &Value::<WithHashing>::int(42));
 }
 
 #[test]
@@ -235,12 +240,12 @@ fn test_copy_instruction() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -258,12 +263,12 @@ fn test_print_instruction() {
     let print = builder.add(Label::Print(Expr::Int(123), ret));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(print, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -301,12 +306,12 @@ fn test_for_loop_in_list() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(init, 4);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -324,12 +329,12 @@ fn test_pause_yields() {
     let pause = builder.add(Label::Pause(ret));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(pause, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -360,12 +365,12 @@ fn test_coverage_records_transitions() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign1, 2);
     let mut coverage = LocalCoverage::new();
 
-    let _ = exec(
+    let _ = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -385,7 +390,7 @@ fn test_channel_send_recv() {
     let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), 1, send));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record_with_cont(
         make,
@@ -398,7 +403,7 @@ fn test_channel_send_recv() {
     );
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -408,7 +413,7 @@ fn test_channel_send_recv() {
     );
 
     let op = result.expect("exec failed").expect("should complete");
-    assert_eq!(op.value, Value::int(99));
+    assert_eq!(op.value, Value::<WithHashing>::int(99));
 }
 
 #[test]
@@ -419,12 +424,12 @@ fn test_recv_blocks_on_empty() {
     let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), 1, recv));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(make, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -478,7 +483,7 @@ fn test_for_loop_map_destructuring() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 4);
+    let mut state = State::<WithHashing>::new(1, 4);
     let mut logger = TestLogger::new();
     let record = make_record_with_cont(
         init,
@@ -491,7 +496,7 @@ fn test_for_loop_map_destructuring() {
     );
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -501,7 +506,7 @@ fn test_for_loop_map_destructuring() {
     );
 
     let op = result.expect("exec failed").expect("should complete");
-    assert_eq!(op.value, Value::int(33));
+    assert_eq!(op.value, Value::<WithHashing>::int(33));
 }
 
 #[test]
@@ -521,7 +526,7 @@ fn test_tuple_assignment() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record_with_cont(
         assign,
@@ -534,7 +539,7 @@ fn test_tuple_assignment() {
     );
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,
@@ -544,7 +549,7 @@ fn test_tuple_assignment() {
     );
 
     let op = result.expect("exec failed").expect("should complete");
-    assert_eq!(op.value, Value::int(30));
+    assert_eq!(op.value, Value::<WithHashing>::int(30));
 }
 
 #[test]
@@ -561,12 +566,12 @@ fn test_runtime_type_error() {
     ));
 
     let program = builder.build();
-    let mut state = State::new(1, 2);
+    let mut state = State::<WithHashing>::new(1, 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec(
+    let result = exec::<WithHashing, TestLogger>(
         &mut state,
         &mut logger,
         &program,

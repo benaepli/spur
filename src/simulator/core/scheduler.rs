@@ -4,10 +4,11 @@ use crate::simulator::core::exec::exec;
 use crate::simulator::core::state::{ClientOpResult, Logger, Runnable, State};
 use crate::simulator::core::values::Value;
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
+use crate::simulator::hash_utils::HashPolicy;
 use rand::Rng;
 
-pub fn schedule_runnable<L: Logger>(
-    state: &mut State,
+pub fn schedule_runnable<H: HashPolicy, L: Logger>(
+    state: &mut State<H>,
     logger: &mut L,
     program: &Program,
     randomly_drop_msgs: bool,
@@ -17,7 +18,7 @@ pub fn schedule_runnable<L: Logger>(
     randomly_delay_msgs: bool,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
-) -> Result<Option<ClientOpResult>, RuntimeError> {
+) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let len = state.runnable_tasks.len();
     if len == 0 {
         return Ok(None); // Halt equivalent
@@ -65,7 +66,7 @@ pub fn schedule_runnable<L: Logger>(
                     let mut r_node_env = state.nodes[reader.node].clone();
                     if let Err(e) = crate::simulator::core::eval::store(
                         &lhs,
-                        Value::unit(),
+                        Value::<H>::unit(),
                         &mut reader.env,
                         &mut r_node_env,
                     ) {
@@ -75,7 +76,7 @@ pub fn schedule_runnable<L: Logger>(
                     state.runnable_tasks.push_back(Runnable::Record(reader));
                 } else {
                     // No reader waiting - buffer the value
-                    chan.buffer.push_back(Value::unit());
+                    chan.buffer.push_back(Value::<H>::unit());
                 }
                 state.channels.insert(timer.channel, chan);
             }

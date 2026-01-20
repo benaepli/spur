@@ -1,10 +1,11 @@
-use crate::compiler::cfg::{Program, VarSlot, SELF_SLOT};
+use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::checker::state::{Budget, SearchNode};
 use crate::simulator::core::{
-    exec, exec_sync_on_node, make_local_env, Continuation, Env, LogEntry, Logger, OpKind, Operation, Record,
-    Runnable, State, UpdatePolicy, Value,
+    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, Runnable, State, UpdatePolicy,
+    Value, exec, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
+use crate::simulator::hash_utils::HashPolicy;
 use ecow::EcoString;
 use log::{info, warn};
 use std::collections::{BinaryHeap, HashMap};
@@ -31,22 +32,22 @@ pub struct CheckerConfig {
     pub keys: Vec<EcoString>,
 }
 
-struct VisitedState {
+struct VisitedState<H: HashPolicy> {
     budget: Budget,
     steps: u32,
-    shortest_history: Vec<Operation>,
+    shortest_history: Vec<Operation<H>>,
 }
 
-pub struct ModelChecker {
+pub struct ModelChecker<H: HashPolicy> {
     program: Arc<Program>,
-    queue: BinaryHeap<SearchNode>,
+    queue: BinaryHeap<SearchNode<H>>,
     /// Maps state hash -> Metadata about the best visit to this state.
-    visited: HashMap<u64, VisitedState>,
+    visited: HashMap<u64, VisitedState<H>>,
     global_state: Arc<GlobalState>,
     config: CheckerConfig,
 }
 
-impl ModelChecker {
+impl<H: HashPolicy> ModelChecker<H> {
     pub fn new(program: Program, global_state: Arc<GlobalState>, config: CheckerConfig) -> Self {
         Self {
             program: Arc::new(program),
@@ -57,11 +58,11 @@ impl ModelChecker {
         }
     }
 
-    fn hash_state(state: &State) -> u64 {
+    fn hash_state(state: &State<H>) -> u64 {
         state.signature()
     }
 
-    fn should_visit(&mut self, node: &SearchNode) -> bool {
+    fn should_visit(&mut self, node: &SearchNode<H>) -> bool {
         let h = Self::hash_state(&node.state);
 
         if let Some(prev) = self.visited.get(&h) {
@@ -91,7 +92,7 @@ impl ModelChecker {
         true
     }
 
-    pub fn explore(&mut self, initial_state: State) {
+    pub fn explore(&mut self, initial_state: State<H>) {
         info!("Starting State-Based Exploration");
 
         let root = SearchNode {
@@ -141,7 +142,7 @@ impl ModelChecker {
         );
     }
 
-    fn expand(&self, node: SearchNode) -> Vec<SearchNode> {
+    fn expand(&self, node: SearchNode<H>) -> Vec<SearchNode<H>> {
         let mut successors = Vec::new();
 
         // Runnable items
@@ -166,7 +167,7 @@ impl ModelChecker {
                             let mut r_node_env = next_state.nodes[reader.node].clone();
                             if let Err(e) = crate::simulator::core::eval::store(
                                 &lhs,
-                                Value::unit(),
+                                Value::<H>::unit(),
                                 &mut reader.env,
                                 &mut r_node_env,
                             ) {
@@ -177,7 +178,7 @@ impl ModelChecker {
                                 .runnable_tasks
                                 .push_back(Runnable::Record(reader));
                         } else {
-                            chan.buffer.push_back(Value::unit());
+                            chan.buffer.push_back(Value::<H>::unit());
                         }
                         next_state.channels.insert(timer.channel, chan);
                     }
@@ -227,7 +228,7 @@ impl ModelChecker {
                 Ok(Some(client_res)) => {
                     let cost_delta = 1.0 - coverage.novelty_score();
                     let mut succ = self.make_successor(&node, next_state, cost_delta);
-                    succ.history.push(Operation {
+                    succ.history.push(Operation::<H> {
                         client_id: client_res.client_id,
                         op_action: client_res.op_name,
                         kind: OpKind::Response,
@@ -251,11 +252,11 @@ impl ModelChecker {
                     self.apply_crash(&mut next_state, node_id);
 
                     let mut succ = self.make_successor(&node, next_state, 5.0);
-                    succ.history.push(Operation {
+                    succ.history.push(Operation::<H> {
                         client_id: -1,
                         op_action: "System.Crash".to_string(),
                         kind: OpKind::Crash,
-                        payload: vec![Value::node(node_id)],
+                        payload: vec![Value::<H>::node(node_id)],
                         unique_id: -1,
                     });
                     succ.best_budget.crashes -= 1;
@@ -281,11 +282,11 @@ impl ModelChecker {
                 self.apply_recover(&mut next_state, &mut logger, &mut coverage, node_id);
 
                 let mut succ = self.make_successor(&node, next_state, 3.0);
-                succ.history.push(Operation {
+                succ.history.push(Operation::<H> {
                     client_id: -1,
                     op_action: "System.Recover".to_string(),
                     kind: OpKind::Recover,
-                    payload: vec![Value::node(node_id)],
+                    payload: vec![Value::<H>::node(node_id)],
                     unique_id: -1,
                 });
                 succ.logs.extend(logger.logs);
@@ -306,14 +307,14 @@ impl ModelChecker {
                     if self.schedule_client_write(&mut next_state, client_id, op_id, 0, key, "val1")
                     {
                         let mut succ = self.make_successor(&node, next_state, 1.0);
-                        succ.history.push(Operation {
+                        succ.history.push(Operation::<H> {
                             client_id: client_id as i32,
                             op_action: "ClientInterface.Write".to_string(),
                             kind: OpKind::Invocation,
                             payload: vec![
-                                Value::node(0),
-                                Value::string(key.clone()),
-                                Value::string(EcoString::from("val1")),
+                                Value::<H>::node(0),
+                                Value::<H>::string(key.clone()),
+                                Value::<H>::string(EcoString::from("val1")),
                             ],
                             unique_id: op_id,
                         });
@@ -336,11 +337,11 @@ impl ModelChecker {
 
                     if self.schedule_client_read(&mut next_state, client_id, op_id, 0, key) {
                         let mut succ = self.make_successor(&node, next_state, 1.0);
-                        succ.history.push(Operation {
+                        succ.history.push(Operation::<H> {
                             client_id: client_id as i32,
                             op_action: "ClientInterface.Read".to_string(),
                             kind: OpKind::Invocation,
-                            payload: vec![Value::node(0), Value::string(key.clone())],
+                            payload: vec![Value::<H>::node(0), Value::<H>::string(key.clone())],
                             unique_id: op_id,
                         });
                         succ.next_op_id += 1;
@@ -354,8 +355,8 @@ impl ModelChecker {
         successors
     }
 
-    fn make_successor(&self, parent: &SearchNode, state: State, cost_delta: f64) -> SearchNode {
-        SearchNode {
+    fn make_successor(&self, parent: &SearchNode<H>, state: State<H>, cost_delta: f64) -> SearchNode<H> {
+        SearchNode::<H> {
             state,
             cost: parent.cost + cost_delta + 0.1,
             steps: parent.steps + 1,
@@ -366,7 +367,7 @@ impl ModelChecker {
         }
     }
 
-    fn apply_crash(&self, state: &mut State, node_id: usize) {
+    fn apply_crash(&self, state: &mut State<H>, node_id: usize) {
         state.crash_info.currently_crashed.insert(node_id);
         let tasks = std::mem::take(&mut state.runnable_tasks);
         for task in tasks {
@@ -395,18 +396,18 @@ impl ModelChecker {
 
     fn apply_recover(
         &self,
-        state: &mut State,
+        state: &mut State<H>,
         logger: &mut SearchLogger,
         coverage: &mut LocalCoverage,
         node_id: usize,
     ) {
         state.crash_info.currently_crashed.remove(&node_id);
-        state.nodes[node_id] = Env::default();
+        state.nodes[node_id] = Env::<H>::default();
 
         if let Some(init_fn) = self.program.get_func_by_name("Node.BASE_NODE_INIT") {
-            let mut env = make_local_env(init_fn, vec![], &Env::default(), &state.nodes[node_id]);
+            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), &state.nodes[node_id]);
             if let VarSlot::Local(self_idx, _) = SELF_SLOT {
-                env.set(self_idx, Value::node(node_id));
+                env.set(self_idx, Value::<H>::node(node_id));
             }
             let _ = exec_sync_on_node(
                 state,
@@ -423,10 +424,10 @@ impl ModelChecker {
         // Schedule Node.RecoverInit if exists
         if let Some(recover_fn) = self.program.get_func_by_name("Node.RecoverInit") {
             let actuals = vec![
-                Value::int(node_id as i64),
-                Value::list((0..self.config.num_servers).map(Value::node).collect()),
+                Value::<H>::int(node_id as i64),
+                Value::<H>::list((0..self.config.num_servers).map(Value::<H>::node).collect()),
             ];
-            let env = make_local_env(recover_fn, actuals, &Env::default(), &state.nodes[node_id]);
+            let env = make_local_env(recover_fn, actuals, &Env::<H>::default(), &state.nodes[node_id]);
             let record = Record {
                 pc: recover_fn.entry,
                 node: node_id,
@@ -452,7 +453,7 @@ impl ModelChecker {
 
     fn schedule_client_write(
         &self,
-        state: &mut State,
+        state: &mut State<H>,
         client_id: usize,
         op_id: i32,
         target_server: usize,
@@ -461,11 +462,11 @@ impl ModelChecker {
     ) -> bool {
         if let Some(func) = self.program.get_func_by_name("ClientInterface.Write") {
             let actuals = vec![
-                Value::node(target_server),
-                Value::string(key.clone()),
-                Value::string(EcoString::from(val)),
+                Value::<H>::node(target_server),
+                Value::<H>::string(key.clone()),
+                Value::<H>::string(EcoString::from(val)),
             ];
-            let env = make_local_env(func, actuals, &Env::default(), &state.nodes[client_id]);
+            let env = make_local_env(func, actuals, &Env::<H>::default(), &state.nodes[client_id]);
             let record = Record {
                 pc: func.entry,
                 node: client_id,
@@ -488,15 +489,15 @@ impl ModelChecker {
 
     fn schedule_client_read(
         &self,
-        state: &mut State,
+        state: &mut State<H>,
         client_id: usize,
         op_id: i32,
         target_server: usize,
         key: &EcoString,
     ) -> bool {
         if let Some(func) = self.program.get_func_by_name("ClientInterface.Read") {
-            let actuals = vec![Value::node(target_server), Value::string(key.clone())];
-            let env = make_local_env(func, actuals, &Env::default(), &state.nodes[client_id]);
+            let actuals = vec![Value::<H>::node(target_server), Value::<H>::string(key.clone())];
+            let env = make_local_env(func, actuals, &Env::<H>::default(), &state.nodes[client_id]);
             let record = Record {
                 pc: func.entry,
                 node: client_id,

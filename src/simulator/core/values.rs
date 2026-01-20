@@ -1,9 +1,10 @@
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::hash_utils::mix;
+use crate::simulator::hash_utils::{HashPolicy, mix};
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
 use std::cmp::Ordering;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -14,23 +15,24 @@ pub struct ChannelId {
 
 /// The inner representation of a value, without cached signature.
 #[derive(Clone, Debug)]
-pub enum ValueKind {
+pub enum ValueKind<H: HashPolicy> {
     Int(i64),
     Bool(bool),
-    Map(ImHashMap<Value, Value>),
-    List(Vector<Value>),
-    Option(Option<Arc<Value>>),
+    Map(ImHashMap<Value<H>, Value<H>>),
+    List(Vector<Value<H>>),
+    Option(Option<Arc<Value<H>>>),
     Channel(ChannelId),
     Node(usize),
     String(EcoString),
     Unit,
-    Tuple(Vector<Value>),
+    Tuple(Vector<Value<H>>),
 }
 
 #[derive(Clone, Debug)]
-pub struct Value {
-    pub kind: ValueKind,
+pub struct Value<H: HashPolicy> {
+    pub kind: ValueKind<H>,
     pub sig: u64,
+    _marker: PhantomData<H>,
 }
 
 /// Helper to securely combine K and V without needing map position.
@@ -41,15 +43,19 @@ pub fn hash_map_entry(k_sig: u64, v_sig: u64) -> u64 {
     mix(k_sig, 0) ^ mix(v_sig, 1)
 }
 
-impl Value {
+impl<H: HashPolicy> Value<H> {
     /// Create a new Value with computed signature.
-    pub fn new(kind: ValueKind) -> Self {
+    pub fn new(kind: ValueKind<H>) -> Self {
         let sig = Self::compute_sig(&kind);
-        Self { kind, sig }
+        Self {
+            kind,
+            sig,
+            _marker: PhantomData,
+        }
     }
 
     /// Compute signature for a ValueKind.
-    fn compute_sig(kind: &ValueKind) -> u64 {
+    fn compute_sig(kind: &ValueKind<H>) -> u64 {
         match kind {
             ValueKind::Int(i) => {
                 let mut h = DefaultHasher::new();
@@ -170,12 +176,12 @@ impl Value {
     }
 
     #[inline]
-    pub fn option(o: Option<Arc<Value>>) -> Self {
+    pub fn option(o: Option<Arc<Value<H>>>) -> Self {
         Self::new(ValueKind::Option(o))
     }
 
     #[inline]
-    pub fn option_some(v: Value) -> Self {
+    pub fn option_some(v: Value<H>) -> Self {
         Self::new(ValueKind::Option(Some(Arc::new(v))))
     }
 
@@ -185,28 +191,32 @@ impl Value {
     }
 
     #[inline]
-    pub fn tuple(v: Vector<Value>) -> Self {
+    pub fn tuple(v: Vector<Value<H>>) -> Self {
         Self::new(ValueKind::Tuple(v))
     }
 
     #[inline]
-    pub fn list(v: Vector<Value>) -> Self {
+    pub fn list(v: Vector<Value<H>>) -> Self {
         Self::new(ValueKind::List(v))
     }
 
     #[inline]
-    pub fn map(m: ImHashMap<Value, Value>) -> Self {
+    pub fn map(m: ImHashMap<Value<H>, Value<H>>) -> Self {
         Self::new(ValueKind::Map(m))
     }
 
     /// Create a Value with a pre-computed signature (for incremental updates)
     #[inline]
-    pub fn with_sig(kind: ValueKind, sig: u64) -> Self {
-        Self { kind, sig }
+    pub fn with_sig(kind: ValueKind<H>, sig: u64) -> Self {
+        Self {
+            kind,
+            sig,
+            _marker: PhantomData,
+        }
     }
 }
 
-impl PartialEq for Value {
+impl<H: HashPolicy> PartialEq for Value<H> {
     fn eq(&self, other: &Self) -> bool {
         use ValueKind::*;
         match (&self.kind, &other.kind) {
@@ -224,14 +234,14 @@ impl PartialEq for Value {
         }
     }
 }
-impl Eq for Value {}
-impl PartialOrd for Value {
+impl<H: HashPolicy> Eq for Value<H> {}
+impl<H: HashPolicy> PartialOrd for Value<H> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Value {
+impl<H: HashPolicy> Ord for Value<H> {
     fn cmp(&self, other: &Self) -> Ordering {
         use ValueKind::*;
         match (&self.kind, &other.kind) {
@@ -275,13 +285,13 @@ impl Ord for Value {
     }
 }
 
-impl Hash for Value {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+impl<H: HashPolicy> Hash for Value<H> {
+    fn hash<Ha: Hasher>(&self, state: &mut Ha) {
         self.sig.hash(state);
     }
 }
 
-impl std::fmt::Display for Value {
+impl<H: HashPolicy> std::fmt::Display for Value<H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use ValueKind::*;
         match &self.kind {
@@ -289,8 +299,8 @@ impl std::fmt::Display for Value {
             Bool(b) => write!(f, "{}", b),
             String(s) => write!(f, "\"{}\"", s),
             Node(n) => write!(f, "node({})", n),
-            Unit => write!(f, "()") ,
-            Option(None) => write!(f, "None") ,
+            Unit => write!(f, "()"),
+            Option(None) => write!(f, "None"),
             Option(Some(v)) => write!(f, "Some({})", v),
             Channel(ch) => write!(f, "channel({}, {})", ch.node, ch.id),
             Tuple(items) => {
@@ -327,7 +337,7 @@ impl std::fmt::Display for Value {
     }
 }
 
-impl Value {
+impl<H: HashPolicy> Value<H> {
     pub fn type_name(&self) -> &'static str {
         use ValueKind::*;
         match &self.kind {
@@ -374,7 +384,7 @@ impl Value {
             })
         }
     }
-    pub fn as_map(&self) -> Result<&ImHashMap<Value, Value>, RuntimeError> {
+    pub fn as_map(&self) -> Result<&ImHashMap<Value<H>, Value<H>>, RuntimeError> {
         if let ValueKind::Map(m) = &self.kind {
             Ok(m)
         } else {
@@ -384,7 +394,7 @@ impl Value {
             })
         }
     }
-    pub fn as_list(&self) -> Result<&Vector<Value>, RuntimeError> {
+    pub fn as_list(&self) -> Result<&Vector<Value<H>>, RuntimeError> {
         if let ValueKind::List(l) = &self.kind {
             Ok(l)
         } else {
@@ -406,62 +416,77 @@ impl Value {
     }
 }
 
-impl PartialEq for Env {
+impl<H: HashPolicy> PartialEq for Env<H> {
     fn eq(&self, other: &Self) -> bool {
         self.slots == other.slots
     }
 }
 
-impl Eq for Env {}
+impl<H: HashPolicy> Eq for Env<H> {}
 
-#[derive(Clone, Debug, Default)]
-pub struct Env {
-    pub slots: Vec<Value>,
+#[derive(Clone, Debug)]
+pub struct Env<H: HashPolicy> {
+    pub slots: Vec<Value<H>>,
     pub sig: u64,
+    _marker: PhantomData<H>,
 }
 
-impl Hash for Env {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+impl<H: HashPolicy> Hash for Env<H> {
+    fn hash<Ha: Hasher>(&self, state: &mut Ha) {
         self.sig.hash(state);
     }
 }
 
-impl Env {
+impl<H: HashPolicy> Default for Env<H> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            sig: 0,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<H: HashPolicy> Env<H> {
     /// Create an environment with `n` slots, all initialized to Unit
     pub fn with_slots(n: usize) -> Self {
-        let unit_val = Value::unit();
+        let unit_val = Value::<H>::unit();
         let unit_sig = unit_val.sig;
-        let slots: Vec<Value> = (0..n).map(|_| Value::unit()).collect();
+        let slots: Vec<Value<H>> = (0..n).map(|_| Value::<H>::unit()).collect();
 
         let mut sig = 0u64;
         for i in 0..n {
-            sig ^= mix(unit_sig, i as u32);
+            sig ^= H::mix(unit_sig, i as u32);
         }
 
-        Self { slots, sig }
+        Self {
+            slots,
+            sig,
+            _marker: PhantomData,
+        }
     }
 
     #[inline(always)]
-    pub fn get(&self, slot: u32) -> &Value {
+    pub fn get(&self, slot: u32) -> &Value<H> {
         &self.slots[slot as usize]
     }
 
     #[inline(always)]
-    pub fn set(&mut self, slot: u32, value: Value) {
+    pub fn set(&mut self, slot: u32, value: Value<H>) {
         let idx = slot as usize;
         if idx >= self.slots.len() {
             // Extending requires recomputing signature
             let old_len = self.slots.len();
-            self.slots.resize(idx + 1, Value::unit());
-            let unit_sig = Value::unit().sig;
+            self.slots.resize(idx + 1, Value::<H>::unit());
+            let unit_sig = Value::<H>::unit().sig;
             for i in old_len..idx {
-                self.sig ^= mix(unit_sig, i as u32);
+                self.sig ^= H::mix(unit_sig, i as u32);
             }
-            self.sig ^= mix(value.sig, slot);
+            self.sig ^= H::mix(value.sig, slot);
             self.slots[idx] = value;
         } else {
             let old_sig = self.slots[idx].sig;
-            self.sig ^= mix(old_sig, slot) ^ mix(value.sig, slot);
+            self.sig = H::update_env_sig(self.sig, old_sig, value.sig, slot);
             self.slots[idx] = value;
         }
     }
@@ -475,10 +500,10 @@ impl Env {
     pub fn ensure_slots(&mut self, n: usize) {
         if self.slots.len() < n {
             let old_len = self.slots.len();
-            self.slots.resize(n, Value::unit());
-            let unit_sig = Value::unit().sig;
+            self.slots.resize(n, Value::<H>::unit());
+            let unit_sig = Value::<H>::unit().sig;
             for i in old_len..n {
-                self.sig ^= mix(unit_sig, i as u32);
+                self.sig ^= H::mix(unit_sig, i as u32);
             }
         }
     }
@@ -490,6 +515,8 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    use crate::simulator::hash_utils::WithHashing;
 
     fn calculate_hash<T: Hash>(t: &T) -> u64 {
         let mut s = DefaultHasher::new();
@@ -505,35 +532,38 @@ mod tests {
     }
 
     // Strategy for Value
-    fn arb_value() -> impl Strategy<Value = Value> {
+    fn arb_value() -> impl Strategy<Value = Value<WithHashing>> {
         let leaf = prop_oneof![
-            any::<i64>().prop_map(Value::int),
-            any::<bool>().prop_map(Value::bool),
-            any::<String>().prop_map(|s| Value::string(EcoString::from(s))),
-            any::<usize>().prop_map(Value::node),
-            Just(Value::unit()),
-            arb_channel_id().prop_map(Value::channel),
+            any::<i64>().prop_map(Value::<WithHashing>::int),
+            any::<bool>().prop_map(Value::<WithHashing>::bool),
+            any::<String>().prop_map(|s| Value::<WithHashing>::string(EcoString::from(s))),
+            any::<usize>().prop_map(Value::<WithHashing>::node),
+            Just(Value::<WithHashing>::unit()),
+            arb_channel_id().prop_map(Value::<WithHashing>::channel),
         ];
 
         leaf.prop_recursive(
-            4, // 4 levels deep
+            4,  // 4 levels deep
             64, // max size 64 nodes
             10, // 10 items per collection
             |inner| {
                 prop_oneof![
                     // Option
                     prop::option::of(inner.clone()).prop_map(|opt| {
-                         match opt {
-                             Some(v) => Value::option_some(v),
-                             None => Value::option_none(),
-                         }
+                        match opt {
+                            Some(v) => Value::<WithHashing>::option_some(v),
+                            None => Value::<WithHashing>::option_none(),
+                        }
                     }),
                     // List
-                    prop::collection::vec(inner.clone(), 0..5).prop_map(|v| Value::list(v.into())),
+                    prop::collection::vec(inner.clone(), 0..5)
+                        .prop_map(|v| Value::<WithHashing>::list(v.into())),
                     // Tuple
-                    prop::collection::vec(inner.clone(), 0..5).prop_map(|v| Value::tuple(v.into())),
+                    prop::collection::vec(inner.clone(), 0..5)
+                        .prop_map(|v| Value::<WithHashing>::tuple(v.into())),
                     // Map
-                    prop::collection::hash_map(inner.clone(), inner.clone(), 0..5).prop_map(|m| Value::map(m.into())),
+                    prop::collection::hash_map(inner.clone(), inner.clone(), 0..5)
+                        .prop_map(|m| Value::<WithHashing>::map(m.into())),
                 ]
             },
         )
@@ -556,8 +586,8 @@ mod tests {
 
         #[test]
         fn test_env_hashing_consistency(v in prop::collection::vec(arb_value(), 0..10)) {
-            let mut env1 = Env::with_slots(v.len());
-            let mut env2 = Env::with_slots(v.len());
+            let mut env1 = Env::<WithHashing>::with_slots(v.len());
+            let mut env2 = Env::<WithHashing>::with_slots(v.len());
 
             for (i, val) in v.iter().enumerate() {
                 env1.set(i as u32, val.clone());
@@ -568,17 +598,17 @@ mod tests {
             prop_assert_eq!(calculate_hash(&env1), calculate_hash(&env2));
             prop_assert_eq!(env1.sig, env2.sig);
         }
-        
+
         #[test]
         fn test_env_hashing_different(v in prop::collection::vec(arb_value(), 1..10), extra in arb_value()) {
-             let mut env1 = Env::with_slots(v.len());
+             let mut env1 = Env::<WithHashing>::with_slots(v.len());
              for (i, val) in v.iter().enumerate() {
                 env1.set(i as u32, val.clone());
              }
-             
+
              let mut env2 = env1.clone();
              env2.set(0, extra);
-             
+
              if env1 != env2 {
                  prop_assert_ne!(calculate_hash(&env1), calculate_hash(&env2));
                  prop_assert_ne!(env1.sig, env2.sig);

@@ -1342,9 +1342,7 @@ impl Compiler {
                 let arg_expr = args.first().expect("BoolToString should have 1 arg");
                 self.compile_expr_to_value(arg_expr, Lhs::Var(arg_var), assign_vertex)
             }
-            BuiltinFn::UniqueId => {
-                self.add_label(Label::UniqueId(target, next_vertex))
-            }
+            BuiltinFn::UniqueId => self.add_label(Label::UniqueId(target, next_vertex)),
         }
     }
 
