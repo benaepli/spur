@@ -64,6 +64,7 @@ pub enum TokenKind {
     GreaterEqual,
     Arrow,
     LeftArrow,
+    FatArrow,
     ColonEqual,
 
     // Literals
@@ -72,6 +73,8 @@ pub enum TokenKind {
     Integer(i64),
 
     // Keywords
+    Enum,
+    Match,
     ClientInterface,
     Role,
     Func,
@@ -141,11 +144,14 @@ impl fmt::Display for TokenKind {
             TokenKind::GreaterEqual => write!(f, ">="),
             TokenKind::Arrow => write!(f, "->"),
             TokenKind::LeftArrow => write!(f, "<-"),
+            TokenKind::FatArrow => write!(f, "=>"),
             TokenKind::ColonEqual => write!(f, ":="),
             TokenKind::Identifier(s) => write!(f, "{}", s),
             TokenKind::String(s) => write!(f, "\"{}\"", s),
             TokenKind::Integer(i) => write!(f, "{}", i),
             TokenKind::ClientInterface => write!(f, "ClientInterface"),
+            TokenKind::Enum => write!(f, "enum"),
+            TokenKind::Match => write!(f, "match"),
             TokenKind::Role => write!(f, "role"),
             TokenKind::Func => write!(f, "func"),
             TokenKind::Var => write!(f, "var"),
@@ -185,6 +191,8 @@ impl fmt::Display for TokenKind {
 }
 
 static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
+    "enum" => TokenKind::Enum,
+    "match" => TokenKind::Match,
     "ClientInterface" => TokenKind::ClientInterface,
     "role" => TokenKind::Role,
     "func" => TokenKind::Func,
@@ -491,6 +499,8 @@ impl<'a> Iterator for Lexer<'a> {
             '=' => {
                 if self.match_next('=') {
                     Ok(TokenKind::EqualEqual)
+                } else if self.match_next('>') {
+                    Ok(TokenKind::FatArrow)
                 } else {
                     Ok(TokenKind::Equal)
                 }

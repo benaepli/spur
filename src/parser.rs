@@ -62,7 +62,15 @@ pub struct TypeDefStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDefStmtKind {
     Struct(Vec<FieldDef>),
+    Enum(Vec<EnumVariant>),
     Alias(TypeDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub payload: Option<TypeDef>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +166,13 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Vec<Statement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub kind: PatternKind,
     pub span: Span,
@@ -175,6 +190,7 @@ pub enum PatternKind {
     Wildcard,
     Unit,
     Tuple(Vec<Pattern>),
+    Variant(String, String, Option<Box<Pattern>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -226,6 +242,8 @@ pub enum ExprKind {
     Len(Box<Expr>),
 
     RpcCall(Box<Expr>, FuncCall),
+    Match(Box<Expr>, Vec<MatchArm>),
+    VariantLit(String, String, Option<Box<Expr>>),
 
     MakeChannel(Box<Expr>),
     Send(Box<Expr>, Box<Expr>),
@@ -340,7 +358,22 @@ where
     let ident = select! { TokenKind::Identifier(s) => s.clone() };
 
     pattern.define({
+        let variant = ident
+            .then_ignore(just(TokenKind::Dot))
+            .then(ident)
+            .then(
+                pattern
+                    .clone()
+                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                    .map(Box::new)
+                    .or_not(),
+            )
+            .map(|((enum_name, variant_name), payload)| {
+                PatternKind::Variant(enum_name, variant_name, payload)
+            });
+
         let atom = choice((
+            variant,
             ident.map(PatternKind::Var),
             just(TokenKind::Underscore).to(PatternKind::Wildcard),
         ))
@@ -457,6 +490,46 @@ where
             span: e.span(),
         });
 
+        let variant_lit = ident
+            .then_ignore(just(TokenKind::Dot))
+            .then(ident)
+            .then(
+                expr.clone()
+                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                    .map(Box::new)
+                    .or_not(),
+            )
+            .map(|((enum_name, variant_name), payload)| {
+                ExprKind::VariantLit(enum_name, variant_name, payload)
+            });
+
+        let match_arm = pattern
+            .clone()
+            .then_ignore(just(TokenKind::FatArrow))
+            .then(
+                statement
+                    .clone()
+                    .repeated()
+                    .collect()
+                    .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
+            )
+            .map_with(|(pattern, body), e| MatchArm {
+                pattern,
+                body,
+                span: e.span(),
+            });
+
+        let match_expr = just(TokenKind::Match)
+            .ignore_then(expr.clone())
+            .then(
+                match_arm
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .collect()
+                    .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
+            )
+            .map(|(expr, arms)| ExprKind::Match(Box::new(expr), arms));
+
         let list_lit = expr
             .clone()
             .separated_by(just(TokenKind::Comma))
@@ -569,6 +642,8 @@ where
             one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
             zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
             func_call.clone().map(ExprKind::FuncCall),
+            match_expr,
+            variant_lit,
             ident.map(ExprKind::Var),
             tuple_lit,
         ))
@@ -946,12 +1021,34 @@ where
         .allow_trailing()
         .collect::<Vec<_>>();
 
+    let enum_variant = ident
+        .then(
+            type_def
+                .clone()
+                .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                .or_not(),
+        )
+        .map_with(|(name, payload), e| EnumVariant {
+            name,
+            payload,
+            span: e.span(),
+        });
+
     let type_def_stmt = just(TokenKind::Type)
         .ignore_then(ident)
         .then(choice((
             field_defs
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
                 .map(TypeDefStmtKind::Struct),
+            just(TokenKind::Enum)
+                .ignore_then(
+                    enum_variant
+                        .separated_by(just(TokenKind::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
+                )
+                .map(TypeDefStmtKind::Enum),
             just(TokenKind::Equal)
                 .ignore_then(type_def.clone())
                 .map(TypeDefStmtKind::Alias),
