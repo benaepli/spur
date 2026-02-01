@@ -194,10 +194,14 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
         }
         Label::MakeChannel(lhs, cap, _) => {
             header_color = "#C8E6C9"; // Green
+            let cap_str = match cap {
+                Some(c) => c.to_string(),
+                None => "unbounded".to_string(),
+            };
             content = format!(
                 "<B>Make Chan</B><BR/>{} (cap: {})",
                 html_escape(&pretty_lhs(prog, lhs)),
-                cap
+                cap_str
             );
         }
         Label::SetTimer(lhs, _) => {

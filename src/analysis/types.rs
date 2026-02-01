@@ -95,7 +95,7 @@ pub enum TypedExprKind {
 
     UnwrapOptional(Box<TypedExpr>), // T? -> T
 
-    MakeChannel(Box<TypedExpr>),
+    MakeChannel(Option<Box<TypedExpr>>),
     Send(Box<TypedExpr>, Box<TypedExpr>),
     Recv(Box<TypedExpr>),
 

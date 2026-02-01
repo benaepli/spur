@@ -387,7 +387,7 @@ fn test_channel_send_recv() {
     let ret = builder.add(Label::Return(Expr::Var(slot(1))));
     let recv = builder.add(Label::Recv(Lhs::Var(slot(1)), Expr::Var(slot(0)), ret));
     let send = builder.add(Label::Send(Expr::Var(slot(0)), Expr::Int(99), recv));
-    let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), 1, send));
+    let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), Some(1), send));
 
     let program = builder.build();
     let mut state = State::<WithHashing>::new(1, 2);
@@ -421,7 +421,7 @@ fn test_recv_blocks_on_empty() {
     let mut builder = TestProgramBuilder::new();
     let ret = builder.add(Label::Return(Expr::Unit));
     let recv = builder.add(Label::Recv(Lhs::Var(slot(1)), Expr::Var(slot(0)), ret));
-    let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), 1, recv));
+    let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), Some(1), recv));
 
     let program = builder.build();
     let mut state = State::<WithHashing>::new(1, 2);

@@ -110,7 +110,7 @@ pub struct FunctionInfo {
 pub enum Label {
     Instr(Instr, Vertex /* next_vertex */),
     Pause(Vertex /* next_vertex */),
-    MakeChannel(Lhs, usize, Vertex),
+    MakeChannel(Lhs, Option<usize>, Vertex),
     SetTimer(Lhs, Vertex),
     UniqueId(Lhs, Vertex),
     Send(Expr, Expr, Vertex),
@@ -517,10 +517,23 @@ impl Compiler {
                     .cloned()
                     .unwrap_or_else(|| format!("var_{}", init.name.0));
                 self.alloc_local_slot(init.name, &name_str, Expr::Nil);
+                self.scan_expr_and_assign_slots(&init.value);
+            }
+            TypedStatementKind::Assignment(assign) => {
+                self.scan_expr_and_assign_slots(&assign.target);
+                self.scan_expr_and_assign_slots(&assign.value);
+            }
+            TypedStatementKind::Expr(expr) => {
+                self.scan_expr_and_assign_slots(expr);
+            }
+            TypedStatementKind::Return(expr) => {
+                self.scan_expr_and_assign_slots(expr);
             }
             TypedStatementKind::Conditional(cond) => {
+                self.scan_expr_and_assign_slots(&cond.if_branch.condition);
                 self.scan_body_and_assign_slots(&cond.if_branch.body);
                 for branch in &cond.elseif_branches {
+                    self.scan_expr_and_assign_slots(&branch.condition);
                     self.scan_body_and_assign_slots(&branch.body);
                 }
                 if let Some(body) = &cond.else_branch {
@@ -528,27 +541,129 @@ impl Compiler {
                 }
             }
             TypedStatementKind::ForLoop(fl) => {
-                if let Some(TypedForLoopInit::VarInit(init)) = &fl.init {
-                    let name_str = self
-                        .id_to_name
-                        .get(&init.name)
-                        .cloned()
-                        .unwrap_or_else(|| format!("var_{}", init.name.0));
-                    self.alloc_local_slot(init.name, &name_str, Expr::Nil);
+                match &fl.init {
+                    Some(TypedForLoopInit::VarInit(init)) => {
+                        let name_str = self
+                            .id_to_name
+                            .get(&init.name)
+                            .cloned()
+                            .unwrap_or_else(|| format!("var_{}", init.name.0));
+                        self.alloc_local_slot(init.name, &name_str, Expr::Nil);
+                        self.scan_expr_and_assign_slots(&init.value);
+                    }
+                    Some(TypedForLoopInit::Assignment(assign)) => {
+                        self.scan_expr_and_assign_slots(&assign.target);
+                        self.scan_expr_and_assign_slots(&assign.value);
+                    }
+                    None => {}
+                }
+                if let Some(cond) = &fl.condition {
+                    self.scan_expr_and_assign_slots(cond);
+                }
+                if let Some(inc) = &fl.increment {
+                    self.scan_expr_and_assign_slots(&inc.target);
+                    self.scan_expr_and_assign_slots(&inc.value);
                 }
                 self.scan_body_and_assign_slots(&fl.body);
             }
             TypedStatementKind::ForInLoop(loop_stmt) => {
                 self.scan_pattern_and_assign_slots(&loop_stmt.pattern);
+                self.scan_expr_and_assign_slots(&loop_stmt.iterable);
                 self.scan_body_and_assign_slots(&loop_stmt.body);
             }
-            _ => {}
+            TypedStatementKind::Break => {}
         }
     }
 
     fn scan_body_and_assign_slots(&mut self, body: &[TypedStatement]) {
         for stmt in body {
             self.scan_stmt_and_assign_slots(stmt);
+        }
+    }
+
+    fn scan_expr_and_assign_slots(&mut self, expr: &TypedExpr) {
+        use crate::analysis::types::TypedExprKind::*;
+        match &expr.kind {
+            BinOp(_, l, r)
+            | Append(l, r)
+            | Prepend(l, r)
+            | Min(l, r)
+            | Exists(l, r)
+            | Erase(l, r)
+            | Send(l, r)
+            | Index(l, r) => {
+                self.scan_expr_and_assign_slots(l);
+                self.scan_expr_and_assign_slots(r);
+            }
+            Not(e)
+            | Negate(e)
+            | Head(e)
+            | Tail(e)
+            | Len(e)
+            | UnwrapOptional(e)
+            | Recv(e)
+            | TupleAccess(e, _)
+            | FieldAccess(e, _)
+            | WrapInOptional(e) => {
+                self.scan_expr_and_assign_slots(e);
+            }
+            MakeChannel(opt_cap) => {
+                if let Some(cap_expr) = opt_cap {
+                    self.scan_expr_and_assign_slots(cap_expr);
+                }
+            }
+            FuncCall(call) => match call {
+                TypedFuncCall::User(u) => {
+                    for arg in &u.args {
+                        self.scan_expr_and_assign_slots(arg);
+                    }
+                }
+                TypedFuncCall::Builtin(_, args, _) => {
+                    for arg in args {
+                        self.scan_expr_and_assign_slots(arg);
+                    }
+                }
+            },
+            MapLit(pairs) => {
+                for (k, v) in pairs {
+                    self.scan_expr_and_assign_slots(k);
+                    self.scan_expr_and_assign_slots(v);
+                }
+            }
+            ListLit(exprs) | TupleLit(exprs) => {
+                for e in exprs {
+                    self.scan_expr_and_assign_slots(e);
+                }
+            }
+            Slice(a, b, c) | Store(a, b, c) => {
+                self.scan_expr_and_assign_slots(a);
+                self.scan_expr_and_assign_slots(b);
+                self.scan_expr_and_assign_slots(c);
+            }
+            RpcCall(target, call) => {
+                self.scan_expr_and_assign_slots(target);
+                for arg in &call.args {
+                    self.scan_expr_and_assign_slots(arg);
+                }
+            }
+            Match(scrutinee, arms) => {
+                self.scan_expr_and_assign_slots(scrutinee);
+                for arm in arms {
+                    self.scan_pattern_and_assign_slots(&arm.pattern);
+                    self.scan_body_and_assign_slots(&arm.body);
+                }
+            }
+            VariantLit(_, _, payload) => {
+                if let Some(p) = payload {
+                    self.scan_expr_and_assign_slots(p);
+                }
+            }
+            StructLit(_, fields) => {
+                for (_, e) in fields {
+                    self.scan_expr_and_assign_slots(e);
+                }
+            }
+            Var(_, _) | IntLit(_) | StringLit(_) | BoolLit(_) | NilLit | SetTimer => {}
         }
     }
 
@@ -559,6 +674,11 @@ impl Compiler {
             }
             TypedPatternKind::Tuple(pats) => {
                 for p in pats {
+                    self.scan_pattern_and_assign_slots(p);
+                }
+            }
+            TypedPatternKind::Variant(_, _, payload) => {
+                if let Some(p) = payload {
                     self.scan_pattern_and_assign_slots(p);
                 }
             }
@@ -1011,11 +1131,13 @@ impl Compiler {
             TypedExprKind::RpcCall(target_expr, call) => {
                 self.compile_rpc_call(target_expr, call, target, next_vertex)
             }
-            TypedExprKind::MakeChannel(cap_expr) => {
-                let capacity = match &cap_expr.kind {
-                    TypedExprKind::IntLit(n) => *n as usize,
-                    _ => 0,
-                };
+            TypedExprKind::MakeChannel(opt_cap) => {
+                let capacity = opt_cap.as_ref().and_then(|cap_expr| {
+                    match &cap_expr.kind {
+                        TypedExprKind::IntLit(n) => Some(*n as usize),
+                        _ => Some(0), // Non-literal capacity defaults to 0 (sync channel)
+                    }
+                });
                 self.add_label(Label::MakeChannel(target, capacity, next_vertex))
             }
             TypedExprKind::Send(chan_expr, val_expr) => {
@@ -1342,6 +1464,26 @@ impl Compiler {
 
             TypedExprKind::Match(scrutinee, arms) => {
                 self.compile_match(scrutinee, arms, target, next_vertex)
+            }
+
+            TypedExprKind::Store(collection, key, value) => {
+                let col_tmp = self.alloc_temp_slot();
+                let key_tmp = self.alloc_temp_slot();
+                let val_tmp = self.alloc_temp_slot();
+
+                let final_expr = Expr::Store(
+                    Box::new(Expr::Var(col_tmp)),
+                    Box::new(Expr::Var(key_tmp)),
+                    Box::new(Expr::Var(val_tmp)),
+                );
+
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+
+                let val_vertex =
+                    self.compile_expr_to_value(value, Lhs::Var(val_tmp), assign_vertex);
+                let key_vertex = self.compile_expr_to_value(key, Lhs::Var(key_tmp), val_vertex);
+                self.compile_expr_to_value(collection, Lhs::Var(col_tmp), key_vertex)
             }
 
             TypedExprKind::SetTimer => self.add_label(Label::SetTimer(target, next_vertex)),

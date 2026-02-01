@@ -1017,10 +1017,14 @@ impl TypeChecker {
                 self.check_struct_literal(*struct_id, fields.clone(), span)
             }
 
-            (ResolvedExprKind::MakeChannel(cap), Type::Chan(_)) => {
-                let typed_cap = self.check_expr(*cap.clone(), &Type::Int)?;
+            (ResolvedExprKind::MakeChannel(opt_cap), Type::Chan(_)) => {
+                let typed_cap = opt_cap
+                    .as_ref()
+                    .map(|cap| self.check_expr((**cap).clone(), &Type::Int))
+                    .transpose()?
+                    .map(Box::new);
                 Ok(TypedExpr {
-                    kind: TypedExprKind::MakeChannel(Box::new(typed_cap)),
+                    kind: TypedExprKind::MakeChannel(typed_cap),
                     ty: expected.clone(),
                     span,
                 })
@@ -1340,10 +1344,13 @@ impl TypeChecker {
                     })
                 }
             }
-            ResolvedExprKind::MakeChannel(cap) => {
-                let typed_cap = self.check_expr(*cap, &Type::Int)?;
+            ResolvedExprKind::MakeChannel(opt_cap) => {
+                let typed_cap = opt_cap
+                    .map(|cap| self.check_expr(*cap, &Type::Int))
+                    .transpose()?
+                    .map(Box::new);
                 Ok(TypedExpr {
-                    kind: TypedExprKind::MakeChannel(Box::new(typed_cap)),
+                    kind: TypedExprKind::MakeChannel(typed_cap),
                     ty: Type::UnknownChannel,
                     span,
                 })

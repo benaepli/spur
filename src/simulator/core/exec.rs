@@ -103,7 +103,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     id: state.alloc_channel_id(),
                 };
 
-                state.channels.insert(chan_id, ChannelState::new(1));
+                state.channels.insert(chan_id, ChannelState::new(Some(1)));
                 store(lhs, Value::channel(chan_id), local_env, node_env)?;
 
                 let func_name_id = program
@@ -142,7 +142,9 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 node: node_id,
                 id: state.alloc_channel_id(),
             };
-            state.channels.insert(cid, ChannelState::new(*cap as i32));
+            // cap: &Option<usize> -> Option<i32>
+            let capacity = cap.map(|c| c as i32);
+            state.channels.insert(cid, ChannelState::new(capacity));
             store(lhs, Value::channel(cid), local_env, node_env)?;
             Ok(Some(StepOutcome::Continue(*next)))
         }
@@ -151,7 +153,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 node: node_id,
                 id: state.alloc_channel_id(),
             };
-            state.channels.insert(cid, ChannelState::new(1));
+            state.channels.insert(cid, ChannelState::new(Some(1)));
             store(lhs, Value::channel(cid), local_env, node_env)?;
 
             // Create a timer that will fire when scheduled
@@ -367,7 +369,10 @@ pub fn exec<H: HashPolicy, L: Logger>(
                     state.nodes[reader.node] = r_node_env;
                     state.runnable_tasks.push_back(Runnable::Record(reader));
                     record.pc = *next;
-                } else if (chan.buffer.len() as i32) < chan.capacity {
+                } else if chan.capacity.is_none()
+                    || (chan.buffer.len() as i32) < chan.capacity.unwrap()
+                {
+                    // Unbounded channel (capacity=None) always accepts, or bounded with space
                     chan.buffer.push_back(val);
                     record.pc = *next;
                 } else {

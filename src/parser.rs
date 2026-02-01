@@ -246,7 +246,7 @@ pub enum ExprKind {
     VariantLit(String, String, Option<Box<Expr>>),
     NamedDotAccess(String, String, Option<Box<Expr>>), // Ambiguous: could be VariantLit or FieldAccess
 
-    MakeChannel(Box<Expr>),
+    MakeChannel(Option<Box<Expr>>),
     Send(Box<Expr>, Box<Expr>),
     Recv(Box<Expr>),
     SetTimer,
@@ -513,13 +513,15 @@ where
         let match_arm = pattern
             .clone()
             .then_ignore(just(TokenKind::FatArrow))
-            .then(
+            .then(choice((
                 statement
                     .clone()
                     .repeated()
                     .collect()
                     .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
-            )
+                expr.clone()
+                    .map_with(|e, span| vec![Statement::new(StatementKind::Expr(e), span.span())]),
+            )))
             .map_with(|(pattern, body), e| MatchArm {
                 pattern,
                 body,
@@ -644,7 +646,14 @@ where
             one_arg_builtin(TokenKind::Head, ExprKind::Head),
             one_arg_builtin(TokenKind::Tail, ExprKind::Tail),
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
-            one_arg_builtin(TokenKind::Make, ExprKind::MakeChannel),
+            // make() for unbounded channel, make(n) for bounded
+            just(TokenKind::Make)
+                .ignore_then(
+                    expr.clone()
+                        .or_not()
+                        .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
+                )
+                .map(|opt_cap| ExprKind::MakeChannel(opt_cap.map(Box::new))),
             two_arg_builtin(TokenKind::Send, ExprKind::Send),
             one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
             zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
@@ -1129,4 +1138,126 @@ pub fn parse_program(tokens: &'_ [Token]) -> ParseResult<Program, Rich<'_, Token
     let input = make_input((0..len).into(), tokens);
 
     program().parse(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    fn parse(source: &str) -> Program {
+        let mut lexer = Lexer::new(source);
+        let (tokens, errs) = lexer.collect_all();
+        if !errs.is_empty() {
+            panic!("Lexer errors: {:?}", errs);
+        }
+        let result = parse_program(&tokens);
+        if let Some(err) = result.errors().next() {
+            panic!("Parser error: {:?}", err);
+        }
+        result.into_output().expect("Expected successful parse")
+    }
+
+    #[test]
+    fn test_enum_definition() {
+        let source = "type E enum { V1, V2(int) };";
+        let program = parse(source);
+        assert_eq!(program.top_level_defs.len(), 1);
+        match &program.top_level_defs[0] {
+            TopLevelDef::Type(stmt) => {
+                assert_eq!(stmt.name, "E");
+                match &stmt.def {
+                    TypeDefStmtKind::Enum(variants) => {
+                        assert_eq!(variants.len(), 2);
+                        assert_eq!(variants[0].name, "V1");
+                        assert_eq!(variants[0].payload, None);
+                        assert_eq!(variants[1].name, "V2");
+                        assert!(
+                            matches!(&variants[1].payload, Some(t) if matches!(t.kind, TypeDefKind::Named(ref n) if n == "int"))
+                        );
+                    }
+                    _ => panic!("Expected enum definition"),
+                }
+            }
+            _ => panic!("Expected type level def"),
+        }
+    }
+
+    #[test]
+    fn test_variant_literals() {
+        let source = "role R { func f() { x = E.V1; y = E.V2(42); } }";
+        let program = parse(source);
+        // Navigate to the assignments
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::Assignment(assign1) = &func.body[0].kind {
+                // E.V1 is initially parsed as NamedDotAccess(E, V1, None)
+                match &assign1.value.kind {
+                    ExprKind::NamedDotAccess(first, second, payload) => {
+                        assert_eq!(first, "E");
+                        assert_eq!(second, "V1");
+                        assert!(payload.is_none());
+                    }
+                    _ => panic!("Expected NamedDotAccess for E.V1"),
+                }
+            }
+            if let StatementKind::Assignment(assign2) = &func.body[1].kind {
+                match &assign2.value.kind {
+                    ExprKind::NamedDotAccess(first, second, payload) => {
+                        assert_eq!(first, "E");
+                        assert_eq!(second, "V2");
+                        assert!(payload.is_some());
+                    }
+                    _ => panic!("Expected NamedDotAccess for E.V2(42)"),
+                }
+            }
+        } else {
+            panic!("Expected role definition");
+        }
+    }
+
+    #[test]
+    fn test_match_expression() {
+        let source = "role R { func f() { match x { E.V1 => { println(\"1\"); }, E.V2(val) => { println(\"2\"); } } } }";
+        let program = parse(source);
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::Expr(expr) = &func.body[0].kind {
+                match &expr.kind {
+                    ExprKind::Match(scrutinee, arms) => {
+                        match &scrutinee.kind {
+                            ExprKind::Var(name) => assert_eq!(name, "x"),
+                            _ => panic!("Expected var x as scrutinee"),
+                        }
+                        assert_eq!(arms.len(), 2);
+
+                        // Arm 1 pattern: E.V1
+                        match &arms[0].pattern.kind {
+                            PatternKind::Variant(enum_name, var_name, payload) => {
+                                assert_eq!(enum_name, "E");
+                                assert_eq!(var_name, "V1");
+                                assert!(payload.is_none());
+                            }
+                            _ => panic!("Expected variant pattern for arm 1"),
+                        }
+
+                        // Arm 2 pattern: E.V2(val)
+                        match &arms[1].pattern.kind {
+                            PatternKind::Variant(enum_name, var_name, payload) => {
+                                assert_eq!(enum_name, "E");
+                                assert_eq!(var_name, "V2");
+                                assert!(payload.is_some());
+                                match &payload.as_ref().unwrap().kind {
+                                    PatternKind::Var(name) => assert_eq!(name, "val"),
+                                    _ => panic!("Expected var pattern in variant payload"),
+                                }
+                            }
+                            _ => panic!("Expected variant pattern for arm 2"),
+                        }
+                    }
+                    _ => panic!("Expected match expression"),
+                }
+            }
+        }
+    }
 }

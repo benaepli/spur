@@ -248,3 +248,178 @@ fn test_function_return_validation() -> Result<(), TypeError> {
     checker.exit_scope();
     Ok(())
 }
+
+// Helpers for variant testing
+impl TypeChecker {
+    fn register_test_enum(&mut self, name: &str, variants: Vec<ResolvedEnumVariant>) -> NameId {
+        let id_val = 1000 + self.type_defs.len();
+        let id = NameId(id_val);
+
+        self.type_defs.insert(
+            id,
+            TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Enum(variants)),
+        );
+        self.enum_names.insert(id, name.to_string());
+        id
+    }
+}
+
+#[test]
+fn test_check_variant_lit_no_payload() -> Result<(), TypeError> {
+    let mut checker = setup_checker();
+
+    // enum E { V1, V2(int) }
+    let variants = vec![
+        ResolvedEnumVariant {
+            name: "V1".to_string(),
+            payload: None,
+            span: dummy_span(),
+        },
+        ResolvedEnumVariant {
+            name: "V2".to_string(),
+            payload: Some(ResolvedTypeDef::Named(id(0))), // int is id(0)
+            span: dummy_span(),
+        },
+    ];
+    let enum_id = checker.register_test_enum("E", variants);
+
+    // E.V1
+    let expr = ResolvedExpr {
+        kind: ResolvedExprKind::VariantLit(enum_id, "V1".to_string(), None),
+        span: dummy_span(),
+    };
+
+    let typed = checker.infer_expr(expr)?;
+    assert_eq!(typed.ty, Type::Enum(enum_id, "E".to_string()));
+
+    Ok(())
+}
+
+#[test]
+fn test_check_variant_lit_with_payload_valid() -> Result<(), TypeError> {
+    let mut checker = setup_checker();
+    let int_id = id(0);
+
+    let variants = vec![
+        ResolvedEnumVariant {
+            name: "V1".to_string(),
+            payload: None,
+            span: dummy_span(),
+        },
+        ResolvedEnumVariant {
+            name: "V2".to_string(),
+            payload: Some(ResolvedTypeDef::Named(int_id)),
+            span: dummy_span(),
+        },
+    ];
+    let enum_id = checker.register_test_enum("E", variants);
+
+    // E.V2(42)
+    let expr = ResolvedExpr {
+        kind: ResolvedExprKind::VariantLit(enum_id, "V2".to_string(), Some(Box::new(int_lit(42)))),
+        span: dummy_span(),
+    };
+
+    let typed = checker.infer_expr(expr)?;
+    assert_eq!(typed.ty, Type::Enum(enum_id, "E".to_string()));
+
+    Ok(())
+}
+
+#[test]
+fn test_check_variant_lit_payload_mismatch() {
+    let mut checker = setup_checker();
+    let int_id = id(0);
+
+    let variants = vec![ResolvedEnumVariant {
+        name: "V2".to_string(),
+        payload: Some(ResolvedTypeDef::Named(int_id)),
+        span: dummy_span(),
+    }];
+    let enum_id = checker.register_test_enum("E", variants);
+
+    // E.V2("wrong")
+    let expr = ResolvedExpr {
+        kind: ResolvedExprKind::VariantLit(
+            enum_id,
+            "V2".to_string(),
+            Some(Box::new(str_lit("wrong"))),
+        ),
+        span: dummy_span(),
+    };
+
+    let err = checker.infer_expr(expr).unwrap_err();
+    assert!(matches!(err, TypeError::Mismatch { .. }));
+}
+
+#[test]
+fn test_check_match_expression_valid() -> Result<(), TypeError> {
+    let mut checker = setup_checker();
+    let int_id = id(0);
+
+    // enum E { V1, V2(int) }
+    let variants = vec![
+        ResolvedEnumVariant {
+            name: "V1".to_string(),
+            payload: None,
+            span: dummy_span(),
+        },
+        ResolvedEnumVariant {
+            name: "V2".to_string(),
+            payload: Some(ResolvedTypeDef::Named(int_id)),
+            span: dummy_span(),
+        },
+    ];
+    let enum_id = checker.register_test_enum("E", variants);
+
+    // Match on E.V1
+    // match E.V1 {
+    //   E.V1 => 1,
+    //   E.V2(x) => x,
+    // }
+    let scrutinee = ResolvedExpr {
+        kind: ResolvedExprKind::VariantLit(enum_id, "V1".to_string(), None),
+        span: dummy_span(),
+    };
+
+    let arm1 = ResolvedMatchArm {
+        pattern: ResolvedPattern {
+            kind: ResolvedPatternKind::Variant(enum_id, "V1".to_string(), None),
+            span: dummy_span(),
+        },
+        body: vec![ResolvedStatement {
+            kind: ResolvedStatementKind::Expr(int_lit(1)),
+            span: dummy_span(),
+        }],
+        span: dummy_span(),
+    };
+
+    let arm2 = ResolvedMatchArm {
+        pattern: ResolvedPattern {
+            kind: ResolvedPatternKind::Variant(
+                enum_id,
+                "V2".to_string(),
+                Some(Box::new(ResolvedPattern {
+                    kind: ResolvedPatternKind::Var(id(20), "x".to_string()),
+                    span: dummy_span(),
+                })),
+            ),
+            span: dummy_span(),
+        },
+        body: vec![ResolvedStatement {
+            kind: ResolvedStatementKind::Expr(expr(ResolvedExprKind::Var(id(20), "x".to_string()))),
+            span: dummy_span(),
+        }],
+        span: dummy_span(),
+    };
+
+    let match_expr = ResolvedExpr {
+        kind: ResolvedExprKind::Match(Box::new(scrutinee), vec![arm1, arm2]),
+        span: dummy_span(),
+    };
+
+    let typed = checker.infer_expr(match_expr)?;
+    assert_eq!(typed.ty, Type::Int);
+
+    Ok(())
+}

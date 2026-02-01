@@ -48,6 +48,30 @@ fn var_init(name: &str, value: Expr) -> Statement {
     }))
 }
 
+// Helpers for variant testing
+impl Resolver {
+    // Expose declaring a type for testing purposes
+    fn declare_test_type(&mut self, name: &str) -> NameId {
+        self.declare_type(name, dummy_span()).unwrap()
+    }
+}
+
+fn variant_lit(enum_name: &str, variant_name: &str, payload: Option<Expr>) -> Expr {
+    expr(ExprKind::VariantLit(
+        enum_name.to_string(),
+        variant_name.to_string(),
+        payload.map(Box::new),
+    ))
+}
+
+fn named_dot(first: &str, second: &str, payload: Option<Expr>) -> Expr {
+    expr(ExprKind::NamedDotAccess(
+        first.to_string(),
+        second.to_string(),
+        payload.map(Box::new),
+    ))
+}
+
 #[test]
 fn test_resolve_literals() -> Result<(), ResolutionError> {
     let mut resolver = Resolver::new();
@@ -285,7 +309,9 @@ fn test_prepopulated_types() {
 #[test]
 fn test_undefined_type() {
     let resolver = Resolver::new();
-    let err = resolver.lookup_type("UndefinedType", dummy_span()).unwrap_err();
+    let err = resolver
+        .lookup_type("UndefinedType", dummy_span())
+        .unwrap_err();
 
     assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "UndefinedType"));
 }
@@ -367,11 +393,7 @@ fn test_nested_scope_variable_isolation() -> Result<(), ResolutionError> {
 fn test_list_literal_resolution() -> Result<(), ResolutionError> {
     let mut resolver = Resolver::new();
 
-    let list = expr(ExprKind::ListLit(vec![
-        int_lit(1),
-        int_lit(2),
-        int_lit(3),
-    ]));
+    let list = expr(ExprKind::ListLit(vec![int_lit(1), int_lit(2), int_lit(3)]));
 
     let res = resolver.resolve_expr(list)?;
     match res.kind {
@@ -405,6 +427,144 @@ fn test_map_literal_resolution() -> Result<(), ResolutionError> {
             assert_eq!(pairs.len(), 2);
         }
         _ => panic!("expected MapLit"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_resolve_variant_literal() -> Result<(), ResolutionError> {
+    let mut resolver = Resolver::new();
+
+    // Declare Enum type "E"
+    let enum_id = resolver.declare_test_type("E");
+
+    // Case 1: Unambiguous VariantLit (already parsed as VariantLit)
+    // E.V1
+    let expr1 = variant_lit("E", "V1", None);
+    let res1 = resolver.resolve_expr(expr1)?;
+    match res1.kind {
+        ResolvedExprKind::VariantLit(type_id, variant_name, payload) => {
+            assert_eq!(type_id, enum_id);
+            assert_eq!(variant_name, "V1");
+            assert!(payload.is_none());
+        }
+        _ => panic!("expected VariantLit"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_resolve_ambiguous_variant_literal() -> Result<(), ResolutionError> {
+    let mut resolver = Resolver::new();
+
+    // Declare Enum type "E"
+    let enum_id = resolver.declare_test_type("E");
+
+    // Case 2: Ambiguous NamedDotAccess resolving to VariantLit
+    // E.V1, where E is a Type
+    let expr1 = named_dot("E", "V1", None);
+    let res1 = resolver.resolve_expr(expr1)?;
+    match res1.kind {
+        ResolvedExprKind::VariantLit(type_id, variant_name, payload) => {
+            assert_eq!(type_id, enum_id);
+            assert_eq!(variant_name, "V1");
+            assert!(payload.is_none());
+        }
+        _ => panic!("expected VariantLit"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_resolve_ambiguous_field_access() -> Result<(), ResolutionError> {
+    let mut resolver = Resolver::new();
+
+    // Declare variable "x"
+    let var_id = resolver.declare_var("x", dummy_span())?;
+
+    // Case 3: Ambiguous NamedDotAccess resolving to FieldAccess
+    // x.f, where x is a variable
+    let expr1 = named_dot("x", "f", None);
+    let res1 = resolver.resolve_expr(expr1)?;
+    match res1.kind {
+        ResolvedExprKind::FieldAccess(target, field_name) => {
+            match target.kind {
+                ResolvedExprKind::Var(id, _) => assert_eq!(id, var_id),
+                _ => panic!("expected Var target"),
+            }
+            assert_eq!(field_name, "f");
+        }
+        _ => panic!("expected FieldAccess"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_resolve_ambiguous_error_unknown_base() {
+    let mut resolver = Resolver::new();
+
+    // Unknown.f
+    let expr1 = named_dot("Unknown", "f", None);
+    let err = resolver.resolve_expr(expr1).unwrap_err();
+
+    // Should fail as NameNotFound (neither type nor variable)
+    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "Unknown"));
+}
+
+#[test]
+fn test_resolve_ambiguous_error_field_access_with_payload() -> Result<(), ResolutionError> {
+    let mut resolver = Resolver::new();
+
+    // Declare variable "x"
+    resolver.declare_var("x", dummy_span())?;
+
+    let expr1 = named_dot("x", "f", Some(int_lit(42)));
+    let err = resolver.resolve_expr(expr1).unwrap_err();
+    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "x"));
+
+    Ok(())
+}
+
+#[test]
+fn test_resolve_match_expression() -> Result<(), ResolutionError> {
+    let mut resolver = Resolver::new();
+    let enum_id = resolver.declare_test_type("E");
+    let var_id = resolver.declare_var("x", dummy_span())?;
+
+    let match_expr = ExprKind::Match(
+        Box::new(var_expr("x")),
+        vec![MatchArm {
+            pattern: Pattern {
+                kind: PatternKind::Variant("E".to_string(), "V1".to_string(), None),
+                span: dummy_span(),
+            },
+            body: vec![stmt(StatementKind::Break)],
+            span: dummy_span(),
+        }],
+    );
+
+    let res = resolver.resolve_expr(expr(match_expr))?;
+    match res.kind {
+        ResolvedExprKind::Match(scrutinee, arms) => {
+            match scrutinee.kind {
+                ResolvedExprKind::Var(id, _) => assert_eq!(id, var_id),
+                _ => panic!("expected Var scrutinee"),
+            }
+            assert_eq!(arms.len(), 1);
+            match &arms[0].pattern.kind {
+                ResolvedPatternKind::Variant(type_id, variant_name, payload) => {
+                    assert_eq!(*type_id, enum_id);
+                    assert_eq!(variant_name, "V1");
+                    assert!(payload.is_none());
+                }
+                _ => panic!("expected Variant pattern"),
+            }
+        }
+        _ => panic!("expected Match"),
     }
 
     Ok(())

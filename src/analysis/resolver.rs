@@ -251,7 +251,7 @@ pub enum ResolvedExprKind {
     Match(Box<ResolvedExpr>, Vec<ResolvedMatchArm>),
     VariantLit(NameId, String, Option<Box<ResolvedExpr>>),
 
-    MakeChannel(Box<ResolvedExpr>),
+    MakeChannel(Option<Box<ResolvedExpr>>),
     Send(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Recv(Box<ResolvedExpr>),
 
@@ -949,8 +949,12 @@ impl Resolver {
                     },
                 )
             }
-            ExprKind::MakeChannel(cap) => {
-                ResolvedExprKind::MakeChannel(Box::new(self.resolve_expr(*cap)?))
+            ExprKind::MakeChannel(opt_cap) => {
+                let resolved = opt_cap
+                    .map(|cap| self.resolve_expr(*cap))
+                    .transpose()?
+                    .map(Box::new);
+                ResolvedExprKind::MakeChannel(resolved)
             }
             ExprKind::Send(ch, val) => ResolvedExprKind::Send(
                 Box::new(self.resolve_expr(*ch)?),

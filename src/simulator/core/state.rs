@@ -1,7 +1,7 @@
 use crate::compiler::cfg::{Lhs, Vertex};
 use crate::simulator::core::eval::store;
 use crate::simulator::core::values::{ChannelId, Env, Value};
-use crate::simulator::hash_utils::{compute_hash, HashPolicy};
+use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use std::hash::{Hash, Hasher};
 
@@ -73,7 +73,8 @@ impl<H: HashPolicy> Hash for CrashInfo<H> {
 
 #[derive(Debug, Clone, Hash)]
 pub struct ChannelState<H: HashPolicy> {
-    pub capacity: i32,
+    /// Channel capacity: None = unbounded, Some(n) = bounded with capacity n
+    pub capacity: Option<i32>,
     pub buffer: Vector<Value<H>>,
     // We move Record out of Runnable and into Waiting.
     pub waiting_readers: Vector<(Record<H>, Lhs)>,
@@ -81,7 +82,7 @@ pub struct ChannelState<H: HashPolicy> {
 }
 
 impl<H: HashPolicy> ChannelState<H> {
-    pub fn new(capacity: i32) -> Self {
+    pub fn new(capacity: Option<i32>) -> Self {
         Self {
             capacity,
             buffer: Vector::new(),
@@ -238,7 +239,9 @@ pub enum Continuation<H: HashPolicy> {
     /// Node recovery continuation
     Recover,
     /// Async message delivery continuation
-    Async { chan_id: ChannelId },
+    Async {
+        chan_id: ChannelId,
+    },
     /// Client operation completion - returns data for caller to handle
     ClientOp {
         client_id: i32,
