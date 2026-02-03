@@ -145,7 +145,11 @@ fn reinit_node<H: HashPolicy, L: Logger>(
     )
 }
 
-fn crash_node<H: HashPolicy>(state: &mut State<H>, history: &mut Vec<Operation<H>>, node_id: usize) {
+fn crash_node<H: HashPolicy>(
+    state: &mut State<H>,
+    history: &mut Vec<Operation<H>>,
+    node_id: usize,
+) {
     if state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is already crashed", node_id);
         return;
@@ -184,6 +188,13 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, history: &mut Vec<Operation<H
                     }
                 } else {
                     state.runnable_tasks.push_back(Runnable::Record(record));
+                }
+            }
+            Runnable::ChannelSend { target, .. } => {
+                // If target is the crashed node, drop it.
+                // If target is another node, keep it.
+                if target != node_id {
+                    state.runnable_tasks.push_back(task);
                 }
             }
         }

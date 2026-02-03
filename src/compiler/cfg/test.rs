@@ -45,7 +45,15 @@ fn test_compile_simple_literals() {
     let target = dummy_target();
     let next = dummy_vertex();
 
-    let entry = compiler.compile_expr_to_value(&int_lit(42), target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &int_lit(42),
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
     let label = compiler.cfg.get(entry).unwrap();
     match label {
         Label::Instr(Instr::Assign(lhs, Expr::Int(val)), n) => {
@@ -56,7 +64,15 @@ fn test_compile_simple_literals() {
         _ => panic!("expected Assign Int, got {:?}", label),
     }
 
-    let entry = compiler.compile_expr_to_value(&bool_lit(true), target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &bool_lit(true),
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
     let label = compiler.cfg.get(entry).unwrap();
     match label {
         Label::Instr(Instr::Assign(lhs, Expr::Bool(val)), n) => {
@@ -67,7 +83,15 @@ fn test_compile_simple_literals() {
         _ => panic!("expected Assign Bool, got {:?}", label),
     }
 
-    let entry = compiler.compile_expr_to_value(&string_lit("hello"), target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &string_lit("hello"),
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
     let label = compiler.cfg.get(entry).unwrap();
     match label {
         Label::Instr(Instr::Assign(lhs, Expr::String(val)), n) => {
@@ -91,7 +115,15 @@ fn test_compile_binop_add() {
         Type::Int,
     );
 
-    let entry = compiler.compile_expr_to_value(&expr, target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &expr,
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
 
     let l_label = compiler.cfg.get(entry).expect("left label missing");
     if let Label::Instr(Instr::Assign(l_lhs, Expr::Int(1)), r_entry) = l_label {
@@ -143,7 +175,15 @@ fn test_compile_short_circuit_and() {
         Type::Bool,
     );
 
-    let entry = compiler.compile_expr_to_value(&expr, target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &expr,
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
 
     let l_label = compiler.cfg.get(entry).expect("left label missing");
     if let Label::Instr(Instr::Assign(l_lhs, Expr::Bool(false)), cond_entry) = l_label {
@@ -196,6 +236,7 @@ fn test_compile_assignment() {
     let entry = compiler.compile_statement(
         &stmt,
         next,
+        dummy_vertex(),
         dummy_vertex(),
         dummy_vertex(),
         VarSlot::Local(99, id(99)),
@@ -259,6 +300,7 @@ fn test_compile_if_statement() {
         next,
         dummy_vertex(),
         dummy_vertex(),
+        dummy_vertex(),
         VarSlot::Local(99, id(99)),
     );
 
@@ -313,18 +355,25 @@ fn test_compile_for_loop() {
         next,
         dummy_vertex(),
         dummy_vertex(),
+        dummy_vertex(),
         VarSlot::Local(99, id(99)),
     );
 
     let head_label = compiler.cfg.get(entry).expect("head label missing");
 
     if let Label::Instr(Instr::Assign(_, Expr::Unit), cond_calc_v) = head_label {
-        let cond_calc = compiler.cfg.get(*cond_calc_v).expect("cond calc label missing");
+        let cond_calc = compiler
+            .cfg
+            .get(*cond_calc_v)
+            .expect("cond calc label missing");
         if let Label::Instr(Instr::Assign(_, Expr::Bool(false)), cond_check_v) = cond_calc {
-            let cond_check = compiler.cfg.get(*cond_check_v).expect("cond check label missing");
+            let cond_check = compiler
+                .cfg
+                .get(*cond_check_v)
+                .expect("cond check label missing");
             if let Label::Cond(_, body_v, exit_v) = cond_check {
                 assert_eq!(*exit_v, next);
-                assert_eq!(*body_v, entry); 
+                assert_eq!(*body_v, entry);
             } else {
                 panic!("expected Cond check, got {:?}", cond_check);
             }
@@ -340,27 +389,30 @@ fn test_compile_for_loop() {
 fn test_compile_return_statement() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
-    
+
     let return_slot = VarSlot::Local(5, id(5));
     let return_target = 100;
-    
+
     let stmt = TypedStatement {
         kind: TypedStatementKind::Return(int_lit(42)),
         span: dummy_span(),
     };
-    
+
     let entry = compiler.compile_statement(
         &stmt,
         dummy_vertex(),
         dummy_vertex(),
+        dummy_vertex(),
         return_target,
-        return_slot
+        return_slot,
     );
-    
+
     let label = compiler.cfg.get(entry).expect("entry label missing");
     match label {
         Label::Instr(Instr::Assign(lhs, Expr::Int(42)), n) => {
-            if let Lhs::Var(slot) = lhs { assert_eq!(slot, &return_slot); }
+            if let Lhs::Var(slot) = lhs {
+                assert_eq!(slot, &return_slot);
+            }
             assert_eq!(*n, return_target);
         }
         _ => panic!("expected Assign(return_slot, 42), got {:?}", label),
@@ -371,11 +423,13 @@ fn test_compile_return_statement() {
 fn test_compile_sync_function_call() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
-    
+
     let func_id = id(50);
     compiler.func_sync_map.insert(func_id, true);
-    compiler.func_qualifier_map.insert(func_id, "Node".to_string());
-    
+    compiler
+        .func_qualifier_map
+        .insert(func_id, "Node".to_string());
+
     let call = TypedFuncCall::User(TypedUserFuncCall {
         name: func_id,
         original_name: "Foo".to_string(),
@@ -383,16 +437,20 @@ fn test_compile_sync_function_call() {
         return_type: Type::Int,
         span: dummy_span(),
     });
-    
+
     let target = dummy_target();
     let next = dummy_vertex();
-    
+
     let entry = compiler.compile_expr_to_value(
         &typed_expr(TypedExprKind::FuncCall(call), Type::Int),
         target.clone(),
-        next
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
     );
-    
+
     let arg_label = compiler.cfg.get(entry).expect("arg label missing");
     if let Label::Instr(Instr::Assign(arg_lhs, Expr::Int(10)), call_entry) = arg_label {
         let call_label = compiler.cfg.get(*call_entry).expect("call label missing");
@@ -401,7 +459,7 @@ fn test_compile_sync_function_call() {
             assert_eq!(name, "Node.Foo");
             assert_eq!(args.len(), 1);
             assert_eq!(*n, next);
-            
+
             if let Lhs::Var(arg_slot) = arg_lhs {
                 assert_eq!(args[0], Expr::Var(*arg_slot));
             }
@@ -421,7 +479,15 @@ fn test_compile_empty_list() {
     let next = dummy_vertex();
 
     let empty_list = typed_expr(TypedExprKind::ListLit(vec![]), Type::EmptyList);
-    let entry = compiler.compile_expr_to_value(&empty_list, target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &empty_list,
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
 
     let label = compiler.cfg.get(entry).unwrap();
     match label {
@@ -441,7 +507,15 @@ fn test_compile_empty_map() {
     let next = dummy_vertex();
 
     let empty_map = typed_expr(TypedExprKind::MapLit(vec![]), Type::EmptyMap);
-    let entry = compiler.compile_expr_to_value(&empty_map, target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &empty_map,
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
 
     let label = compiler.cfg.get(entry).unwrap();
     match label {
@@ -513,6 +587,7 @@ fn test_compile_nested_if_statements() {
         next,
         dummy_vertex(),
         dummy_vertex(),
+        dummy_vertex(),
         VarSlot::Local(99, id(99)),
     );
 
@@ -549,6 +624,7 @@ fn test_compile_break_in_loop() {
         next,
         dummy_vertex(),
         dummy_vertex(),
+        dummy_vertex(),
         VarSlot::Local(99, id(99)),
     );
 
@@ -574,7 +650,15 @@ fn test_compile_complex_binop_chain() {
         Type::Int,
     );
 
-    let entry = compiler.compile_expr_to_value(&mul_expr, target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &mul_expr,
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
 
     // Verify compilation produces CFG nodes
     let label = compiler.cfg.get(entry).expect("entry missing");
@@ -597,7 +681,15 @@ fn test_compile_short_circuit_or() {
         Type::Bool,
     );
 
-    let entry = compiler.compile_expr_to_value(&expr, target.clone(), next);
+    let entry = compiler.compile_expr_to_value(
+        &expr,
+        target.clone(),
+        next,
+        dummy_vertex(),
+        dummy_vertex(),
+        dummy_vertex(),
+        VarSlot::Local(0, id(0)),
+    );
 
     // Verify short-circuit: eval left, then conditional jump
     let l_label = compiler.cfg.get(entry).expect("left label missing");
@@ -630,6 +722,7 @@ fn test_compile_empty_loop_body() {
     let entry = compiler.compile_statement(
         &loop_stmt,
         next,
+        dummy_vertex(),
         dummy_vertex(),
         dummy_vertex(),
         VarSlot::Local(99, id(99)),
@@ -699,10 +792,72 @@ fn test_compile_elseif_chain() {
         next,
         dummy_vertex(),
         dummy_vertex(),
+        dummy_vertex(),
         VarSlot::Local(99, id(99)),
     );
 
     // Verify elseif is compiled
     let label = compiler.cfg.get(entry).expect("entry missing");
     assert!(matches!(label, Label::Instr(_, _)));
+}
+#[test]
+fn test_compile_continue_in_loop() {
+    let mut compiler = Compiler::new();
+    compiler.begin_function(&[]);
+    let next = dummy_vertex();
+
+    let loop_stmt = TypedStatement {
+        kind: TypedStatementKind::ForLoop(TypedForLoop {
+            init: None,
+            condition: Some(bool_lit(true)),
+            increment: None,
+            body: vec![TypedStatement {
+                kind: TypedStatementKind::Continue,
+                span: dummy_span(),
+            }],
+            span: dummy_span(),
+        }),
+        span: dummy_span(),
+    };
+
+    let entry = compiler.compile_statement(
+        &loop_stmt,
+        next,
+        dummy_vertex(),
+        dummy_vertex(), // continue_target (shouldn't be used for the loop itself)
+        dummy_vertex(),
+        VarSlot::Local(99, id(99)),
+    );
+
+    // Verify the loop is compiled and continue jumps to loop head (since no increment)
+    let head_label = compiler.cfg.get(entry).expect("loop head missing");
+
+    // Structure:
+    // head -> cond_calc -> cond_check -> body -> continue -> head
+
+    if let Label::Instr(Instr::Assign(_, Expr::Unit), cond_calc_v) = head_label {
+        // cond_calc ...
+        let cond_calc = compiler.cfg.get(*cond_calc_v).expect("cond calc missing");
+        if let Label::Instr(Instr::Assign(_, Expr::Bool(true)), cond_check_v) = cond_calc {
+            let cond_check = compiler.cfg.get(*cond_check_v).expect("cond check missing");
+            if let Label::Cond(_, body_v, exit_v) = cond_check {
+                assert_eq!(*exit_v, next);
+
+                let body_label = compiler.cfg.get(*body_v).expect("body label missing");
+                // body should be the continue statement
+                if let Label::Continue(target) = body_label {
+                    // target should be loop head (entry)
+                    assert_eq!(*target, entry);
+                } else {
+                    panic!("expected Continue label, got {:?}", body_label);
+                }
+            } else {
+                panic!("expected Cond check, got {:?}", cond_check);
+            }
+        } else {
+            panic!("expected cond calc true");
+        }
+    } else {
+        panic!("expected loop head, got {:?}", head_label);
+    }
 }

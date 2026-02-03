@@ -187,6 +187,45 @@ impl<H: HashPolicy> ModelChecker<H> {
                     continue;
                 }
                 Runnable::Record(r) => r,
+                Runnable::ChannelSend {
+                    target,
+                    channel,
+                    message,
+                    origin_node,
+                    x,
+                    policy,
+                    pc,
+                } => {
+                    if next_state.crash_info.currently_crashed.contains(&target) {
+                        continue;
+                    }
+
+                    // Execute send: check for waiting readers
+                    if let Some(mut chan) = next_state.channels.get(&channel).cloned() {
+                        if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                            let mut r_node_env = next_state.nodes[reader.node].clone();
+                            if let Err(e) = crate::simulator::core::eval::store(
+                                &lhs,
+                                message,
+                                &mut reader.env,
+                                &mut r_node_env,
+                            ) {
+                                log::warn!("Store failed in channel send completion: {}", e);
+                            }
+                            next_state.nodes[reader.node] = r_node_env;
+                            next_state
+                                .runnable_tasks
+                                .push_back(Runnable::Record(reader));
+                        } else {
+                            chan.buffer.push_back(message);
+                        }
+                        next_state.channels.insert(channel, chan);
+                    }
+                    // Create successor
+                    let succ = self.make_successor(&node, next_state, x);
+                    successors.push(succ);
+                    continue;
+                }
             };
 
             // Handle crashed nodes (drop or queue message)
@@ -355,7 +394,12 @@ impl<H: HashPolicy> ModelChecker<H> {
         successors
     }
 
-    fn make_successor(&self, parent: &SearchNode<H>, state: State<H>, cost_delta: f64) -> SearchNode<H> {
+    fn make_successor(
+        &self,
+        parent: &SearchNode<H>,
+        state: State<H>,
+        cost_delta: f64,
+    ) -> SearchNode<H> {
         SearchNode::<H> {
             state,
             cost: parent.cost + cost_delta + 0.1,
@@ -390,6 +434,13 @@ impl<H: HashPolicy> ModelChecker<H> {
                         state.runnable_tasks.push_back(Runnable::Record(record));
                     }
                 }
+                Runnable::ChannelSend { target, .. } => {
+                    // If target is the crashed node, drop it.
+                    // If target is another node, keep it.
+                    if target != node_id {
+                        state.runnable_tasks.push_back(task);
+                    }
+                }
             }
         }
     }
@@ -405,7 +456,8 @@ impl<H: HashPolicy> ModelChecker<H> {
         state.nodes[node_id] = Env::<H>::default();
 
         if let Some(init_fn) = self.program.get_func_by_name("Node.BASE_NODE_INIT") {
-            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), &state.nodes[node_id]);
+            let mut env =
+                make_local_env(init_fn, vec![], &Env::<H>::default(), &state.nodes[node_id]);
             if let VarSlot::Local(self_idx, _) = SELF_SLOT {
                 env.set(self_idx, Value::<H>::node(node_id));
             }
@@ -427,7 +479,12 @@ impl<H: HashPolicy> ModelChecker<H> {
                 Value::<H>::int(node_id as i64),
                 Value::<H>::list((0..self.config.num_servers).map(Value::<H>::node).collect()),
             ];
-            let env = make_local_env(recover_fn, actuals, &Env::<H>::default(), &state.nodes[node_id]);
+            let env = make_local_env(
+                recover_fn,
+                actuals,
+                &Env::<H>::default(),
+                &state.nodes[node_id],
+            );
             let record = Record {
                 pc: recover_fn.entry,
                 node: node_id,
@@ -496,7 +553,10 @@ impl<H: HashPolicy> ModelChecker<H> {
         key: &EcoString,
     ) -> bool {
         if let Some(func) = self.program.get_func_by_name("ClientInterface.Read") {
-            let actuals = vec![Value::<H>::node(target_server), Value::<H>::string(key.clone())];
+            let actuals = vec![
+                Value::<H>::node(target_server),
+                Value::<H>::string(key.clone()),
+            ];
             let env = make_local_env(func, actuals, &Env::<H>::default(), &state.nodes[client_id]);
             let record = Record {
                 pc: func.entry,

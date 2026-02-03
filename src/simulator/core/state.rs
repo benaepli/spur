@@ -73,21 +73,16 @@ impl<H: HashPolicy> Hash for CrashInfo<H> {
 
 #[derive(Debug, Clone, Hash)]
 pub struct ChannelState<H: HashPolicy> {
-    /// Channel capacity: None = unbounded, Some(n) = bounded with capacity n
-    pub capacity: Option<i32>,
     pub buffer: Vector<Value<H>>,
     // We move Record out of Runnable and into Waiting.
     pub waiting_readers: Vector<(Record<H>, Lhs)>,
-    pub waiting_writers: Vector<(Record<H>, Value<H>)>,
 }
 
 impl<H: HashPolicy> ChannelState<H> {
-    pub fn new(capacity: Option<i32>) -> Self {
+    pub fn new() -> Self {
         Self {
-            capacity,
             buffer: Vector::new(),
             waiting_readers: Vector::new(),
-            waiting_writers: Vector::new(),
         }
     }
 }
@@ -120,6 +115,15 @@ pub struct Timer {
 pub enum Runnable<H: HashPolicy> {
     Timer(Timer),
     Record(Record<H>),
+    ChannelSend {
+        target: usize,
+        channel: ChannelId,
+        message: Value<H>,
+        origin_node: usize,
+        x: f64,
+        policy: UpdatePolicy,
+        pc: Vertex,
+    },
 }
 
 impl<H: HashPolicy> Hash for Runnable<H> {
@@ -133,6 +137,24 @@ impl<H: HashPolicy> Hash for Runnable<H> {
                 1u8.hash(state);
                 r.hash(state);
             }
+            Runnable::ChannelSend {
+                target,
+                channel,
+                message,
+                origin_node,
+                x,
+                policy,
+                pc,
+            } => {
+                2u8.hash(state);
+                target.hash(state);
+                channel.hash(state);
+                message.hash(state);
+                origin_node.hash(state);
+                x.to_bits().hash(state); // f64 hash via bits
+                policy.hash(state);
+                pc.hash(state);
+            }
         }
     }
 }
@@ -143,6 +165,7 @@ impl<H: HashPolicy> Runnable<H> {
         match self {
             Runnable::Timer(t) => t.node,
             Runnable::Record(r) => r.node,
+            Runnable::ChannelSend { target, .. } => *target,
         }
     }
 
@@ -151,6 +174,7 @@ impl<H: HashPolicy> Runnable<H> {
         match self {
             Runnable::Timer(t) => t.pc,
             Runnable::Record(r) => r.pc,
+            Runnable::ChannelSend { pc, .. } => *pc,
         }
     }
 }

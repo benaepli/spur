@@ -126,6 +126,9 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             Label::Break(target) => {
                 edge(*target, Some("break"), Some("dashed"), Some("red"))?;
             }
+            Label::Continue(target) => {
+                edge(*target, Some("continue"), Some("dashed"), Some("blue"))?;
+            }
             Label::Return(_) => { /* Terminal */ }
         }
     }
@@ -252,6 +255,10 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
         Label::Break(_) => {
             header_color = "#FFCCBC"; // Light orange
             content = "<B>Break</B>".into();
+        }
+        Label::Continue(_) => {
+            header_color = "#B3E5FC"; // Light blue
+            content = "<B>Continue</B>".into();
         }
     }
 
@@ -517,6 +524,7 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         Label::Cond(_, t, e) => vec![*t, *e],
         Label::ForLoopIn(_, _, _, body, next) => vec![*body, *next],
         Label::Break(t) => vec![*t],
+        Label::Continue(t) => vec![*t],
         Label::Return(_) => vec![],
     }
 }

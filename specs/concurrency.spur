@@ -17,7 +17,7 @@ role Head {
     }
 
     async func AsyncRead(key: string) -> Value {
-        var ch: chan<Value> = make(1);
+        var ch: chan<Value> = make();
         headRead(ch, key);
         return <-ch;
     }

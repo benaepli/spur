@@ -74,6 +74,8 @@ pub enum TypeError {
     ReturnOutsideFunction(Span),
     #[error("Break statement found outside of a loop")]
     BreakOutsideLoop(Span),
+    #[error("Continue statement found outside of a loop")]
+    ContinueOutsideLoop(Span),
     #[error("Cannot iterate over type `{ty}`")]
     NotIterable { ty: Type, span: Span },
     #[error("Pattern does not match iterable type")]
@@ -500,6 +502,16 @@ impl TypeChecker {
                 }
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::Break,
+                    span,
+                };
+                Ok((typed_stmt, false))
+            }
+            ResolvedStatementKind::Continue => {
+                if self.loop_depth == 0 {
+                    return Err(TypeError::ContinueOutsideLoop(span));
+                }
+                let typed_stmt = TypedStatement {
+                    kind: TypedStatementKind::Continue,
                     span,
                 };
                 Ok((typed_stmt, false))
@@ -1017,18 +1029,11 @@ impl TypeChecker {
                 self.check_struct_literal(*struct_id, fields.clone(), span)
             }
 
-            (ResolvedExprKind::MakeChannel(opt_cap), Type::Chan(_)) => {
-                let typed_cap = opt_cap
-                    .as_ref()
-                    .map(|cap| self.check_expr((**cap).clone(), &Type::Int))
-                    .transpose()?
-                    .map(Box::new);
-                Ok(TypedExpr {
-                    kind: TypedExprKind::MakeChannel(typed_cap),
-                    ty: expected.clone(),
-                    span,
-                })
-            }
+            (ResolvedExprKind::MakeChannel, Type::Chan(_)) => Ok(TypedExpr {
+                kind: TypedExprKind::MakeChannel,
+                ty: expected.clone(),
+                span,
+            }),
 
             _ => {
                 let inferred = self.infer_expr(expr)?;
@@ -1344,17 +1349,11 @@ impl TypeChecker {
                     })
                 }
             }
-            ResolvedExprKind::MakeChannel(opt_cap) => {
-                let typed_cap = opt_cap
-                    .map(|cap| self.check_expr(*cap, &Type::Int))
-                    .transpose()?
-                    .map(Box::new);
-                Ok(TypedExpr {
-                    kind: TypedExprKind::MakeChannel(typed_cap),
-                    ty: Type::UnknownChannel,
-                    span,
-                })
-            }
+            ResolvedExprKind::MakeChannel => Ok(TypedExpr {
+                kind: TypedExprKind::MakeChannel,
+                ty: Type::Chan(Box::new(Type::UnknownChannel)),
+                span,
+            }),
             ResolvedExprKind::Send(chan_expr, val_expr) => {
                 if self.current_func_is_sync {
                     return Err(TypeError::SendInSyncFunc { span });

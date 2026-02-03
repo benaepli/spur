@@ -103,7 +103,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     id: state.alloc_channel_id(),
                 };
 
-                state.channels.insert(chan_id, ChannelState::new(Some(1)));
+                state.channels.insert(chan_id, ChannelState::new());
                 store(lhs, Value::channel(chan_id), local_env, node_env)?;
 
                 let func_name_id = program
@@ -137,14 +137,12 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 Ok(Some(StepOutcome::Continue(*next)))
             }
         },
-        Label::MakeChannel(lhs, cap, next) => {
+        Label::MakeChannel(lhs, _, next) => {
             let cid = ChannelId {
                 node: node_id,
                 id: state.alloc_channel_id(),
             };
-            // cap: &Option<usize> -> Option<i32>
-            let capacity = cap.map(|c| c as i32);
-            state.channels.insert(cid, ChannelState::new(capacity));
+            state.channels.insert(cid, ChannelState::new());
             store(lhs, Value::channel(cid), local_env, node_env)?;
             Ok(Some(StepOutcome::Continue(*next)))
         }
@@ -153,7 +151,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 node: node_id,
                 id: state.alloc_channel_id(),
             };
-            state.channels.insert(cid, ChannelState::new(Some(1)));
+            state.channels.insert(cid, ChannelState::new());
             store(lhs, Value::channel(cid), local_env, node_env)?;
 
             // Create a timer that will fire when scheduled
@@ -191,6 +189,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::Break(target) => Ok(Some(StepOutcome::Continue(*target))),
+        Label::Continue(target) => Ok(Some(StepOutcome::Continue(*target))),
         Label::ForLoopIn(lhs, expr, iter_state_slot, body, next) => {
             let iter_slot_idx = match iter_state_slot {
                 VarSlot::Local(idx, _) => *idx,
@@ -354,37 +353,38 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 let cid = eval(&local_env, &node_env, chan_expr)?.as_channel()?;
                 let val = eval(&local_env, &node_env, val_expr)?;
                 if cid.node != record.node {
-                    return Err(RuntimeError::NetworkedChannelUnsupported);
-                }
-                // Local Send
-                let mut chan = state
-                    .channels
-                    .get(&cid)
-                    .ok_or(RuntimeError::ChannelNotFound(cid.id))?
-                    .clone();
-                if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                    // Wakeup reader
-                    let mut r_node_env = state.nodes[reader.node].clone();
-                    store(&lhs, val, &mut reader.env, &mut r_node_env)?;
-                    state.nodes[reader.node] = r_node_env;
-                    state.runnable_tasks.push_back(Runnable::Record(reader));
-                    record.pc = *next;
-                } else if chan.capacity.is_none()
-                    || (chan.buffer.len() as i32) < chan.capacity.unwrap()
-                {
-                    // Unbounded channel (capacity=None) always accepts, or bounded with space
-                    chan.buffer.push_back(val);
+                    // Remote Send
+                    state.runnable_tasks.push_back(Runnable::ChannelSend {
+                        target: cid.node,
+                        channel: cid,
+                        message: val,
+                        origin_node: record.node,
+                        x: record.x,
+                        policy: record.policy.clone(),
+                        pc: *next,
+                    });
+                    // Non-blocking, proceed
                     record.pc = *next;
                 } else {
-                    let node_id = record.node;
-                    record.env = local_env;
-                    record.pc = *next;
-                    chan.waiting_writers.push_back((record, val));
+                    // Local Send
+                    let mut chan = state
+                        .channels
+                        .get(&cid)
+                        .ok_or(RuntimeError::ChannelNotFound(cid.id))?
+                        .clone();
+
+                    if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                        // Wakeup reader
+                        let mut r_node_env = state.nodes[reader.node].clone();
+                        store(&lhs, val, &mut reader.env, &mut r_node_env)?;
+                        state.nodes[reader.node] = r_node_env;
+                        state.runnable_tasks.push_back(Runnable::Record(reader));
+                    } else {
+                        chan.buffer.push_back(val);
+                    }
                     state.channels.insert(cid, chan);
-                    state.nodes[node_id] = node_env;
-                    return Ok(None);
+                    record.pc = *next;
                 }
-                state.channels.insert(cid, chan);
             }
             Label::Recv(lhs, chan_expr, next) => {
                 let cid = eval(&local_env, &node_env, chan_expr)?.as_channel()?;
@@ -400,15 +400,6 @@ pub fn exec<H: HashPolicy, L: Logger>(
 
                 if let Some(val) = chan.buffer.pop_front() {
                     store(lhs, val, &mut local_env, &mut node_env)?;
-                    // Wake writer if any
-                    if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
-                        chan.buffer.push_back(w_val);
-                        state.runnable_tasks.push_back(Runnable::Record(writer));
-                    }
-                    record.pc = *next;
-                } else if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
-                    store(lhs, w_val, &mut local_env, &mut node_env)?;
-                    state.runnable_tasks.push_back(Runnable::Record(writer));
                     record.pc = *next;
                 } else {
                     // Block Reader
@@ -453,6 +444,11 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 unreachable!(
                     "Label {:?} should have been handled by execute_common_label or is missing implementation in exec loop",
                     label
+                )
+            }
+            Label::Continue(_) => {
+                unreachable!(
+                    "Label::Continue should have been handled by execute_common_label or is missing implementation in exec loop"
                 )
             }
         }
