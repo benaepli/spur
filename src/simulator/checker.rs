@@ -532,8 +532,9 @@ impl<H: HashPolicy> ModelChecker<H> {
                 vec![],
                 &Env::<H>::default(),
                 &state.nodes[node_id.index],
+                &self.program.id_to_name,
             );
-            if let VarSlot::Local(self_idx, _) = SELF_SLOT {
+            if let VarSlot::Node(self_idx, _) = SELF_SLOT {
                 env.set(self_idx, Value::<H>::node(node_id));
             }
             let _ = exec_sync_on_node(
@@ -569,6 +570,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 actuals,
                 &Env::<H>::default(),
                 &state.nodes[node_id.index],
+                &self.program.id_to_name,
             );
             let record = Record {
                 pc: recover_fn.entry,
@@ -613,6 +615,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 actuals,
                 &Env::<H>::default(),
                 &state.nodes[client_node_id.index],
+                &self.program.id_to_name,
             );
             let record = Record {
                 pc: func.entry,
@@ -652,6 +655,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 actuals,
                 &Env::<H>::default(),
                 &state.nodes[client_node_id.index],
+                &self.program.id_to_name,
             );
             let record = Record {
                 pc: func.entry,

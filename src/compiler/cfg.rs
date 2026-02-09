@@ -63,6 +63,7 @@ pub enum Expr {
     Some(Box<Expr>),
     IntToString(Box<Expr>),
     BoolToString(Box<Expr>),
+    NodeToString(Box<Expr>),
     // Variant operations
     Variant(u32, EcoString, Option<Box<Expr>>), // (enum_id, variant_name, payload)
     IsVariant(Box<Expr>, EcoString),            // Check if value is a specific variant
@@ -2207,6 +2208,23 @@ impl Compiler {
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
                 let arg_expr = args.first().expect("BoolToString should have 1 arg");
+                self.compile_expr_to_value(
+                    arg_expr,
+                    Lhs::Var(arg_var),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            }
+            BuiltinFn::RoleToString => {
+                let arg_var = self.alloc_temp_slot();
+                let final_expr = Expr::NodeToString(Box::new(Expr::Var(arg_var)));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+
+                let arg_expr = args.first().expect("RoleToString should have 1 arg");
                 self.compile_expr_to_value(
                     arg_expr,
                     Lhs::Var(arg_var),

@@ -54,13 +54,15 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     match label {
         Label::Instr(instr, next) => match instr {
             Instr::Assign(lhs, rhs) | Instr::Copy(lhs, rhs) => {
-                let v = eval(local_env, node_env, rhs)?;
+                let v = eval(local_env, node_env, rhs, &program.id_to_name)?;
                 store(lhs, v, local_env, node_env)?;
                 Ok(Some(StepOutcome::Continue(*next)))
             }
             Instr::SyncCall(lhs, func_name, args) => {
-                let arg_vals: Result<Vec<Value<H>>, _> =
-                    args.iter().map(|a| eval(local_env, node_env, a)).collect();
+                let arg_vals: Result<Vec<Value<H>>, _> = args
+                    .iter()
+                    .map(|a| eval(local_env, node_env, a, &program.id_to_name))
+                    .collect();
                 let arg_vals = arg_vals?;
                 let func_name_id = program
                     .func_name_to_id
@@ -75,7 +77,13 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     return Err(RuntimeError::SyncCallToAsyncFunction(func_name.clone()));
                 }
 
-                let mut callee_local = make_local_env(func_info, arg_vals, local_env, node_env);
+                let mut callee_local = make_local_env(
+                    func_info,
+                    arg_vals,
+                    local_env,
+                    node_env,
+                    &program.id_to_name,
+                );
 
                 let val = exec_sync_inner(
                     state,
@@ -93,9 +101,12 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 Ok(Some(StepOutcome::Continue(*next)))
             }
             Instr::Async(lhs, node_expr, func_name, args) => {
-                let target_node = eval(local_env, node_env, node_expr)?.as_node()?;
-                let arg_vals: Result<Vec<Value<H>>, _> =
-                    args.iter().map(|a| eval(local_env, node_env, a)).collect();
+                let target_node =
+                    eval(local_env, node_env, node_expr, &program.id_to_name)?.as_node()?;
+                let arg_vals: Result<Vec<Value<H>>, _> = args
+                    .iter()
+                    .map(|a| eval(local_env, node_env, a, &program.id_to_name))
+                    .collect();
                 let arg_vals = arg_vals?;
 
                 let chan_id = ChannelId {
@@ -114,7 +125,13 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     .rpc
                     .get(func_name_id)
                     .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
-                let callee_locals = make_local_env(func_info, arg_vals, local_env, node_env);
+                let callee_locals = make_local_env(
+                    func_info,
+                    arg_vals,
+                    local_env,
+                    node_env,
+                    &program.id_to_name,
+                );
 
                 let new_record = Record {
                     pc: func_info.entry,
@@ -169,18 +186,18 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::Cond(cond, bthen, belse) => {
-            if eval(local_env, node_env, cond)?.as_bool()? {
+            if eval(local_env, node_env, cond, &program.id_to_name)?.as_bool()? {
                 Ok(Some(StepOutcome::Continue(*bthen)))
             } else {
                 Ok(Some(StepOutcome::Continue(*belse)))
             }
         }
         Label::Return(expr) => {
-            let val = eval(local_env, node_env, expr)?;
+            let val = eval(local_env, node_env, expr, &program.id_to_name)?;
             Ok(Some(StepOutcome::Return(val)))
         }
         Label::Print(expr, next) => {
-            let val = eval(local_env, node_env, expr)?;
+            let val = eval(local_env, node_env, expr, &program.id_to_name)?;
             logger.log(LogEntry {
                 node: node_id,
                 content: val.to_string(),
@@ -199,7 +216,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             let col_val = {
                 let current = local_env.get(iter_slot_idx).clone();
                 if matches!(current.kind, ValueKind::Unit) {
-                    let original_collection = eval(local_env, node_env, expr)?;
+                    let original_collection = eval(local_env, node_env, expr, &program.id_to_name)?;
                     local_env.set(iter_slot_idx, original_collection.clone());
                     original_collection
                 } else {
@@ -350,8 +367,9 @@ pub fn exec<H: HashPolicy, L: Logger>(
 
         match label {
             Label::Send(chan_expr, val_expr, next) => {
-                let cid = eval(&local_env, &node_env, chan_expr)?.as_channel()?;
-                let val = eval(&local_env, &node_env, val_expr)?;
+                let cid =
+                    eval(&local_env, &node_env, chan_expr, &program.id_to_name)?.as_channel()?;
+                let val = eval(&local_env, &node_env, val_expr, &program.id_to_name)?;
                 if cid.node != record.node {
                     // Remote Send
                     state.runnable_tasks.push_back(Runnable::ChannelSend {
@@ -387,7 +405,8 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 }
             }
             Label::Recv(lhs, chan_expr, next) => {
-                let cid = eval(&local_env, &node_env, chan_expr)?.as_channel()?;
+                let cid =
+                    eval(&local_env, &node_env, chan_expr, &program.id_to_name)?.as_channel()?;
                 if cid.node != record.node {
                     return Err(RuntimeError::RemoteChannelRead);
                 }
@@ -422,7 +441,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 return Ok(None); // Yield
             }
             Label::SpinAwait(expr, next) => {
-                if eval(&local_env, &node_env, expr)?.as_bool()? {
+                if eval(&local_env, &node_env, expr, &program.id_to_name)?.as_bool()? {
                     record.pc = *next;
                 } else {
                     let node_id = record.node;

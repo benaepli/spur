@@ -91,7 +91,13 @@ fn recover_node<H: HashPolicy, L: Logger>(
     };
 
     let node_env = &state.nodes[node_id.index];
-    let env = make_local_env(recover_fn, actuals, &Env::<H>::default(), node_env);
+    let env = make_local_env(
+        recover_fn,
+        actuals,
+        &Env::<H>::default(),
+        node_env,
+        &prog.id_to_name,
+    );
 
     let record = Record {
         pc: recover_fn.entry,
@@ -122,8 +128,14 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         .ok_or_else(|| RuntimeError::MissingRequiredFunction("Node.BASE_NODE_INIT".to_string()))?;
 
     let node_env = &state.nodes[node_id.index];
-    let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
-    if let VarSlot::Local(self_idx, _) = SELF_SLOT {
+    let mut env = make_local_env(
+        init_fn,
+        vec![],
+        &Env::<H>::default(),
+        node_env,
+        &prog.id_to_name,
+    );
+    if let VarSlot::Node(self_idx, _) = SELF_SLOT {
         env.set(self_idx, Value::<H>::node(node_id));
     }
 
@@ -303,6 +315,7 @@ fn schedule_client_op<H: HashPolicy>(
         actuals.clone(),
         &Env::default(),
         &state.nodes[client_node_id.index],
+        &prog.id_to_name,
     );
 
     history.push(Operation {

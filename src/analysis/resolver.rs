@@ -19,6 +19,7 @@ pub enum BuiltinFn {
     Println,
     IntToString,
     BoolToString,
+    RoleToString,
     UniqueId,
 }
 
@@ -30,6 +31,7 @@ impl FromStr for BuiltinFn {
             "println" => Ok(BuiltinFn::Println),
             "int_to_string" => Ok(BuiltinFn::IntToString),
             "bool_to_string" => Ok(BuiltinFn::BoolToString),
+            "role_to_string" => Ok(BuiltinFn::RoleToString),
             "unique_id" => Ok(BuiltinFn::UniqueId),
             _ => Err(()),
         }

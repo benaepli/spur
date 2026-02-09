@@ -1736,6 +1736,34 @@ impl TypeChecker {
         args: Vec<ResolvedExpr>,
         span: Span,
     ) -> Result<TypedExpr, TypeError> {
+        // Special case: role_to_string accepts any role type
+        if builtin == BuiltinFn::RoleToString {
+            if args.len() != 1 {
+                return Err(TypeError::WrongNumberOfArgs {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            }
+            let typed_arg = self.infer_expr(args.into_iter().next().unwrap())?;
+            if !matches!(typed_arg.ty, Type::Role(_, _)) {
+                return Err(TypeError::Mismatch {
+                    expected: Type::Role(NameId(0), "role".to_string()),
+                    found: typed_arg.ty.clone(),
+                    span,
+                });
+            }
+            return Ok(TypedExpr {
+                kind: TypedExprKind::FuncCall(TypedFuncCall::Builtin(
+                    builtin,
+                    vec![typed_arg],
+                    Type::String,
+                )),
+                ty: Type::String,
+                span,
+            });
+        }
+
         let sig = self.builtin_signatures.get(&builtin).unwrap_or_else(|| {
             panic!(
                 "Missing signature for builtin function '{:?}'. \

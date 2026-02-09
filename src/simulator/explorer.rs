@@ -233,7 +233,13 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
                 index: client_index,
             };
             let node_env = &state.nodes[client_index];
-            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
+            let mut env = make_local_env(
+                init_fn,
+                vec![],
+                &Env::<H>::default(),
+                node_env,
+                &program.id_to_name,
+            );
             exec_sync_on_node(
                 &mut state,
                 logger,
@@ -254,7 +260,13 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
                 index: i,
             };
             let node_env = &state.nodes[i];
-            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
+            let mut env = make_local_env(
+                init_fn,
+                vec![],
+                &Env::<H>::default(),
+                node_env,
+                &program.id_to_name,
+            );
             exec_sync_on_node(
                 &mut state,
                 logger,
@@ -310,7 +322,13 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
         };
         let actuals = vec![Value::<H>::int(i as i64), peer_list.clone()];
         let node_env = &state.nodes[i];
-        let mut env = make_local_env(init_fn, actuals, &Env::<H>::default(), node_env);
+        let mut env = make_local_env(
+            init_fn,
+            actuals,
+            &Env::<H>::default(),
+            node_env,
+            &program.id_to_name,
+        );
 
         exec_sync_on_node(
             state,
