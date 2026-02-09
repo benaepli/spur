@@ -1,7 +1,7 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::exec::exec;
-use crate::simulator::core::state::{ClientOpResult, Logger, Runnable, State};
+use crate::simulator::core::state::{ClientOpResult, Logger, NodeId, Runnable, State};
 use crate::simulator::core::values::Value;
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
@@ -14,7 +14,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
     randomly_drop_msgs: bool,
     cut_tail_from_mid: bool,
     sever_all_but_mid: bool,
-    partition_away_nodes: &[usize],
+    partition_away_nodes: &[NodeId],
     randomly_delay_msgs: bool,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
@@ -63,7 +63,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
             if let Some(mut chan) = state.channels.get(&timer.channel).cloned() {
                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                     // There's a reader waiting - directly wake it
-                    let mut r_node_env = state.nodes[reader.node].clone();
+                    let mut r_node_env = state.nodes[reader.node.index].clone();
                     if let Err(e) = crate::simulator::core::eval::store(
                         &lhs,
                         Value::<H>::unit(),
@@ -72,7 +72,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                     ) {
                         log::warn!("Store failed in timer completion: {}", e);
                     }
-                    state.nodes[reader.node] = r_node_env;
+                    state.nodes[reader.node.index] = r_node_env;
                     state.runnable_tasks.push_back(Runnable::Record(reader));
                 } else {
                     // No reader waiting - buffer the value
@@ -113,15 +113,16 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                 }
 
                 if cut_tail_from_mid
-                    && ((src_node == 2 && dest_node == 1) || (dest_node == 2 && src_node == 1))
+                    && ((src_node.index == 2 && dest_node.index == 1)
+                        || (dest_node.index == 2 && src_node.index == 1))
                 {
                     should_deliver = false;
                 }
 
                 if sever_all_but_mid {
-                    if dest_node == 2 && src_node != 1 {
+                    if dest_node.index == 2 && src_node.index != 1 {
                         should_deliver = false;
-                    } else if src_node == 2 && dest_node != 1 {
+                    } else if src_node.index == 2 && dest_node.index != 1 {
                         should_deliver = false;
                     }
                 }
@@ -160,7 +161,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                     if let Some(mut chan) = state.channels.get(&channel).cloned() {
                         if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                             // Wakeup reader
-                            let mut r_node_env = state.nodes[reader.node].clone();
+                            let mut r_node_env = state.nodes[reader.node.index].clone();
                             if let Err(e) = crate::simulator::core::eval::store(
                                 &lhs,
                                 message,
@@ -169,7 +170,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                             ) {
                                 log::warn!("Store failed in remote channel delivery: {}", e);
                             }
-                            state.nodes[reader.node] = r_node_env;
+                            state.nodes[reader.node.index] = r_node_env;
                             state.runnable_tasks.push_back(Runnable::Record(reader));
                         } else {
                             // Unbounded buffer

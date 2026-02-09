@@ -1,7 +1,9 @@
 use super::*;
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Cfg, Expr, Instr, Label, Lhs, Program, VarSlot};
-use crate::simulator::core::state::{Continuation, LogEntry, Logger, Record, State, UpdatePolicy};
+use crate::simulator::core::state::{
+    Continuation, LogEntry, Logger, NodeId, Record, State, UpdatePolicy,
+};
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::LocalCoverage;
 use crate::simulator::hash_utils::WithHashing;
@@ -39,6 +41,7 @@ impl TestProgramBuilder {
             next_name_id: 0,
             vertex_to_span: HashMap::new(),
             max_node_slots: 2,
+            roles: vec![],
         }
     }
 }
@@ -70,10 +73,14 @@ fn make_record_with_cont(
     local_slots: usize,
     continuation: Continuation<WithHashing>,
 ) -> Record<WithHashing> {
+    let nid = NodeId {
+        role: NameId(0),
+        index: 0,
+    };
     Record {
         pc,
-        node: 0,
-        origin_node: 0,
+        node: nid,
+        origin_node: nid,
         continuation,
         env: Env::<WithHashing>::with_slots(local_slots),
         x: 0.5,
@@ -93,7 +100,7 @@ fn test_assign_then_cond_true() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
@@ -121,7 +128,7 @@ fn test_assign_then_cond_false() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
@@ -150,7 +157,7 @@ fn test_arithmetic_assignment() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
@@ -183,7 +190,7 @@ fn test_multiple_assigns() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign1, 2);
     let mut coverage = LocalCoverage::new();
@@ -209,7 +216,7 @@ fn test_node_slot_assignment() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
@@ -240,7 +247,7 @@ fn test_copy_instruction() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
@@ -263,7 +270,7 @@ fn test_print_instruction() {
     let print = builder.add(Label::Print(Expr::Int(123), ret));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(print, 2);
     let mut coverage = LocalCoverage::new();
@@ -306,7 +313,7 @@ fn test_for_loop_in_list() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(init, 4);
     let mut coverage = LocalCoverage::new();
@@ -329,7 +336,7 @@ fn test_pause_yields() {
     let pause = builder.add(Label::Pause(ret));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(pause, 2);
     let mut coverage = LocalCoverage::new();
@@ -365,7 +372,7 @@ fn test_coverage_records_transitions() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign1, 2);
     let mut coverage = LocalCoverage::new();
@@ -390,7 +397,7 @@ fn test_channel_send_recv() {
     let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), Some(1), send));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record_with_cont(
         make,
@@ -424,7 +431,7 @@ fn test_recv_blocks_on_empty() {
     let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), Some(1), recv));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(make, 2);
     let mut coverage = LocalCoverage::new();
@@ -483,7 +490,7 @@ fn test_for_loop_map_destructuring() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 4);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 4);
     let mut logger = TestLogger::new();
     let record = make_record_with_cont(
         init,
@@ -526,7 +533,7 @@ fn test_tuple_assignment() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record_with_cont(
         assign,
@@ -566,7 +573,7 @@ fn test_runtime_type_error() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(1, 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
     let mut logger = TestLogger::new();
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();

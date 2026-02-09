@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-
+use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, Runnable, RuntimeError, State,
-    UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env, schedule_runnable,
+    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, Record, Runnable, RuntimeError,
+    State, UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env, schedule_runnable,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
@@ -13,6 +12,7 @@ use crate::simulator::path::plan::{
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
+use std::collections::HashMap;
 
 pub mod generator;
 pub mod plan;
@@ -49,9 +49,9 @@ pub struct PathState<H: HashPolicy> {
 }
 
 impl<H: HashPolicy> PathState<H> {
-    pub fn new(node_count: usize, node_slot_count: usize) -> Self {
+    pub fn new(role_node_counts: &[(NameId, usize)], node_slot_count: usize) -> Self {
         Self {
-            state: State::<H>::new(node_count, node_slot_count),
+            state: State::<H>::new(role_node_counts, node_slot_count),
             coverage: LocalCoverage::new(),
             logs: Logs::default(),
             history: Vec::new(),
@@ -65,7 +65,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
     state: &mut State<H>,
     logger: &mut L,
     prog: &Program,
-    node_id: usize,
+    node_id: NodeId,
     _global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
@@ -76,16 +76,21 @@ fn recover_node<H: HashPolicy, L: Logger>(
 
     let actuals = match topology.topology {
         Topology::Full => vec![
-            Value::<H>::int(node_id as i64),
+            Value::<H>::int(node_id.index as i64),
             Value::<H>::list(
                 (0..topology.num_servers)
-                    .map(|j| Value::<H>::node(j as usize))
+                    .map(|j| {
+                        Value::<H>::node(NodeId {
+                            role: node_id.role,
+                            index: j as usize,
+                        })
+                    })
                     .collect(),
             ),
         ],
     };
 
-    let node_env = &state.nodes[node_id];
+    let node_env = &state.nodes[node_id.index];
     let env = make_local_env(recover_fn, actuals, &Env::<H>::default(), node_env);
 
     let record = Record {
@@ -107,7 +112,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
     state: &mut State<H>,
     logger: &mut L,
     prog: &Program,
-    node_id: usize,
+    node_id: NodeId,
     global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
@@ -116,7 +121,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         .get_func_by_name("Node.BASE_NODE_INIT")
         .ok_or_else(|| RuntimeError::MissingRequiredFunction("Node.BASE_NODE_INIT".to_string()))?;
 
-    let node_env = &state.nodes[node_id];
+    let node_env = &state.nodes[node_id.index];
     let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
     if let VarSlot::Local(self_idx, _) = SELF_SLOT {
         env.set(self_idx, Value::<H>::node(node_id));
@@ -148,7 +153,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
 fn crash_node<H: HashPolicy>(
     state: &mut State<H>,
     history: &mut Vec<Operation<H>>,
-    node_id: usize,
+    node_id: NodeId,
 ) {
     if state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is already crashed", node_id);
@@ -207,7 +212,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
     history: &mut Vec<Operation<H>>,
     prog: &Program,
     topology: &TopologyInfo,
-    node_id: usize,
+    node_id: NodeId,
     global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
@@ -226,7 +231,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
         unique_id: -1,
     });
 
-    state.nodes[node_id] = Env::<H>::default();
+    state.nodes[node_id.index] = Env::<H>::default();
     reinit_node(
         topology,
         state,
@@ -255,13 +260,18 @@ fn schedule_client_op<H: HashPolicy>(
     prog: &Program,
     op_id: i32,
     op_spec: &ClientOpSpec,
-    client_id: i32,
+    client_node_id: NodeId,
+    server_role: NameId,
 ) -> Result<(), RuntimeError> {
+    let client_id = client_node_id.index as i32;
     let (op_name, actuals) = match op_spec {
         ClientOpSpec::Write(target, key, val) => (
             "ClientInterface.Write",
             vec![
-                Value::<H>::node(*target as usize),
+                Value::<H>::node(NodeId {
+                    role: server_role,
+                    index: *target as usize,
+                }),
                 Value::<H>::string(EcoString::from(key.as_str())),
                 Value::<H>::string(EcoString::from(val.as_str())),
             ],
@@ -269,13 +279,19 @@ fn schedule_client_op<H: HashPolicy>(
         ClientOpSpec::Read(target, key) => (
             "ClientInterface.Read",
             vec![
-                Value::<H>::node(*target as usize),
+                Value::<H>::node(NodeId {
+                    role: server_role,
+                    index: *target as usize,
+                }),
                 Value::<H>::string(EcoString::from(key.as_str())),
             ],
         ),
         ClientOpSpec::SimulateTimeout(target) => (
             "ClientInterface.SimulateTimeout",
-            vec![Value::<H>::node(*target as usize)],
+            vec![Value::<H>::node(NodeId {
+                role: server_role,
+                index: *target as usize,
+            })],
         ),
     };
 
@@ -286,7 +302,7 @@ fn schedule_client_op<H: HashPolicy>(
         op_func,
         actuals.clone(),
         &Env::default(),
-        &state.nodes[client_id as usize],
+        &state.nodes[client_node_id.index],
     );
 
     history.push(Operation {
@@ -299,8 +315,8 @@ fn schedule_client_op<H: HashPolicy>(
 
     state.runnable_tasks.push_back(Runnable::Record(Record {
         pc: op_func.entry,
-        node: client_id as usize,
-        origin_node: client_id as usize,
+        node: client_node_id,
+        origin_node: client_node_id,
         continuation: Continuation::ClientOp {
             client_id,
             op_name: op_name.to_string(),
@@ -327,6 +343,20 @@ pub fn exec_plan<H: HashPolicy>(
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
 
+    // Look up role NameIds from the program
+    let server_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "Node")
+        .map(|(id, _)| *id)
+        .unwrap_or(NameId(0));
+    let client_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "ClientInterface")
+        .map(|(id, _)| *id)
+        .unwrap_or(NameId(1));
+
     for step in 0..max_iterations {
         if engine.is_complete() {
             info!("Plan completed in {} steps", step);
@@ -348,13 +378,18 @@ pub fn exec_plan<H: HashPolicy>(
                     if let Some(client_id) = path_state.free_clients.pop() {
                         op_id_counter += 1;
                         in_progress.insert(op_id_counter, node_idx);
+                        let client_node_id = NodeId {
+                            role: client_role,
+                            index: client_id as usize,
+                        };
                         schedule_client_op(
                             &mut path_state.state,
                             &mut path_state.history,
                             &program,
                             op_id_counter,
                             op_spec,
-                            client_id,
+                            client_node_id,
+                            server_role,
                         )?;
                     } else {
                         if let Err(e) = engine.mark_as_ready(node_idx) {
@@ -363,21 +398,25 @@ pub fn exec_plan<H: HashPolicy>(
                     }
                 }
                 EventAction::CrashNode(node_id) => {
-                    crash_node(
-                        &mut path_state.state,
-                        &mut path_state.history,
-                        *node_id as usize,
-                    );
+                    let nid = NodeId {
+                        role: server_role,
+                        index: *node_id as usize,
+                    };
+                    crash_node(&mut path_state.state, &mut path_state.history, nid);
                     engine.mark_event_completed(node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
+                    let nid = NodeId {
+                        role: server_role,
+                        index: *node_id as usize,
+                    };
                     recover_crashed_node(
                         &mut path_state.state,
                         &mut path_state.logs,
                         &mut path_state.history,
                         &program,
                         &topology,
-                        *node_id as usize,
+                        nid,
                         global_state,
                         global_snapshot,
                         &mut path_state.coverage,

@@ -173,6 +173,9 @@ pub struct Program {
 
     /// Maximum number of node-level slots used by any role in this program.
     pub max_node_slots: u32,
+
+    /// Ordered list of role (NameId, original_name) pairs, in declaration order.
+    pub roles: Vec<(NameId, String)>,
 }
 
 impl Program {
@@ -224,6 +227,9 @@ pub struct Compiler {
 
     /// Maximum number of node-level slots encountered so far
     max_node_slots: u32,
+
+    /// Ordered list of role (NameId, original_name)
+    roles: Vec<(NameId, String)>,
 }
 
 impl Default for Compiler {
@@ -251,6 +257,7 @@ impl Compiler {
             current_slot_names: Vec::new(),
             current_local_defaults: Vec::new(),
             max_node_slots: 1,
+            roles: Vec::new(),
         }
     }
 
@@ -369,6 +376,7 @@ impl Compiler {
             match def {
                 TypedTopLevelDef::Role(role) => {
                     let qualifier = role.original_name.clone();
+                    self.roles.push((role.name, qualifier.clone()));
                     for func in &role.func_defs {
                         self.func_sync_map.insert(func.name, func.is_sync);
                         self.func_qualifier_map.insert(func.name, qualifier.clone());
@@ -406,6 +414,7 @@ impl Compiler {
             next_name_id,
             vertex_to_span: self.vertex_to_span,
             max_node_slots: self.max_node_slots,
+            roles: self.roles,
         }
     }
 

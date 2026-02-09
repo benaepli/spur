@@ -2,8 +2,8 @@ use crate::compiler::cfg::{Instr, Label, Lhs, Program, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{eval, make_local_env, store};
 use crate::simulator::core::state::{
-    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, Record, Runnable, State, Timer,
-    UpdatePolicy,
+    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, Record, Runnable, State,
+    Timer, UpdatePolicy,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
@@ -14,12 +14,12 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
     logger: &mut L,
     program: &Program,
     local_env: &mut Env<H>,
-    node_id: usize,
+    node_id: NodeId,
     start_pc: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Value<H>, RuntimeError> {
-    let mut node_env = state.nodes[node_id].clone();
+    let mut node_env = state.nodes[node_id.index].clone();
     let result = exec_sync_inner(
         state,
         logger,
@@ -31,7 +31,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
     );
-    state.nodes[node_id] = node_env;
+    state.nodes[node_id.index] = node_env;
     result
 }
 
@@ -47,7 +47,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     program: &Program,
     local_env: &mut Env<H>,
     node_env: &mut Env<H>,
-    node_id: usize,
+    node_id: NodeId,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
@@ -259,7 +259,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
     local_env: &mut Env<H>,
     node_env: &mut Env<H>,
     start_pc: usize,
-    node_id: usize,
+    node_id: NodeId,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Value<H>, RuntimeError> {
@@ -309,7 +309,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
     local_coverage: &mut LocalCoverage,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let mut local_env = record.env;
-    let mut node_env = state.nodes[record.node].clone();
+    let mut node_env = state.nodes[record.node.index].clone();
 
     let mut prev_pc = record.pc;
 
@@ -341,7 +341,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 }
                 StepOutcome::Return(val) => {
                     let node_id = record.node;
-                    state.nodes[node_id] = node_env;
+                    state.nodes[node_id.index] = node_env;
                     let result = record.continuation.call(state, val);
                     return Ok(result);
                 }
@@ -375,9 +375,9 @@ pub fn exec<H: HashPolicy, L: Logger>(
 
                     if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                         // Wakeup reader
-                        let mut r_node_env = state.nodes[reader.node].clone();
+                        let mut r_node_env = state.nodes[reader.node.index].clone();
                         store(&lhs, val, &mut reader.env, &mut r_node_env)?;
-                        state.nodes[reader.node] = r_node_env;
+                        state.nodes[reader.node.index] = r_node_env;
                         state.runnable_tasks.push_back(Runnable::Record(reader));
                     } else {
                         chan.buffer.push_back(val);
@@ -408,7 +408,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                     record.pc = *next; // When woke, proceed to next
                     chan.waiting_readers.push_back((record, lhs.clone()));
                     state.channels.insert(cid, chan);
-                    state.nodes[node_id] = node_env;
+                    state.nodes[node_id.index] = node_env;
                     return Ok(None); // Stop execution
                 }
                 state.channels.insert(cid, chan);
@@ -418,7 +418,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 record.env = local_env;
                 record.pc = *next;
                 state.runnable_tasks.push_back(Runnable::Record(record));
-                state.nodes[node_id] = node_env;
+                state.nodes[node_id.index] = node_env;
                 return Ok(None); // Yield
             }
             Label::SpinAwait(expr, next) => {
@@ -428,7 +428,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                     let node_id = record.node;
                     record.env = local_env;
                     state.runnable_tasks.push_back(Runnable::Record(record));
-                    state.nodes[node_id] = node_env;
+                    state.nodes[node_id.index] = node_env;
                     return Ok(None); // Yield
                 }
             }
