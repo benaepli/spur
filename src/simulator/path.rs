@@ -351,6 +351,7 @@ pub fn exec_plan<H: HashPolicy>(
     randomly_delay_msgs: bool,
     global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
+    run_id: i64,
 ) -> Result<(), RuntimeError> {
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
@@ -362,17 +363,39 @@ pub fn exec_plan<H: HashPolicy>(
         .iter()
         .find(|(_, name)| name == "Node")
         .map(|(id, _)| *id)
-        .unwrap_or(NameId(0));
+        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
     let client_role = program
         .roles
         .iter()
         .find(|(_, name)| name == "ClientInterface")
         .map(|(id, _)| *id)
-        .unwrap_or(NameId(1));
+        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
+
+    let validate_node = |state: &State<H>,
+                         index: usize,
+                         expected_role: NameId,
+                         _role_name: &str|
+     -> Result<NodeId, RuntimeError> {
+        if index >= state.nodes.len() {
+            return Err(RuntimeError::IndexOutOfBounds {
+                index,
+                len: state.nodes.len(),
+            });
+        }
+        let node_val = state.nodes[index].get(0);
+        let node_id = node_val.as_node()?;
+        if node_id.role != expected_role {
+            return Err(RuntimeError::TypeError {
+                expected: "node with correct role",
+                got: "node with incorrect role",
+            });
+        }
+        Ok(node_id)
+    };
 
     for step in 0..max_iterations {
         if engine.is_complete() {
-            info!("Plan completed in {} steps", step);
+            info!("Plan {} completed in {} steps", run_id, step);
             return Ok(());
         }
 
@@ -391,10 +414,23 @@ pub fn exec_plan<H: HashPolicy>(
                     if let Some(client_id) = path_state.free_clients.pop() {
                         op_id_counter += 1;
                         in_progress.insert(op_id_counter, node_idx);
-                        let client_node_id = NodeId {
-                            role: client_role,
-                            index: client_id as usize,
+
+                        // Validate client node
+                        let client_node_id = validate_node(
+                            &path_state.state,
+                            client_id as usize,
+                            client_role,
+                            "ClientInterface",
+                        )?;
+
+                        // Validate target server in op_spec
+                        let target_idx = match op_spec {
+                            ClientOpSpec::Write(t, _, _) => *t as usize,
+                            ClientOpSpec::Read(t, _) => *t as usize,
+                            ClientOpSpec::SimulateTimeout(t) => *t as usize,
                         };
+                        validate_node(&path_state.state, target_idx, server_role, "Node")?;
+
                         schedule_client_op(
                             &mut path_state.state,
                             &mut path_state.history,
@@ -411,18 +447,14 @@ pub fn exec_plan<H: HashPolicy>(
                     }
                 }
                 EventAction::CrashNode(node_id) => {
-                    let nid = NodeId {
-                        role: server_role,
-                        index: *node_id as usize,
-                    };
+                    let nid =
+                        validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
                     crash_node(&mut path_state.state, &mut path_state.history, nid);
                     engine.mark_event_completed(node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
-                    let nid = NodeId {
-                        role: server_role,
-                        index: *node_id as usize,
-                    };
+                    let nid =
+                        validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
                     recover_crashed_node(
                         &mut path_state.state,
                         &mut path_state.logs,

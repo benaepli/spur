@@ -214,13 +214,13 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
         .iter()
         .find(|(_, name)| name == "Node")
         .map(|(id, _)| *id)
-        .unwrap_or(NameId(0));
+        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
     let client_role = program
         .roles
         .iter()
         .find(|(_, name)| name == "ClientInterface")
         .map(|(id, _)| *id)
-        .unwrap_or(NameId(1));
+        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
 
     let role_node_counts = vec![(server_role, num_servers), (client_role, num_clients)];
     let mut state = State::<H>::new(&role_node_counts, program.max_node_slots as usize);
@@ -302,7 +302,7 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
         .iter()
         .find(|(_, name)| name == "Node")
         .map(|(id, _)| *id)
-        .unwrap_or(NameId(0));
+        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
 
     let peer_list = Value::<H>::list(
         (0..num_servers)
@@ -383,13 +383,13 @@ pub fn run_single_simulation(
         .iter()
         .find(|(_, name)| name == "Node")
         .map(|(id, _)| *id)
-        .unwrap_or(NameId(0));
+        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
     let client_role = program
         .roles
         .iter()
         .find(|(_, name)| name == "ClientInterface")
         .map(|(id, _)| *id)
-        .unwrap_or(NameId(1));
+        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
 
     let role_node_counts = vec![(server_role, num_servers), (client_role, num_clients)];
     let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing>::new(
@@ -431,6 +431,7 @@ pub fn run_single_simulation(
         config.randomly_delay_msgs,
         global_state,
         Some(&global_snapshot),
+        run_id,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -621,10 +622,15 @@ pub fn run_explorer_genetic(
             .par_iter()
             .map(|run_config| {
                 let run_id = run_counter.fetch_add(1, Ordering::Relaxed);
-                let score =
-                    run_single_simulation(program, &writer, &global_state, run_id, run_config)
-                        .unwrap_or(0.0);
-                (run_config.clone(), score)
+                let result =
+                    run_single_simulation(program, &writer, &global_state, run_id, run_config);
+                match result {
+                    Ok(score) => (run_config.clone(), score),
+                    Err(e) => {
+                        error!("Genetic run {} failed: {}", run_id, e);
+                        (run_config.clone(), 0.0)
+                    }
+                }
             })
             .collect();
 

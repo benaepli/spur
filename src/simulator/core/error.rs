@@ -71,4 +71,7 @@ pub enum RuntimeError {
 
     #[error("variant has no payload")]
     VariantHasNoPayload,
+
+    #[error("role not found: {0}")]
+    RoleNotFound(String),
 }

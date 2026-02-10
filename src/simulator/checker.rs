@@ -286,13 +286,13 @@ impl<H: HashPolicy> ModelChecker<H> {
 
         // Crashes
         if node.best_budget.crashes > 0 {
-            let server_role = self
-                .program
-                .roles
-                .iter()
-                .find(|(_, name)| name == "Node")
-                .map(|(id, _)| *id)
-                .unwrap_or(NameId(0));
+            let server_role =
+                if let Some((id, _)) = self.program.roles.iter().find(|(_, name)| name == "Node") {
+                    *id
+                } else {
+                    log::error!("Role 'Node' not found");
+                    return Vec::new();
+                };
             for i in 0..self.config.num_servers {
                 let node_id = NodeId {
                     role: server_role,
@@ -348,20 +348,24 @@ impl<H: HashPolicy> ModelChecker<H> {
 
         // Writes
         if node.best_budget.writes > 0 {
-            let server_role = self
-                .program
-                .roles
-                .iter()
-                .find(|(_, name)| name == "Node")
-                .map(|(id, _)| *id)
-                .unwrap_or(NameId(0));
-            let client_role = self
+            let server_role =
+                if let Some((id, _)) = self.program.roles.iter().find(|(_, name)| name == "Node") {
+                    *id
+                } else {
+                    log::error!("Role 'Node' not found");
+                    return Vec::new();
+                };
+            let client_role = if let Some((id, _)) = self
                 .program
                 .roles
                 .iter()
                 .find(|(_, name)| name == "ClientInterface")
-                .map(|(id, _)| *id)
-                .unwrap_or(NameId(1));
+            {
+                *id
+            } else {
+                log::error!("Role 'ClientInterface' not found");
+                return Vec::new();
+            };
             for client_idx in
                 self.config.num_servers..self.config.num_servers + self.config.num_clients
             {
@@ -407,20 +411,24 @@ impl<H: HashPolicy> ModelChecker<H> {
 
         // Reads
         if node.best_budget.reads > 0 {
-            let server_role = self
-                .program
-                .roles
-                .iter()
-                .find(|(_, name)| name == "Node")
-                .map(|(id, _)| *id)
-                .unwrap_or(NameId(0));
-            let client_role = self
+            let server_role =
+                if let Some((id, _)) = self.program.roles.iter().find(|(_, name)| name == "Node") {
+                    *id
+                } else {
+                    log::error!("Role 'Node' not found");
+                    return Vec::new();
+                };
+            let client_role = if let Some((id, _)) = self
                 .program
                 .roles
                 .iter()
                 .find(|(_, name)| name == "ClientInterface")
-                .map(|(id, _)| *id)
-                .unwrap_or(NameId(1));
+            {
+                *id
+            } else {
+                log::error!("Role 'ClientInterface' not found");
+                return Vec::new();
+            };
             for client_idx in
                 self.config.num_servers..self.config.num_servers + self.config.num_clients
             {
@@ -537,7 +545,7 @@ impl<H: HashPolicy> ModelChecker<H> {
             if let VarSlot::Node(self_idx, _) = SELF_SLOT {
                 env.set(self_idx, Value::<H>::node(node_id));
             }
-            let _ = exec_sync_on_node(
+            if let Err(e) = exec_sync_on_node(
                 state,
                 logger,
                 &self.program,
@@ -546,7 +554,9 @@ impl<H: HashPolicy> ModelChecker<H> {
                 init_fn.entry,
                 None,
                 coverage,
-            );
+            ) {
+                warn!("Failed to re-initialize node {}: {}", node_id, e);
+            }
         }
 
         // Schedule Node.RecoverInit if exists
