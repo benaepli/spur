@@ -226,6 +226,10 @@ pub struct TypedProgram {
     pub top_level_defs: Vec<TypedTopLevelDef>,
     pub next_name_id: usize,
     pub id_to_name: HashMap<NameId, String>,
+    /// Struct definitions: NameId → list of (field_name, field_type)
+    pub struct_defs: HashMap<NameId, Vec<(String, Type)>>,
+    /// Enum definitions: NameId → list of (variant_name, optional payload_type)
+    pub enum_defs: HashMap<NameId, Vec<(String, Option<Type>)>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

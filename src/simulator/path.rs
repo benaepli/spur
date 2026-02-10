@@ -518,8 +518,8 @@ pub fn exec_plan<H: HashPolicy>(
     }
 
     warn!(
-        "Hit max iterations ({}) before plan completion",
-        max_iterations
+        "Hit max iterations ({}) before plan {} completion",
+        max_iterations, run_id
     );
     Ok(())
 }

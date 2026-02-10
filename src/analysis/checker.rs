@@ -246,10 +246,42 @@ impl TypeChecker {
             }
         }
 
+        // Resolve type definitions for downstream passes.
+        let mut struct_defs = HashMap::new();
+        let mut enum_defs = HashMap::new();
+        for (name_id, type_def) in &self.type_defs {
+            match type_def {
+                TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => {
+                    let resolved_fields: Vec<(String, Type)> = fields
+                        .iter()
+                        .map(|f| Ok((f.name.clone(), self.resolve_type(&f.type_def)?)))
+                        .collect::<Result<_, TypeError>>()?;
+                    struct_defs.insert(*name_id, resolved_fields);
+                }
+                TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Enum(variants)) => {
+                    let resolved_variants: Vec<(String, Option<Type>)> = variants
+                        .iter()
+                        .map(|v| {
+                            let payload_ty = v
+                                .payload
+                                .as_ref()
+                                .map(|p| self.resolve_type(p))
+                                .transpose()?;
+                            Ok((v.name.clone(), payload_ty))
+                        })
+                        .collect::<Result<_, TypeError>>()?;
+                    enum_defs.insert(*name_id, resolved_variants);
+                }
+                _ => {}
+            }
+        }
+
         Ok(TypedProgram {
             top_level_defs: typed_top_levels,
             next_name_id,
             id_to_name,
+            struct_defs,
+            enum_defs,
         })
     }
 
@@ -1351,7 +1383,7 @@ impl TypeChecker {
             }
             ResolvedExprKind::MakeChannel => Ok(TypedExpr {
                 kind: TypedExprKind::MakeChannel,
-                ty: Type::Chan(Box::new(Type::UnknownChannel)),
+                ty: Type::UnknownChannel,
                 span,
             }),
             ResolvedExprKind::Send(chan_expr, val_expr) => {

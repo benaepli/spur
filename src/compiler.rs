@@ -44,6 +44,9 @@ pub fn compile(input: &str, name: &str) -> Result<cfg::Program, anyhow::Error> {
         Ok(r) => r,
     };
 
+    let _trivially_copyable_map =
+        crate::analysis::trivially_copyable::compute_trivially_copyable(&typed);
+
     // Compile to CFG
     let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(typed);
