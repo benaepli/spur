@@ -1,16 +1,26 @@
 use crate::parser::*;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use thiserror::Error;
 
 // A unique identifier for every named entity (variable, function, type, role).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct NameId(pub usize);
+
+impl std::fmt::Display for NameId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NameId({})", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinFn {
     Println,
     IntToString,
+    BoolToString,
+    RoleToString,
+    UniqueId,
 }
 
 impl FromStr for BuiltinFn {
@@ -20,6 +30,9 @@ impl FromStr for BuiltinFn {
         match s {
             "println" => Ok(BuiltinFn::Println),
             "int_to_string" => Ok(BuiltinFn::IntToString),
+            "bool_to_string" => Ok(BuiltinFn::BoolToString),
+            "role_to_string" => Ok(BuiltinFn::RoleToString),
+            "unique_id" => Ok(BuiltinFn::UniqueId),
             _ => Err(()),
         }
     }
@@ -36,6 +49,8 @@ pub enum ResolutionError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProgram {
     pub top_level_defs: Vec<ResolvedTopLevelDef>,
+    pub next_name_id: usize,
+    pub id_to_name: HashMap<NameId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,7 +107,15 @@ pub struct ResolvedTypeDefStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedTypeDefStmtKind {
     Struct(Vec<ResolvedFieldDef>),
+    Enum(Vec<ResolvedEnumVariant>),
     Alias(ResolvedTypeDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedEnumVariant {
+    pub name: String,
+    pub payload: Option<ResolvedTypeDef>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,9 +132,7 @@ pub enum ResolvedTypeDef {
     List(Box<ResolvedTypeDef>),
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
-    Future(Box<ResolvedTypeDef>),
-    Promise(Box<ResolvedTypeDef>),
-    Lock,
+    Chan(Box<ResolvedTypeDef>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +151,7 @@ pub enum ResolvedStatementKind {
     ForLoop(ResolvedForLoop),
     ForInLoop(ResolvedForInLoop),
     Break,
-    Lock(Box<ResolvedExpr>, Vec<ResolvedStatement>),
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +200,13 @@ pub struct ResolvedAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedMatchArm {
+    pub pattern: ResolvedPattern,
+    pub body: Vec<ResolvedStatement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedPattern {
     pub kind: ResolvedPatternKind,
     pub span: Span,
@@ -189,6 +217,7 @@ pub enum ResolvedPatternKind {
     Var(NameId, String),
     Wildcard,
     Tuple(Vec<ResolvedPattern>),
+    Variant(NameId, String, Option<Box<ResolvedPattern>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -222,12 +251,14 @@ pub enum ResolvedExprKind {
     Tail(Box<ResolvedExpr>),
     Len(Box<ResolvedExpr>),
     RpcCall(Box<ResolvedExpr>, ResolvedRpcCall),
-    Await(Box<ResolvedExpr>),
-    SpinAwait(Box<ResolvedExpr>),
-    CreatePromise,
-    CreateFuture(Box<ResolvedExpr>),
-    ResolvePromise(Box<ResolvedExpr>, Box<ResolvedExpr>),
-    CreateLock,
+    Match(Box<ResolvedExpr>, Vec<ResolvedMatchArm>),
+    VariantLit(NameId, String, Option<Box<ResolvedExpr>>),
+
+    MakeChannel,
+    Send(Box<ResolvedExpr>, Box<ResolvedExpr>),
+    Recv(Box<ResolvedExpr>),
+
+    SetTimer,
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
@@ -271,6 +302,7 @@ pub struct Resolver {
     current_role: Option<NameId>,
 
     pre_populated_types: PrepopulatedTypes,
+    id_to_name: HashMap<NameId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -279,32 +311,37 @@ pub struct PrepopulatedTypes {
     pub string: NameId,
     pub bool: NameId,
     pub unit: NameId,
-    pub lock: NameId,
+}
+
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Resolver {
     pub fn new() -> Self {
         let mut next_id = 0;
-        let mut new_name_id = || {
+        let mut id_to_name = HashMap::new();
+        let mut new_name_id = |name: &str| {
             let id = NameId(next_id);
             next_id += 1;
+            id_to_name.insert(id, name.to_string());
             id
         };
 
         // Pre-populate the global scope with built-in types.
         let mut type_scope = HashMap::new();
 
-        let int_type = new_name_id();
-        let string_type = new_name_id();
-        let bool_type = new_name_id();
-        let unit_type = new_name_id();
-        let lock_type = new_name_id();
+        let int_type = new_name_id("int");
+        let string_type = new_name_id("string");
+        let bool_type = new_name_id("bool");
+        let unit_type = new_name_id("unit");
 
         type_scope.insert("int".to_string(), int_type);
         type_scope.insert("string".to_string(), string_type);
         type_scope.insert("bool".to_string(), bool_type);
         type_scope.insert("unit".to_string(), unit_type);
-        type_scope.insert("lock".to_string(), lock_type);
 
         Resolver {
             var_scopes: vec![HashMap::new()],
@@ -319,8 +356,8 @@ impl Resolver {
                 string: string_type,
                 bool: bool_type,
                 unit: unit_type,
-                lock: lock_type,
             },
+            id_to_name,
         }
     }
 
@@ -328,9 +365,10 @@ impl Resolver {
         &self.pre_populated_types
     }
 
-    fn new_name_id(&mut self) -> NameId {
+    fn new_name_id(&mut self, name: &str) -> NameId {
         let id = NameId(self.next_id);
         self.next_id += 1;
+        self.id_to_name.insert(id, name.to_string());
         id
     }
 
@@ -357,19 +395,19 @@ impl Resolver {
     }
 
     fn declare_var(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        let id = self.new_name_id();
+        let id = self.new_name_id(name);
         Self::declare_in_scope(self.var_scopes.last_mut().unwrap(), name, id, span)?;
         Ok(id)
     }
 
     fn declare_type(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        let id = self.new_name_id();
+        let id = self.new_name_id(name);
         Self::declare_in_scope(self.type_scopes.last_mut().unwrap(), name, id, span)?;
         Ok(id)
     }
 
     fn declare_role(&mut self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        let id = self.new_name_id();
+        let id = self.new_name_id(name);
         Self::declare_in_scope(&mut self.role_scope, name, id, span)?;
         Self::declare_in_scope(self.type_scopes.last_mut().unwrap(), name, id, span)?;
         self.role_func_scopes.insert(id, HashMap::new());
@@ -393,7 +431,7 @@ impl Resolver {
     }
 
     fn lookup_var(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        Self::lookup_in_scopes(&self.var_scopes, name, span)
+        Self::lookup_in_scopes(self.var_scopes.iter().rev(), name, span)
     }
 
     fn lookup_func(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
@@ -415,7 +453,7 @@ impl Resolver {
     }
 
     fn lookup_type(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
-        match Self::lookup_in_scopes(&self.type_scopes, name, span) {
+        match Self::lookup_in_scopes(self.type_scopes.iter().rev(), name, span) {
             Ok(id) => Ok(id), // Found it as a type
             Err(ResolutionError::NameNotFound(_, _)) => {
                 // Not found as a type, fall back to checking if it's a role name.
@@ -451,7 +489,7 @@ impl Resolver {
                 let role_id = self.lookup_role(&role_def.name, role_def.span)?;
 
                 for func in &role_def.func_defs {
-                    let id = self.new_name_id();
+                    let id = self.new_name_id(&func.name);
                     let scope = self.role_func_scopes.get_mut(&role_id).unwrap();
                     Self::declare_in_scope(scope, &func.name, id, func.span)?;
                 }
@@ -467,6 +505,8 @@ impl Resolver {
 
         Ok(ResolvedProgram {
             top_level_defs: resolved_top_levels,
+            next_name_id: self.next_id,
+            id_to_name: self.id_to_name.clone(),
         })
     }
 
@@ -483,7 +523,7 @@ impl Resolver {
     }
 
     fn resolve_role_def(&mut self, role: RoleDef) -> Result<ResolvedRoleDef, ResolutionError> {
-        let prev_role = self.current_role.clone();
+        let prev_role = self.current_role;
         let name_id = self.lookup_role(&role.name, role.span)?;
         self.current_role = Some(name_id);
 
@@ -582,6 +622,13 @@ impl Resolver {
                     .collect::<Result<_, _>>()?;
                 ResolvedTypeDefStmtKind::Struct(resolved_fields)
             }
+            TypeDefStmtKind::Enum(variants) => {
+                let resolved_variants = variants
+                    .into_iter()
+                    .map(|v| self.resolve_enum_variant(v))
+                    .collect::<Result<_, _>>()?;
+                ResolvedTypeDefStmtKind::Enum(resolved_variants)
+            }
             TypeDefStmtKind::Alias(td) => {
                 ResolvedTypeDefStmtKind::Alias(self.resolve_type_def(td)?)
             }
@@ -599,6 +646,20 @@ impl Resolver {
             name: field.name,
             type_def: self.resolve_type_def(field.type_def)?,
             span: field.span,
+        })
+    }
+
+    fn resolve_enum_variant(
+        &mut self,
+        variant: EnumVariant,
+    ) -> Result<ResolvedEnumVariant, ResolutionError> {
+        Ok(ResolvedEnumVariant {
+            name: variant.name,
+            payload: variant
+                .payload
+                .map(|t| self.resolve_type_def(t))
+                .transpose()?,
+            span: variant.span,
         })
     }
 
@@ -622,13 +683,7 @@ impl Resolver {
             TypeDefKind::Optional(t) => Ok(ResolvedTypeDef::Optional(Box::new(
                 self.resolve_type_def(*t)?,
             ))),
-            TypeDefKind::Future(t) => Ok(ResolvedTypeDef::Future(Box::new(
-                self.resolve_type_def(*t)?,
-            ))),
-            TypeDefKind::Promise(t) => Ok(ResolvedTypeDef::Promise(Box::new(
-                self.resolve_type_def(*t)?,
-            ))),
-            TypeDefKind::Lock => Ok(ResolvedTypeDef::Lock),
+            TypeDefKind::Chan(t) => Ok(ResolvedTypeDef::Chan(Box::new(self.resolve_type_def(*t)?))),
         }
     }
 
@@ -653,16 +708,7 @@ impl Resolver {
                 ResolvedStatementKind::ForInLoop(self.resolve_for_in_loop(fil)?)
             }
             StatementKind::Break => ResolvedStatementKind::Break,
-            StatementKind::Lock(lock_expr, body) => {
-                self.enter_scope();
-                let resolved_lock_expr = self.resolve_expr(lock_expr)?;
-                let resolved_body = body
-                    .into_iter()
-                    .map(|s| self.resolve_statement(s))
-                    .collect::<Result<_, _>>()?;
-                self.exit_scope();
-                ResolvedStatementKind::Lock(Box::new(resolved_lock_expr), resolved_body)
-            }
+            StatementKind::Continue => ResolvedStatementKind::Continue,
         };
         Ok(ResolvedStatement { kind, span })
     }
@@ -797,6 +843,14 @@ impl Resolver {
                     .collect::<Result<_, _>>()?;
                 ResolvedPatternKind::Tuple(resolved_pats)
             }
+            PatternKind::Variant(enum_name, variant_name, payload) => {
+                let type_id = self.lookup_type(&enum_name, span)?;
+                let resolved_payload = payload
+                    .map(|p| self.resolve_pattern(*p))
+                    .transpose()?
+                    .map(Box::new);
+                ResolvedPatternKind::Variant(type_id, variant_name, resolved_payload)
+            }
         };
         Ok(ResolvedPattern { kind, span })
     }
@@ -899,17 +953,13 @@ impl Resolver {
                     },
                 )
             }
-            ExprKind::Await(e) => ResolvedExprKind::Await(Box::new(self.resolve_expr(*e)?)),
-            ExprKind::SpinAwait(e) => ResolvedExprKind::SpinAwait(Box::new(self.resolve_expr(*e)?)),
-            ExprKind::CreatePromise => ResolvedExprKind::CreatePromise,
-            ExprKind::CreateFuture(e) => {
-                ResolvedExprKind::CreateFuture(Box::new(self.resolve_expr(*e)?))
-            }
-            ExprKind::ResolvePromise(p, v) => ResolvedExprKind::ResolvePromise(
-                Box::new(self.resolve_expr(*p)?),
-                Box::new(self.resolve_expr(*v)?),
+            ExprKind::MakeChannel => ResolvedExprKind::MakeChannel,
+            ExprKind::Send(ch, val) => ResolvedExprKind::Send(
+                Box::new(self.resolve_expr(*ch)?),
+                Box::new(self.resolve_expr(*val)?),
             ),
-            ExprKind::CreateLock => ResolvedExprKind::CreateLock,
+            ExprKind::Recv(ch) => ResolvedExprKind::Recv(Box::new(self.resolve_expr(*ch)?)),
+            ExprKind::SetTimer => ResolvedExprKind::SetTimer,
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)?),
                 Box::new(self.resolve_expr(*i)?),
@@ -926,6 +976,44 @@ impl Resolver {
                 ResolvedExprKind::FieldAccess(Box::new(self.resolve_expr(*e)?), name)
             }
             ExprKind::Unwrap(e) => ResolvedExprKind::Unwrap(Box::new(self.resolve_expr(*e)?)),
+            ExprKind::Match(expr, arms) => {
+                let resolved_expr = Box::new(self.resolve_expr(*expr)?);
+                let resolved_arms = arms
+                    .into_iter()
+                    .map(|arm| self.resolve_match_arm(arm))
+                    .collect::<Result<_, _>>()?;
+                ResolvedExprKind::Match(resolved_expr, resolved_arms)
+            }
+            ExprKind::VariantLit(enum_name, variant_name, payload) => {
+                let type_id = self.lookup_type(&enum_name, span)?;
+                let resolved_payload = payload
+                    .map(|e| self.resolve_expr(*e))
+                    .transpose()?
+                    .map(Box::new);
+                ResolvedExprKind::VariantLit(type_id, variant_name, resolved_payload)
+            }
+            ExprKind::NamedDotAccess(first_name, second_name, payload) => {
+                // Try to resolve as a type first (variant literal)
+                if let Ok(type_id) = self.lookup_type(&first_name, span) {
+                    let resolved_payload = payload
+                        .map(|e| self.resolve_expr(*e))
+                        .transpose()?
+                        .map(Box::new);
+                    ResolvedExprKind::VariantLit(type_id, second_name, resolved_payload)
+                } else {
+                    // Must be a variable with field access
+                    if payload.is_some() {
+                        // Field access doesn't take arguments - this is an error
+                        return Err(ResolutionError::NameNotFound(first_name, span));
+                    }
+                    let var_id = self.lookup_var(&first_name, span)?;
+                    let var_expr = ResolvedExpr {
+                        kind: ResolvedExprKind::Var(var_id, first_name),
+                        span,
+                    };
+                    ResolvedExprKind::FieldAccess(Box::new(var_expr), second_name)
+                }
+            }
             ExprKind::StructLit(name, fields) => {
                 let type_id = self.lookup_type(&name, span)?;
                 let resolved_fields = fields
@@ -957,4 +1045,23 @@ impl Resolver {
             span: call.span,
         })
     }
+
+    fn resolve_match_arm(&mut self, arm: MatchArm) -> Result<ResolvedMatchArm, ResolutionError> {
+        self.enter_scope();
+        let pattern = self.resolve_pattern(arm.pattern)?;
+        let body = arm
+            .body
+            .into_iter()
+            .map(|s| self.resolve_statement(s))
+            .collect::<Result<_, _>>()?;
+        self.exit_scope();
+        Ok(ResolvedMatchArm {
+            pattern,
+            body,
+            span: arm.span,
+        })
+    }
 }
+
+#[cfg(test)]
+mod test;

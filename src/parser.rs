@@ -62,7 +62,15 @@ pub struct TypeDefStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDefStmtKind {
     Struct(Vec<FieldDef>),
+    Enum(Vec<EnumVariant>),
     Alias(TypeDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub payload: Option<TypeDef>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,9 +87,7 @@ pub enum TypeDefKind {
     List(Box<TypeDef>),
     Tuple(Vec<TypeDef>),
     Optional(Box<TypeDef>),
-    Future(Box<TypeDef>),
-    Promise(Box<TypeDef>),
-    Lock,
+    Chan(Box<TypeDef>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,7 +118,7 @@ pub enum StatementKind {
     ForLoop(ForLoop),
     ForInLoop(ForInLoop),
     Break,
-    Lock(Expr, Vec<Statement>),
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +167,13 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Vec<Statement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub kind: PatternKind,
     pub span: Span,
@@ -178,6 +191,7 @@ pub enum PatternKind {
     Wildcard,
     Unit,
     Tuple(Vec<Pattern>),
+    Variant(String, String, Option<Box<Pattern>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,14 +243,14 @@ pub enum ExprKind {
     Len(Box<Expr>),
 
     RpcCall(Box<Expr>, FuncCall),
+    Match(Box<Expr>, Vec<MatchArm>),
+    VariantLit(String, String, Option<Box<Expr>>),
+    NamedDotAccess(String, String, Option<Box<Expr>>), // Ambiguous: could be VariantLit or FieldAccess
 
-    Await(Box<Expr>),
-    SpinAwait(Box<Expr>),
-
-    CreatePromise,
-    CreateFuture(Box<Expr>),
-    ResolvePromise(Box<Expr>, Box<Expr>),
-    CreateLock,
+    MakeChannel,
+    Send(Box<Expr>, Box<Expr>),
+    Recv(Box<Expr>),
+    SetTimer,
 
     // Postfix operations
     Index(Box<Expr>, Box<Expr>),
@@ -330,6 +344,12 @@ fn unwind_update(lhs: Expr, key: Expr, value: Expr, span: Span) -> Expr {
         ExprKind::Index(parent, index_expr) => {
             unwind_update(*parent, *index_expr, current_update, span)
         }
+        ExprKind::NamedDotAccess(first, second, None) => {
+            // Treat as field access: first.second
+            let first_expr = Expr::new(ExprKind::Var(first), span);
+            let parent_key = Expr::new(ExprKind::StringLit(second), span);
+            unwind_update(first_expr, parent_key, current_update, span)
+        }
         _ => current_update,
     }
 }
@@ -346,8 +366,23 @@ where
     let ident = select! { TokenKind::Identifier(s) => s.clone() };
 
     pattern.define({
+        let variant = ident
+            .then_ignore(just(TokenKind::Dot))
+            .then(ident)
+            .then(
+                pattern
+                    .clone()
+                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                    .map(Box::new)
+                    .or_not(),
+            )
+            .map(|((enum_name, variant_name), payload)| {
+                PatternKind::Variant(enum_name, variant_name, payload)
+            });
+
         let atom = choice((
-            ident.clone().map(PatternKind::Var),
+            variant,
+            ident.map(PatternKind::Var),
             just(TokenKind::Underscore).to(PatternKind::Wildcard),
         ))
         .map_with(|kind, e| Pattern::new(kind, e.span()));
@@ -372,13 +407,8 @@ where
     });
 
     type_def.define({
-        let named = ident.clone().map_with(|name, e| TypeDef {
+        let named = ident.map_with(|name, e| TypeDef {
             kind: TypeDefKind::Named(name),
-            span: e.span(),
-        });
-
-        let lock_type = just(TokenKind::Lock).map_with(|_, e| TypeDef {
-            kind: TypeDefKind::Lock,
             span: e.span(),
         });
 
@@ -417,29 +447,18 @@ where
                 span: e.span(),
             });
 
-        let future = just(TokenKind::Future)
+        let chan_type = just(TokenKind::Chan)
             .ignore_then(
                 type_def
                     .clone()
                     .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
             )
             .map_with(|t, e| TypeDef {
-                kind: TypeDefKind::Future(Box::new(t)),
+                kind: TypeDefKind::Chan(Box::new(t)),
                 span: e.span(),
             });
 
-        let promise = just(TokenKind::Promise)
-            .ignore_then(
-                type_def
-                    .clone()
-                    .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
-            )
-            .map_with(|t, e| TypeDef {
-                kind: TypeDefKind::Promise(Box::new(t)),
-                span: e.span(),
-            });
-
-        let base_type = choice((named, lock_type, map, list, tuple, future, promise));
+        let base_type = choice((named, map, list, tuple, chan_type));
 
         base_type
             .clone()
@@ -473,14 +492,53 @@ where
                 .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
         };
 
-        let func_call = ident
+        let func_call = ident.then(args()).map_with(|(name, args), e| FuncCall {
+            name,
+            args,
+            span: e.span(),
+        });
+
+        let named_dot_access = ident
+            .then_ignore(just(TokenKind::Dot))
+            .then(ident)
+            .then(
+                expr.clone()
+                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                    .map(Box::new)
+                    .or_not(),
+            )
+            .map(|((first_name, second_name), payload)| {
+                ExprKind::NamedDotAccess(first_name, second_name, payload)
+            });
+
+        let match_arm = pattern
             .clone()
-            .then(args())
-            .map_with(|(name, args), e| FuncCall {
-                name,
-                args,
+            .then_ignore(just(TokenKind::FatArrow))
+            .then(choice((
+                statement
+                    .clone()
+                    .repeated()
+                    .collect()
+                    .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
+                expr.clone()
+                    .map_with(|e, span| vec![Statement::new(StatementKind::Expr(e), span.span())]),
+            )))
+            .map_with(|(pattern, body), e| MatchArm {
+                pattern,
+                body,
                 span: e.span(),
             });
+
+        let match_expr = just(TokenKind::Match)
+            .ignore_then(expr.clone())
+            .then(
+                match_arm
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .collect()
+                    .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
+            )
+            .map(|(expr, arms)| ExprKind::Match(Box::new(expr), arms));
 
         let list_lit = expr
             .clone()
@@ -522,10 +580,8 @@ where
         .map(ExprKind::TupleLit);
 
         let struct_lit = ident
-            .clone()
             .then(
                 ident
-                    .clone()
                     .then_ignore(just(TokenKind::Colon))
                     .then(expr.clone())
                     .separated_by(just(TokenKind::Comma))
@@ -591,12 +647,17 @@ where
             one_arg_builtin(TokenKind::Head, ExprKind::Head),
             one_arg_builtin(TokenKind::Tail, ExprKind::Tail),
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
-            zero_arg_builtin(TokenKind::CreatePromise, ExprKind::CreatePromise),
-            one_arg_builtin(TokenKind::CreateFuture, ExprKind::CreateFuture),
-            two_arg_builtin(TokenKind::ResolvePromise, ExprKind::ResolvePromise),
-            zero_arg_builtin(TokenKind::CreateLock, ExprKind::CreateLock),
+            // make() for unbounded channel
+            just(TokenKind::Make)
+                .ignore_then(just(TokenKind::LeftParen).ignore_then(just(TokenKind::RightParen)))
+                .map(|_| ExprKind::MakeChannel),
+            two_arg_builtin(TokenKind::Send, ExprKind::Send),
+            one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
+            zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
             func_call.clone().map(ExprKind::FuncCall),
-            ident.clone().map(ExprKind::Var),
+            match_expr,
+            named_dot_access,
+            ident.map(ExprKind::Var),
             tuple_lit,
         ))
         .map_with(|kind, e| Expr::new(kind, e.span()));
@@ -635,7 +696,7 @@ where
                 .map_with(|idx, e| PostfixOp::TupleAccess(idx, e.span())),
             // Field Access: .ID
             just(TokenKind::Dot)
-                .ignore_then(ident.clone())
+                .ignore_then(ident)
                 .map_with(|name, e| PostfixOp::FieldAccess(name, e.span())),
             just(TokenKind::Bang).map_with(|_, e| PostfixOp::Unwrap(e.span())),
             // RPC Call: -> call()
@@ -664,6 +725,12 @@ where
                         let key = Expr::new(ExprKind::StringLit(field_name), span);
                         unwind_update(*parent, key, val, span)
                     }
+                    ExprKind::NamedDotAccess(first, second, None) => {
+                        // Treat as field access: first.second
+                        let first_expr = Expr::new(ExprKind::Var(first), span);
+                        let key = Expr::new(ExprKind::StringLit(second), span);
+                        unwind_update(first_expr, key, val, span)
+                    }
                     _ => lhs,
                 }
             }
@@ -689,23 +756,15 @@ where
     expr.define({
         let unary = recursive(|unary| {
             choice((
-                just(TokenKind::At)
-                    .then(unary.clone())
-                    .map_with(|(_, val), e| Expr::new(ExprKind::Await(Box::new(val)), e.span())),
                 just(TokenKind::Bang)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Not(Box::new(val)), e.span())),
                 just(TokenKind::Minus)
                     .then(unary.clone())
                     .map_with(|(_, val), e| Expr::new(ExprKind::Negate(Box::new(val)), e.span())),
-                just(TokenKind::Await)
+                just(TokenKind::LeftArrow)
                     .then(unary.clone())
-                    .map_with(|(_, val), e| Expr::new(ExprKind::Await(Box::new(val)), e.span())),
-                just(TokenKind::SpinAwait)
-                    .then(unary.clone())
-                    .map_with(|(_, val), e| {
-                        Expr::new(ExprKind::SpinAwait(Box::new(val)), e.span())
-                    }),
+                    .map_with(|(_, val), e| Expr::new(ExprKind::Recv(Box::new(val)), e.span())),
                 primary.clone(),
             ))
         });
@@ -749,16 +808,14 @@ where
         let and_expr = build_binary_op(comparison, just(TokenKind::And).to(BinOp::And));
         let or_expr = build_binary_op(and_expr, just(TokenKind::Or).to(BinOp::Or));
 
-        let coalescing_expr = build_binary_op(
+        build_binary_op(
             or_expr,
             just(TokenKind::QuestionQuestion).to(BinOp::Coalesce),
-        );
-
-        coalescing_expr
+        )
     });
 
     let var_init_core = just(TokenKind::Var)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(
             just(TokenKind::Colon)
                 .ignore_then(type_def.clone())
@@ -783,7 +840,6 @@ where
         };
 
         let assignment = ident
-            .clone()
             .map_with(|name, e| Expr::new(ExprKind::Var(name), e.span()))
             .then_ignore(just(TokenKind::Equal))
             .then(expr.clone())
@@ -808,8 +864,17 @@ where
                     span: e.span(),
                 })
         };
+        let else_if_branch = just(TokenKind::Else)
+            .ignore_then(just(TokenKind::If))
+            .ignore_then(expr.clone())
+            .then(block())
+            .map_with(|(condition, body), e| IfBranch {
+                condition,
+                body,
+                span: e.span(),
+            });
         let cond_stmts = if_branch(TokenKind::If)
-            .then(if_branch(TokenKind::ElseIf).repeated().collect())
+            .then(else_if_branch.repeated().collect())
             .then(just(TokenKind::Else).ignore_then(block()).or_not())
             .map_with(|((if_branch, elseif_branches), else_branch), e| {
                 Statement::new(
@@ -879,45 +944,39 @@ where
                 )
             });
 
-        let simple_stmt = |kind, constructor: fn(Expr) -> StatementKind| {
-            just(kind)
-                .ignore_then(expr.clone())
-                .then_ignore(just(TokenKind::Semicolon).or_not())
-                .map_with(move |expr, e| Statement::new(constructor(expr), e.span()))
-        };
+        let break_stmt =
+            just(TokenKind::Break).map_with(|_, e| Statement::new(StatementKind::Break, e.span()));
 
-        let lock_stmt = just(TokenKind::Await)
-            .ignore_then(just(TokenKind::Lock))
-            .ignore_then(
-                expr.clone()
-                    .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-            )
-            .then(block())
-            .map_with(|(lock_expr, body), e| {
-                Statement::new(StatementKind::Lock(lock_expr, body), e.span())
+        let continue_stmt = just(TokenKind::Continue)
+            .map_with(|_, e| Statement::new(StatementKind::Continue, e.span()));
+
+        let return_stmt = just(TokenKind::Return)
+            .ignore_then(expr.clone().or_not())
+            .map_with(|opt_expr, e| {
+                let expr =
+                    opt_expr.unwrap_or_else(|| Expr::new(ExprKind::TupleLit(vec![]), e.span()));
+                Statement::new(StatementKind::Return(expr), e.span())
             });
 
-        choice((
-            cond_stmts,
+        let expr_stmt = expr
+            .clone()
+            .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span()));
+
+        let simple_stmt = choice((
             var_init_stmt,
-            assignment
-                .then_ignore(just(TokenKind::Semicolon).or_not())
-                .map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
-            expr.clone()
-                .then_ignore(just(TokenKind::Semicolon).or_not())
-                .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span())),
-            simple_stmt(TokenKind::Return, StatementKind::Return),
-            for_loop,
-            for_in_loop,
-            lock_stmt,
-            just(TokenKind::Break)
-                .then_ignore(just(TokenKind::Semicolon).or_not())
-                .map_with(|_, e| Statement::new(StatementKind::Break, e.span())),
+            break_stmt,
+            continue_stmt,
+            return_stmt,
+            assignment.map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
+            expr_stmt,
         ))
+        .then_ignore(just(TokenKind::Semicolon).or_not());
+
+        choice((cond_stmts, for_loop, for_in_loop, simple_stmt))
     });
 
     let var_init = just(TokenKind::Var)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(
             just(TokenKind::Colon)
                 .ignore_then(type_def.clone())
@@ -934,7 +993,6 @@ where
         });
 
     let func_param = ident
-        .clone()
         .then_ignore(just(TokenKind::Colon))
         .then(type_def.clone())
         .map_with(|(name, type_def), e| FuncParam {
@@ -947,10 +1005,10 @@ where
         .allow_trailing()
         .collect::<Vec<_>>();
 
-    let func_def = just(TokenKind::Sync)
+    let func_def = just(TokenKind::Async)
         .or_not()
         .then_ignore(just(TokenKind::Func))
-        .then(ident.clone())
+        .then(ident)
         .then(func_params.delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)))
         .then(
             just(TokenKind::Arrow)
@@ -965,9 +1023,9 @@ where
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
         )
         .map_with(
-            |((((is_sync_opt, name), params), return_type), body), e| FuncDef {
+            |((((is_async_opt, name), params), return_type), body), e| FuncDef {
                 name,
-                is_sync: is_sync_opt.is_some(),
+                is_sync: is_async_opt.is_none(),
                 params,
                 return_type,
                 body,
@@ -976,7 +1034,6 @@ where
         );
 
     let field_def = ident
-        .clone()
         .then_ignore(just(TokenKind::Colon))
         .then(type_def.clone())
         .map_with(|(name, type_def), e| FieldDef {
@@ -989,12 +1046,34 @@ where
         .allow_trailing()
         .collect::<Vec<_>>();
 
+    let enum_variant = ident
+        .then(
+            type_def
+                .clone()
+                .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                .or_not(),
+        )
+        .map_with(|(name, payload), e| EnumVariant {
+            name,
+            payload,
+            span: e.span(),
+        });
+
     let type_def_stmt = just(TokenKind::Type)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(choice((
             field_defs
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
                 .map(TypeDefStmtKind::Struct),
+            just(TokenKind::Enum)
+                .ignore_then(
+                    enum_variant
+                        .separated_by(just(TokenKind::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
+                )
+                .map(TypeDefStmtKind::Enum),
             just(TokenKind::Equal)
                 .ignore_then(type_def.clone())
                 .map(TypeDefStmtKind::Alias),
@@ -1016,7 +1095,7 @@ where
     };
 
     let role_def = just(TokenKind::Role)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(role_contents())
         .map_with(|(name, (var_inits, func_defs)), e| {
             TopLevelDef::Role(RoleDef {
@@ -1059,7 +1138,129 @@ fn make_input(
 
 pub fn parse_program(tokens: &'_ [Token]) -> ParseResult<Program, Rich<'_, TokenKind>> {
     let len = tokens.last().map(|t| t.span.end()).unwrap_or(0);
-    let input = make_input((0..len).into(), &tokens);
+    let input = make_input((0..len).into(), tokens);
 
     program().parse(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    fn parse(source: &str) -> Program {
+        let mut lexer = Lexer::new(source);
+        let (tokens, errs) = lexer.collect_all();
+        if !errs.is_empty() {
+            panic!("Lexer errors: {:?}", errs);
+        }
+        let result = parse_program(&tokens);
+        if let Some(err) = result.errors().next() {
+            panic!("Parser error: {:?}", err);
+        }
+        result.into_output().expect("Expected successful parse")
+    }
+
+    #[test]
+    fn test_enum_definition() {
+        let source = "type E enum { V1, V2(int) };";
+        let program = parse(source);
+        assert_eq!(program.top_level_defs.len(), 1);
+        match &program.top_level_defs[0] {
+            TopLevelDef::Type(stmt) => {
+                assert_eq!(stmt.name, "E");
+                match &stmt.def {
+                    TypeDefStmtKind::Enum(variants) => {
+                        assert_eq!(variants.len(), 2);
+                        assert_eq!(variants[0].name, "V1");
+                        assert_eq!(variants[0].payload, None);
+                        assert_eq!(variants[1].name, "V2");
+                        assert!(
+                            matches!(&variants[1].payload, Some(t) if matches!(t.kind, TypeDefKind::Named(ref n) if n == "int"))
+                        );
+                    }
+                    _ => panic!("Expected enum definition"),
+                }
+            }
+            _ => panic!("Expected type level def"),
+        }
+    }
+
+    #[test]
+    fn test_variant_literals() {
+        let source = "role R { func f() { x = E.V1; y = E.V2(42); } }";
+        let program = parse(source);
+        // Navigate to the assignments
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::Assignment(assign1) = &func.body[0].kind {
+                // E.V1 is initially parsed as NamedDotAccess(E, V1, None)
+                match &assign1.value.kind {
+                    ExprKind::NamedDotAccess(first, second, payload) => {
+                        assert_eq!(first, "E");
+                        assert_eq!(second, "V1");
+                        assert!(payload.is_none());
+                    }
+                    _ => panic!("Expected NamedDotAccess for E.V1"),
+                }
+            }
+            if let StatementKind::Assignment(assign2) = &func.body[1].kind {
+                match &assign2.value.kind {
+                    ExprKind::NamedDotAccess(first, second, payload) => {
+                        assert_eq!(first, "E");
+                        assert_eq!(second, "V2");
+                        assert!(payload.is_some());
+                    }
+                    _ => panic!("Expected NamedDotAccess for E.V2(42)"),
+                }
+            }
+        } else {
+            panic!("Expected role definition");
+        }
+    }
+
+    #[test]
+    fn test_match_expression() {
+        let source = "role R { func f() { match x { E.V1 => { println(\"1\"); }, E.V2(val) => { println(\"2\"); } } } }";
+        let program = parse(source);
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::Expr(expr) = &func.body[0].kind {
+                match &expr.kind {
+                    ExprKind::Match(scrutinee, arms) => {
+                        match &scrutinee.kind {
+                            ExprKind::Var(name) => assert_eq!(name, "x"),
+                            _ => panic!("Expected var x as scrutinee"),
+                        }
+                        assert_eq!(arms.len(), 2);
+
+                        // Arm 1 pattern: E.V1
+                        match &arms[0].pattern.kind {
+                            PatternKind::Variant(enum_name, var_name, payload) => {
+                                assert_eq!(enum_name, "E");
+                                assert_eq!(var_name, "V1");
+                                assert!(payload.is_none());
+                            }
+                            _ => panic!("Expected variant pattern for arm 1"),
+                        }
+
+                        // Arm 2 pattern: E.V2(val)
+                        match &arms[1].pattern.kind {
+                            PatternKind::Variant(enum_name, var_name, payload) => {
+                                assert_eq!(enum_name, "E");
+                                assert_eq!(var_name, "V2");
+                                assert!(payload.is_some());
+                                match &payload.as_ref().unwrap().kind {
+                                    PatternKind::Var(name) => assert_eq!(name, "val"),
+                                    _ => panic!("Expected var pattern in variant payload"),
+                                }
+                            }
+                            _ => panic!("Expected variant pattern for arm 2"),
+                        }
+                    }
+                    _ => panic!("Expected match expression"),
+                }
+            }
+        }
+    }
 }

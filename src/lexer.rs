@@ -63,6 +63,8 @@ pub enum TokenKind {
     Greater,
     GreaterEqual,
     Arrow,
+    LeftArrow,
+    FatArrow,
     ColonEqual,
 
     // Literals
@@ -71,6 +73,8 @@ pub enum TokenKind {
     Integer(i64),
 
     // Keywords
+    Enum,
+    Match,
     ClientInterface,
     Role,
     Func,
@@ -78,12 +82,10 @@ pub enum TokenKind {
     Type,
     Return,
     For,
-    Await,
-    SpinAwait,
-    Sync,
+    Async,
     Break,
+    Continue,
     If,
-    ElseIf,
     Else,
     In,
     And,
@@ -103,13 +105,11 @@ pub enum TokenKind {
     False,
     Nil,
     Erase,
-    CreatePromise,
-    CreateFuture,
-    ResolvePromise,
-    Future,
-    Promise,
-    Lock,
-    CreateLock,
+    Chan,
+    Make,
+    Send,
+    Recv,
+    SetTimer,
     Store,
 }
 
@@ -144,23 +144,25 @@ impl fmt::Display for TokenKind {
             TokenKind::Greater => write!(f, ">"),
             TokenKind::GreaterEqual => write!(f, ">="),
             TokenKind::Arrow => write!(f, "->"),
+            TokenKind::LeftArrow => write!(f, "<-"),
+            TokenKind::FatArrow => write!(f, "=>"),
             TokenKind::ColonEqual => write!(f, ":="),
             TokenKind::Identifier(s) => write!(f, "{}", s),
             TokenKind::String(s) => write!(f, "\"{}\"", s),
             TokenKind::Integer(i) => write!(f, "{}", i),
             TokenKind::ClientInterface => write!(f, "ClientInterface"),
+            TokenKind::Enum => write!(f, "enum"),
+            TokenKind::Match => write!(f, "match"),
             TokenKind::Role => write!(f, "role"),
             TokenKind::Func => write!(f, "func"),
             TokenKind::Var => write!(f, "var"),
             TokenKind::Type => write!(f, "type"),
             TokenKind::Return => write!(f, "return"),
             TokenKind::For => write!(f, "for"),
-            TokenKind::Await => write!(f, "await"),
-            TokenKind::SpinAwait => write!(f, "spin_await"),
-            TokenKind::Sync => write!(f, "sync"),
+            TokenKind::Async => write!(f, "async"),
             TokenKind::Break => write!(f, "break"),
+            TokenKind::Continue => write!(f, "continue"),
             TokenKind::If => write!(f, "if"),
-            TokenKind::ElseIf => write!(f, "elseif"),
             TokenKind::Else => write!(f, "else"),
             TokenKind::In => write!(f, "in"),
             TokenKind::And => write!(f, "and"),
@@ -180,19 +182,19 @@ impl fmt::Display for TokenKind {
             TokenKind::False => write!(f, "false"),
             TokenKind::Nil => write!(f, "nil"),
             TokenKind::Erase => write!(f, "erase"),
-            TokenKind::CreatePromise => write!(f, "create_promise"),
-            TokenKind::CreateFuture => write!(f, "create_future"),
-            TokenKind::ResolvePromise => write!(f, "resolve_promise"),
-            TokenKind::Future => write!(f, "future"),
-            TokenKind::Promise => write!(f, "promise"),
-            TokenKind::Lock => write!(f, "lock"),
-            TokenKind::CreateLock => write!(f, "create_lock"),
+            TokenKind::Chan => write!(f, "chan"),
+            TokenKind::Make => write!(f, "make"),
+            TokenKind::Send => write!(f, "send"),
+            TokenKind::Recv => write!(f, "recv"),
+            TokenKind::SetTimer => write!(f, "set_timer"),
             TokenKind::Store => write!(f, "store"),
         }
     }
 }
 
 static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
+    "enum" => TokenKind::Enum,
+    "match" => TokenKind::Match,
     "ClientInterface" => TokenKind::ClientInterface,
     "role" => TokenKind::Role,
     "func" => TokenKind::Func,
@@ -200,12 +202,10 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "type" => TokenKind::Type,
     "return" => TokenKind::Return,
     "for" => TokenKind::For,
-    "await" => TokenKind::Await,
-    "spin_await" => TokenKind::SpinAwait,
-    "sync" => TokenKind::Sync,
+    "async" => TokenKind::Async,
     "break" => TokenKind::Break,
+    "continue" => TokenKind::Continue,
     "if" => TokenKind::If,
-    "elseif" => TokenKind::ElseIf,
     "else" => TokenKind::Else,
     "in" => TokenKind::In,
     "and" => TokenKind::And,
@@ -225,13 +225,11 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "false" => TokenKind::False,
     "nil" => TokenKind::Nil,
     "erase" => TokenKind::Erase,
-    "create_promise" => TokenKind::CreatePromise,
-    "create_future" => TokenKind::CreateFuture,
-    "resolve_promise" => TokenKind::ResolvePromise,
-    "future" => TokenKind::Future,
-    "promise" => TokenKind::Promise,
-    "lock" => TokenKind::Lock,
-    "create_lock" => TokenKind::CreateLock,
+    "chan" => TokenKind::Chan,
+    "make" => TokenKind::Make,
+    "send" => TokenKind::Send,
+    "recv" => TokenKind::Recv,
+    "set_timer" => TokenKind::SetTimer,
     "store" => TokenKind::Store,
 };
 
@@ -417,7 +415,7 @@ impl<'a> Lexer<'a> {
         KEYWORDS
             .get(&result as &str)
             .cloned()
-            .unwrap_or_else(|| TokenKind::Identifier(result))
+            .unwrap_or(TokenKind::Identifier(result))
     }
 }
 
@@ -504,6 +502,8 @@ impl<'a> Iterator for Lexer<'a> {
             '=' => {
                 if self.match_next('=') {
                     Ok(TokenKind::EqualEqual)
+                } else if self.match_next('>') {
+                    Ok(TokenKind::FatArrow)
                 } else {
                     Ok(TokenKind::Equal)
                 }
@@ -518,7 +518,9 @@ impl<'a> Iterator for Lexer<'a> {
             }
 
             '<' => {
-                if self.match_next('=') {
+                if self.match_next('-') {
+                    Ok(TokenKind::LeftArrow)
+                } else if self.match_next('=') {
                     Ok(TokenKind::LessEqual)
                 } else {
                     Ok(TokenKind::Less)

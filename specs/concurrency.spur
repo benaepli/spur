@@ -3,33 +3,32 @@ type Value = int;
 role Head {
     var db: map<string, Value> = {};
 
-    func headWrite(key: string, value: int) {
+    async func headWrite(key: string, value: int) {
         db = db[key] := value;
     }
 
-    func AsyncWrite(key: string, value: int) -> bool {
+    async func AsyncWrite(key: string, value: int) -> bool {
         headWrite(key, value);
         return true;
     }
 
-    func headRead(p: promise<Value>, key: string) {
-        resolve_promise(p, db[key]);
+    async func headRead(ch: chan<Value>, key: string) {
+        send(ch, db[key]);
     }
 
-    func AsyncRead(key: string) -> Value {
-        var p: promise<Value> = create_promise();
-        var f = create_future(p);
-        headRead(p, key);
-        return await f;
+    async func AsyncRead(key: string) -> Value {
+        var ch: chan<Value> = make();
+        headRead(ch, key);
+        return <-ch;
     }
 }
 
 ClientInterface {
-    func write(node: Head, key: string, value: Value) {
-        @node->AsyncWrite(key, value);
+    async func write(node: Head, key: string, value: Value) {
+        <-node->AsyncWrite(key, value);
     }
 
-    func read(node: Head, key: string) -> Value {
-        return @node->AsyncRead(key);
+    async func read(node: Head, key: string) -> Value {
+        return <-node->AsyncRead(key);
     }
 }

@@ -1,63 +1,79 @@
 use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::analysis::types::{
     TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit,
-    TypedFuncCall, TypedFuncDef, TypedPattern, TypedPatternKind, TypedProgram, TypedStatement,
-    TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
+    TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram,
+    TypedStatement, TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
 };
-use crate::parser::BinOp;
+use crate::parser::{BinOp, Span};
+use ecow::EcoString;
 use serde::Serialize;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt;
-use std::rc::Rc;
+
+pub const SELF_NAME: NameId = NameId(usize::MAX);
+
+/// Identifies where a variable lives at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum VarSlot {
+    /// Index into the function's local environment
+    Local(u32, NameId),
+    /// Index into the node's persistent environment
+    Node(u32, NameId),
+}
+
+/// Slot 0 in node env is reserved for 'self'
+pub const SELF_SLOT: VarSlot = VarSlot::Node(0, SELF_NAME);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Expr {
-    EVar(String),
-    EFind(Box<Expr>, Box<Expr>),
-    EInt(i64),
-    EBool(bool),
-    ENot(Box<Expr>),
-    EAnd(Box<Expr>, Box<Expr>),
-    EOr(Box<Expr>, Box<Expr>),
-    EEqualsEquals(Box<Expr>, Box<Expr>),
-    EMap(Vec<(Expr, Expr)>),
-    EList(Vec<Expr>),
-    EListPrepend(Box<Expr>, Box<Expr>),
-    EListAppend(Box<Expr>, Box<Expr>),
-    EListSubsequence(Box<Expr>, Box<Expr>, Box<Expr>),
-    EString(String),
-    ELessThan(Box<Expr>, Box<Expr>),
-    ELessThanEquals(Box<Expr>, Box<Expr>),
-    EGreaterThan(Box<Expr>, Box<Expr>),
-    EGreaterThanEquals(Box<Expr>, Box<Expr>),
-    EKeyExists(Box<Expr>, Box<Expr>),
-    EMapErase(Box<Expr>, Box<Expr>),
-    EStore(Box<Expr>, Box<Expr>, Box<Expr>),
-    EListLen(Box<Expr>),
-    EListAccess(Box<Expr>, usize),
-    EPlus(Box<Expr>, Box<Expr>),
-    EMinus(Box<Expr>, Box<Expr>),
-    ETimes(Box<Expr>, Box<Expr>),
-    EDiv(Box<Expr>, Box<Expr>),
-    EMod(Box<Expr>, Box<Expr>),
-    EMin(Box<Expr>, Box<Expr>),
-    ETuple(Vec<Expr>),
-    ETupleAccess(Box<Expr>, usize),
-    EUnit,
-    ENil,
-    EUnwrap(Box<Expr>),
-    ECoalesce(Box<Expr>, Box<Expr>),
-    ECreatePromise,
-    ECreateLock,
-    ESome(Box<Expr>),
-    EIntToString(Box<Expr>),
+    Var(VarSlot),
+    Find(Box<Expr>, Box<Expr>),
+    Int(i64),
+    Bool(bool),
+    Not(Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    EqualsEquals(Box<Expr>, Box<Expr>),
+    Map(Vec<(Expr, Expr)>),
+    List(Vec<Expr>),
+    ListPrepend(Box<Expr>, Box<Expr>),
+    ListAppend(Box<Expr>, Box<Expr>),
+    ListSubsequence(Box<Expr>, Box<Expr>, Box<Expr>),
+    String(EcoString),
+    LessThan(Box<Expr>, Box<Expr>),
+    LessThanEquals(Box<Expr>, Box<Expr>),
+    GreaterThan(Box<Expr>, Box<Expr>),
+    GreaterThanEquals(Box<Expr>, Box<Expr>),
+    KeyExists(Box<Expr>, Box<Expr>),
+    MapErase(Box<Expr>, Box<Expr>),
+    Store(Box<Expr>, Box<Expr>, Box<Expr>),
+    ListLen(Box<Expr>),
+    ListAccess(Box<Expr>, usize),
+    Plus(Box<Expr>, Box<Expr>),
+    Minus(Box<Expr>, Box<Expr>),
+    Times(Box<Expr>, Box<Expr>),
+    Div(Box<Expr>, Box<Expr>),
+    Mod(Box<Expr>, Box<Expr>),
+    Min(Box<Expr>, Box<Expr>),
+    Tuple(Vec<Expr>),
+    TupleAccess(Box<Expr>, usize),
+    Unit,
+    Nil,
+    Unwrap(Box<Expr>),
+    Coalesce(Box<Expr>, Box<Expr>),
+    Some(Box<Expr>),
+    IntToString(Box<Expr>),
+    BoolToString(Box<Expr>),
+    NodeToString(Box<Expr>),
+    // Variant operations
+    Variant(u32, EcoString, Option<Box<Expr>>), // (enum_id, variant_name, payload)
+    IsVariant(Box<Expr>, EcoString),            // Check if value is a specific variant
+    VariantPayload(Box<Expr>),                  // Extract payload from variant
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Hash)]
 pub enum Lhs {
-    Var(String),
-    Tuple(Vec<String>),
+    Var(VarSlot),
+    Tuple(Vec<VarSlot>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -65,7 +81,6 @@ pub enum Instr {
     Assign(Lhs, Expr),
     Async(Lhs, Expr, String, Vec<Expr>),
     Copy(Lhs, Expr),
-    Resolve(Lhs, Expr),
     SyncCall(Lhs, String, Vec<Expr>),
 }
 
@@ -74,17 +89,33 @@ pub type Vertex = usize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FunctionInfo {
     pub entry: Vertex,
-    pub name: String,
-    pub formals: Vec<String>,
-    pub locals: Vec<(String, Expr)>, // (name, default_value)
+    pub name: NameId,
+
+    /// Number of parameters (occupy slots 0..param_count)
+    pub param_count: u32,
+
+    /// Total local slots needed (params + locals + temps)
+    pub local_slot_count: u32,
+
+    /// Default values for locals, indexed by (slot - param_count)
+    pub local_defaults: Vec<Expr>,
+
     pub is_sync: bool,
+
+    /// For debugging: maps slot index -> original variable name
+    #[serde(skip)]
+    pub debug_slot_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Label {
     Instr(Instr, Vertex /* next_vertex */),
     Pause(Vertex /* next_vertex */),
-    Await(Lhs, Expr, Vertex /* next_vertex */),
+    MakeChannel(Lhs, Option<usize>, Vertex),
+    SetTimer(Lhs, Vertex),
+    UniqueId(Lhs, Vertex),
+    Send(Expr, Expr, Vertex),
+    Recv(Lhs, Expr, Vertex),
     SpinAwait(Expr, Vertex /* next_vertex */),
     Return(Expr),
     Cond(
@@ -95,42 +126,24 @@ pub enum Label {
     ForLoopIn(
         Lhs,
         Expr,
-        Vertex, /* body_vertex */
-        Vertex, /* next_vertex */
+        VarSlot, /* iterator_state_slot */
+        Vertex,  /* body_vertex */
+        Vertex,  /* next_vertex */
     ),
     Print(Expr, Vertex /* next_vertex */),
     Break(Vertex /* break_target_vertex */),
-    Lock(Expr, Vertex /* next_vertex */),
-    Unlock(Expr, Vertex /* next_vertex */),
+    Continue(Vertex /* continue_target_vertex */),
 }
 
-pub struct FutureValue {
-    pub value: Option<Value>,
-    pub waiters: Vec<Box<dyn FnMut(Value)>>,
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Cfg {
+    pub graph: Vec<Label>,
 }
 
-impl fmt::Debug for FutureValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FutureValue")
-            .field("value", &self.value)
-            .field("waiters", &format!("<{} waiters>", self.waiters.len()))
-            .finish()
+impl Cfg {
+    pub fn get_label(&self, v: Vertex) -> &Label {
+        &self.graph[v]
     }
-}
-
-#[derive(Debug, Clone)]
-pub enum Value {
-    VInt(i64),
-    VBool(bool),
-    VMap(Rc<RefCell<HashMap<Value, Value>>>),
-    VList(Rc<RefCell<Vec<Value>>>),
-    VOption(Option<Box<Value>>),
-    VFuture(Rc<RefCell<FutureValue>>),
-    VLock(Rc<RefCell<bool>>),
-    VNode(i64),
-    VString(String),
-    VUnit,
-    VTuple(Vec<Value>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -138,61 +151,233 @@ pub struct Program {
     // The CFG is just a list of all vertices.
     // The `Vertex` indices in `Label` and `FunctionInfo`
     // are indices into this Vec.
-    pub cfg: Vec<Label>,
+    pub cfg: Cfg,
 
-    // Map of function_name -> FunctionInfo
-    pub rpc: HashMap<String, FunctionInfo>,
+    // Map of function NameId -> FunctionInfo
+    pub rpc: HashMap<NameId, FunctionInfo>,
+
+    // Mapping from qualified function name strings to NameId
+    pub func_name_to_id: HashMap<String, NameId>,
+
+    // Mapping from NameId to original name (for debugging/display)
+    pub id_to_name: HashMap<NameId, String>,
+
+    // The next available NameId for generating new names
+    pub next_name_id: usize,
+
+    /// Maps vertices to their source statement spans.
+    /// Not all vertices have spans - compiler-generated vertices
+    /// (function entry/exit, etc.) will not appear in this map.
+    /// All vertices generated from compiling a statement share that statement's span.
+    #[serde(skip)]
+    pub vertex_to_span: HashMap<Vertex, Span>,
+
+    /// Maximum number of node-level slots used by any role in this program.
+    pub max_node_slots: u32,
+
+    /// Ordered list of role (NameId, original_name) pairs, in declaration order.
+    pub roles: Vec<(NameId, String)>,
+}
+
+impl Program {
+    /// Look up a function by its qualified name (e.g., "Node.Init").
+    /// Returns the FunctionInfo if found, None otherwise.
+    pub fn get_func_by_name(&self, name: &str) -> Option<&FunctionInfo> {
+        self.func_name_to_id
+            .get(name)
+            .and_then(|id| self.rpc.get(id))
+    }
 }
 
 pub struct Compiler {
     /// The CFG being built. New labels are pushed here.
     cfg: Vec<Label>,
-    /// Counter for generating fresh temporary variable names.
-    temp_counter: usize,
 
-    rpc_map: HashMap<String, FunctionInfo>,
+    rpc_map: HashMap<NameId, FunctionInfo>,
 
     func_sync_map: HashMap<NameId, bool>,
     func_qualifier_map: HashMap<NameId, String>,
+
+    /// Mapping from qualified function name strings to NameId
+    func_name_to_id: HashMap<String, NameId>,
+
+    /// Mapping from NameId to original name (for debugging/display)
+    id_to_name: HashMap<NameId, String>,
+
+    /// Counter for generating new NameIds for temp variables
+    next_name_id: usize,
+
+    /// Tracks the span of the statement currently being compiled
+    current_span: Option<Span>,
+    /// Maps each vertex to its source statement span
+    vertex_to_span: HashMap<Vertex, Span>,
+
+    /// Current function's local variable slot assignments
+    local_slots: HashMap<NameId, u32>,
+    next_local_slot: u32,
+
+    /// Node-level (role instance) variable slot assignments
+    node_slots: HashMap<NameId, u32>,
+    next_node_slot: u32,
+
+    /// Debug names for current function's slots
+    current_slot_names: Vec<String>,
+
+    /// Default values for current function's local slots
+    current_local_defaults: Vec<Expr>,
+
+    /// Maximum number of node-level slots encountered so far
+    max_node_slots: u32,
+
+    /// Ordered list of role (NameId, original_name)
+    roles: Vec<(NameId, String)>,
 }
 
-fn resolved_name(name_id: NameId, original_name: &str) -> String {
-    format!("{}_{}", name_id.0, original_name)
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Compiler {
     pub fn new() -> Self {
         Compiler {
             cfg: Vec::new(),
-            temp_counter: 0,
             rpc_map: HashMap::new(),
             func_sync_map: HashMap::new(),
             func_qualifier_map: HashMap::new(),
+            func_name_to_id: HashMap::new(),
+            id_to_name: HashMap::new(),
+            next_name_id: 0,
+            current_span: None,
+            vertex_to_span: HashMap::new(),
+            local_slots: HashMap::new(),
+            next_local_slot: 0,
+            node_slots: HashMap::new(),
+            next_node_slot: 1, // Slot 0 reserved for 'self'
+            current_slot_names: Vec::new(),
+            current_local_defaults: Vec::new(),
+            max_node_slots: 1,
+            roles: Vec::new(),
         }
     }
 
-    /// Allocates a new, unique temporary variable name.
-    fn new_temp_var(&mut self, locals: &mut Vec<(String, Expr)>) -> String {
-        let name = format!("_tmp{}", self.temp_counter);
-        self.temp_counter += 1;
-        locals.push((name.clone(), Expr::ENil));
-        name
+    /// Call when starting to compile a new role
+    fn begin_role(&mut self, var_inits: &[TypedVarInit]) {
+        self.node_slots.clear();
+        self.next_node_slot = 1; // Slot 0 reserved for 'self'
+
+        for init in var_inits {
+            self.node_slots.insert(init.name, self.next_node_slot);
+            self.next_node_slot += 1;
+        }
+
+        if self.next_node_slot > self.max_node_slots {
+            self.max_node_slots = self.next_node_slot;
+        }
+    }
+
+    /// Call when starting to compile a new function
+    fn begin_function(&mut self, params: &[(NameId, String)]) {
+        self.local_slots.clear();
+        self.next_local_slot = 0;
+        self.current_slot_names.clear();
+        self.current_local_defaults.clear();
+
+        for (name_id, name_str) in params {
+            self.local_slots.insert(*name_id, self.next_local_slot);
+            self.current_slot_names.push(name_str.clone());
+            self.next_local_slot += 1;
+            // Parameters don't need defaults as they are provided by caller
+        }
+    }
+
+    /// Allocate a local slot for a variable declaration
+    fn alloc_local_slot(&mut self, name_id: NameId, name_str: &str, default: Expr) -> u32 {
+        let slot = self.next_local_slot;
+        self.next_local_slot += 1;
+        self.local_slots.insert(name_id, slot);
+        self.current_slot_names.push(name_str.to_string());
+        self.current_local_defaults.push(default);
+        slot
+    }
+
+    /// Allocate an anonymous temp slot
+    fn alloc_temp_slot(&mut self) -> VarSlot {
+        let slot = self.next_local_slot;
+        self.next_local_slot += 1;
+        let name_str = format!("_tmp{}", slot);
+        let name_id = self.alloc_name_id(name_str);
+        self.current_slot_names.push(format!("_tmp{}", slot));
+        self.current_local_defaults.push(Expr::Unit);
+        VarSlot::Local(slot, name_id)
+    }
+
+    /// Look up the slot for a resolved variable
+    fn resolve_slot(&self, name_id: NameId) -> VarSlot {
+        if name_id == SELF_NAME {
+            return SELF_SLOT;
+        }
+        if let Some(&slot) = self.local_slots.get(&name_id) {
+            return VarSlot::Local(slot, name_id);
+        }
+        if let Some(&slot) = self.node_slots.get(&name_id) {
+            return VarSlot::Node(slot, name_id);
+        }
+        let var_name = self
+            .id_to_name
+            .get(&name_id)
+            .map(|s| s.as_str())
+            .unwrap_or("<unknown>");
+        panic!(
+            "Variable '{}' (NameId {:?}) not found in slot maps. \
+             This indicates a bug in the resolver or CFG builder.",
+            var_name, name_id
+        );
+    }
+
+    /// Allocates a new NameId and registers it with a display name.
+    fn alloc_name_id(&mut self, display_name: String) -> NameId {
+        let id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(id, display_name);
+        id
     }
 
     /// Adds a new label to the CFG and returns its Vertex index.
+    /// If current_span is set, associates this vertex with that span.
     fn add_label(&mut self, label: Label) -> Vertex {
         let vertex = self.cfg.len();
         self.cfg.push(label);
+
+        // Associate vertex with current statement span if available
+        if let Some(span) = self.current_span {
+            self.vertex_to_span.insert(vertex, span);
+        }
+
         vertex
+    }
+
+    /// Allocates a new NameId for a function and registers it.
+    fn alloc_func_name_id(&mut self, qualified_name: String) -> NameId {
+        let id = self.alloc_name_id(qualified_name.clone());
+        self.func_name_to_id.insert(qualified_name, id);
+        id
     }
 
     /// The main entry point.
     pub fn compile_program(mut self, program: TypedProgram) -> Program {
+        let next_name_id = program.next_name_id;
+        self.next_name_id = next_name_id;
+        // Initialize id_to_name from the resolver's map
+        self.id_to_name = program.id_to_name;
+
         // Build func_sync_map and compile all top-level definitions
         for def in &program.top_level_defs {
             match def {
                 TypedTopLevelDef::Role(role) => {
                     let qualifier = role.original_name.clone();
+                    self.roles.push((role.name, qualifier.clone()));
                     for func in &role.func_defs {
                         self.func_sync_map.insert(func.name, func.is_sync);
                         self.func_qualifier_map.insert(func.name, qualifier.clone());
@@ -205,115 +390,327 @@ impl Compiler {
         for def in program.top_level_defs {
             match def {
                 TypedTopLevelDef::Role(role) => {
+                    // Set up node-level slot assignments for this role
+                    self.begin_role(&role.var_inits);
+
                     // Compile role's var_inits into a special init function
-                    let init_fn = self.compile_init_func(
-                        &role.var_inits,
-                        format!("{}.{}", role.original_name, "BASE_NODE_INIT"),
-                    );
-                    self.rpc_map.insert(init_fn.name.clone(), init_fn);
+                    let init_func_name = format!("{}.{}", role.original_name, "BASE_NODE_INIT");
+                    let init_fn = self.compile_init_func(&role.var_inits, init_func_name);
+                    self.rpc_map.insert(init_fn.name, init_fn);
 
                     // Compile all other functions in the role
                     for func in role.func_defs {
                         let func_info = self.compile_func_def(func);
-                        self.rpc_map.insert(func_info.name.clone(), func_info);
+                        self.rpc_map.insert(func_info.name, func_info);
                     }
                 }
             }
         }
 
         Program {
-            cfg: self.cfg,
+            cfg: Cfg { graph: self.cfg },
             rpc: self.rpc_map,
+            func_name_to_id: self.func_name_to_id,
+            id_to_name: self.id_to_name,
+            next_name_id,
+            vertex_to_span: self.vertex_to_span,
+            max_node_slots: self.max_node_slots,
+            roles: self.roles,
         }
     }
 
-    fn compile_init_func(&mut self, inits: &[TypedVarInit], name: String) -> FunctionInfo {
-        let mut locals = Vec::new();
-        let return_var_name = self.new_temp_var(&mut locals);
-        let final_vertex = self.add_label(Label::Return(Expr::EVar(return_var_name.clone())));
+    fn compile_init_func(
+        &mut self,
+        inits: &[TypedVarInit],
+        qualified_name: String,
+    ) -> FunctionInfo {
+        // Begin a new function with no parameters
+        self.begin_function(&[]);
+
+        // Allocate a temp slot for the return value
+        let return_slot = self.alloc_temp_slot();
+        let final_vertex = self.add_label(Label::Return(Expr::Var(return_slot)));
 
         let mut next_vertex = final_vertex;
         // Build the init chain backwards
+        // These assign to NODE slots, not local slots
         for init in inits.iter().rev() {
-            let var_name = resolved_name(init.name, &init.original_name);
+            let node_slot = self.resolve_slot(init.name);
             next_vertex = self.compile_expr_to_value(
-                &mut locals,
                 &init.value,
-                Lhs::Var(var_name),
+                Lhs::Var(node_slot),
                 next_vertex,
+                final_vertex,
+                final_vertex,
+                final_vertex,
+                return_slot,
             );
         }
 
         let entry = self.add_label(Label::Instr(
-            Instr::Assign(Lhs::Var(return_var_name.clone()), Expr::EUnit),
+            Instr::Assign(Lhs::Var(return_slot), Expr::Unit),
             next_vertex,
         ));
 
-        if let Some(local) = locals.iter_mut().find(|(n, _)| *n == return_var_name) {
-            local.1 = Expr::EUnit;
-        }
+        let func_name_id = self.alloc_func_name_id(qualified_name);
 
         FunctionInfo {
             entry,
-            name,
-            formals: vec![],
-            locals, // Inits are "globals"
+            name: func_name_id,
+            param_count: 0,
+            local_slot_count: self.next_local_slot,
+            local_defaults: self.current_local_defaults.clone(),
             is_sync: true,
+            debug_slot_names: self.current_slot_names.clone(),
         }
     }
 
     fn compile_func_def(&mut self, func: TypedFuncDef) -> FunctionInfo {
-        let mut locals = self.scan_body(&func.body);
-        let return_var_name = self.new_temp_var(&mut locals);
-        let final_return_vertex =
-            self.add_label(Label::Return(Expr::EVar(return_var_name.clone())));
+        // Collect parameter info: (NameId, display_name)
+        let params: Vec<(NameId, String)> = func
+            .params
+            .iter()
+            .map(|p| (p.name, p.original_name.clone()))
+            .collect();
+        let param_count = params.len() as u32;
+
+        // Begin the function - this assigns slots to parameters
+        self.begin_function(&params);
+
+        // Scan the body for all local variable declarations and assign them slots
+        self.scan_and_assign_slots(&func.body);
+
+        // Allocate a temp slot for the return value
+        let return_slot = self.alloc_temp_slot();
+        let final_return_vertex = self.add_label(Label::Return(Expr::Var(return_slot)));
 
         let body_entry = self.compile_block(
-            &mut locals,
             &func.body,
             final_return_vertex,
             final_return_vertex, // `break_target` (breaks go to end of function)
+            final_return_vertex, // `continue_target`
             final_return_vertex, // `return_target`
-            &return_var_name,
+            return_slot,
         );
 
-        let formals = func
-            .params
-            .into_iter()
-            .map(|p| resolved_name(p.name, &p.original_name))
-            .collect();
-
-        if let Some(local) = locals.iter_mut().find(|(n, _)| *n == return_var_name) {
-            local.1 = Expr::EUnit;
-        }
-
         let entry = self.add_label(Label::Instr(
-            Instr::Assign(Lhs::Var(return_var_name.clone()), Expr::EUnit),
+            Instr::Assign(Lhs::Var(return_slot), Expr::Unit),
             body_entry,
         ));
 
-        let qualifier = self
-            .func_qualifier_map
-            .get(&func.name)
-            .expect("Function qualifier should exist in map");
+        let qualifier = self.func_qualifier_map.get(&func.name).unwrap_or_else(|| {
+            panic!(
+                "Function qualifier not found for function '{}'. \
+                     This indicates a bug in the CFG builder initialization.",
+                func.original_name
+            )
+        });
+
+        // Use the existing func.name NameId from the resolver, not a new one
+        let qualified_name = format!("{}.{}", qualifier, func.original_name);
+        self.func_name_to_id.insert(qualified_name, func.name);
 
         FunctionInfo {
             entry,
-            name: format!("{}.{}", qualifier, func.original_name),
-            formals,
-            locals,
+            name: func.name,
+            param_count,
+            local_slot_count: self.next_local_slot,
+            local_defaults: self.current_local_defaults.clone(),
             is_sync: func.is_sync,
+            debug_slot_names: self.current_slot_names.clone(),
+        }
+    }
+
+    /// Scan the function body for all local variable declarations and assign them slots.
+    fn scan_and_assign_slots(&mut self, body: &[TypedStatement]) {
+        for stmt in body {
+            self.scan_stmt_and_assign_slots(stmt);
+        }
+    }
+
+    fn scan_stmt_and_assign_slots(&mut self, stmt: &TypedStatement) {
+        match &stmt.kind {
+            TypedStatementKind::VarInit(init) => {
+                let name_str = self
+                    .id_to_name
+                    .get(&init.name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("var_{}", init.name.0));
+                self.alloc_local_slot(init.name, &name_str, Expr::Nil);
+                self.scan_expr_and_assign_slots(&init.value);
+            }
+            TypedStatementKind::Assignment(assign) => {
+                self.scan_expr_and_assign_slots(&assign.target);
+                self.scan_expr_and_assign_slots(&assign.value);
+            }
+            TypedStatementKind::Expr(expr) => {
+                self.scan_expr_and_assign_slots(expr);
+            }
+            TypedStatementKind::Return(expr) => {
+                self.scan_expr_and_assign_slots(expr);
+            }
+            TypedStatementKind::Conditional(cond) => {
+                self.scan_expr_and_assign_slots(&cond.if_branch.condition);
+                self.scan_body_and_assign_slots(&cond.if_branch.body);
+                for branch in &cond.elseif_branches {
+                    self.scan_expr_and_assign_slots(&branch.condition);
+                    self.scan_body_and_assign_slots(&branch.body);
+                }
+                if let Some(body) = &cond.else_branch {
+                    self.scan_body_and_assign_slots(body);
+                }
+            }
+            TypedStatementKind::ForLoop(fl) => {
+                match &fl.init {
+                    Some(TypedForLoopInit::VarInit(init)) => {
+                        let name_str = self
+                            .id_to_name
+                            .get(&init.name)
+                            .cloned()
+                            .unwrap_or_else(|| format!("var_{}", init.name.0));
+                        self.alloc_local_slot(init.name, &name_str, Expr::Nil);
+                        self.scan_expr_and_assign_slots(&init.value);
+                    }
+                    Some(TypedForLoopInit::Assignment(assign)) => {
+                        self.scan_expr_and_assign_slots(&assign.target);
+                        self.scan_expr_and_assign_slots(&assign.value);
+                    }
+                    None => {}
+                }
+                if let Some(cond) = &fl.condition {
+                    self.scan_expr_and_assign_slots(cond);
+                }
+                if let Some(inc) = &fl.increment {
+                    self.scan_expr_and_assign_slots(&inc.target);
+                    self.scan_expr_and_assign_slots(&inc.value);
+                }
+                self.scan_body_and_assign_slots(&fl.body);
+            }
+            TypedStatementKind::ForInLoop(loop_stmt) => {
+                self.scan_pattern_and_assign_slots(&loop_stmt.pattern);
+                self.scan_expr_and_assign_slots(&loop_stmt.iterable);
+                self.scan_body_and_assign_slots(&loop_stmt.body);
+            }
+            TypedStatementKind::Break => {}
+            TypedStatementKind::Continue => {}
+        }
+    }
+
+    fn scan_body_and_assign_slots(&mut self, body: &[TypedStatement]) {
+        for stmt in body {
+            self.scan_stmt_and_assign_slots(stmt);
+        }
+    }
+
+    fn scan_expr_and_assign_slots(&mut self, expr: &TypedExpr) {
+        use crate::analysis::types::TypedExprKind::*;
+        match &expr.kind {
+            BinOp(_, l, r)
+            | Append(l, r)
+            | Prepend(l, r)
+            | Min(l, r)
+            | Exists(l, r)
+            | Erase(l, r)
+            | Send(l, r)
+            | Index(l, r) => {
+                self.scan_expr_and_assign_slots(l);
+                self.scan_expr_and_assign_slots(r);
+            }
+            Not(e)
+            | Negate(e)
+            | Head(e)
+            | Tail(e)
+            | Len(e)
+            | UnwrapOptional(e)
+            | Recv(e)
+            | TupleAccess(e, _)
+            | FieldAccess(e, _)
+            | WrapInOptional(e) => {
+                self.scan_expr_and_assign_slots(e);
+            }
+            MakeChannel => {}
+            FuncCall(call) => match call {
+                TypedFuncCall::User(u) => {
+                    for arg in &u.args {
+                        self.scan_expr_and_assign_slots(arg);
+                    }
+                }
+                TypedFuncCall::Builtin(_, args, _) => {
+                    for arg in args {
+                        self.scan_expr_and_assign_slots(arg);
+                    }
+                }
+            },
+            MapLit(pairs) => {
+                for (k, v) in pairs {
+                    self.scan_expr_and_assign_slots(k);
+                    self.scan_expr_and_assign_slots(v);
+                }
+            }
+            ListLit(exprs) | TupleLit(exprs) => {
+                for e in exprs {
+                    self.scan_expr_and_assign_slots(e);
+                }
+            }
+            Slice(a, b, c) | Store(a, b, c) => {
+                self.scan_expr_and_assign_slots(a);
+                self.scan_expr_and_assign_slots(b);
+                self.scan_expr_and_assign_slots(c);
+            }
+            RpcCall(target, call) => {
+                self.scan_expr_and_assign_slots(target);
+                for arg in &call.args {
+                    self.scan_expr_and_assign_slots(arg);
+                }
+            }
+            Match(scrutinee, arms) => {
+                self.scan_expr_and_assign_slots(scrutinee);
+                for arm in arms {
+                    self.scan_pattern_and_assign_slots(&arm.pattern);
+                    self.scan_body_and_assign_slots(&arm.body);
+                }
+            }
+            VariantLit(_, _, payload) => {
+                if let Some(p) = payload {
+                    self.scan_expr_and_assign_slots(p);
+                }
+            }
+            StructLit(_, fields) => {
+                for (_, e) in fields {
+                    self.scan_expr_and_assign_slots(e);
+                }
+            }
+            Var(_, _) | IntLit(_) | StringLit(_) | BoolLit(_) | NilLit | SetTimer => {}
+        }
+    }
+
+    fn scan_pattern_and_assign_slots(&mut self, pat: &TypedPattern) {
+        match &pat.kind {
+            TypedPatternKind::Var(id, name) => {
+                self.alloc_local_slot(*id, name, Expr::Nil);
+            }
+            TypedPatternKind::Tuple(pats) => {
+                for p in pats {
+                    self.scan_pattern_and_assign_slots(p);
+                }
+            }
+            TypedPatternKind::Variant(_, _, payload) => {
+                if let Some(p) = payload {
+                    self.scan_pattern_and_assign_slots(p);
+                }
+            }
+            _ => {} // Wildcard doesn't add a named local
         }
     }
 
     fn compile_block(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         body: &[TypedStatement],
         next_vertex: Vertex,
         break_target: Vertex,
+        continue_target: Vertex,
         return_target: Vertex,
-        return_var: &str,
+        return_slot: VarSlot,
     ) -> Vertex {
         let mut next = next_vertex;
         // Iterate in reverse to chain statements:
@@ -322,115 +719,152 @@ impl Compiler {
         // ...
         // Stmt0 -> Stmt1
         for stmt in body.iter().rev() {
-            next =
-                self.compile_statement(locals, stmt, next, break_target, return_target, return_var);
+            next = self.compile_statement(
+                stmt,
+                next,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
+            );
         }
         next
     }
 
     fn compile_statement(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         stmt: &TypedStatement,
         next_vertex: Vertex,
         break_target: Vertex,
+        continue_target: Vertex,
         return_target: Vertex,
-        return_var: &str,
+        return_slot: VarSlot,
     ) -> Vertex {
-        match &stmt.kind {
+        // Save previous span and set current span
+        let prev_span = self.current_span;
+        self.current_span = Some(stmt.span);
+
+        let result = match &stmt.kind {
             TypedStatementKind::VarInit(init) => {
-                // Compile the value, assigning to the new variable
+                // Compile the value, assigning to the new variable's slot
+                let slot = self.resolve_slot(init.name);
                 self.compile_expr_to_value(
-                    locals,
                     &init.value,
-                    Lhs::Var(resolved_name(init.name, &init.original_name)),
+                    Lhs::Var(slot),
                     next_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
                 )
             }
             TypedStatementKind::Assignment(assign) => {
                 // Compile the value, assigning to the target LHS
                 let lhs = self.convert_lhs(&assign.target);
-                self.compile_expr_to_value(locals, &assign.value, lhs, next_vertex)
+                self.compile_expr_to_value(
+                    &assign.value,
+                    lhs,
+                    next_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
             TypedStatementKind::Expr(expr) => {
-                // Compile the expression, but discard the result into a dummy var
-                let dummy_var = self.new_temp_var(locals);
-                self.compile_expr_to_value(locals, expr, Lhs::Var(dummy_var), next_vertex)
+                // Compile the expression, but discard the result into a dummy slot
+                let dummy_slot = self.alloc_temp_slot();
+                self.compile_expr_to_value(
+                    expr,
+                    Lhs::Var(dummy_slot),
+                    next_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
             TypedStatementKind::Return(expr) => {
-                // Compile the expression, store result in the dedicated return_var,
+                // Compile the expression, store result in the dedicated return_slot,
                 // and then jump to the function's final return_target.
                 self.compile_expr_to_value(
-                    locals,
                     expr,
-                    Lhs::Var(return_var.to_string()),
+                    Lhs::Var(return_slot),
                     return_target,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
                 )
             }
             TypedStatementKind::ForLoop(loop_stmt) => {
-                self.compile_for_loop(locals, loop_stmt, next_vertex, return_target, return_var)
+                self.compile_for_loop(loop_stmt, next_vertex, return_target, return_slot)
             }
             TypedStatementKind::Conditional(cond) => self.compile_conditional(
-                locals,
                 cond,
                 next_vertex,
                 break_target,
+                continue_target,
                 return_target,
-                return_var,
+                return_slot,
             ),
             TypedStatementKind::ForInLoop(loop_stmt) => {
                 // `next_vertex` is the break target for a loop
-                self.compile_for_in_loop(locals, loop_stmt, next_vertex, return_target, return_var)
+                self.compile_for_in_loop(loop_stmt, next_vertex, return_target, return_slot)
             }
             TypedStatementKind::Break => self.add_label(Label::Break(break_target)),
-            TypedStatementKind::Lock(lock_expr, body) => self.compile_lock_statement(
-                locals,
-                lock_expr,
-                body,
-                next_vertex,
-                break_target,
-                return_target,
-                return_var,
-            ),
-        }
+            TypedStatementKind::Continue => self.add_label(Label::Continue(continue_target)),
+        };
+
+        // Restore previous span
+        self.current_span = prev_span;
+
+        result
     }
 
     fn compile_for_loop(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         loop_stmt: &TypedForLoop,
         next_vertex: Vertex,
         return_target: Vertex,
-        return_var: &str,
+        return_slot: VarSlot,
     ) -> Vertex {
-        let loop_head_vertex = self.add_label(Label::Return(Expr::EUnit));
+        let loop_head_vertex = self.add_label(Label::Return(Expr::Unit));
 
         let increment_vertex = match &loop_stmt.increment {
             Some(assign) => {
                 let lhs = self.convert_lhs(&assign.target);
-                self.compile_expr_to_value(locals, &assign.value, lhs, loop_head_vertex)
+                self.compile_expr_to_value(
+                    &assign.value,
+                    lhs,
+                    loop_head_vertex,
+                    next_vertex,
+                    next_vertex,
+                    return_target,
+                    return_slot,
+                )
             }
             None => loop_head_vertex,
         };
 
         let body_vertex = self.compile_block(
-            locals,
             &loop_stmt.body,
             increment_vertex, // After body, go to increment
             next_vertex,      // Break goes to exit
+            increment_vertex, // Continue goes to increment
             return_target,
-            return_var,
+            return_slot,
         );
 
-        let cond_var = self.new_temp_var(locals);
+        let cond_slot = self.alloc_temp_slot();
 
         let cond_check_vertex = self.add_label(Label::Cond(
-            Expr::EVar(cond_var.clone()),
+            Expr::Var(cond_slot),
             body_vertex, // True -> Body
             next_vertex, // False -> Exit
         ));
 
-        let cond_expr = loop_stmt.condition.as_ref().cloned().unwrap_or_else(|| {
+        let cond_expr = loop_stmt.condition.as_ref().cloned().unwrap_or({
             // If no condition, default to true
             TypedExpr {
                 kind: TypedExprKind::BoolLit(true),
@@ -439,24 +873,46 @@ impl Compiler {
             }
         });
 
-        let cond_calc_vertex =
-            self.compile_expr_to_value(locals, &cond_expr, Lhs::Var(cond_var), cond_check_vertex);
+        let cond_calc_vertex = self.compile_expr_to_value(
+            &cond_expr,
+            Lhs::Var(cond_slot),
+            cond_check_vertex,
+            next_vertex,
+            next_vertex,
+            return_target,
+            return_slot,
+        );
 
+        let dummy_slot = self.alloc_temp_slot();
         self.cfg[loop_head_vertex] = Label::Instr(
-            Instr::Assign(Lhs::Var(self.new_temp_var(locals)), Expr::EUnit),
+            Instr::Assign(Lhs::Var(dummy_slot), Expr::Unit),
             cond_calc_vertex,
         );
 
         match &loop_stmt.init {
-            Some(TypedForLoopInit::VarInit(vi)) => self.compile_expr_to_value(
-                locals,
-                &vi.value,
-                Lhs::Var(resolved_name(vi.name, &vi.original_name)),
-                loop_head_vertex,
-            ),
+            Some(TypedForLoopInit::VarInit(vi)) => {
+                let slot = self.resolve_slot(vi.name);
+                self.compile_expr_to_value(
+                    &vi.value,
+                    Lhs::Var(slot),
+                    loop_head_vertex,
+                    next_vertex,
+                    next_vertex,
+                    return_target,
+                    return_slot,
+                )
+            }
             Some(TypedForLoopInit::Assignment(assign)) => {
                 let lhs = self.convert_lhs(&assign.target);
-                self.compile_expr_to_value(locals, &assign.value, lhs, loop_head_vertex)
+                self.compile_expr_to_value(
+                    &assign.value,
+                    lhs,
+                    loop_head_vertex,
+                    next_vertex,
+                    next_vertex,
+                    return_target,
+                    return_slot,
+                )
             }
             None => loop_head_vertex,
         }
@@ -464,229 +920,366 @@ impl Compiler {
 
     fn compile_conditional(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         cond: &TypedCondStmts,
         next_vertex: Vertex,
         break_target: Vertex,
+        continue_target: Vertex,
         return_target: Vertex,
-        return_var: &str,
+        return_slot: VarSlot,
     ) -> Vertex {
         let else_vertex = cond.else_branch.as_ref().map_or(next_vertex, |body| {
             self.compile_block(
-                locals,
                 body,
                 next_vertex,
                 break_target,
+                continue_target,
                 return_target,
-                return_var,
+                return_slot,
             )
         });
 
         let mut next_cond_vertex = else_vertex;
         for branch in cond.elseif_branches.iter().rev() {
             let body_vertex = self.compile_block(
-                locals,
                 &branch.body,
                 next_vertex,
                 break_target,
+                continue_target,
                 return_target,
-                return_var,
+                return_slot,
             );
-            let cond_tmp = self.new_temp_var(locals);
+            let cond_slot = self.alloc_temp_slot();
             let check_vertex = self.add_label(Label::Cond(
-                Expr::EVar(cond_tmp.clone()),
+                Expr::Var(cond_slot),
                 body_vertex,
                 next_cond_vertex,
             ));
             next_cond_vertex = self.compile_expr_to_value(
-                locals,
                 &branch.condition,
-                Lhs::Var(cond_tmp),
+                Lhs::Var(cond_slot),
                 check_vertex,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
             );
         }
 
         let if_body_vertex = self.compile_block(
-            locals,
             &cond.if_branch.body,
             next_vertex,
             break_target,
+            continue_target,
             return_target,
-            return_var,
+            return_slot,
         );
-        let if_cond_tmp = self.new_temp_var(locals);
+        let if_cond_slot = self.alloc_temp_slot();
 
         let if_check_vertex = self.add_label(Label::Cond(
-            Expr::EVar(if_cond_tmp.clone()),
+            Expr::Var(if_cond_slot),
             if_body_vertex,
             next_cond_vertex,
         ));
 
         self.compile_expr_to_value(
-            locals,
             &cond.if_branch.condition,
-            Lhs::Var(if_cond_tmp),
+            Lhs::Var(if_cond_slot),
             if_check_vertex,
+            break_target,
+            continue_target,
+            return_target,
+            return_slot,
         )
     }
 
     fn compile_for_in_loop(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         loop_stmt: &TypedForInLoop,
         next_vertex: Vertex,
         return_target: Vertex,
-        return_var: &str,
+        return_slot: VarSlot,
     ) -> Vertex {
         // The [ForLoopIn] label is the "head" of the loop.
         // We add a dummy label to reserve its vertex index.
-        let for_vertex = self.add_label(Label::Return(Expr::EUnit)); // Dummy label
+        let for_vertex = self.add_label(Label::Return(Expr::Unit)); // Dummy label
 
         // Compile the [Body] block.
         // After it runs, it loops back to the [ForLoopIn] check.
         // Any `Break` inside it goes to `next_vertex`.
         let body_vertex = self.compile_block(
-            locals,
             &loop_stmt.body,
             for_vertex,  // Loop back to the ForLoopIn label
             next_vertex, // Break target
+            for_vertex,  // Continue target (start next iteration)
             return_target,
-            return_var,
+            return_slot,
         );
 
         // Now we create the real [ForLoopIn] label.
-        let lhs = self.convert_pattern(locals, &loop_stmt.pattern);
-        // We iterate over a local copy to avoid modification-during-iteration issues.
-        let iterable_copy_var = self.new_temp_var(locals);
+        let lhs = self.convert_pattern(&loop_stmt.pattern);
+        // Allocate a slot for the iterator state (the remaining collection)
+        let iter_state_slot = self.alloc_temp_slot();
+        let iterable_expr = self.convert_simple_expr(&loop_stmt.iterable);
+
         let for_label = Label::ForLoopIn(
             lhs,
-            Expr::EVar(iterable_copy_var.clone()),
-            body_vertex, // On iteration, go to body
-            next_vertex, // When done, exit loop
+            iterable_expr,   // The collection expression
+            iter_state_slot, // Iterator state slot
+            body_vertex,     // On iteration, go to body
+            next_vertex,     // When done, exit loop
         );
 
         // Replace the dummy label with the real one.
         self.cfg[for_vertex] = for_label;
 
-        // Compile the [Iterable] expression.
-        // This `Copy` instruction runs once, then goes to the [ForLoopIn] label.
-        let iterable_expr = self.convert_simple_expr(&loop_stmt.iterable);
-        let copy_vertex = self.add_label(Label::Instr(
-            Instr::Copy(Lhs::Var(iterable_copy_var), iterable_expr),
-            for_vertex, // After copy, go to the loop head
-        ));
-
-        // The entry point to the whole statement is the `Copy` instruction.
-        copy_vertex
+        // The entry point to the whole statement is the for_vertex.
+        for_vertex
     }
 
-    fn compile_lock_statement(
-        &mut self,
-        locals: &mut Vec<(String, Expr)>,
-        lock_expr: &TypedExpr,
-        body: &[TypedStatement],
-        next_vertex: Vertex,
-        break_target: Vertex,
-        return_target: Vertex,
-        return_var: &str,
-    ) -> Vertex {
-        let lock_var = self.new_temp_var(locals);
-        let lock_var_expr = Expr::EVar(lock_var.clone());
-
-        let unlock_then_break_vertex =
-            self.add_label(Label::Unlock(lock_var_expr.clone(), break_target));
-
-        let unlock_then_return_vertex =
-            self.add_label(Label::Unlock(lock_var_expr.clone(), return_target));
-
-        let unlock_then_continue_vertex =
-            self.add_label(Label::Unlock(lock_var_expr.clone(), next_vertex));
-
-        let body_vertex = self.compile_block(
-            locals,
-            body,
-            unlock_then_continue_vertex, // next_vertex for the block
-            unlock_then_break_vertex,    // break_target for the block
-            unlock_then_return_vertex,   // return_target for the block
-            return_var,
-        );
-
-        // Create the Lock label, which runs before the body
-        let lock_vertex = self.add_label(Label::Lock(lock_var_expr, body_vertex));
-
-        let entry_vertex =
-            self.compile_expr_to_value(locals, lock_expr, Lhs::Var(lock_var), lock_vertex);
-
-        entry_vertex
-    }
-
-    // Helper to generate temp vars and EVar expressions for a list
-    fn compile_temp_list(
-        &mut self,
-        locals: &mut Vec<(String, Expr)>,
-        count: usize,
-    ) -> (Vec<String>, Vec<Expr>) {
+    // Helper to generate temp slots and Expr::Var expressions for a list
+    fn compile_temp_list(&mut self, count: usize) -> (Vec<VarSlot>, Vec<Expr>) {
         (0..count)
             .map(|_| {
-                let tmp = self.new_temp_var(locals);
-                (tmp.clone(), Expr::EVar(tmp))
+                let slot = self.alloc_temp_slot();
+                (slot, Expr::Var(slot))
             })
             .unzip()
     }
 
-    // Helper to generate temp vars and EVar expressions for (key, value) pairs
+    // Helper to generate temp slots and Expr::Var expressions for (key, value) pairs
     fn compile_temp_pairs(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         count: usize,
-    ) -> (Vec<String>, Vec<String>, Vec<(Expr, Expr)>) {
-        let mut key_tmps = Vec::with_capacity(count);
-        let mut val_tmps = Vec::with_capacity(count);
+    ) -> (Vec<VarSlot>, Vec<VarSlot>, Vec<(Expr, Expr)>) {
+        let mut key_slots = Vec::with_capacity(count);
+        let mut val_slots = Vec::with_capacity(count);
         let mut simple_pairs = Vec::with_capacity(count);
         for _ in 0..count {
-            let key_tmp = self.new_temp_var(locals);
-            let val_tmp = self.new_temp_var(locals);
-            simple_pairs.push((Expr::EVar(key_tmp.clone()), Expr::EVar(val_tmp.clone())));
-            key_tmps.push(key_tmp);
-            val_tmps.push(val_tmp);
+            let key_slot = self.alloc_temp_slot();
+            let val_slot = self.alloc_temp_slot();
+            simple_pairs.push((Expr::Var(key_slot), Expr::Var(val_slot)));
+            key_slots.push(key_slot);
+            val_slots.push(val_slot);
         }
-        (key_tmps, val_tmps, simple_pairs)
+        (key_slots, val_slots, simple_pairs)
     }
 
-    // Helper to recursively compile a list of expressions into a list of temp vars
+    // Helper to recursively compile a list of expressions into a list of temp slots
     fn compile_expr_list_recursive<'a, I>(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         exprs: I,
-        tmps: Vec<String>,
+        slots: Vec<VarSlot>,
         next_vertex: Vertex,
+        break_target: Vertex,
+        continue_target: Vertex,
+        return_target: Vertex,
+        return_slot: VarSlot,
     ) -> Vertex
     where
         I: DoubleEndedIterator<Item = &'a TypedExpr>,
     {
         let mut next = next_vertex;
-        for (expr, tmp) in exprs.rev().zip(tmps.iter().rev()) {
-            next = self.compile_expr_to_value(locals, expr, Lhs::Var(tmp.clone()), next);
+        for (expr, slot) in exprs.rev().zip(slots.iter().rev()) {
+            next = self.compile_expr_to_value(
+                expr,
+                Lhs::Var(*slot),
+                next,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
+            );
         }
         next
     }
 
+    /// Compile a match expression into a chain of conditional checks.
+    /// Each arm checks if the scrutinee matches a specific variant.
+    fn compile_match(
+        &mut self,
+        scrutinee: &TypedExpr,
+        arms: &[TypedMatchArm],
+        target: Lhs,
+        next_vertex: Vertex,
+        break_target: Vertex,
+        continue_target: Vertex,
+        return_target: Vertex,
+        return_slot: VarSlot,
+    ) -> Vertex {
+        // Allocate a temp slot for the scrutinee value
+        let scrutinee_slot = self.alloc_temp_slot();
+
+        // Build the match arms from last to first (backwards chaining)
+        // The "else" for the last arm is just next_vertex (exhaustive match assumed)
+        let mut current_else_vertex = next_vertex;
+
+        for arm in arms.iter().rev() {
+            // Get variant info from pattern
+            let (variant_name, payload_pattern) = match &arm.pattern.kind {
+                TypedPatternKind::Variant(_, name, payload_pat) => {
+                    (name.clone(), payload_pat.clone())
+                }
+                _ => {
+                    // For non-variant patterns (e.g., wildcard), treat as default case
+                    let body_vertex = self.compile_match_arm_body(
+                        &arm.body,
+                        target.clone(),
+                        next_vertex,
+                        break_target,
+                        continue_target,
+                        return_target,
+                        return_slot,
+                    );
+                    current_else_vertex = body_vertex;
+                    continue;
+                }
+            };
+
+            // Compile the arm body with optional payload binding
+            let body_start = if let Some(payload_pat) = payload_pattern {
+                // Extract payload and bind it
+                let payload_lhs = self.convert_pattern(&payload_pat);
+
+                // Body vertex (compiles arm body statements)
+                let body_vertex = self.compile_match_arm_body(
+                    &arm.body,
+                    target.clone(),
+                    next_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+
+                // Extract payload: payload_lhs = VariantPayload(scrutinee)
+                let extract_vertex = self.add_label(Label::Instr(
+                    Instr::Assign(
+                        payload_lhs,
+                        Expr::VariantPayload(Box::new(Expr::Var(scrutinee_slot))),
+                    ),
+                    body_vertex,
+                ));
+
+                extract_vertex
+            } else {
+                // No payload to bind, just compile the body
+                self.compile_match_arm_body(
+                    &arm.body,
+                    target.clone(),
+                    next_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            };
+
+            // Create conditional: if IsVariant(scrutinee, variant_name) then body else next_arm
+            let cond_vertex = self.add_label(Label::Cond(
+                Expr::IsVariant(
+                    Box::new(Expr::Var(scrutinee_slot)),
+                    EcoString::from(variant_name.as_str()),
+                ),
+                body_start,
+                current_else_vertex,
+            ));
+
+            current_else_vertex = cond_vertex;
+        }
+
+        // Compile scrutinee evaluation -> first arm check
+        self.compile_expr_to_value(
+            scrutinee,
+            Lhs::Var(scrutinee_slot),
+            current_else_vertex,
+            break_target,
+            continue_target,
+            return_target,
+            return_slot,
+        )
+    }
+
+    /// Helper to compile the body of a match arm.
+    /// The body is a list of statements; the last expression (if any) determines the result.
+    fn compile_match_arm_body(
+        &mut self,
+        body: &[TypedStatement],
+        target: Lhs,
+        next_vertex: Vertex,
+        break_target: Vertex,
+        continue_target: Vertex,
+        return_target: Vertex,
+        return_slot: VarSlot,
+    ) -> Vertex {
+        if body.is_empty() {
+            // Empty body: assign unit to target
+            return self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+        }
+
+        // Check if the last statement is an expression (which becomes the match result)
+        let last_stmt = body.last().unwrap();
+        let (init_stmts, result_vertex) = if let TypedStatementKind::Expr(expr) = &last_stmt.kind {
+            // Last stmt is an expression: compile it as the result
+            let result_vertex = self.compile_expr_to_value(
+                expr,
+                target,
+                next_vertex,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
+            );
+            (&body[..body.len() - 1], result_vertex)
+        } else if let TypedStatementKind::Return(_) = &last_stmt.kind {
+            // Return statement: compile all statements (return will handle the jump)
+            // We use a placeholder for return target/slot, but proper handling
+            // requires access to the function's return context
+            let unit_vertex =
+                self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+            (body, unit_vertex)
+        } else {
+            // Last stmt is not an expression: result is unit
+            let unit_vertex =
+                self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+            (body, unit_vertex)
+        };
+
+        // Compile remaining statements in reverse order
+        let mut current_vertex = result_vertex;
+        for stmt in init_stmts.iter().rev() {
+            // Note: We use dummy break/return targets here since match arms
+            // shouldn't contain break statements (they're not in a loop).
+            // Return is also simplified - a full implementation would need
+            // to thread through the function's return context.
+            current_vertex = self.compile_statement(
+                stmt,
+                current_vertex,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
+            );
+        }
+
+        current_vertex
+    }
+
     fn convert_simple_binop(&mut self, op: &BinOp, left: Box<Expr>, right: Box<Expr>) -> Expr {
         match op {
-            BinOp::Add => Expr::EPlus(left, right),
-            BinOp::Subtract => Expr::EMinus(left, right),
-            BinOp::Multiply => Expr::ETimes(left, right),
-            BinOp::Divide => Expr::EDiv(left, right),
-            BinOp::Modulo => Expr::EMod(left, right),
-            BinOp::And => Expr::EAnd(left, right),
-            BinOp::Or => Expr::EOr(left, right),
-            BinOp::Equal => Expr::EEqualsEquals(left, right),
-            BinOp::NotEqual => Expr::ENot(Box::new(Expr::EEqualsEquals(left, right))),
-            BinOp::Less => Expr::ELessThan(left, right),
-            BinOp::LessEqual => Expr::ELessThanEquals(left, right),
-            BinOp::Greater => Expr::EGreaterThan(left, right),
-            BinOp::GreaterEqual => Expr::EGreaterThanEquals(left, right),
-            BinOp::Coalesce => Expr::ECoalesce(left, right),
+            BinOp::Add => Expr::Plus(left, right),
+            BinOp::Subtract => Expr::Minus(left, right),
+            BinOp::Multiply => Expr::Times(left, right),
+            BinOp::Divide => Expr::Div(left, right),
+            BinOp::Modulo => Expr::Mod(left, right),
+            BinOp::And => Expr::And(left, right),
+            BinOp::Or => Expr::Or(left, right),
+            BinOp::Equal => Expr::EqualsEquals(left, right),
+            BinOp::NotEqual => Expr::Not(Box::new(Expr::EqualsEquals(left, right))),
+            BinOp::Less => Expr::LessThan(left, right),
+            BinOp::LessEqual => Expr::LessThanEquals(left, right),
+            BinOp::Greater => Expr::GreaterThan(left, right),
+            BinOp::GreaterEqual => Expr::GreaterThanEquals(left, right),
+            BinOp::Coalesce => Expr::Coalesce(left, right),
         }
     }
 
@@ -695,385 +1288,712 @@ impl Compiler {
     /// Returns the entry vertex for this sequence of instructions.
     fn compile_expr_to_value(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         expr: &TypedExpr,
         target: Lhs,
         next_vertex: Vertex,
+        break_target: Vertex,
+        continue_target: Vertex,
+        return_target: Vertex,
+        return_slot: VarSlot,
     ) -> Vertex {
         match &expr.kind {
             // --- Complex, side-effecting cases ---
-            TypedExprKind::FuncCall(call) => {
-                self.compile_func_call(locals, call, target, next_vertex)
+            TypedExprKind::FuncCall(call) => self.compile_func_call(
+                call,
+                target,
+                next_vertex,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
+            ),
+            TypedExprKind::RpcCall(target_expr, call) => self.compile_rpc_call(
+                target_expr,
+                call,
+                target,
+                next_vertex,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
+            ),
+            TypedExprKind::MakeChannel => {
+                self.add_label(Label::MakeChannel(target, None, next_vertex))
             }
-            TypedExprKind::RpcCall(target_expr, call) => {
-                self.compile_rpc_call(locals, target_expr, call, target, next_vertex)
-            }
-            TypedExprKind::Await(e) => {
-                let future_var = self.new_temp_var(locals);
-                // The Await label takes the `target` Lhs directly.
-                // This is where the result of the future will be stored.
-                let await_label = Label::Await(target, Expr::EVar(future_var.clone()), next_vertex);
-                let await_vertex = self.add_label(await_label);
-                // Compile the inner expression `e` to get the future,
-                // storing it in `future_var`.
-                self.compile_expr_to_value(locals, e, Lhs::Var(future_var), await_vertex)
-            }
-            TypedExprKind::SpinAwait(e) => {
-                let bool_var = self.new_temp_var(locals);
+            TypedExprKind::Send(chan_expr, val_expr) => {
+                let chan_tmp = self.alloc_temp_slot();
+                let val_tmp = self.alloc_temp_slot();
 
-                // 1. Assign unit to the target, which runs *after* the spinawait.
-                let assign_unit_vertex = self.add_label(Label::Instr(
-                    Instr::Assign(target, Expr::EUnit),
-                    next_vertex,
+                let assign_unit_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+
+                let send_vertex = self.add_label(Label::Send(
+                    Expr::Var(chan_tmp),
+                    Expr::Var(val_tmp),
+                    assign_unit_vertex,
                 ));
 
-                // 2. The SpinAwait label. It just blocks, then goes to assign unit.
-                let spin_label = Label::SpinAwait(Expr::EVar(bool_var.clone()), assign_unit_vertex);
-                let spin_vertex = self.add_label(spin_label);
-
-                // 3. Compile the inner expression `e` to get the boolean,
-                //    storing it in `bool_var`.
-                self.compile_expr_to_value(locals, e, Lhs::Var(bool_var), spin_vertex)
+                let val_vertex = self.compile_expr_to_value(
+                    val_expr,
+                    Lhs::Var(val_tmp),
+                    send_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    chan_expr,
+                    Lhs::Var(chan_tmp),
+                    val_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            }
+            TypedExprKind::Recv(chan_expr) => {
+                let chan_tmp = self.alloc_temp_slot();
+                let recv_vertex =
+                    self.add_label(Label::Recv(target, Expr::Var(chan_tmp), next_vertex));
+                self.compile_expr_to_value(
+                    chan_expr,
+                    Lhs::Var(chan_tmp),
+                    recv_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::BinOp(op, l, r) => {
                 match op {
                     BinOp::And => {
                         let assign_false_vertex = self.add_label(Label::Instr(
-                            Instr::Assign(target.clone(), Expr::EBool(false)),
+                            Instr::Assign(target.clone(), Expr::Bool(false)),
                             next_vertex,
                         ));
 
-                        let eval_right_vertex =
-                            self.compile_expr_to_value(locals, r, target.clone(), next_vertex);
+                        let eval_right_vertex = self.compile_expr_to_value(
+                            r,
+                            target.clone(),
+                            next_vertex,
+                            break_target,
+                            continue_target,
+                            return_target,
+                            return_slot,
+                        );
 
                         // Branch based on Left result
-                        let l_tmp = self.new_temp_var(locals);
+                        let l_tmp = self.alloc_temp_slot();
                         let cond_vertex = self.add_label(Label::Cond(
-                            Expr::EVar(l_tmp.clone()),
+                            Expr::Var(l_tmp),
                             eval_right_vertex,   // If True: evaluate right
                             assign_false_vertex, // If False: short-circuit to false
                         ));
 
-                        self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), cond_vertex)
+                        self.compile_expr_to_value(
+                            l,
+                            Lhs::Var(l_tmp),
+                            cond_vertex,
+                            break_target,
+                            continue_target,
+                            return_target,
+                            return_slot,
+                        )
                     }
                     BinOp::Or => {
                         let assign_true_vertex = self.add_label(Label::Instr(
-                            Instr::Assign(target.clone(), Expr::EBool(true)),
+                            Instr::Assign(target.clone(), Expr::Bool(true)),
                             next_vertex,
                         ));
 
-                        let eval_right_vertex =
-                            self.compile_expr_to_value(locals, r, target.clone(), next_vertex);
+                        let eval_right_vertex = self.compile_expr_to_value(
+                            r,
+                            target.clone(),
+                            next_vertex,
+                            break_target,
+                            continue_target,
+                            return_target,
+                            return_slot,
+                        );
 
                         // Branch based on Left result
-                        let l_tmp = self.new_temp_var(locals);
+                        let l_tmp = self.alloc_temp_slot();
                         let cond_vertex = self.add_label(Label::Cond(
-                            Expr::EVar(l_tmp.clone()),
+                            Expr::Var(l_tmp),
                             assign_true_vertex, // If True: short-circuit to true
                             eval_right_vertex,  // If False: evaluate right
                         ));
 
-                        self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), cond_vertex)
+                        self.compile_expr_to_value(
+                            l,
+                            Lhs::Var(l_tmp),
+                            cond_vertex,
+                            break_target,
+                            continue_target,
+                            return_target,
+                            return_slot,
+                        )
                     }
                     _ => {
                         // Standard strict evaluation for non-boolean ops (+, -, *, etc.)
-                        let l_tmp = self.new_temp_var(locals);
-                        let r_tmp = self.new_temp_var(locals);
-                        let l_expr = Box::new(Expr::EVar(l_tmp.clone()));
-                        let r_expr = Box::new(Expr::EVar(r_tmp.clone()));
+                        let l_tmp = self.alloc_temp_slot();
+                        let r_tmp = self.alloc_temp_slot();
+                        let l_expr = Box::new(Expr::Var(l_tmp));
+                        let r_expr = Box::new(Expr::Var(r_tmp));
                         let final_expr = self.convert_simple_binop(op, l_expr, r_expr);
 
                         let assign_vertex = self.add_label(Label::Instr(
                             Instr::Assign(target, final_expr),
                             next_vertex,
                         ));
-                        let r_vertex =
-                            self.compile_expr_to_value(locals, r, Lhs::Var(r_tmp), assign_vertex);
-                        let l_vertex =
-                            self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), r_vertex);
-                        l_vertex
+                        let r_vertex = self.compile_expr_to_value(
+                            r,
+                            Lhs::Var(r_tmp),
+                            assign_vertex,
+                            break_target,
+                            continue_target,
+                            return_target,
+                            return_slot,
+                        );
+
+                        self.compile_expr_to_value(
+                            l,
+                            Lhs::Var(l_tmp),
+                            r_vertex,
+                            break_target,
+                            continue_target,
+                            return_target,
+                            return_slot,
+                        )
                     }
                 }
             }
 
             TypedExprKind::Not(e) => {
-                let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::ENot(Box::new(Expr::EVar(e_tmp.clone())));
+                let e_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::Not(Box::new(Expr::Var(e_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    e,
+                    Lhs::Var(e_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Negate(e) => {
-                let e_tmp = self.new_temp_var(locals);
-                let final_expr =
-                    Expr::EMinus(Box::new(Expr::EInt(0)), Box::new(Expr::EVar(e_tmp.clone())));
+                let e_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::Minus(Box::new(Expr::Int(0)), Box::new(Expr::Var(e_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    e,
+                    Lhs::Var(e_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::MapLit(pairs) => {
-                let (key_tmps, val_tmps, simple_pairs) =
-                    self.compile_temp_pairs(locals, pairs.len());
-                let final_expr = Expr::EMap(simple_pairs);
+                let (key_tmps, val_tmps, simple_pairs) = self.compile_temp_pairs(pairs.len());
+                let final_expr = Expr::Map(simple_pairs);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
                 let keys_entry_vertex = self.compile_expr_list_recursive(
-                    locals,
                     pairs.iter().map(|(k, _v)| k),
                     key_tmps,
                     assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
                 );
 
                 self.compile_expr_list_recursive(
-                    locals,
                     pairs.iter().map(|(_k, v)| v),
                     val_tmps,
                     keys_entry_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
                 )
             }
 
             TypedExprKind::ListLit(items) => {
-                let (tmps, simple_exprs) = self.compile_temp_list(locals, items.len());
-                let final_expr = Expr::EList(simple_exprs);
+                let (tmps, simple_exprs) = self.compile_temp_list(items.len());
+                let final_expr = Expr::List(simple_exprs);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_list_recursive(locals, items.iter(), tmps, assign_vertex)
+                self.compile_expr_list_recursive(
+                    items.iter(),
+                    tmps,
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::TupleLit(items) => {
-                let (tmps, simple_exprs) = self.compile_temp_list(locals, items.len());
-                let final_expr = Expr::ETuple(simple_exprs);
+                let (tmps, simple_exprs) = self.compile_temp_list(items.len());
+                let final_expr = Expr::Tuple(simple_exprs);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_list_recursive(locals, items.iter(), tmps, assign_vertex)
+                self.compile_expr_list_recursive(
+                    items.iter(),
+                    tmps,
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Append(l, i) => {
-                let l_tmp = self.new_temp_var(locals);
-                let i_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListAppend(
-                    Box::new(Expr::EVar(l_tmp.clone())),
-                    Box::new(Expr::EVar(i_tmp.clone())),
-                );
+                let l_tmp = self.alloc_temp_slot();
+                let i_tmp = self.alloc_temp_slot();
+                let final_expr =
+                    Expr::ListAppend(Box::new(Expr::Var(l_tmp)), Box::new(Expr::Var(i_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                let i_vertex =
-                    self.compile_expr_to_value(locals, i, Lhs::Var(i_tmp), assign_vertex);
-                self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), i_vertex)
+                let i_vertex = self.compile_expr_to_value(
+                    i,
+                    Lhs::Var(i_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    l,
+                    Lhs::Var(l_tmp),
+                    i_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Prepend(i, l) => {
-                let i_tmp = self.new_temp_var(locals);
-                let l_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListPrepend(
-                    Box::new(Expr::EVar(i_tmp.clone())),
-                    Box::new(Expr::EVar(l_tmp.clone())),
-                );
+                let i_tmp = self.alloc_temp_slot();
+                let l_tmp = self.alloc_temp_slot();
+                let final_expr =
+                    Expr::ListPrepend(Box::new(Expr::Var(i_tmp)), Box::new(Expr::Var(l_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                let l_vertex =
-                    self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), assign_vertex);
-                self.compile_expr_to_value(locals, i, Lhs::Var(i_tmp), l_vertex)
+                let l_vertex = self.compile_expr_to_value(
+                    l,
+                    Lhs::Var(l_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    i,
+                    Lhs::Var(i_tmp),
+                    l_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Len(e) => {
-                let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListLen(Box::new(Expr::EVar(e_tmp.clone())));
+                let e_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::ListLen(Box::new(Expr::Var(e_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    e,
+                    Lhs::Var(e_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Min(l, r) => {
-                let l_tmp = self.new_temp_var(locals);
-                let r_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EMin(
-                    Box::new(Expr::EVar(l_tmp.clone())),
-                    Box::new(Expr::EVar(r_tmp.clone())),
-                );
+                let l_tmp = self.alloc_temp_slot();
+                let r_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::Min(Box::new(Expr::Var(l_tmp)), Box::new(Expr::Var(r_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                let r_vertex =
-                    self.compile_expr_to_value(locals, r, Lhs::Var(r_tmp), assign_vertex);
-                self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), r_vertex)
+                let r_vertex = self.compile_expr_to_value(
+                    r,
+                    Lhs::Var(r_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    l,
+                    Lhs::Var(l_tmp),
+                    r_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Exists(map, key) => {
-                let map_tmp = self.new_temp_var(locals);
-                let key_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EKeyExists(
-                    Box::new(Expr::EVar(key_tmp.clone())),
-                    Box::new(Expr::EVar(map_tmp.clone())),
-                );
+                let map_tmp = self.alloc_temp_slot();
+                let key_tmp = self.alloc_temp_slot();
+                let final_expr =
+                    Expr::KeyExists(Box::new(Expr::Var(key_tmp)), Box::new(Expr::Var(map_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                let key_vertex =
-                    self.compile_expr_to_value(locals, key, Lhs::Var(key_tmp), assign_vertex);
-                self.compile_expr_to_value(locals, map, Lhs::Var(map_tmp), key_vertex)
+                let key_vertex = self.compile_expr_to_value(
+                    key,
+                    Lhs::Var(key_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    map,
+                    Lhs::Var(map_tmp),
+                    key_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Erase(map, key) => {
-                let map_tmp = self.new_temp_var(locals);
-                let key_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EMapErase(
-                    Box::new(Expr::EVar(key_tmp.clone())),
-                    Box::new(Expr::EVar(map_tmp.clone())),
-                );
+                let map_tmp = self.alloc_temp_slot();
+                let key_tmp = self.alloc_temp_slot();
+                let final_expr =
+                    Expr::MapErase(Box::new(Expr::Var(key_tmp)), Box::new(Expr::Var(map_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                let key_vertex =
-                    self.compile_expr_to_value(locals, key, Lhs::Var(key_tmp), assign_vertex);
-                self.compile_expr_to_value(locals, map, Lhs::Var(map_tmp), key_vertex)
+                let key_vertex = self.compile_expr_to_value(
+                    key,
+                    Lhs::Var(key_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    map,
+                    Lhs::Var(map_tmp),
+                    key_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Head(l) => {
-                let l_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListAccess(Box::new(Expr::EVar(l_tmp.clone())), 0);
+                let l_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::ListAccess(Box::new(Expr::Var(l_tmp)), 0);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    l,
+                    Lhs::Var(l_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Tail(l) => {
-                let l_tmp = self.new_temp_var(locals);
-                let list_expr = Expr::EVar(l_tmp.clone());
-                let final_expr = Expr::EListSubsequence(
+                let l_tmp = self.alloc_temp_slot();
+                let list_expr = Expr::Var(l_tmp);
+                let final_expr = Expr::ListSubsequence(
                     Box::new(list_expr.clone()),
-                    Box::new(Expr::EInt(1)),
-                    Box::new(Expr::EListLen(Box::new(list_expr))),
+                    Box::new(Expr::Int(1)),
+                    Box::new(Expr::ListLen(Box::new(list_expr))),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, l, Lhs::Var(l_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    l,
+                    Lhs::Var(l_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Index(target_expr, index_expr) => {
-                let target_tmp = self.new_temp_var(locals);
-                let index_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EFind(
-                    Box::new(Expr::EVar(target_tmp.clone())),
-                    Box::new(Expr::EVar(index_tmp.clone())),
+                let target_tmp = self.alloc_temp_slot();
+                let index_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::Find(
+                    Box::new(Expr::Var(target_tmp)),
+                    Box::new(Expr::Var(index_tmp)),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
                 let index_vertex = self.compile_expr_to_value(
-                    locals,
                     index_expr,
                     Lhs::Var(index_tmp),
                     assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
                 );
-                self.compile_expr_to_value(locals, target_expr, Lhs::Var(target_tmp), index_vertex)
+                self.compile_expr_to_value(
+                    target_expr,
+                    Lhs::Var(target_tmp),
+                    index_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::Slice(target_expr, start_expr, end_expr) => {
-                let target_tmp = self.new_temp_var(locals);
-                let start_tmp = self.new_temp_var(locals);
-                let end_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EListSubsequence(
-                    Box::new(Expr::EVar(target_tmp.clone())),
-                    Box::new(Expr::EVar(start_tmp.clone())),
-                    Box::new(Expr::EVar(end_tmp.clone())),
+                let target_tmp = self.alloc_temp_slot();
+                let start_tmp = self.alloc_temp_slot();
+                let end_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::ListSubsequence(
+                    Box::new(Expr::Var(target_tmp)),
+                    Box::new(Expr::Var(start_tmp)),
+                    Box::new(Expr::Var(end_tmp)),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                let end_vertex =
-                    self.compile_expr_to_value(locals, end_expr, Lhs::Var(end_tmp), assign_vertex);
-                let start_vertex =
-                    self.compile_expr_to_value(locals, start_expr, Lhs::Var(start_tmp), end_vertex);
-                self.compile_expr_to_value(locals, target_expr, Lhs::Var(target_tmp), start_vertex)
+                let end_vertex = self.compile_expr_to_value(
+                    end_expr,
+                    Lhs::Var(end_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                let start_vertex = self.compile_expr_to_value(
+                    start_expr,
+                    Lhs::Var(start_tmp),
+                    end_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    target_expr,
+                    Lhs::Var(target_tmp),
+                    start_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::TupleAccess(tuple_expr, index) => {
-                let tuple_tmp = self.new_temp_var(locals);
-                let final_expr =
-                    Expr::ETupleAccess(Box::new(Expr::EVar(tuple_tmp.clone())), *index);
+                let tuple_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::TupleAccess(Box::new(Expr::Var(tuple_tmp)), *index);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, tuple_expr, Lhs::Var(tuple_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    tuple_expr,
+                    Lhs::Var(tuple_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::FieldAccess(target_expr, field) => {
-                let target_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EFind(
-                    Box::new(Expr::EVar(target_tmp.clone())),
-                    Box::new(Expr::EString(field.clone())),
+                let target_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::Find(
+                    Box::new(Expr::Var(target_tmp)),
+                    Box::new(Expr::String(EcoString::from(field.as_str()))),
                 );
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, target_expr, Lhs::Var(target_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    target_expr,
+                    Lhs::Var(target_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::UnwrapOptional(e) => {
-                let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::EUnwrap(Box::new(Expr::EVar(e_tmp.clone())));
+                let e_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::Unwrap(Box::new(Expr::Var(e_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    e,
+                    Lhs::Var(e_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::WrapInOptional(e) => {
-                let e_tmp = self.new_temp_var(locals);
-                let final_expr = Expr::ESome(Box::new(Expr::EVar(e_tmp.clone())));
+                let e_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::Some(Box::new(Expr::Var(e_tmp)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_to_value(locals, e, Lhs::Var(e_tmp), assign_vertex)
+                self.compile_expr_to_value(
+                    e,
+                    Lhs::Var(e_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
             TypedExprKind::StructLit(_, fields) => {
                 let (field_names, val_exprs): (Vec<_>, Vec<_>) = fields.iter().cloned().unzip();
-                let (tmps, simple_exprs) = self.compile_temp_list(locals, val_exprs.len());
+                let (tmps, simple_exprs) = self.compile_temp_list(val_exprs.len());
                 let final_pairs = field_names
                     .into_iter()
-                    .map(Expr::EString)
+                    .map(|s| Expr::String(EcoString::from(s.as_str())))
                     .zip(simple_exprs)
                     .collect();
-                let final_expr = Expr::EMap(final_pairs);
+                let final_expr = Expr::Map(final_pairs);
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
-                self.compile_expr_list_recursive(locals, val_exprs.iter(), tmps, assign_vertex)
+                self.compile_expr_list_recursive(
+                    val_exprs.iter(),
+                    tmps,
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
-            TypedExprKind::ResolvePromise(p, v) => {
-                let p_tmp = self.new_temp_var(locals);
-                let v_tmp = self.new_temp_var(locals);
+            TypedExprKind::VariantLit(enum_id, variant_name, payload) => {
+                if let Some(payload_expr) = payload {
+                    // Variant with payload - compile payload first
+                    let payload_tmp = self.alloc_temp_slot();
+                    let final_expr = Expr::Variant(
+                        enum_id.0 as u32,
+                        EcoString::from(variant_name.as_str()),
+                        Some(Box::new(Expr::Var(payload_tmp))),
+                    );
+                    let assign_vertex = self
+                        .add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                    self.compile_expr_to_value(
+                        payload_expr,
+                        Lhs::Var(payload_tmp),
+                        assign_vertex,
+                        break_target,
+                        continue_target,
+                        return_target,
+                        return_slot,
+                    )
+                } else {
+                    // Variant without payload - simple assignment
+                    let final_expr = Expr::Variant(
+                        enum_id.0 as u32,
+                        EcoString::from(variant_name.as_str()),
+                        None,
+                    );
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex))
+                }
+            }
 
-                // Assign unit to the target (e.g., `_tmp = ()`)
-                let assign_unit_label =
-                    Label::Instr(Instr::Assign(target, Expr::EUnit), next_vertex);
-                let assign_unit_vertex = self.add_label(assign_unit_label);
+            TypedExprKind::Match(scrutinee, arms) => self.compile_match(
+                scrutinee,
+                arms,
+                target,
+                next_vertex,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
+            ),
 
-                // Resolve the promise (e.g., `resolve(_p_tmp, _v_tmp)`)
-                let resolve_label = Label::Instr(
-                    Instr::Resolve(Lhs::Var(p_tmp.clone()), Expr::EVar(v_tmp.clone())),
-                    assign_unit_vertex,
+            TypedExprKind::Store(collection, key, value) => {
+                let col_tmp = self.alloc_temp_slot();
+                let key_tmp = self.alloc_temp_slot();
+                let val_tmp = self.alloc_temp_slot();
+
+                let final_expr = Expr::Store(
+                    Box::new(Expr::Var(col_tmp)),
+                    Box::new(Expr::Var(key_tmp)),
+                    Box::new(Expr::Var(val_tmp)),
                 );
-                let resolve_vertex = self.add_label(resolve_label);
 
-                // Compile p and v
-                let v_vertex =
-                    self.compile_expr_to_value(locals, v, Lhs::Var(v_tmp), resolve_vertex);
-                self.compile_expr_to_value(locals, p, Lhs::Var(p_tmp), v_vertex)
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+
+                let val_vertex = self.compile_expr_to_value(
+                    value,
+                    Lhs::Var(val_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                let key_vertex = self.compile_expr_to_value(
+                    key,
+                    Lhs::Var(key_tmp),
+                    val_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    collection,
+                    Lhs::Var(col_tmp),
+                    key_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
 
-            // --- Truly simple, non-side-effecting cases ---
-            TypedExprKind::CreateFuture(e) => {
-                // create_future(p) is just a copy of p.
-                self.compile_expr_to_value(locals, e, target, next_vertex)
-            }
-
-            TypedExprKind::CreatePromise => {
-                let label = Label::Instr(Instr::Assign(target, Expr::ECreatePromise), next_vertex);
-                self.add_label(label)
-            }
-
-            TypedExprKind::CreateLock => {
-                let label = Label::Instr(Instr::Assign(target, Expr::ECreateLock), next_vertex);
-                self.add_label(label)
-            }
+            TypedExprKind::SetTimer => self.add_label(Label::SetTimer(target, next_vertex)),
 
             _ => {
                 // Desugar the simple expression
@@ -1087,25 +2007,31 @@ impl Compiler {
 
     fn compile_async_call_internal(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         node_expr: Expr, // The node to call the function on
         call: &TypedUserFuncCall,
         target: Lhs, // The final destination for the future
         next_vertex: Vertex,
+        break_target: Vertex,
+        continue_target: Vertex,
+        return_target: Vertex,
+        return_slot: VarSlot,
     ) -> Vertex {
         // Allocate all temporary variable names up front.
         // Create temp var names for each argument.
-        let (arg_temp_vars, arg_exprs): (Vec<String>, Vec<Expr>) = (0..call.args.len())
+        let (arg_temp_vars, arg_exprs): (Vec<VarSlot>, Vec<Expr>) = (0..call.args.len())
             .map(|_| {
-                let tmp = self.new_temp_var(locals);
-                (tmp.clone(), Expr::EVar(tmp))
+                let tmp = self.alloc_temp_slot();
+                (tmp, Expr::Var(tmp))
             })
             .unzip();
 
-        let qualifier = self
-            .func_qualifier_map
-            .get(&call.name)
-            .expect("Function qualifier should exist in map");
+        let qualifier = self.func_qualifier_map.get(&call.name).unwrap_or_else(|| {
+            panic!(
+                "Function qualifier not found for function '{}'. \
+                     This indicates a bug in the CFG builder initialization.",
+                call.original_name
+            )
+        });
         let func_name = format!("{}.{}", qualifier, call.original_name);
 
         // Build the call chain backwards (Async -> next_vertex).
@@ -1122,8 +2048,15 @@ impl Compiler {
 
         // Build the argument compilation chain backwards.
         for (arg, tmp_var) in call.args.iter().rev().zip(arg_temp_vars.iter().rev()) {
-            entry_vertex =
-                self.compile_expr_to_value(locals, arg, Lhs::Var(tmp_var.clone()), entry_vertex);
+            entry_vertex = self.compile_expr_to_value(
+                arg,
+                Lhs::Var(*tmp_var),
+                entry_vertex,
+                break_target,
+                continue_target,
+                return_target,
+                return_slot,
+            );
         }
 
         // This is the entry point for the "call" part
@@ -1132,32 +2065,42 @@ impl Compiler {
 
     fn compile_func_call(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         call: &TypedFuncCall,
         target: Lhs,
         next_vertex: Vertex,
+        break_target: Vertex,
+        continue_target: Vertex,
+        return_target: Vertex,
+        return_slot: VarSlot,
     ) -> Vertex {
         match call {
             TypedFuncCall::User(user_call) => {
                 let is_sync = self
                     .func_sync_map
                     .get(&user_call.name)
-                    .cloned()
+                    .copied()
                     .unwrap_or(false);
 
                 if is_sync {
                     // Allocate temp vars for all arguments
-                    let (arg_tmps, arg_exprs): (Vec<String>, Vec<Expr>) = (0..user_call.args.len())
-                        .map(|_| {
-                            let tmp = self.new_temp_var(locals);
-                            (tmp.clone(), Expr::EVar(tmp))
-                        })
-                        .unzip();
+                    let (arg_tmps, arg_exprs): (Vec<VarSlot>, Vec<Expr>) =
+                        (0..user_call.args.len())
+                            .map(|_| {
+                                let tmp = self.alloc_temp_slot();
+                                (tmp, Expr::Var(tmp))
+                            })
+                            .unzip();
 
-                    let qualifier = self
-                        .func_qualifier_map
-                        .get(&user_call.name)
-                        .expect("Function qualifier should exist in map");
+                    let qualifier =
+                        self.func_qualifier_map
+                            .get(&user_call.name)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Function qualifier not found for function '{}'. \
+                                 This indicates a bug in the CFG builder initialization.",
+                                    user_call.original_name
+                                )
+                            });
                     let func_name = format!("{}.{}", qualifier, user_call.original_name);
 
                     // Create the SyncCall instruction.
@@ -1172,86 +2115,180 @@ impl Compiler {
 
                     // Compile all argument expressions, chaining them backwards.
                     self.compile_expr_list_recursive(
-                        locals,
                         user_call.args.iter(),
                         arg_tmps,
                         sync_call_vertex,
+                        break_target,
+                        continue_target,
+                        return_target,
+                        return_slot,
                     )
                 } else {
-                    let node_expr = Expr::EVar("self".to_string());
+                    let node_expr = Expr::Var(SELF_SLOT);
                     self.compile_async_call_internal(
-                        locals,
                         node_expr,
                         user_call,
                         target,
                         next_vertex,
+                        break_target,
+                        continue_target,
+                        return_target,
+                        return_slot,
                     )
                 }
             }
             TypedFuncCall::Builtin(builtin, args, _return_ty) => {
                 // --- This is the new logic for built-ins ---
-                self.compile_builtin_call(locals, *builtin, args, target, next_vertex)
+                self.compile_builtin_call(
+                    *builtin,
+                    args,
+                    target,
+                    next_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
         }
     }
 
     fn compile_builtin_call(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         builtin: BuiltinFn,
         args: &Vec<TypedExpr>,
         target: Lhs,
         next_vertex: Vertex,
+        break_target: Vertex,
+        continue_target: Vertex,
+        return_target: Vertex,
+        return_slot: VarSlot,
     ) -> Vertex {
         match builtin {
             BuiltinFn::Println => {
-                let assign_vertex = self.add_label(Label::Instr(
-                    Instr::Assign(target, Expr::EUnit),
-                    next_vertex,
-                ));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
 
-                let arg_var = self.new_temp_var(locals);
-                let print_label = Label::Print(Expr::EVar(arg_var.clone()), assign_vertex);
+                let arg_var = self.alloc_temp_slot();
+                let print_label = Label::Print(Expr::Var(arg_var), assign_vertex);
                 let print_vertex = self.add_label(print_label);
 
-                let arg_expr = args.get(0).expect("Println should have 1 arg");
-                self.compile_expr_to_value(locals, arg_expr, Lhs::Var(arg_var), print_vertex)
+                let arg_expr = args.first().expect("Println should have 1 arg");
+                self.compile_expr_to_value(
+                    arg_expr,
+                    Lhs::Var(arg_var),
+                    print_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
             BuiltinFn::IntToString => {
-                let arg_var = self.new_temp_var(locals);
-                let final_expr = Expr::EIntToString(Box::new(Expr::EVar(arg_var.clone())));
+                let arg_var = self.alloc_temp_slot();
+                let final_expr = Expr::IntToString(Box::new(Expr::Var(arg_var)));
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
 
-                let arg_expr = args.get(0).expect("IntToString should have 1 arg");
-                self.compile_expr_to_value(locals, arg_expr, Lhs::Var(arg_var), assign_vertex)
+                let arg_expr = args.first().expect("IntToString should have 1 arg");
+                self.compile_expr_to_value(
+                    arg_expr,
+                    Lhs::Var(arg_var),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
             }
+            BuiltinFn::BoolToString => {
+                let arg_var = self.alloc_temp_slot();
+                let final_expr = Expr::BoolToString(Box::new(Expr::Var(arg_var)));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+
+                let arg_expr = args.first().expect("BoolToString should have 1 arg");
+                self.compile_expr_to_value(
+                    arg_expr,
+                    Lhs::Var(arg_var),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            }
+            BuiltinFn::RoleToString => {
+                let arg_var = self.alloc_temp_slot();
+                let final_expr = Expr::NodeToString(Box::new(Expr::Var(arg_var)));
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+
+                let arg_expr = args.first().expect("RoleToString should have 1 arg");
+                self.compile_expr_to_value(
+                    arg_expr,
+                    Lhs::Var(arg_var),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            }
+            BuiltinFn::UniqueId => self.add_label(Label::UniqueId(target, next_vertex)),
         }
     }
 
     fn compile_rpc_call(
         &mut self,
-        locals: &mut Vec<(String, Expr)>,
         target_expr: &TypedExpr,
         call: &TypedUserFuncCall,
         target: Lhs,
         next_vertex: Vertex,
+        break_target: Vertex,
+        continue_target: Vertex,
+        return_target: Vertex,
+        return_slot: VarSlot,
     ) -> Vertex {
-        //  Allocate a temp var to hold the target role
-        let target_var = self.new_temp_var(locals);
-        let node_expr = Expr::EVar(target_var.clone());
+        let (arg_tmps, arg_exprs) = self.compile_temp_list(call.args.len());
 
-        // Get the entry vertex for the internal call logic
-        let internal_call_vertex =
-            self.compile_async_call_internal(locals, node_expr, call, target, next_vertex);
+        let node_tmp = self.alloc_temp_slot();
+        let node_expr = Expr::Var(node_tmp);
 
-        // Compile the target_expr, which runs *before* the internal call
-        // The result is stored in `target_var`, which `internal_call_vertex` will use.
+        let qualifier = self.func_qualifier_map.get(&call.name).unwrap_or_else(|| {
+            panic!(
+                "Function qualifier not found for function '{}'. \
+                     This indicates a bug in the CFG builder initialization.",
+                call.original_name
+            )
+        });
+        let func_name = format!("{}.{}", qualifier, call.original_name);
+
+        // The simulator's Async handler automatically creates a channel/future and stores it in `target`.
+        let async_label = Label::Instr(
+            Instr::Async(target, node_expr, func_name, arg_exprs),
+            next_vertex,
+        );
+        let async_vertex = self.add_label(async_label);
+
+        let args_entry_vertex = self.compile_expr_list_recursive(
+            call.args.iter(),
+            arg_tmps,
+            async_vertex,
+            break_target,
+            continue_target,
+            return_target,
+            return_slot,
+        );
+
         self.compile_expr_to_value(
-            locals,
             target_expr,
-            Lhs::Var(target_var),
-            internal_call_vertex,
+            Lhs::Var(node_tmp),
+            args_entry_vertex,
+            break_target,
+            continue_target,
+            return_target,
+            return_slot,
         )
     }
 
@@ -1259,116 +2296,126 @@ impl Compiler {
     /// Panics if it encounters a complex (side-effecting) expression.
     fn convert_simple_expr(&mut self, expr: &TypedExpr) -> Expr {
         match &expr.kind {
-            TypedExprKind::Var(id, name) => Expr::EVar(resolved_name(*id, &name)),
-            TypedExprKind::IntLit(i) => Expr::EInt(i.clone()),
-            TypedExprKind::StringLit(s) => Expr::EString(s.clone()),
-            TypedExprKind::BoolLit(b) => Expr::EBool(b.clone()),
-            TypedExprKind::NilLit => Expr::ENil,
+            TypedExprKind::Var(id, _name) => Expr::Var(self.resolve_slot(*id)),
+            TypedExprKind::IntLit(i) => Expr::Int(*i),
+            TypedExprKind::StringLit(s) => Expr::String(EcoString::from(s.as_str())),
+            TypedExprKind::BoolLit(b) => Expr::Bool(*b),
+            TypedExprKind::NilLit => Expr::Nil,
             TypedExprKind::BinOp(op, l, r) => {
                 let left = Box::new(self.convert_simple_expr(l));
                 let right = Box::new(self.convert_simple_expr(r));
                 self.convert_simple_binop(op, left, right)
             }
-            TypedExprKind::Not(e) => Expr::ENot(Box::new(self.convert_simple_expr(e))),
-            TypedExprKind::Negate(e) => Expr::EMinus(
-                Box::new(Expr::EInt(0)),
+            TypedExprKind::Not(e) => Expr::Not(Box::new(self.convert_simple_expr(e))),
+            TypedExprKind::Negate(e) => Expr::Minus(
+                Box::new(Expr::Int(0)),
                 Box::new(self.convert_simple_expr(e)),
             ),
-            TypedExprKind::MapLit(pairs) => Expr::EMap(
+            TypedExprKind::MapLit(pairs) => Expr::Map(
                 pairs
                     .iter()
                     .map(|(k, v)| (self.convert_simple_expr(k), self.convert_simple_expr(v)))
                     .collect(),
             ),
             TypedExprKind::ListLit(items) => {
-                Expr::EList(items.iter().map(|e| self.convert_simple_expr(e)).collect())
+                Expr::List(items.iter().map(|e| self.convert_simple_expr(e)).collect())
             }
             TypedExprKind::TupleLit(items) => {
-                Expr::ETuple(items.iter().map(|e| self.convert_simple_expr(e)).collect())
+                Expr::Tuple(items.iter().map(|e| self.convert_simple_expr(e)).collect())
             }
             // Desugar: `append(l, i)` -> `EListAppend(l, i)`
-            TypedExprKind::Append(l, i) => Expr::EListAppend(
+            TypedExprKind::Append(l, i) => Expr::ListAppend(
                 Box::new(self.convert_simple_expr(l)),
                 Box::new(self.convert_simple_expr(i)),
             ),
-            TypedExprKind::Prepend(i, l) => Expr::EListPrepend(
+            TypedExprKind::Prepend(i, l) => Expr::ListPrepend(
                 Box::new(self.convert_simple_expr(i)),
                 Box::new(self.convert_simple_expr(l)),
             ),
             // Desugar: `len(e)` -> `EListLen(e)`
-            TypedExprKind::Len(e) => Expr::EListLen(Box::new(self.convert_simple_expr(e))),
-            TypedExprKind::Min(l, r) => Expr::EMin(
+            TypedExprKind::Len(e) => Expr::ListLen(Box::new(self.convert_simple_expr(e))),
+            TypedExprKind::Min(l, r) => Expr::Min(
                 Box::new(self.convert_simple_expr(l)),
                 Box::new(self.convert_simple_expr(r)),
             ),
-            TypedExprKind::Exists(map, key) => Expr::EKeyExists(
+            TypedExprKind::Exists(map, key) => Expr::KeyExists(
                 Box::new(self.convert_simple_expr(key)),
                 Box::new(self.convert_simple_expr(map)),
             ),
-            TypedExprKind::Erase(map, key) => Expr::EMapErase(
+            TypedExprKind::Erase(map, key) => Expr::MapErase(
                 Box::new(self.convert_simple_expr(key)),
                 Box::new(self.convert_simple_expr(map)),
             ),
-            TypedExprKind::Store(collection, key, value) => Expr::EStore(
+            TypedExprKind::Store(collection, key, value) => Expr::Store(
                 Box::new(self.convert_simple_expr(collection)),
                 Box::new(self.convert_simple_expr(key)),
                 Box::new(self.convert_simple_expr(value)),
             ),
             // Desugar: `head(l)` -> `EListAccess(l, 0)`
-            TypedExprKind::Head(l) => Expr::EListAccess(Box::new(self.convert_simple_expr(l)), 0),
+            TypedExprKind::Head(l) => Expr::ListAccess(Box::new(self.convert_simple_expr(l)), 0),
             // Desugar: `tail(l)` -> `EListSubsequence(l, 1, len(l))`
             TypedExprKind::Tail(l) => {
                 let list_expr = self.convert_simple_expr(l);
-                Expr::EListSubsequence(
+                Expr::ListSubsequence(
                     Box::new(list_expr.clone()),
-                    Box::new(Expr::EInt(1)),
-                    Box::new(Expr::EListLen(Box::new(list_expr))),
+                    Box::new(Expr::Int(1)),
+                    Box::new(Expr::ListLen(Box::new(list_expr))),
                 )
             }
-            TypedExprKind::CreateFuture(e) => self.convert_simple_expr(e),
             // Desugar: `s[i]` -> `EFind(s, i)`
-            TypedExprKind::Index(target, index) => Expr::EFind(
+            TypedExprKind::Index(target, index) => Expr::Find(
                 Box::new(self.convert_simple_expr(target)),
                 Box::new(self.convert_simple_expr(index)),
             ),
             // Desugar: `s[i:j]` -> `EListSubsequence(s, i, j)`
-            TypedExprKind::Slice(target, start, end) => Expr::EListSubsequence(
+            TypedExprKind::Slice(target, start, end) => Expr::ListSubsequence(
                 Box::new(self.convert_simple_expr(target)),
                 Box::new(self.convert_simple_expr(start)),
                 Box::new(self.convert_simple_expr(end)),
             ),
             TypedExprKind::TupleAccess(tuple, index) => {
-                Expr::ETupleAccess(Box::new(self.convert_simple_expr(tuple)), *index)
+                Expr::TupleAccess(Box::new(self.convert_simple_expr(tuple)), *index)
             }
             // Desugar: `s.field` -> `EFind(s, "field")`
-            TypedExprKind::FieldAccess(target, field) => Expr::EFind(
+            TypedExprKind::FieldAccess(target, field) => Expr::Find(
                 Box::new(self.convert_simple_expr(target)),
-                Box::new(Expr::EString(field.clone())),
+                Box::new(Expr::String(EcoString::from(field.as_str()))),
             ),
-            TypedExprKind::UnwrapOptional(e) => {
-                Expr::EUnwrap(Box::new(self.convert_simple_expr(e)))
-            }
+            TypedExprKind::UnwrapOptional(e) => Expr::Unwrap(Box::new(self.convert_simple_expr(e))),
 
-            TypedExprKind::WrapInOptional(e) => Expr::ESome(Box::new(self.convert_simple_expr(e))),
+            TypedExprKind::WrapInOptional(e) => Expr::Some(Box::new(self.convert_simple_expr(e))),
             // Desugar: `MyStruct { ... }` -> `EMap { ... }`
-            TypedExprKind::StructLit(_, fields) => Expr::EMap(
+            TypedExprKind::StructLit(_, fields) => Expr::Map(
                 fields
                     .iter()
-                    .map(|(name, val)| (Expr::EString(name.clone()), self.convert_simple_expr(val)))
+                    .map(|(name, val)| {
+                        (
+                            Expr::String(EcoString::from(name.as_str())),
+                            self.convert_simple_expr(val),
+                        )
+                    })
                     .collect(),
             ),
 
-            TypedExprKind::CreateLock => Expr::ECreateLock,
+            TypedExprKind::SetTimer => {
+                unreachable!(
+                    "SetTimer should be compiled as a Label, not an Expr. \
+                     This should have been caught earlier. Expression: {:?}",
+                    expr
+                )
+            }
 
             // --- Panic on complex expressions ---
             TypedExprKind::FuncCall(_)
             | TypedExprKind::RpcCall(_, _)
-            | TypedExprKind::Await(_)
-            | TypedExprKind::SpinAwait(_)
-            | TypedExprKind::CreatePromise
-            | TypedExprKind::ResolvePromise(_, _) => {
-                panic!(
-                    "Cannot have complex call inside a simple expression: {:?}",
+            | TypedExprKind::MakeChannel
+            | TypedExprKind::Send(_, _)
+            | TypedExprKind::Recv(_)
+            | TypedExprKind::Match(_, _)
+            | TypedExprKind::VariantLit(_, _, _) => {
+                unreachable!(
+                    "Cannot have complex expression inside a simple expression. \
+                     This should have been caught by the type checker. Expression: {:?}",
                     expr
                 )
             }
@@ -1377,94 +2424,37 @@ impl Compiler {
 
     fn convert_lhs(&mut self, expr: &TypedExpr) -> Lhs {
         match &expr.kind {
-            TypedExprKind::Var(id, name) => Lhs::Var(resolved_name(*id, name)),
-            _ => panic!("Invalid assignment target: {:?}", expr),
+            TypedExprKind::Var(id, _name) => Lhs::Var(self.resolve_slot(*id)),
+            _ => unreachable!(
+                "Invalid assignment target. \
+                 This should have been caught by the type checker. Expression: {:?}",
+                expr
+            ),
         }
     }
 
-    fn convert_pattern(&mut self, locals: &mut Vec<(String, Expr)>, pat: &TypedPattern) -> Lhs {
+    fn convert_pattern(&mut self, pat: &TypedPattern) -> Lhs {
         match &pat.kind {
-            TypedPatternKind::Var(id, name) => Lhs::Var(resolved_name(*id, name)),
-            TypedPatternKind::Wildcard => Lhs::Var(self.new_temp_var(locals)),
+            TypedPatternKind::Var(id, _name) => Lhs::Var(self.resolve_slot(*id)),
+            TypedPatternKind::Wildcard => Lhs::Var(self.alloc_temp_slot()),
             TypedPatternKind::Tuple(pats) => {
                 let names = pats
                     .iter()
-                    .map(|p| {
-                        match &p.kind {
-                            TypedPatternKind::Var(id, name) => resolved_name(*id, name),
-                            _ => self.new_temp_var(locals), // Use dummy var for wildcard/unit
-                        }
+                    .map(|p| match &p.kind {
+                        TypedPatternKind::Var(id, _name) => self.resolve_slot(*id),
+                        _ => self.alloc_temp_slot(), // Use dummy var for wildcard/unit
                     })
                     .collect();
                 Lhs::Tuple(names)
             }
-        }
-    }
-
-    fn scan_body(&mut self, body: &[TypedStatement]) -> Vec<(String, Expr)> {
-        let mut locals = Vec::new();
-        for stmt in body {
-            self.scan_stmt_for_locals(stmt, &mut locals);
-        }
-        locals
-    }
-
-    fn scan_body_for_locals(&mut self, body: &[TypedStatement], locals: &mut Vec<(String, Expr)>) {
-        for stmt in body {
-            self.scan_stmt_for_locals(stmt, locals);
-        }
-    }
-
-    fn scan_stmt_for_locals(&mut self, stmt: &TypedStatement, locals: &mut Vec<(String, Expr)>) {
-        match &stmt.kind {
-            TypedStatementKind::VarInit(init) => {
-                // `let x = ...` adds a local
-                locals.push((
-                    resolved_name(init.name, &init.original_name),
-                    Expr::ENil, // Use placeholder, actual init is handled by CFG
-                ));
+            TypedPatternKind::Variant(_, _, _) => {
+                // TODO: Implement variant pattern matching in CFG
+                // For now, we use a temp slot; match compilation needs to be added
+                Lhs::Var(self.alloc_temp_slot())
             }
-            TypedStatementKind::Conditional(cond) => {
-                self.scan_body_for_locals(&cond.if_branch.body, locals);
-                for branch in &cond.elseif_branches {
-                    self.scan_body_for_locals(&branch.body, locals);
-                }
-                if let Some(body) = &cond.else_branch {
-                    self.scan_body_for_locals(body, locals);
-                }
-            }
-            TypedStatementKind::ForLoop(fl) => {
-                // This is the C-style loop, which might have an init
-                if let Some(TypedForLoopInit::VarInit(init)) = &fl.init {
-                    locals.push((
-                        resolved_name(init.name, &init.original_name),
-                        Expr::ENil, // Use placeholder
-                    ));
-                }
-                self.scan_body_for_locals(&fl.body, locals);
-            }
-            TypedStatementKind::ForInLoop(loop_stmt) => {
-                // `for (x, y) in ...` adds locals
-                self.scan_pattern_for_locals(&loop_stmt.pattern, locals);
-                self.scan_body_for_locals(&loop_stmt.body, locals);
-            }
-            // Other statements don't declare locals
-            _ => {}
-        }
-    }
-
-    fn scan_pattern_for_locals(&mut self, pat: &TypedPattern, locals: &mut Vec<(String, Expr)>) {
-        match &pat.kind {
-            TypedPatternKind::Var(id, name) => {
-                // `ENil` is just a placeholder default
-                locals.push((resolved_name(*id, name), Expr::ENil));
-            }
-            TypedPatternKind::Tuple(pats) => {
-                for p in pats {
-                    self.scan_pattern_for_locals(p, locals);
-                }
-            }
-            _ => {} // Wildcard, Unit don't add named locals
         }
     }
 }
+
+#[cfg(test)]
+mod test;

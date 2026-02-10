@@ -1,7 +1,5 @@
 # Language Design
 
-Spur is an imperative, C-style language with modern features.
-
 ## EBNF Grammar
 
 ```ebnf
@@ -15,13 +13,13 @@ role_def ::= 'role' ID '{' var_inits func_defs '}'
 client_def ::= 'ClientInterface' '{' var_inits func_defs '}'
 
 func_defs ::= ( func_def )*
-func_def ::= ( 'sync' )? 'func' ID '(' func_params? ')' ( '->' type_def )? '{' statements '}'
+func_def ::= ( 'async' )? 'func' ID '(' func_params? ')' ( '->' type_def )? '{' statements '}'
 
 func_call ::= ID '(' args? ')'
 args ::= expr ( ',' expr )* ','?
 
 var_inits ::= ( var_init ';' )*
-var_init ::= 'var' ID ':' type_def '=' expr
+var_init ::= 'var' ID ( ':' type_def )? '=' expr
 
 func_params ::= ID ':' type_def ( ',' ID ':' type_def )* ','?
 
@@ -40,8 +38,7 @@ base_type ::=
 ID
 | 'map' '<' type_def ',' type_def '>'
 | 'list' '<' type_def '>'
-| 'promise' '<' type_def '>'
-| 'future' '<' type_def '>'
+| 'chan' '<' type_def '>'
 | 'lock'
 | '(' type_def_list? ')'
 
@@ -57,14 +54,14 @@ cond_stmts
 | lock_stmt
 | 'break' ';'
 
-cond_stmts ::= if_stmt ( elseif_stmt )* ( else_stmt )?
+cond_stmts ::= if_stmt ( else_if_stmt )* ( else_stmt )?
 if_stmt ::= 'if' '(' expr ')' '{' statements '}'
-elseif_stmt ::= 'elseif' '(' expr ')' '{' statements '}'
+else_if_stmt ::= 'else' 'if' '(' expr ')' '{' statements '}'
 else_stmt ::= 'else' '{' statements '}'
 
 for_loop ::= 'for' ( ( var_init | assignment )? ';' expr? ';' assignment? | expr | ) '{' statements '}'
 for_in_loop ::= 'for' pattern 'in' expr '{' statements '}'
-lock_stmt ::= 'await' 'lock' '(' expr ')' '{' statements '}'
+lock_stmt ::= 'lock' '(' expr ')' '{' statements '}'
 
 assignment ::= ID '=' expr
 
@@ -90,7 +87,7 @@ additive_expr ::= multiplicative_expr ( ( '+' | '-' ) multiplicative_expr )*
 
 multiplicative_expr ::= unary_expr ( ( '*' | '/' | '%' ) unary_expr )*
 
-unary_expr ::= ( '!' | '-' | 'await' | 'spin_await' | '@' ) unary_expr | primary_expr
+unary_expr ::= ( '!' | '-' | '<-' ) unary_expr | primary_expr
 
 primary_expr ::= primary_base postfix_op*
 
@@ -108,21 +105,20 @@ ID
 | 'min' '(' expr ',' expr ')'
 | 'exists' '(' expr ',' expr ')'
 | 'erase' '(' expr ',' expr ')'
-| 'create_promise' '(' ')'
-| 'create_future' '(' expr ')'
-| 'resolve_promise' '(' expr ',' expr ')'
+| 'make' '(' expr ')'
+| 'send' '(' expr ',' expr ')'
+| 'recv' '(' expr ')'
 | 'create_lock' '(' ')'
 | '(' expr ')'
 
 postfix_op ::=
 '[' expr ']'
 | '[' expr ':' expr ']'
-| '[' expr ':=' expr ']'
 | '.' INT
 | '.' ID
-| '.' ID ':=' expr
 | '!'
 | '->' func_call
+| ':=' expr
 
 literals ::= STRING | INT
 
@@ -152,13 +148,14 @@ The type system is composed of:
 - Primitives: `int`, `string`, `bool`
 - Tuples and the unit type: `()`, `(T)`, `(T, U)`, etc.
 - Collections: `list<T>`, `map<K, V>`
-- Concurrency: `future<T>`, `promise<T>`, and `lock`
+- Concurrency: `chan<T>` and `lock`
 - Optional types: `T?`, which can be either `nil` or a value of type `T`
 
 ## Reference and Value Semantics
 
 Primitives and tuples are passed by value.
 All other types are passed by reference.
+This is likely irrelevant, since all maps, structs, and lists are immutable.
 
 ## Struct Updates
 
@@ -178,10 +175,10 @@ All intermediate structures are copied to preserve immutability.
 
 ### Index Update Syntax
 
-You can update map or list elements using the `[key := value]` syntax:
+You can update map or list elements using the `[key] := value` syntax:
 
 ```
-var updated = record["age" := 30];
+var updated = record["age"] := 30;
 ```
 
 This creates a copy of `record` with the `"age"` key updated to `30`.
@@ -192,34 +189,39 @@ Both syntaxes can be chained for deeply nested updates:
 
 ```
 var updated = record.address.zip := 12345;
-var updated2 = my_map["outer"]["inner" := value];
+var updated2 = my_map["outer"]["inner"] := value;
 ```
 
 ### Desugaring
 
 Update expressions are syntactic sugar for the `store` built-in function:
+
 - `x.field := value` desugars to `store(x, "field", value)`
-- `x[key := value]` desugars to `store(x, key, value)`
+- `x[key] := value` desugars to `store(x, key, value)`
 - Nested updates like `x.a.b := v` desugar to `store(x, "a", store(x.a, "b", v))`
 
 ## Concurrency
 
-Spur supports two function types for concurrency: `async` (default) and `sync`.
+Spur supports two function types for concurrency: `sync` (default) and `async`.
 
-By default, all functions are asynchronous. 
-Calling a standard func does not block execution and immediately returns a `future<T>`. 
-To get the actual return value, you must await the future, which will pause the current task.
+By default, all functions are synchronous. A sync func is a blocking, atomic call that:
 
-A function can be explicitly marked as synchronous with the `sync` keyword:
+- Cannot make RPC calls
+- Cannot call async functions
+- Cannot use channel operations (`send` and `recv`)
+
+A function can be explicitly marked as asynchronous with the `async` keyword:
+
 ```
-sync func my_sync_call() -> int {
+async func my_async_call() -> int {
   return 10;
 }
 ```
-A `sync func` is a blocking, atomic call. They are restricted and cannot contain `await`, `rpc_call`, `spin_await`,
-or call other `async` functions.
 
-This async-first model, where most operations are non-blocking, can result in issues around synchronizing asynchronous code.\
+Calling an async func does not block execution and immediately returns a `chan<T>`.
+To get the actual return value, you must receive from the channel, which will pause the current task.
+
+This sync-first model, where most operations are blocking, can result in issues around concurrent processing.\
 To address this, we provide a `lock` type.
 
 ### RPCs
@@ -228,37 +230,65 @@ This asynchronous model extends seamlessly to remote procedure calls (RPCs). RPC
 to call a function on a target role instance:
 
 ```
-var f: future<string> = other_role->some_func(1, 2);
+var f: chan<string> = other_role->some_func(1, 2);
 ```
 
-### Spin Await
+### Channels
 
-For simpler, busy-wait synchronization, the language also provides `spin_await`.
+Channels provide a typed communication mechanism for passing values between concurrent tasks.
+
+#### Channel Type
+
+Channels have type `chan<T>` where `T` is the type of values sent through the channel:
+
 ```
-spin_await <bool_expr>
+var my_chan: chan<int>;
+var msg_chan: chan<string>;
 ```
-This expression will pause the current task and poll until `bool_expr` evaluates to true. 
-Once true, it unblocks and evaluates to ().
 
-Note: This is a highly inefficient operation and is generally unrealistic for production systems. 
-It is included primarily to map directly towards design, which is the focus of this language.
-For faster execution and schedule generation/consistency checking, use promises when possible. 
+#### Creating Channels
 
+Use the `make()` function to create a new channel with a specified buffer size:
+
+```
+var ch = make(10);  // Creates a channel with buffer size 10
+```
+
+#### Sending Values
+
+Send values to a channel using the `send()` function:
+
+```
+send(ch, 42);       // Send the value 42 to channel ch
+send(msg_chan, "hello");  // Send a string to msg_chan
+```
+
+#### Receiving Values
+
+Receive values from a channel using either `recv()` or the `<-` operator:
+
+```
+var value = recv(ch);      // Explicit recv call
+var value = <- ch;          // Syntactic sugar using <- operator
+```
+
+Both forms block until a value is available on the channel.
+
+#### Restrictions
+
+Channel operations (`send` and `recv`) cannot be used inside sync functions (non-async). Attempting to do so will result in a compile-time error. This ensures that synchronous functions remain non-blocking and atomic.
 
 ## Additional Operators
 
-### Await Shorthand
-
-The @ operator is a prefix shorthand for the await keyword.
-- `@f` is equivalent to `await f` for `f: future<T>`
-
 ### Unwrap
 
-The unwrap `!` operator is used for unwrapping an optional. 
+The unwrap `!` operator is used for unwrapping an optional.
 In other words, `o!` either retrieves the value or panics if the optional is `nil`.
 
 ## Built-in Functions
+
 We also have a variety of built-in functions.
 Right now, this includes:
+
 - `println: string -> ()`
 - `int_to_string: int -> string`

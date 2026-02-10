@@ -1,0 +1,58 @@
+type Status enum {
+    Active,
+    Inactive,
+    Suspended(string),
+    Code(int),
+};
+
+role Test {
+    func assert(cond: bool) {}
+
+    func main() {
+        var s1 = Status.Active;
+        var s2 = Status.Inactive;
+        var s3 = Status.Suspended("violation");
+        var s4 = Status.Code(404);
+
+        var res1 = match s1 {
+            Status.Active => 1,
+            Status.Inactive => 0,
+            Status.Suspended(_) => -1,
+            Status.Code(_) => -2,
+        };
+        assert(res1 == 1);
+
+        var res2 = match s2 {
+            Status.Active => 1,
+            Status.Inactive => 0,
+            _ => -1,
+        };
+        assert(res2 == 0);
+
+        var res3 = match s3 {
+            Status.Suspended(msg) => msg,
+            _ => "unknown",
+        };
+        assert(res3 == "violation");
+
+        var res4 = match s4 {
+            Status.Code(c) => c,
+            _ => 0,
+        };
+        assert(res4 == 404);
+        
+        var s5 = get_status(true);
+        match s5 {
+             Status.Active => assert(true),
+             _ => assert(false),
+        }
+    }
+
+    func get_status(active: bool) -> Status {
+        if active {
+            return Status.Active;
+        } else {
+            return Status.Inactive;
+        }
+    }
+}
