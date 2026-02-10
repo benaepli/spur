@@ -95,7 +95,7 @@ pub enum TypedExprKind {
 
     UnwrapOptional(Box<TypedExpr>), // T? -> T
 
-    MakeChannel(Option<Box<TypedExpr>>),
+    MakeChannel,
     Send(Box<TypedExpr>, Box<TypedExpr>),
     Recv(Box<TypedExpr>),
 
@@ -149,6 +149,7 @@ pub enum TypedStatementKind {
     ForLoop(TypedForLoop),
     ForInLoop(TypedForInLoop),
     Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]

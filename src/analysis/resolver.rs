@@ -19,6 +19,7 @@ pub enum BuiltinFn {
     Println,
     IntToString,
     BoolToString,
+    RoleToString,
     UniqueId,
 }
 
@@ -30,6 +31,7 @@ impl FromStr for BuiltinFn {
             "println" => Ok(BuiltinFn::Println),
             "int_to_string" => Ok(BuiltinFn::IntToString),
             "bool_to_string" => Ok(BuiltinFn::BoolToString),
+            "role_to_string" => Ok(BuiltinFn::RoleToString),
             "unique_id" => Ok(BuiltinFn::UniqueId),
             _ => Err(()),
         }
@@ -149,6 +151,7 @@ pub enum ResolvedStatementKind {
     ForLoop(ResolvedForLoop),
     ForInLoop(ResolvedForInLoop),
     Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,7 +254,7 @@ pub enum ResolvedExprKind {
     Match(Box<ResolvedExpr>, Vec<ResolvedMatchArm>),
     VariantLit(NameId, String, Option<Box<ResolvedExpr>>),
 
-    MakeChannel(Option<Box<ResolvedExpr>>),
+    MakeChannel,
     Send(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Recv(Box<ResolvedExpr>),
 
@@ -705,6 +708,7 @@ impl Resolver {
                 ResolvedStatementKind::ForInLoop(self.resolve_for_in_loop(fil)?)
             }
             StatementKind::Break => ResolvedStatementKind::Break,
+            StatementKind::Continue => ResolvedStatementKind::Continue,
         };
         Ok(ResolvedStatement { kind, span })
     }
@@ -949,13 +953,7 @@ impl Resolver {
                     },
                 )
             }
-            ExprKind::MakeChannel(opt_cap) => {
-                let resolved = opt_cap
-                    .map(|cap| self.resolve_expr(*cap))
-                    .transpose()?
-                    .map(Box::new);
-                ResolvedExprKind::MakeChannel(resolved)
-            }
+            ExprKind::MakeChannel => ResolvedExprKind::MakeChannel,
             ExprKind::Send(ch, val) => ResolvedExprKind::Send(
                 Box::new(self.resolve_expr(*ch)?),
                 Box::new(self.resolve_expr(*val)?),

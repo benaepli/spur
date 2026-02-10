@@ -1,9 +1,12 @@
+use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, VarSlot};
 use crate::simulator::core::error::RuntimeError;
+use crate::simulator::core::state::NodeId;
 use crate::simulator::core::values::{Env, Value, ValueKind, hash_map_entry};
 use crate::simulator::hash_utils::HashPolicy;
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
@@ -66,6 +69,7 @@ pub fn make_local_env<H: HashPolicy>(
     args: Vec<Value<H>>,
     local_env: &Env<H>,
     node_env: &Env<H>,
+    role_names: &HashMap<NameId, String>,
 ) -> Env<H> {
     let mut env = Env::<H>::with_slots(func.local_slot_count as usize);
 
@@ -77,7 +81,7 @@ pub fn make_local_env<H: HashPolicy>(
     // Initialize other locals to their defaults
     for (i, default_expr) in func.local_defaults.iter().enumerate() {
         let slot = func.param_count + i as u32;
-        if let Ok(val) = eval(local_env, node_env, default_expr) {
+        if let Ok(val) = eval(local_env, node_env, default_expr, role_names) {
             env.set(slot, val);
         }
     }
@@ -143,6 +147,7 @@ pub fn eval<H: HashPolicy>(
     local_env: &Env<H>,
     node_env: &Env<H>,
     expr: &Expr,
+    role_names: &HashMap<NameId, String>,
 ) -> Result<Value<H>, RuntimeError> {
     match expr {
         Expr::Int(i) => Ok(Value::<H>::int(*i)),
@@ -152,8 +157,8 @@ pub fn eval<H: HashPolicy>(
         Expr::Nil => Ok(Value::<H>::option_none()),
         Expr::Var(s) => Ok(load(*s, local_env, node_env)),
         Expr::Plus(e1, e2) => {
-            let v1 = eval(local_env, node_env, e1)?;
-            let v2 = eval(local_env, node_env, e2)?;
+            let v1 = eval(local_env, node_env, e1, role_names)?;
+            let v2 = eval(local_env, node_env, e2, role_names)?;
 
             match (&v1.kind, &v2.kind) {
                 (ValueKind::Int(i1), ValueKind::Int(i2)) => Ok(Value::<H>::int(i1 + i2)),
@@ -170,59 +175,75 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::Minus(e1, e2) => Ok(Value::<H>::int(
-            eval(local_env, node_env, e1)?.as_int()? - eval(local_env, node_env, e2)?.as_int()?,
+            eval(local_env, node_env, e1, role_names)?.as_int()?
+                - eval(local_env, node_env, e2, role_names)?.as_int()?,
         )),
         Expr::Times(e1, e2) => Ok(Value::<H>::int(
-            eval(local_env, node_env, e1)?.as_int()? * eval(local_env, node_env, e2)?.as_int()?,
+            eval(local_env, node_env, e1, role_names)?.as_int()?
+                * eval(local_env, node_env, e2, role_names)?.as_int()?,
         )),
         Expr::Div(e1, e2) => Ok(Value::<H>::int(
-            eval(local_env, node_env, e1)?.as_int()? / eval(local_env, node_env, e2)?.as_int()?,
+            eval(local_env, node_env, e1, role_names)?.as_int()?
+                / eval(local_env, node_env, e2, role_names)?.as_int()?,
         )),
         Expr::Mod(e1, e2) => Ok(Value::<H>::int(
-            eval(local_env, node_env, e1)?.as_int()? % eval(local_env, node_env, e2)?.as_int()?,
+            eval(local_env, node_env, e1, role_names)?.as_int()?
+                % eval(local_env, node_env, e2, role_names)?.as_int()?,
         )),
         Expr::LessThan(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1)? < eval(local_env, node_env, e2)?,
+            eval(local_env, node_env, e1, role_names)? < eval(local_env, node_env, e2, role_names)?,
         )),
         Expr::EqualsEquals(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1)? == eval(local_env, node_env, e2)?,
+            eval(local_env, node_env, e1, role_names)?
+                == eval(local_env, node_env, e2, role_names)?,
         )),
-        Expr::Not(e) => Ok(Value::<H>::bool(!eval(local_env, node_env, e)?.as_bool()?)),
+        Expr::Not(e) => Ok(Value::<H>::bool(
+            !eval(local_env, node_env, e, role_names)?.as_bool()?,
+        )),
         Expr::And(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1)?.as_bool()?
-                && eval(local_env, node_env, e2)?.as_bool()?,
+            eval(local_env, node_env, e1, role_names)?.as_bool()?
+                && eval(local_env, node_env, e2, role_names)?.as_bool()?,
         )),
         Expr::Or(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1)?.as_bool()?
-                || eval(local_env, node_env, e2)?.as_bool()?,
+            eval(local_env, node_env, e1, role_names)?.as_bool()?
+                || eval(local_env, node_env, e2, role_names)?.as_bool()?,
         )),
-        Expr::Some(e) => Ok(Value::<H>::option_some(eval(local_env, node_env, e)?)),
+        Expr::Some(e) => Ok(Value::<H>::option_some(eval(
+            local_env, node_env, e, role_names,
+        )?)),
         Expr::Tuple(es) => {
-            let vals: Result<Vector<_>, _> =
-                es.iter().map(|e| eval(local_env, node_env, e)).collect();
+            let vals: Result<Vector<_>, _> = es
+                .iter()
+                .map(|e| eval(local_env, node_env, e, role_names))
+                .collect();
             Ok(Value::<H>::tuple(vals?))
         }
         Expr::List(es) => {
-            let vals: Result<Vector<_>, _> =
-                es.iter().map(|e| eval(local_env, node_env, e)).collect();
+            let vals: Result<Vector<_>, _> = es
+                .iter()
+                .map(|e| eval(local_env, node_env, e, role_names))
+                .collect();
             Ok(Value::<H>::list(vals?))
         }
         Expr::Map(kv) => {
             let mut m = ImHashMap::new();
             for (k, v) in kv {
-                m.insert(eval(local_env, node_env, k)?, eval(local_env, node_env, v)?);
+                m.insert(
+                    eval(local_env, node_env, k, role_names)?,
+                    eval(local_env, node_env, v, role_names)?,
+                );
             }
             Ok(Value::<H>::map(m))
         }
         Expr::Find(col, key) => {
-            let col_val = eval(local_env, node_env, col)?;
+            let col_val = eval(local_env, node_env, col, role_names)?;
             match &col_val.kind {
                 ValueKind::Map(m) => {
-                    let k = eval(local_env, node_env, key)?;
+                    let k = eval(local_env, node_env, key, role_names)?;
                     m.get(&k).cloned().ok_or(RuntimeError::KeyNotFound)
                 }
                 ValueKind::List(l) => {
-                    let idx = eval(local_env, node_env, key)?.as_int()? as usize;
+                    let idx = eval(local_env, node_env, key, role_names)?.as_int()? as usize;
                     l.get(idx).cloned().ok_or(RuntimeError::IndexOutOfBounds {
                         index: idx,
                         len: l.len(),
@@ -234,23 +255,27 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::ListPrepend(head, tail) => {
-            let h = eval(local_env, node_env, head)?;
-            let t = eval(local_env, node_env, tail)?.as_list()?.clone();
+            let h = eval(local_env, node_env, head, role_names)?;
+            let t = eval(local_env, node_env, tail, role_names)?
+                .as_list()?
+                .clone();
             let mut new_list = Vector::new();
             new_list.push_back(h);
             new_list.append(t);
             Ok(Value::<H>::list(new_list))
         }
         Expr::ListAppend(list, item) => {
-            let mut l = eval(local_env, node_env, list)?.as_list()?.clone();
-            let i = eval(local_env, node_env, item)?;
+            let mut l = eval(local_env, node_env, list, role_names)?
+                .as_list()?
+                .clone();
+            let i = eval(local_env, node_env, item, role_names)?;
             l.push_back(i);
             Ok(Value::<H>::list(l))
         }
         Expr::ListSubsequence(list, start, end) => {
-            let l = eval(local_env, node_env, list)?;
-            let s = eval(local_env, node_env, start)?.as_int()? as usize;
-            let e = eval(local_env, node_env, end)?.as_int()? as usize;
+            let l = eval(local_env, node_env, list, role_names)?;
+            let s = eval(local_env, node_env, start, role_names)?.as_int()? as usize;
+            let e = eval(local_env, node_env, end, role_names)?.as_int()? as usize;
             let vec = l.as_list()?;
             if s > vec.len() || e > vec.len() || s > e {
                 return Err(RuntimeError::SubsequenceOutOfBounds {
@@ -262,26 +287,30 @@ pub fn eval<H: HashPolicy>(
             Ok(Value::<H>::list(vec.clone().slice(s..e)))
         }
         Expr::LessThanEquals(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1)? <= eval(local_env, node_env, e2)?,
+            eval(local_env, node_env, e1, role_names)?
+                <= eval(local_env, node_env, e2, role_names)?,
         )),
         Expr::GreaterThan(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1)? > eval(local_env, node_env, e2)?,
+            eval(local_env, node_env, e1, role_names)? > eval(local_env, node_env, e2, role_names)?,
         )),
         Expr::GreaterThanEquals(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1)? >= eval(local_env, node_env, e2)?,
+            eval(local_env, node_env, e1, role_names)?
+                >= eval(local_env, node_env, e2, role_names)?,
         )),
         Expr::KeyExists(key, map) => {
-            let k = eval(local_env, node_env, key)?;
-            let m = eval(local_env, node_env, map)?;
+            let k = eval(local_env, node_env, key, role_names)?;
+            let m = eval(local_env, node_env, map, role_names)?;
             Ok(Value::<H>::bool(m.as_map()?.contains_key(&k)))
         }
         Expr::MapErase(key, map) => {
-            let k = eval(local_env, node_env, key)?;
-            let m = eval(local_env, node_env, map)?.as_map()?.clone();
+            let k = eval(local_env, node_env, key, role_names)?;
+            let m = eval(local_env, node_env, map, role_names)?
+                .as_map()?
+                .clone();
             Ok(Value::<H>::map(m.without(&k)))
         }
         Expr::ListLen(list) => {
-            let list_val = eval(local_env, node_env, list)?;
+            let list_val = eval(local_env, node_env, list, role_names)?;
             match &list_val.kind {
                 ValueKind::List(l) => Ok(Value::<H>::int(l.len() as i64)),
                 ValueKind::Map(m) => Ok(Value::<H>::int(m.len() as i64)),
@@ -291,7 +320,7 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::ListAccess(list, idx) => {
-            let l = eval(local_env, node_env, list)?;
+            let l = eval(local_env, node_env, list, role_names)?;
             let vec = l.as_list()?;
             let i = *idx;
             if i >= vec.len() {
@@ -303,12 +332,12 @@ pub fn eval<H: HashPolicy>(
             Ok(vec[i].clone())
         }
         Expr::Min(e1, e2) => {
-            let v1 = eval(local_env, node_env, e1)?.as_int()?;
-            let v2 = eval(local_env, node_env, e2)?.as_int()?;
+            let v1 = eval(local_env, node_env, e1, role_names)?.as_int()?;
+            let v2 = eval(local_env, node_env, e2, role_names)?.as_int()?;
             Ok(Value::<H>::int(v1.min(v2)))
         }
         Expr::TupleAccess(tuple, idx) => {
-            let t = eval(local_env, node_env, tuple)?;
+            let t = eval(local_env, node_env, tuple, role_names)?;
             if let ValueKind::Tuple(vec) = &t.kind {
                 if *idx >= vec.len() {
                     return Err(RuntimeError::IndexOutOfBounds {
@@ -325,7 +354,7 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::Unwrap(e) => {
-            let val = eval(local_env, node_env, e)?;
+            let val = eval(local_env, node_env, e, role_names)?;
             match &val.kind {
                 ValueKind::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v.clone())),
                 ValueKind::Option(None) => Err(RuntimeError::UnwrapNone),
@@ -336,36 +365,51 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::Coalesce(opt, default) => {
-            let val = eval(local_env, node_env, opt)?;
+            let val = eval(local_env, node_env, opt, role_names)?;
             match &val.kind {
                 ValueKind::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v.clone())),
-                ValueKind::Option(None) => eval(local_env, node_env, default),
+                ValueKind::Option(None) => eval(local_env, node_env, default, role_names),
                 _ => Err(RuntimeError::CoalesceNonOption {
                     got: val.type_name(),
                 }),
             }
         }
         Expr::IntToString(e) => Ok(Value::<H>::string(EcoString::from(
-            eval(local_env, node_env, e)?.as_int()?.to_string(),
+            eval(local_env, node_env, e, role_names)?
+                .as_int()?
+                .to_string(),
         ))),
         Expr::BoolToString(e) => Ok(Value::<H>::string(EcoString::from(
-            eval(local_env, node_env, e)?.as_bool()?.to_string(),
+            eval(local_env, node_env, e, role_names)?
+                .as_bool()?
+                .to_string(),
         ))),
+        Expr::NodeToString(e) => {
+            let node_id = eval(local_env, node_env, e, role_names)?.as_node()?;
+            let role_name = role_names
+                .get(&node_id.role)
+                .map(|s| s.as_str())
+                .unwrap_or("Unknown");
+            Ok(Value::<H>::string(EcoString::from(format!(
+                "{}[{}]",
+                role_name, node_id.index
+            ))))
+        }
         Expr::Store(col, key, val) => update_collection(
-            eval(local_env, node_env, col)?,
-            eval(local_env, node_env, key)?,
-            eval(local_env, node_env, val)?,
+            eval(local_env, node_env, col, role_names)?,
+            eval(local_env, node_env, key, role_names)?,
+            eval(local_env, node_env, val, role_names)?,
         ),
         Expr::Variant(enum_id, name, payload) => {
             let payload_val = payload
                 .as_ref()
-                .map(|p| eval(local_env, node_env, p))
+                .map(|p| eval(local_env, node_env, p, role_names))
                 .transpose()?
                 .map(Arc::new);
             Ok(Value::<H>::variant(*enum_id, name.clone(), payload_val))
         }
         Expr::IsVariant(expr, name) => {
-            let val = eval(local_env, node_env, expr)?;
+            let val = eval(local_env, node_env, expr, role_names)?;
             match &val.kind {
                 ValueKind::Variant(_, variant_name, _) => {
                     Ok(Value::<H>::bool(variant_name == name))
@@ -374,7 +418,7 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::VariantPayload(expr) => {
-            let val = eval(local_env, node_env, expr)?;
+            let val = eval(local_env, node_env, expr, role_names)?;
             match &val.kind {
                 ValueKind::Variant(_, _, Some(payload)) => Ok((**payload).clone()),
                 ValueKind::Variant(_, _, None) => Err(RuntimeError::VariantHasNoPayload),
@@ -391,6 +435,7 @@ pub fn eval<H: HashPolicy>(
 mod tests {
     use super::*;
     use crate::analysis::resolver::NameId;
+    use crate::simulator::core::state::NodeId;
     use crate::simulator::hash_utils::WithHashing;
 
     fn dummy_slot(idx: u32) -> VarSlot {
@@ -404,24 +449,25 @@ mod tests {
     #[test]
     fn test_eval_literals() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
         assert_eq!(
-            eval(&env, &env, &Expr::Int(42)).unwrap(),
+            eval(&env, &env, &Expr::Int(42), &roles).unwrap(),
             Value::<WithHashing>::int(42)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Bool(true)).unwrap(),
+            eval(&env, &env, &Expr::Bool(true), &roles).unwrap(),
             Value::<WithHashing>::bool(true)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::String("hello".into())).unwrap(),
+            eval(&env, &env, &Expr::String("hello".into()), &roles).unwrap(),
             Value::<WithHashing>::string("hello".into())
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Unit).unwrap(),
+            eval(&env, &env, &Expr::Unit, &roles).unwrap(),
             Value::<WithHashing>::unit()
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Nil).unwrap(),
+            eval(&env, &env, &Expr::Nil, &roles).unwrap(),
             Value::<WithHashing>::option_none()
         );
     }
@@ -429,27 +475,28 @@ mod tests {
     #[test]
     fn test_eval_arithmetic() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
         let e1 = Box::new(Expr::Int(10));
         let e2 = Box::new(Expr::Int(3));
 
         assert_eq!(
-            eval(&env, &env, &Expr::Plus(e1.clone(), e2.clone())).unwrap(),
+            eval(&env, &env, &Expr::Plus(e1.clone(), e2.clone()), &roles).unwrap(),
             Value::<WithHashing>::int(13)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Minus(e1.clone(), e2.clone())).unwrap(),
+            eval(&env, &env, &Expr::Minus(e1.clone(), e2.clone()), &roles).unwrap(),
             Value::<WithHashing>::int(7)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Times(e1.clone(), e2.clone())).unwrap(),
+            eval(&env, &env, &Expr::Times(e1.clone(), e2.clone()), &roles).unwrap(),
             Value::<WithHashing>::int(30)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Div(e1.clone(), e2.clone())).unwrap(),
+            eval(&env, &env, &Expr::Div(e1.clone(), e2.clone()), &roles).unwrap(),
             Value::<WithHashing>::int(3)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Mod(e1.clone(), e2.clone())).unwrap(),
+            eval(&env, &env, &Expr::Mod(e1.clone(), e2.clone()), &roles).unwrap(),
             Value::<WithHashing>::int(1)
         );
     }
@@ -457,12 +504,13 @@ mod tests {
     #[test]
     fn test_eval_string_concat() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
 
         // Basic concatenation
         let s1 = Box::new(Expr::String(EcoString::from("hello")));
         let s2 = Box::new(Expr::String(EcoString::from("world")));
         assert_eq!(
-            eval(&env, &env, &Expr::Plus(s1, s2)).unwrap(),
+            eval(&env, &env, &Expr::Plus(s1, s2), &roles).unwrap(),
             Value::<WithHashing>::string(EcoString::from("helloworld"))
         );
 
@@ -470,7 +518,7 @@ mod tests {
         let s3 = Box::new(Expr::String(EcoString::from("hello ")));
         let s4 = Box::new(Expr::String(EcoString::from("world")));
         assert_eq!(
-            eval(&env, &env, &Expr::Plus(s3, s4)).unwrap(),
+            eval(&env, &env, &Expr::Plus(s3, s4), &roles).unwrap(),
             Value::<WithHashing>::string(EcoString::from("hello world"))
         );
 
@@ -478,11 +526,11 @@ mod tests {
         let s5 = Box::new(Expr::String(EcoString::from("")));
         let s6 = Box::new(Expr::String(EcoString::from("test")));
         assert_eq!(
-            eval(&env, &env, &Expr::Plus(s5.clone(), s6.clone())).unwrap(),
+            eval(&env, &env, &Expr::Plus(s5.clone(), s6.clone()), &roles).unwrap(),
             Value::<WithHashing>::string(EcoString::from("test"))
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Plus(s6, s5)).unwrap(),
+            eval(&env, &env, &Expr::Plus(s6, s5), &roles).unwrap(),
             Value::<WithHashing>::string(EcoString::from("test"))
         );
     }
@@ -490,19 +538,20 @@ mod tests {
     #[test]
     fn test_eval_logical() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
         let t = Box::new(Expr::Bool(true));
         let f = Box::new(Expr::Bool(false));
 
         assert_eq!(
-            eval(&env, &env, &Expr::Not(t.clone())).unwrap(),
+            eval(&env, &env, &Expr::Not(t.clone()), &roles).unwrap(),
             Value::<WithHashing>::bool(false)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::And(t.clone(), f.clone())).unwrap(),
+            eval(&env, &env, &Expr::And(t.clone(), f.clone()), &roles).unwrap(),
             Value::<WithHashing>::bool(false)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::Or(t.clone(), f.clone())).unwrap(),
+            eval(&env, &env, &Expr::Or(t.clone(), f.clone()), &roles).unwrap(),
             Value::<WithHashing>::bool(true)
         );
     }
@@ -510,27 +559,52 @@ mod tests {
     #[test]
     fn test_eval_comparison() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
         let e1 = Box::new(Expr::Int(10));
         let e2 = Box::new(Expr::Int(20));
 
         assert_eq!(
-            eval(&env, &env, &Expr::EqualsEquals(e1.clone(), e1.clone())).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::EqualsEquals(e1.clone(), e1.clone()),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::bool(true)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::LessThan(e1.clone(), e2.clone())).unwrap(),
+            eval(&env, &env, &Expr::LessThan(e1.clone(), e2.clone()), &roles).unwrap(),
             Value::<WithHashing>::bool(true)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::LessThanEquals(e1.clone(), e1.clone())).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::LessThanEquals(e1.clone(), e1.clone()),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::bool(true)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::GreaterThan(e2.clone(), e1.clone())).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::GreaterThan(e2.clone(), e1.clone()),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::bool(true)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::GreaterThanEquals(e1.clone(), e1.clone())).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::GreaterThanEquals(e1.clone(), e1.clone()),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::bool(true)
         );
     }
@@ -538,16 +612,17 @@ mod tests {
     #[test]
     fn test_eval_vars() {
         let mut local_env = Env::<WithHashing>::with_slots(2);
+        let roles = HashMap::new();
         local_env.set(0, Value::<WithHashing>::int(100));
         let mut node_env = Env::<WithHashing>::with_slots(1);
         node_env.set(0, Value::<WithHashing>::int(200));
 
         assert_eq!(
-            eval(&local_env, &node_env, &Expr::Var(dummy_slot(0))).unwrap(),
+            eval(&local_env, &node_env, &Expr::Var(dummy_slot(0)), &roles).unwrap(),
             Value::<WithHashing>::int(100)
         );
         assert_eq!(
-            eval(&local_env, &node_env, &Expr::Var(node_slot(0))).unwrap(),
+            eval(&local_env, &node_env, &Expr::Var(node_slot(0)), &roles).unwrap(),
             Value::<WithHashing>::int(200)
         );
     }
@@ -555,26 +630,40 @@ mod tests {
     #[test]
     fn test_eval_collections() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
 
         // Tuple
         let tuple_expr = Expr::Tuple(vec![Expr::Int(1), Expr::Bool(true)]);
-        let _tuple_val = eval(&env, &env, &tuple_expr).unwrap();
+        let _tuple_val = eval(&env, &env, &tuple_expr, &roles).unwrap();
         assert_eq!(
-            eval(&env, &env, &Expr::TupleAccess(Box::new(tuple_expr), 1)).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::TupleAccess(Box::new(tuple_expr), 1),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::bool(true)
         );
 
         // List
         let list_expr = Expr::List(vec![Expr::Int(1), Expr::Int(2)]);
         assert_eq!(
-            eval(&env, &env, &Expr::ListLen(Box::new(list_expr.clone()))).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::ListLen(Box::new(list_expr.clone())),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::int(2)
         );
         assert_eq!(
             eval(
                 &env,
                 &env,
-                &Expr::ListAccess(Box::new(list_expr.clone()), 0)
+                &Expr::ListAccess(Box::new(list_expr.clone()), 0),
+                &roles
             )
             .unwrap(),
             Value::<WithHashing>::int(1)
@@ -582,11 +671,11 @@ mod tests {
 
         // List operations
         let append_expr = Expr::ListAppend(Box::new(list_expr.clone()), Box::new(Expr::Int(3)));
-        let appended_val = eval(&env, &env, &append_expr).unwrap();
+        let appended_val = eval(&env, &env, &append_expr, &roles).unwrap();
         assert_eq!(appended_val.as_list().unwrap().len(), 3);
 
         let prepend_expr = Expr::ListPrepend(Box::new(Expr::Int(0)), Box::new(list_expr.clone()));
-        let prepended_val = eval(&env, &env, &prepend_expr).unwrap();
+        let prepended_val = eval(&env, &env, &prepend_expr, &roles).unwrap();
         assert_eq!(
             prepended_val.as_list().unwrap()[0],
             Value::<WithHashing>::int(0)
@@ -597,7 +686,7 @@ mod tests {
             Box::new(Expr::Int(0)),
             Box::new(Expr::Int(1)),
         );
-        let sub_val = eval(&env, &env, &sub_expr).unwrap();
+        let sub_val = eval(&env, &env, &sub_expr, &roles).unwrap();
         assert_eq!(sub_val.as_list().unwrap().len(), 1);
 
         // Map
@@ -609,7 +698,8 @@ mod tests {
                 &Expr::Find(
                     Box::new(map_expr.clone()),
                     Box::new(Expr::String("key".into()))
-                )
+                ),
+                &roles
             )
             .unwrap(),
             Value::<WithHashing>::int(42)
@@ -621,23 +711,31 @@ mod tests {
                 &Expr::KeyExists(
                     Box::new(Expr::String("key".into())),
                     Box::new(map_expr.clone())
-                )
+                ),
+                &roles
             )
             .unwrap(),
             Value::<WithHashing>::bool(true)
         );
 
         let erase_expr = Expr::MapErase(Box::new(Expr::String("key".into())), Box::new(map_expr));
-        let erased_val = eval(&env, &env, &erase_expr).unwrap();
+        let erased_val = eval(&env, &env, &erase_expr, &roles).unwrap();
         assert_eq!(erased_val.as_map().unwrap().len(), 0);
     }
 
     #[test]
     fn test_eval_options() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
         let some_expr = Expr::Some(Box::new(Expr::Int(42)));
         assert_eq!(
-            eval(&env, &env, &Expr::Unwrap(Box::new(some_expr.clone()))).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::Unwrap(Box::new(some_expr.clone())),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::int(42)
         );
 
@@ -646,7 +744,8 @@ mod tests {
             eval(
                 &env,
                 &env,
-                &Expr::Coalesce(Box::new(nil_expr), Box::new(Expr::Int(100)))
+                &Expr::Coalesce(Box::new(nil_expr), Box::new(Expr::Int(100))),
+                &roles
             )
             .unwrap(),
             Value::<WithHashing>::int(100)
@@ -655,7 +754,8 @@ mod tests {
             eval(
                 &env,
                 &env,
-                &Expr::Coalesce(Box::new(some_expr), Box::new(Expr::Int(100)))
+                &Expr::Coalesce(Box::new(some_expr), Box::new(Expr::Int(100))),
+                &roles
             )
             .unwrap(),
             Value::<WithHashing>::int(42)
@@ -665,25 +765,45 @@ mod tests {
     #[test]
     fn test_eval_misc() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
         assert_eq!(
             eval(
                 &env,
                 &env,
-                &Expr::Min(Box::new(Expr::Int(10)), Box::new(Expr::Int(20)))
+                &Expr::Min(Box::new(Expr::Int(10)), Box::new(Expr::Int(20))),
+                &roles
             )
             .unwrap(),
             Value::<WithHashing>::int(10)
         );
         assert_eq!(
-            eval(&env, &env, &Expr::IntToString(Box::new(Expr::Int(123)))).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::IntToString(Box::new(Expr::Int(123))),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::string("123".into())
         );
         assert_eq!(
-            eval(&env, &env, &Expr::BoolToString(Box::new(Expr::Bool(true)))).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::BoolToString(Box::new(Expr::Bool(true))),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::string("true".into())
         );
         assert_eq!(
-            eval(&env, &env, &Expr::BoolToString(Box::new(Expr::Bool(false)))).unwrap(),
+            eval(
+                &env,
+                &env,
+                &Expr::BoolToString(Box::new(Expr::Bool(false))),
+                &roles
+            )
+            .unwrap(),
             Value::<WithHashing>::string("false".into())
         );
     }
@@ -691,13 +811,14 @@ mod tests {
     #[test]
     fn test_eval_store_update() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
         let list_expr = Expr::List(vec![Expr::Int(1)]);
         let store_expr = Expr::Store(
             Box::new(list_expr),
             Box::new(Expr::Int(0)),
             Box::new(Expr::Int(42)),
         );
-        let updated_list = eval(&env, &env, &store_expr).unwrap();
+        let updated_list = eval(&env, &env, &store_expr, &roles).unwrap();
         assert_eq!(
             updated_list.as_list().unwrap()[0],
             Value::<WithHashing>::int(42)
@@ -707,10 +828,12 @@ mod tests {
     #[test]
     fn test_eval_errors() {
         let env = Env::<WithHashing>::with_slots(0);
+        let roles = HashMap::new();
         let res = eval(
             &env,
             &env,
             &Expr::Plus(Box::new(Expr::Bool(true)), Box::new(Expr::Int(1))),
+            &roles,
         );
         assert!(res.is_err());
     }
@@ -758,8 +881,41 @@ mod tests {
         };
         let args = vec![Value::<WithHashing>::int(5)];
         let env = Env::<WithHashing>::with_slots(0);
-        let local = make_local_env(&func, args, &env, &env);
+        let roles = HashMap::new();
+        let local = make_local_env(&func, args, &env, &env, &roles);
         assert_eq!(local.get(0), &Value::<WithHashing>::int(5));
         assert_eq!(local.get(1), &Value::<WithHashing>::int(10));
+    }
+    #[test]
+    fn test_role_to_string() {
+        let mut local_env = Env::<WithHashing>::with_slots(1);
+        let node_env = Env::<WithHashing>::with_slots(0);
+        let mut roles = HashMap::new();
+        roles.insert(NameId(0), "Server".to_string());
+        roles.insert(NameId(1), "Client".to_string());
+
+        // Test known role
+        let server_node = Value::<WithHashing>::node(NodeId {
+            role: NameId(0),
+            index: 1,
+        });
+        local_env.set(0, server_node);
+
+        let expr = Expr::NodeToString(Box::new(Expr::Var(crate::compiler::cfg::VarSlot::Local(
+            0,
+            NameId(0),
+        ))));
+
+        let result = eval(&local_env, &node_env, &expr, &roles).unwrap();
+        assert_eq!(result, Value::<WithHashing>::string("Server[1]".into()));
+
+        // Test unknown role
+        let unknown_node = Value::<WithHashing>::node(NodeId {
+            role: NameId(99),
+            index: 0,
+        });
+        local_env.set(0, unknown_node);
+        let result = eval(&local_env, &node_env, &expr, &roles).unwrap();
+        assert_eq!(result, Value::<WithHashing>::string("Unknown[0]".into()));
     }
 }

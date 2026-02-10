@@ -2,8 +2,8 @@ use crate::compiler::cfg::{Instr, Label, Lhs, Program, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{eval, make_local_env, store};
 use crate::simulator::core::state::{
-    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, Record, Runnable, State, Timer,
-    UpdatePolicy,
+    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, Record, Runnable, State,
+    Timer, UpdatePolicy,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
@@ -14,12 +14,12 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
     logger: &mut L,
     program: &Program,
     local_env: &mut Env<H>,
-    node_id: usize,
+    node_id: NodeId,
     start_pc: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Value<H>, RuntimeError> {
-    let mut node_env = state.nodes[node_id].clone();
+    let mut node_env = state.nodes[node_id.index].clone();
     let result = exec_sync_inner(
         state,
         logger,
@@ -31,7 +31,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
     );
-    state.nodes[node_id] = node_env;
+    state.nodes[node_id.index] = node_env;
     result
 }
 
@@ -47,20 +47,22 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     program: &Program,
     local_env: &mut Env<H>,
     node_env: &mut Env<H>,
-    node_id: usize,
+    node_id: NodeId,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
     match label {
         Label::Instr(instr, next) => match instr {
             Instr::Assign(lhs, rhs) | Instr::Copy(lhs, rhs) => {
-                let v = eval(local_env, node_env, rhs)?;
+                let v = eval(local_env, node_env, rhs, &program.id_to_name)?;
                 store(lhs, v, local_env, node_env)?;
                 Ok(Some(StepOutcome::Continue(*next)))
             }
             Instr::SyncCall(lhs, func_name, args) => {
-                let arg_vals: Result<Vec<Value<H>>, _> =
-                    args.iter().map(|a| eval(local_env, node_env, a)).collect();
+                let arg_vals: Result<Vec<Value<H>>, _> = args
+                    .iter()
+                    .map(|a| eval(local_env, node_env, a, &program.id_to_name))
+                    .collect();
                 let arg_vals = arg_vals?;
                 let func_name_id = program
                     .func_name_to_id
@@ -75,7 +77,13 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     return Err(RuntimeError::SyncCallToAsyncFunction(func_name.clone()));
                 }
 
-                let mut callee_local = make_local_env(func_info, arg_vals, local_env, node_env);
+                let mut callee_local = make_local_env(
+                    func_info,
+                    arg_vals,
+                    local_env,
+                    node_env,
+                    &program.id_to_name,
+                );
 
                 let val = exec_sync_inner(
                     state,
@@ -93,9 +101,12 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 Ok(Some(StepOutcome::Continue(*next)))
             }
             Instr::Async(lhs, node_expr, func_name, args) => {
-                let target_node = eval(local_env, node_env, node_expr)?.as_node()?;
-                let arg_vals: Result<Vec<Value<H>>, _> =
-                    args.iter().map(|a| eval(local_env, node_env, a)).collect();
+                let target_node =
+                    eval(local_env, node_env, node_expr, &program.id_to_name)?.as_node()?;
+                let arg_vals: Result<Vec<Value<H>>, _> = args
+                    .iter()
+                    .map(|a| eval(local_env, node_env, a, &program.id_to_name))
+                    .collect();
                 let arg_vals = arg_vals?;
 
                 let chan_id = ChannelId {
@@ -103,7 +114,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     id: state.alloc_channel_id(),
                 };
 
-                state.channels.insert(chan_id, ChannelState::new(Some(1)));
+                state.channels.insert(chan_id, ChannelState::new());
                 store(lhs, Value::channel(chan_id), local_env, node_env)?;
 
                 let func_name_id = program
@@ -114,7 +125,13 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     .rpc
                     .get(func_name_id)
                     .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
-                let callee_locals = make_local_env(func_info, arg_vals, local_env, node_env);
+                let callee_locals = make_local_env(
+                    func_info,
+                    arg_vals,
+                    local_env,
+                    node_env,
+                    &program.id_to_name,
+                );
 
                 let new_record = Record {
                     pc: func_info.entry,
@@ -137,14 +154,12 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 Ok(Some(StepOutcome::Continue(*next)))
             }
         },
-        Label::MakeChannel(lhs, cap, next) => {
+        Label::MakeChannel(lhs, _, next) => {
             let cid = ChannelId {
                 node: node_id,
                 id: state.alloc_channel_id(),
             };
-            // cap: &Option<usize> -> Option<i32>
-            let capacity = cap.map(|c| c as i32);
-            state.channels.insert(cid, ChannelState::new(capacity));
+            state.channels.insert(cid, ChannelState::new());
             store(lhs, Value::channel(cid), local_env, node_env)?;
             Ok(Some(StepOutcome::Continue(*next)))
         }
@@ -153,7 +168,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 node: node_id,
                 id: state.alloc_channel_id(),
             };
-            state.channels.insert(cid, ChannelState::new(Some(1)));
+            state.channels.insert(cid, ChannelState::new());
             store(lhs, Value::channel(cid), local_env, node_env)?;
 
             // Create a timer that will fire when scheduled
@@ -171,18 +186,18 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::Cond(cond, bthen, belse) => {
-            if eval(local_env, node_env, cond)?.as_bool()? {
+            if eval(local_env, node_env, cond, &program.id_to_name)?.as_bool()? {
                 Ok(Some(StepOutcome::Continue(*bthen)))
             } else {
                 Ok(Some(StepOutcome::Continue(*belse)))
             }
         }
         Label::Return(expr) => {
-            let val = eval(local_env, node_env, expr)?;
+            let val = eval(local_env, node_env, expr, &program.id_to_name)?;
             Ok(Some(StepOutcome::Return(val)))
         }
         Label::Print(expr, next) => {
-            let val = eval(local_env, node_env, expr)?;
+            let val = eval(local_env, node_env, expr, &program.id_to_name)?;
             logger.log(LogEntry {
                 node: node_id,
                 content: val.to_string(),
@@ -191,6 +206,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::Break(target) => Ok(Some(StepOutcome::Continue(*target))),
+        Label::Continue(target) => Ok(Some(StepOutcome::Continue(*target))),
         Label::ForLoopIn(lhs, expr, iter_state_slot, body, next) => {
             let iter_slot_idx = match iter_state_slot {
                 VarSlot::Local(idx, _) => *idx,
@@ -200,7 +216,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             let col_val = {
                 let current = local_env.get(iter_slot_idx).clone();
                 if matches!(current.kind, ValueKind::Unit) {
-                    let original_collection = eval(local_env, node_env, expr)?;
+                    let original_collection = eval(local_env, node_env, expr, &program.id_to_name)?;
                     local_env.set(iter_slot_idx, original_collection.clone());
                     original_collection
                 } else {
@@ -260,7 +276,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
     local_env: &mut Env<H>,
     node_env: &mut Env<H>,
     start_pc: usize,
-    node_id: usize,
+    node_id: NodeId,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<Value<H>, RuntimeError> {
@@ -310,7 +326,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
     local_coverage: &mut LocalCoverage,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let mut local_env = record.env;
-    let mut node_env = state.nodes[record.node].clone();
+    let mut node_env = state.nodes[record.node.index].clone();
 
     let mut prev_pc = record.pc;
 
@@ -342,7 +358,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 }
                 StepOutcome::Return(val) => {
                     let node_id = record.node;
-                    state.nodes[node_id] = node_env;
+                    state.nodes[node_id.index] = node_env;
                     let result = record.continuation.call(state, val);
                     return Ok(result);
                 }
@@ -351,43 +367,46 @@ pub fn exec<H: HashPolicy, L: Logger>(
 
         match label {
             Label::Send(chan_expr, val_expr, next) => {
-                let cid = eval(&local_env, &node_env, chan_expr)?.as_channel()?;
-                let val = eval(&local_env, &node_env, val_expr)?;
+                let cid =
+                    eval(&local_env, &node_env, chan_expr, &program.id_to_name)?.as_channel()?;
+                let val = eval(&local_env, &node_env, val_expr, &program.id_to_name)?;
                 if cid.node != record.node {
-                    return Err(RuntimeError::NetworkedChannelUnsupported);
-                }
-                // Local Send
-                let mut chan = state
-                    .channels
-                    .get(&cid)
-                    .ok_or(RuntimeError::ChannelNotFound(cid.id))?
-                    .clone();
-                if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                    // Wakeup reader
-                    let mut r_node_env = state.nodes[reader.node].clone();
-                    store(&lhs, val, &mut reader.env, &mut r_node_env)?;
-                    state.nodes[reader.node] = r_node_env;
-                    state.runnable_tasks.push_back(Runnable::Record(reader));
-                    record.pc = *next;
-                } else if chan.capacity.is_none()
-                    || (chan.buffer.len() as i32) < chan.capacity.unwrap()
-                {
-                    // Unbounded channel (capacity=None) always accepts, or bounded with space
-                    chan.buffer.push_back(val);
+                    // Remote Send
+                    state.runnable_tasks.push_back(Runnable::ChannelSend {
+                        target: cid.node,
+                        channel: cid,
+                        message: val,
+                        origin_node: record.node,
+                        x: record.x,
+                        policy: record.policy.clone(),
+                        pc: *next,
+                    });
+                    // Non-blocking, proceed
                     record.pc = *next;
                 } else {
-                    let node_id = record.node;
-                    record.env = local_env;
-                    record.pc = *next;
-                    chan.waiting_writers.push_back((record, val));
+                    // Local Send
+                    let mut chan = state
+                        .channels
+                        .get(&cid)
+                        .ok_or(RuntimeError::ChannelNotFound(cid.id))?
+                        .clone();
+
+                    if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                        // Wakeup reader
+                        let mut r_node_env = state.nodes[reader.node.index].clone();
+                        store(&lhs, val, &mut reader.env, &mut r_node_env)?;
+                        state.nodes[reader.node.index] = r_node_env;
+                        state.runnable_tasks.push_back(Runnable::Record(reader));
+                    } else {
+                        chan.buffer.push_back(val);
+                    }
                     state.channels.insert(cid, chan);
-                    state.nodes[node_id] = node_env;
-                    return Ok(None);
+                    record.pc = *next;
                 }
-                state.channels.insert(cid, chan);
             }
             Label::Recv(lhs, chan_expr, next) => {
-                let cid = eval(&local_env, &node_env, chan_expr)?.as_channel()?;
+                let cid =
+                    eval(&local_env, &node_env, chan_expr, &program.id_to_name)?.as_channel()?;
                 if cid.node != record.node {
                     return Err(RuntimeError::RemoteChannelRead);
                 }
@@ -400,15 +419,6 @@ pub fn exec<H: HashPolicy, L: Logger>(
 
                 if let Some(val) = chan.buffer.pop_front() {
                     store(lhs, val, &mut local_env, &mut node_env)?;
-                    // Wake writer if any
-                    if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
-                        chan.buffer.push_back(w_val);
-                        state.runnable_tasks.push_back(Runnable::Record(writer));
-                    }
-                    record.pc = *next;
-                } else if let Some((writer, w_val)) = chan.waiting_writers.pop_front() {
-                    store(lhs, w_val, &mut local_env, &mut node_env)?;
-                    state.runnable_tasks.push_back(Runnable::Record(writer));
                     record.pc = *next;
                 } else {
                     // Block Reader
@@ -417,7 +427,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                     record.pc = *next; // When woke, proceed to next
                     chan.waiting_readers.push_back((record, lhs.clone()));
                     state.channels.insert(cid, chan);
-                    state.nodes[node_id] = node_env;
+                    state.nodes[node_id.index] = node_env;
                     return Ok(None); // Stop execution
                 }
                 state.channels.insert(cid, chan);
@@ -427,17 +437,17 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 record.env = local_env;
                 record.pc = *next;
                 state.runnable_tasks.push_back(Runnable::Record(record));
-                state.nodes[node_id] = node_env;
+                state.nodes[node_id.index] = node_env;
                 return Ok(None); // Yield
             }
             Label::SpinAwait(expr, next) => {
-                if eval(&local_env, &node_env, expr)?.as_bool()? {
+                if eval(&local_env, &node_env, expr, &program.id_to_name)?.as_bool()? {
                     record.pc = *next;
                 } else {
                     let node_id = record.node;
                     record.env = local_env;
                     state.runnable_tasks.push_back(Runnable::Record(record));
-                    state.nodes[node_id] = node_env;
+                    state.nodes[node_id.index] = node_env;
                     return Ok(None); // Yield
                 }
             }
@@ -453,6 +463,11 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 unreachable!(
                     "Label {:?} should have been handled by execute_common_label or is missing implementation in exec loop",
                     label
+                )
+            }
+            Label::Continue(_) => {
+                unreachable!(
+                    "Label::Continue should have been handled by execute_common_label or is missing implementation in exec loop"
                 )
             }
         }

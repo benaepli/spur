@@ -27,7 +27,7 @@ pub struct PersistableLog {
 pub fn serialize_logs(logs: &[LogEntry]) -> Vec<PersistableLog> {
     logs.par_iter()
         .map(|l| PersistableLog {
-            node_id: l.node as i64,
+            node_id: l.node.index as i64,
             content: l.content.clone(),
             step: l.step,
         })

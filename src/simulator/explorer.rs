@@ -1,6 +1,7 @@
+use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Env, Logger, RuntimeError, State, Value, exec_sync_on_node, make_local_env,
+    Env, Logger, NodeId, RuntimeError, State, Value, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
@@ -207,19 +208,44 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<State<H>, RuntimeError> {
-    let mut state = State::<H>::new(num_servers + num_clients, program.max_node_slots as usize);
+    // Look up role NameIds from the program
+    let server_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "Node")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
+    let client_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "ClientInterface")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
+
+    let role_node_counts = vec![(server_role, num_servers), (client_role, num_clients)];
+    let mut state = State::<H>::new(&role_node_counts, program.max_node_slots as usize);
 
     if let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
         for i in 0..num_clients {
-            let client_id = num_servers + i;
-            let node_env = &state.nodes[client_id];
-            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
+            let client_index = num_servers + i;
+            let client_node_id = NodeId {
+                role: client_role,
+                index: client_index,
+            };
+            let node_env = &state.nodes[client_index];
+            let mut env = make_local_env(
+                init_fn,
+                vec![],
+                &Env::<H>::default(),
+                node_env,
+                &program.id_to_name,
+            );
             exec_sync_on_node(
                 &mut state,
                 logger,
                 program,
                 &mut env,
-                client_id,
+                client_node_id,
                 init_fn.entry,
                 global_snapshot,
                 local_coverage,
@@ -228,9 +254,19 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
     }
 
     if let Some(init_fn) = program.get_func_by_name("Node.BASE_NODE_INIT") {
-        for node_id in 0..num_servers {
-            let node_env = &state.nodes[node_id];
-            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), node_env);
+        for i in 0..num_servers {
+            let node_id = NodeId {
+                role: server_role,
+                index: i,
+            };
+            let node_env = &state.nodes[i];
+            let mut env = make_local_env(
+                init_fn,
+                vec![],
+                &Env::<H>::default(),
+                node_env,
+                &program.id_to_name,
+            );
             exec_sync_on_node(
                 &mut state,
                 logger,
@@ -261,12 +297,38 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
         return Ok(());
     };
 
-    let peer_list = Value::<H>::list((0..num_servers).map(Value::<H>::node).collect());
+    let server_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "Node")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
 
-    for node_id in 0..num_servers {
-        let actuals = vec![Value::<H>::int(node_id as i64), peer_list.clone()];
-        let node_env = &state.nodes[node_id];
-        let mut env = make_local_env(init_fn, actuals, &Env::<H>::default(), node_env);
+    let peer_list = Value::<H>::list(
+        (0..num_servers)
+            .map(|i| {
+                Value::<H>::node(NodeId {
+                    role: server_role,
+                    index: i,
+                })
+            })
+            .collect(),
+    );
+
+    for i in 0..num_servers {
+        let node_id = NodeId {
+            role: server_role,
+            index: i,
+        };
+        let actuals = vec![Value::<H>::int(i as i64), peer_list.clone()];
+        let node_env = &state.nodes[i];
+        let mut env = make_local_env(
+            init_fn,
+            actuals,
+            &Env::<H>::default(),
+            node_env,
+            &program.id_to_name,
+        );
 
         exec_sync_on_node(
             state,
@@ -315,8 +377,23 @@ pub fn run_single_simulation(
     // Use NoHashing for exec_plan mode (no state deduplication needed)
     let num_servers = config.num_servers as usize;
     let num_clients = config.num_clients as usize;
+
+    let server_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "Node")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
+    let client_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "ClientInterface")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
+
+    let role_node_counts = vec![(server_role, num_servers), (client_role, num_clients)];
     let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing>::new(
-        num_servers + num_clients,
+        &role_node_counts,
         program.max_node_slots as usize,
     );
     path_state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
@@ -354,6 +431,7 @@ pub fn run_single_simulation(
         config.randomly_delay_msgs,
         global_state,
         Some(&global_snapshot),
+        run_id,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -544,10 +622,15 @@ pub fn run_explorer_genetic(
             .par_iter()
             .map(|run_config| {
                 let run_id = run_counter.fetch_add(1, Ordering::Relaxed);
-                let score =
-                    run_single_simulation(program, &writer, &global_state, run_id, run_config)
-                        .unwrap_or(0.0);
-                (run_config.clone(), score)
+                let result =
+                    run_single_simulation(program, &writer, &global_state, run_id, run_config);
+                match result {
+                    Ok(score) => (run_config.clone(), score),
+                    Err(e) => {
+                        error!("Genetic run {} failed: {}", run_id, e);
+                        (run_config.clone(), 0.0)
+                    }
+                }
             })
             .collect();
 

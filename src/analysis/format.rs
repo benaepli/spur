@@ -228,6 +228,16 @@ pub fn report_type_errors(
                     "help: break statements can only appear inside loops".to_string(),
                 ]),
 
+            TypeError::ContinueOutsideLoop(span) => Diagnostic::error()
+                .with_message("continue statement outside of loop")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message("cannot continue from here"),
+                ])
+                .with_notes(vec![
+                    "help: continue statements can only appear inside loops".to_string(),
+                ]),
+
             TypeError::NotIterable { ty, span } => Diagnostic::error()
                 .with_message("cannot iterate over this type")
                 .with_labels(vec![

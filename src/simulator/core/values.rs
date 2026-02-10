@@ -1,4 +1,5 @@
 use crate::simulator::core::error::RuntimeError;
+use crate::simulator::core::state::NodeId;
 use crate::simulator::hash_utils::{HashPolicy, mix};
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
@@ -9,7 +10,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChannelId {
-    pub node: usize,
+    pub node: NodeId,
     pub id: usize,
 }
 
@@ -22,7 +23,7 @@ pub enum ValueKind<H: HashPolicy> {
     List(Vector<Value<H>>),
     Option(Option<Arc<Value<H>>>),
     Channel(ChannelId),
-    Node(usize),
+    Node(NodeId),
     String(EcoString),
     Unit,
     Tuple(Vector<Value<H>>),
@@ -176,7 +177,7 @@ impl<H: HashPolicy> Value<H> {
     }
 
     #[inline]
-    pub fn node(n: usize) -> Self {
+    pub fn node(n: NodeId) -> Self {
         Self::new(ValueKind::Node(n))
     }
 
@@ -405,7 +406,7 @@ impl<H: HashPolicy> Value<H> {
             })
         }
     }
-    pub fn as_node(&self) -> Result<usize, RuntimeError> {
+    pub fn as_node(&self) -> Result<NodeId, RuntimeError> {
         if let ValueKind::Node(n) = &self.kind {
             Ok(*n)
         } else {
@@ -560,15 +561,24 @@ mod tests {
 
     use crate::simulator::hash_utils::WithHashing;
 
+    use crate::analysis::resolver::NameId;
+
     fn calculate_hash<T: Hash>(t: &T) -> u64 {
         let mut s = DefaultHasher::new();
         t.hash(&mut s);
         s.finish()
     }
 
+    // Strategy for NodeId
+    prop_compose! {
+        fn arb_node_id()(role in any::<usize>(), index in any::<usize>()) -> NodeId {
+            NodeId { role: NameId(role), index }
+        }
+    }
+
     // Strategy for ChannelId
     prop_compose! {
-        fn arb_channel_id()(node in any::<usize>(), id in any::<usize>()) -> ChannelId {
+        fn arb_channel_id()(node in arb_node_id(), id in any::<usize>()) -> ChannelId {
             ChannelId { node, id }
         }
     }
@@ -579,7 +589,7 @@ mod tests {
             any::<i64>().prop_map(Value::<WithHashing>::int),
             any::<bool>().prop_map(Value::<WithHashing>::bool),
             any::<String>().prop_map(|s| Value::<WithHashing>::string(EcoString::from(s))),
-            any::<usize>().prop_map(Value::<WithHashing>::node),
+            arb_node_id().prop_map(Value::<WithHashing>::node),
             Just(Value::<WithHashing>::unit()),
             arb_channel_id().prop_map(Value::<WithHashing>::channel),
         ];

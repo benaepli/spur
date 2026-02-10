@@ -1,8 +1,9 @@
+use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::checker::state::{Budget, SearchNode};
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, OpKind, Operation, Record, Runnable, State, UpdatePolicy,
-    Value, exec, exec_sync_on_node, make_local_env,
+    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, Record, Runnable, State,
+    UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use crate::simulator::hash_utils::HashPolicy;
@@ -164,7 +165,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                     // Execute timer: send unit value to its channel
                     if let Some(mut chan) = next_state.channels.get(&timer.channel).cloned() {
                         if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                            let mut r_node_env = next_state.nodes[reader.node].clone();
+                            let mut r_node_env = next_state.nodes[reader.node.index].clone();
                             if let Err(e) = crate::simulator::core::eval::store(
                                 &lhs,
                                 Value::<H>::unit(),
@@ -173,7 +174,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                             ) {
                                 log::warn!("Store failed in timer completion: {}", e);
                             }
-                            next_state.nodes[reader.node] = r_node_env;
+                            next_state.nodes[reader.node.index] = r_node_env;
                             next_state
                                 .runnable_tasks
                                 .push_back(Runnable::Record(reader));
@@ -187,6 +188,45 @@ impl<H: HashPolicy> ModelChecker<H> {
                     continue;
                 }
                 Runnable::Record(r) => r,
+                Runnable::ChannelSend {
+                    target,
+                    channel,
+                    message,
+                    origin_node,
+                    x,
+                    policy,
+                    pc,
+                } => {
+                    if next_state.crash_info.currently_crashed.contains(&target) {
+                        continue;
+                    }
+
+                    // Execute send: check for waiting readers
+                    if let Some(mut chan) = next_state.channels.get(&channel).cloned() {
+                        if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                            let mut r_node_env = next_state.nodes[reader.node.index].clone();
+                            if let Err(e) = crate::simulator::core::eval::store(
+                                &lhs,
+                                message,
+                                &mut reader.env,
+                                &mut r_node_env,
+                            ) {
+                                log::warn!("Store failed in channel send completion: {}", e);
+                            }
+                            next_state.nodes[reader.node.index] = r_node_env;
+                            next_state
+                                .runnable_tasks
+                                .push_back(Runnable::Record(reader));
+                        } else {
+                            chan.buffer.push_back(message);
+                        }
+                        next_state.channels.insert(channel, chan);
+                    }
+                    // Create successor
+                    let succ = self.make_successor(&node, next_state, x);
+                    successors.push(succ);
+                    continue;
+                }
             };
 
             // Handle crashed nodes (drop or queue message)
@@ -246,7 +286,18 @@ impl<H: HashPolicy> ModelChecker<H> {
 
         // Crashes
         if node.best_budget.crashes > 0 {
-            for node_id in 0..self.config.num_servers {
+            let server_role =
+                if let Some((id, _)) = self.program.roles.iter().find(|(_, name)| name == "Node") {
+                    *id
+                } else {
+                    log::error!("Role 'Node' not found");
+                    return Vec::new();
+                };
+            for i in 0..self.config.num_servers {
+                let node_id = NodeId {
+                    role: server_role,
+                    index: i,
+                };
                 if !node.state.crash_info.currently_crashed.contains(&node_id) {
                     let mut next_state = node.state.clone();
                     self.apply_crash(&mut next_state, node_id);
@@ -267,7 +318,7 @@ impl<H: HashPolicy> ModelChecker<H> {
 
         // Recovery
         if node.best_budget.recovers > 0 {
-            let crashed: Vec<usize> = node
+            let crashed: Vec<NodeId> = node
                 .state
                 .crash_info
                 .currently_crashed
@@ -297,22 +348,54 @@ impl<H: HashPolicy> ModelChecker<H> {
 
         // Writes
         if node.best_budget.writes > 0 {
-            for client_id in
+            let server_role =
+                if let Some((id, _)) = self.program.roles.iter().find(|(_, name)| name == "Node") {
+                    *id
+                } else {
+                    log::error!("Role 'Node' not found");
+                    return Vec::new();
+                };
+            let client_role = if let Some((id, _)) = self
+                .program
+                .roles
+                .iter()
+                .find(|(_, name)| name == "ClientInterface")
+            {
+                *id
+            } else {
+                log::error!("Role 'ClientInterface' not found");
+                return Vec::new();
+            };
+            for client_idx in
                 self.config.num_servers..self.config.num_servers + self.config.num_clients
             {
+                let client_node_id = NodeId {
+                    role: client_role,
+                    index: client_idx,
+                };
+                let server_node_id = NodeId {
+                    role: server_role,
+                    index: 0,
+                };
                 for key in &self.config.keys {
                     let mut next_state = node.state.clone();
                     let op_id = node.next_op_id;
 
-                    if self.schedule_client_write(&mut next_state, client_id, op_id, 0, key, "val1")
-                    {
+                    if self.schedule_client_write(
+                        &mut next_state,
+                        client_node_id,
+                        op_id,
+                        server_node_id,
+                        key,
+                        "val1",
+                    ) {
                         let mut succ = self.make_successor(&node, next_state, 1.0);
                         succ.history.push(Operation::<H> {
-                            client_id: client_id as i32,
+                            client_id: client_idx as i32,
                             op_action: "ClientInterface.Write".to_string(),
                             kind: OpKind::Invocation,
                             payload: vec![
-                                Value::<H>::node(0),
+                                Value::<H>::node(server_node_id),
                                 Value::<H>::string(key.clone()),
                                 Value::<H>::string(EcoString::from("val1")),
                             ],
@@ -328,20 +411,55 @@ impl<H: HashPolicy> ModelChecker<H> {
 
         // Reads
         if node.best_budget.reads > 0 {
-            for client_id in
+            let server_role =
+                if let Some((id, _)) = self.program.roles.iter().find(|(_, name)| name == "Node") {
+                    *id
+                } else {
+                    log::error!("Role 'Node' not found");
+                    return Vec::new();
+                };
+            let client_role = if let Some((id, _)) = self
+                .program
+                .roles
+                .iter()
+                .find(|(_, name)| name == "ClientInterface")
+            {
+                *id
+            } else {
+                log::error!("Role 'ClientInterface' not found");
+                return Vec::new();
+            };
+            for client_idx in
                 self.config.num_servers..self.config.num_servers + self.config.num_clients
             {
+                let client_node_id = NodeId {
+                    role: client_role,
+                    index: client_idx,
+                };
+                let server_node_id = NodeId {
+                    role: server_role,
+                    index: 0,
+                };
                 for key in &self.config.keys {
                     let mut next_state = node.state.clone();
                     let op_id = node.next_op_id;
 
-                    if self.schedule_client_read(&mut next_state, client_id, op_id, 0, key) {
+                    if self.schedule_client_read(
+                        &mut next_state,
+                        client_node_id,
+                        op_id,
+                        server_node_id,
+                        key,
+                    ) {
                         let mut succ = self.make_successor(&node, next_state, 1.0);
                         succ.history.push(Operation::<H> {
-                            client_id: client_id as i32,
+                            client_id: client_idx as i32,
                             op_action: "ClientInterface.Read".to_string(),
                             kind: OpKind::Invocation,
-                            payload: vec![Value::<H>::node(0), Value::<H>::string(key.clone())],
+                            payload: vec![
+                                Value::<H>::node(server_node_id),
+                                Value::<H>::string(key.clone()),
+                            ],
                             unique_id: op_id,
                         });
                         succ.next_op_id += 1;
@@ -355,7 +473,12 @@ impl<H: HashPolicy> ModelChecker<H> {
         successors
     }
 
-    fn make_successor(&self, parent: &SearchNode<H>, state: State<H>, cost_delta: f64) -> SearchNode<H> {
+    fn make_successor(
+        &self,
+        parent: &SearchNode<H>,
+        state: State<H>,
+        cost_delta: f64,
+    ) -> SearchNode<H> {
         SearchNode::<H> {
             state,
             cost: parent.cost + cost_delta + 0.1,
@@ -367,7 +490,7 @@ impl<H: HashPolicy> ModelChecker<H> {
         }
     }
 
-    fn apply_crash(&self, state: &mut State<H>, node_id: usize) {
+    fn apply_crash(&self, state: &mut State<H>, node_id: NodeId) {
         state.crash_info.currently_crashed.insert(node_id);
         let tasks = std::mem::take(&mut state.runnable_tasks);
         for task in tasks {
@@ -390,6 +513,13 @@ impl<H: HashPolicy> ModelChecker<H> {
                         state.runnable_tasks.push_back(Runnable::Record(record));
                     }
                 }
+                Runnable::ChannelSend { target, .. } => {
+                    // If target is the crashed node, drop it.
+                    // If target is another node, keep it.
+                    if target != node_id {
+                        state.runnable_tasks.push_back(task);
+                    }
+                }
             }
         }
     }
@@ -399,17 +529,23 @@ impl<H: HashPolicy> ModelChecker<H> {
         state: &mut State<H>,
         logger: &mut SearchLogger,
         coverage: &mut LocalCoverage,
-        node_id: usize,
+        node_id: NodeId,
     ) {
         state.crash_info.currently_crashed.remove(&node_id);
-        state.nodes[node_id] = Env::<H>::default();
+        state.nodes[node_id.index] = Env::<H>::default();
 
         if let Some(init_fn) = self.program.get_func_by_name("Node.BASE_NODE_INIT") {
-            let mut env = make_local_env(init_fn, vec![], &Env::<H>::default(), &state.nodes[node_id]);
-            if let VarSlot::Local(self_idx, _) = SELF_SLOT {
+            let mut env = make_local_env(
+                init_fn,
+                vec![],
+                &Env::<H>::default(),
+                &state.nodes[node_id.index],
+                &self.program.id_to_name,
+            );
+            if let VarSlot::Node(self_idx, _) = SELF_SLOT {
                 env.set(self_idx, Value::<H>::node(node_id));
             }
-            let _ = exec_sync_on_node(
+            if let Err(e) = exec_sync_on_node(
                 state,
                 logger,
                 &self.program,
@@ -418,16 +554,34 @@ impl<H: HashPolicy> ModelChecker<H> {
                 init_fn.entry,
                 None,
                 coverage,
-            );
+            ) {
+                warn!("Failed to re-initialize node {}: {}", node_id, e);
+            }
         }
 
         // Schedule Node.RecoverInit if exists
         if let Some(recover_fn) = self.program.get_func_by_name("Node.RecoverInit") {
+            let server_role = node_id.role;
             let actuals = vec![
-                Value::<H>::int(node_id as i64),
-                Value::<H>::list((0..self.config.num_servers).map(Value::<H>::node).collect()),
+                Value::<H>::int(node_id.index as i64),
+                Value::<H>::list(
+                    (0..self.config.num_servers)
+                        .map(|i| {
+                            Value::<H>::node(NodeId {
+                                role: server_role,
+                                index: i,
+                            })
+                        })
+                        .collect(),
+                ),
             ];
-            let env = make_local_env(recover_fn, actuals, &Env::<H>::default(), &state.nodes[node_id]);
+            let env = make_local_env(
+                recover_fn,
+                actuals,
+                &Env::<H>::default(),
+                &state.nodes[node_id.index],
+                &self.program.id_to_name,
+            );
             let record = Record {
                 pc: recover_fn.entry,
                 node: node_id,
@@ -454,9 +608,9 @@ impl<H: HashPolicy> ModelChecker<H> {
     fn schedule_client_write(
         &self,
         state: &mut State<H>,
-        client_id: usize,
+        client_node_id: NodeId,
         op_id: i32,
-        target_server: usize,
+        target_server: NodeId,
         key: &EcoString,
         val: &str,
     ) -> bool {
@@ -466,13 +620,19 @@ impl<H: HashPolicy> ModelChecker<H> {
                 Value::<H>::string(key.clone()),
                 Value::<H>::string(EcoString::from(val)),
             ];
-            let env = make_local_env(func, actuals, &Env::<H>::default(), &state.nodes[client_id]);
+            let env = make_local_env(
+                func,
+                actuals,
+                &Env::<H>::default(),
+                &state.nodes[client_node_id.index],
+                &self.program.id_to_name,
+            );
             let record = Record {
                 pc: func.entry,
-                node: client_id,
-                origin_node: client_id,
+                node: client_node_id,
+                origin_node: client_node_id,
                 continuation: Continuation::ClientOp {
-                    client_id: client_id as i32,
+                    client_id: client_node_id.index as i32,
                     op_name: "Write".to_string(),
                     unique_id: op_id,
                 },
@@ -490,20 +650,29 @@ impl<H: HashPolicy> ModelChecker<H> {
     fn schedule_client_read(
         &self,
         state: &mut State<H>,
-        client_id: usize,
+        client_node_id: NodeId,
         op_id: i32,
-        target_server: usize,
+        target_server: NodeId,
         key: &EcoString,
     ) -> bool {
         if let Some(func) = self.program.get_func_by_name("ClientInterface.Read") {
-            let actuals = vec![Value::<H>::node(target_server), Value::<H>::string(key.clone())];
-            let env = make_local_env(func, actuals, &Env::<H>::default(), &state.nodes[client_id]);
+            let actuals = vec![
+                Value::<H>::node(target_server),
+                Value::<H>::string(key.clone()),
+            ];
+            let env = make_local_env(
+                func,
+                actuals,
+                &Env::<H>::default(),
+                &state.nodes[client_node_id.index],
+                &self.program.id_to_name,
+            );
             let record = Record {
                 pc: func.entry,
-                node: client_id,
-                origin_node: client_id,
+                node: client_node_id,
+                origin_node: client_node_id,
                 continuation: Continuation::ClientOp {
-                    client_id: client_id as i32,
+                    client_id: client_node_id.index as i32,
                     op_name: "Read".to_string(),
                     unique_id: op_id,
                 },

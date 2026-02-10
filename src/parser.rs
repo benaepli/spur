@@ -118,6 +118,7 @@ pub enum StatementKind {
     ForLoop(ForLoop),
     ForInLoop(ForInLoop),
     Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,7 +247,7 @@ pub enum ExprKind {
     VariantLit(String, String, Option<Box<Expr>>),
     NamedDotAccess(String, String, Option<Box<Expr>>), // Ambiguous: could be VariantLit or FieldAccess
 
-    MakeChannel(Option<Box<Expr>>),
+    MakeChannel,
     Send(Box<Expr>, Box<Expr>),
     Recv(Box<Expr>),
     SetTimer,
@@ -646,14 +647,10 @@ where
             one_arg_builtin(TokenKind::Head, ExprKind::Head),
             one_arg_builtin(TokenKind::Tail, ExprKind::Tail),
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
-            // make() for unbounded channel, make(n) for bounded
+            // make() for unbounded channel
             just(TokenKind::Make)
-                .ignore_then(
-                    expr.clone()
-                        .or_not()
-                        .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)),
-                )
-                .map(|opt_cap| ExprKind::MakeChannel(opt_cap.map(Box::new))),
+                .ignore_then(just(TokenKind::LeftParen).ignore_then(just(TokenKind::RightParen)))
+                .map(|_| ExprKind::MakeChannel),
             two_arg_builtin(TokenKind::Send, ExprKind::Send),
             one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
             zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
@@ -947,29 +944,35 @@ where
                 )
             });
 
-        let simple_stmt = |kind, constructor: fn(Expr) -> StatementKind| {
-            just(kind)
-                .ignore_then(expr.clone())
-                .then_ignore(just(TokenKind::Semicolon).or_not())
-                .map_with(move |expr, e| Statement::new(constructor(expr), e.span()))
-        };
+        let break_stmt =
+            just(TokenKind::Break).map_with(|_, e| Statement::new(StatementKind::Break, e.span()));
 
-        choice((
-            cond_stmts,
+        let continue_stmt = just(TokenKind::Continue)
+            .map_with(|_, e| Statement::new(StatementKind::Continue, e.span()));
+
+        let return_stmt = just(TokenKind::Return)
+            .ignore_then(expr.clone().or_not())
+            .map_with(|opt_expr, e| {
+                let expr =
+                    opt_expr.unwrap_or_else(|| Expr::new(ExprKind::TupleLit(vec![]), e.span()));
+                Statement::new(StatementKind::Return(expr), e.span())
+            });
+
+        let expr_stmt = expr
+            .clone()
+            .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span()));
+
+        let simple_stmt = choice((
             var_init_stmt,
-            assignment
-                .then_ignore(just(TokenKind::Semicolon).or_not())
-                .map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
-            expr.clone()
-                .then_ignore(just(TokenKind::Semicolon).or_not())
-                .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span())),
-            simple_stmt(TokenKind::Return, StatementKind::Return),
-            for_loop,
-            for_in_loop,
-            just(TokenKind::Break)
-                .then_ignore(just(TokenKind::Semicolon).or_not())
-                .map_with(|_, e| Statement::new(StatementKind::Break, e.span())),
+            break_stmt,
+            continue_stmt,
+            return_stmt,
+            assignment.map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
+            expr_stmt,
         ))
+        .then_ignore(just(TokenKind::Semicolon).or_not());
+
+        choice((cond_stmts, for_loop, for_in_loop, simple_stmt))
     });
 
     let var_init = just(TokenKind::Var)

@@ -1,3 +1,4 @@
+use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Lhs, Vertex};
 use crate::simulator::core::eval::store;
 use crate::simulator::core::values::{ChannelId, Env, Value};
@@ -5,9 +6,24 @@ use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use std::hash::{Hash, Hasher};
 
+use serde::Serialize;
+
+/// A node identifier pairing the role's NameId with a positional index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+pub struct NodeId {
+    pub role: NameId,
+    pub index: usize,
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.role, self.index)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LogEntry {
-    pub node: usize,
+    pub node: NodeId,
     pub content: String,
     pub step: i32,
 }
@@ -20,8 +36,8 @@ pub trait Logger {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record<H: HashPolicy> {
     pub pc: Vertex,
-    pub node: usize,
-    pub origin_node: usize,
+    pub node: NodeId,
+    pub origin_node: NodeId,
     pub continuation: Continuation<H>,
     pub env: Env<H>, // Just local env, node env is in State
     pub x: f64,
@@ -54,10 +70,10 @@ impl UpdatePolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct CrashInfo<H: HashPolicy> {
-    pub currently_crashed: OrdSet<usize>,
-    pub queued_messages: Vector<(usize, Record<H>)>, // (dest_node, record)
+    pub currently_crashed: OrdSet<NodeId>,
+    pub queued_messages: Vector<(NodeId, Record<H>)>, // (dest_node, record)
     pub current_step: i32,
 }
 
@@ -73,21 +89,16 @@ impl<H: HashPolicy> Hash for CrashInfo<H> {
 
 #[derive(Debug, Clone, Hash)]
 pub struct ChannelState<H: HashPolicy> {
-    /// Channel capacity: None = unbounded, Some(n) = bounded with capacity n
-    pub capacity: Option<i32>,
     pub buffer: Vector<Value<H>>,
     // We move Record out of Runnable and into Waiting.
     pub waiting_readers: Vector<(Record<H>, Lhs)>,
-    pub waiting_writers: Vector<(Record<H>, Value<H>)>,
 }
 
 impl<H: HashPolicy> ChannelState<H> {
-    pub fn new(capacity: Option<i32>) -> Self {
+    pub fn new() -> Self {
         Self {
-            capacity,
             buffer: Vector::new(),
             waiting_readers: Vector::new(),
-            waiting_writers: Vector::new(),
         }
     }
 }
@@ -112,7 +123,7 @@ pub struct Operation<H: HashPolicy> {
 #[derive(Debug, Clone, Hash, PartialEq)]
 pub struct Timer {
     pub pc: Vertex,
-    pub node: usize,
+    pub node: NodeId,
     pub channel: ChannelId,
 }
 
@@ -120,6 +131,15 @@ pub struct Timer {
 pub enum Runnable<H: HashPolicy> {
     Timer(Timer),
     Record(Record<H>),
+    ChannelSend {
+        target: NodeId,
+        channel: ChannelId,
+        message: Value<H>,
+        origin_node: NodeId,
+        x: f64,
+        policy: UpdatePolicy,
+        pc: Vertex,
+    },
 }
 
 impl<H: HashPolicy> Hash for Runnable<H> {
@@ -133,16 +153,35 @@ impl<H: HashPolicy> Hash for Runnable<H> {
                 1u8.hash(state);
                 r.hash(state);
             }
+            Runnable::ChannelSend {
+                target,
+                channel,
+                message,
+                origin_node,
+                x,
+                policy,
+                pc,
+            } => {
+                2u8.hash(state);
+                target.hash(state);
+                channel.hash(state);
+                message.hash(state);
+                origin_node.hash(state);
+                x.to_bits().hash(state); // f64 hash via bits
+                policy.hash(state);
+                pc.hash(state);
+            }
         }
     }
 }
 
 impl<H: HashPolicy> Runnable<H> {
     /// Get the node this runnable belongs to.
-    pub fn node(&self) -> usize {
+    pub fn node(&self) -> NodeId {
         match self {
             Runnable::Timer(t) => t.node,
             Runnable::Record(r) => r.node,
+            Runnable::ChannelSend { target, .. } => *target,
         }
     }
 
@@ -151,13 +190,14 @@ impl<H: HashPolicy> Runnable<H> {
         match self {
             Runnable::Timer(t) => t.pc,
             Runnable::Record(r) => r.pc,
+            Runnable::ChannelSend { pc, .. } => *pc,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct State<H: HashPolicy> {
-    pub nodes: Vector<Env<H>>, // Index is node_id
+    pub nodes: Vector<Env<H>>, // Index is node_id.index
     pub runnable_tasks: Vector<Runnable<H>>,
     pub channels: ImHashMap<ChannelId, ChannelState<H>>,
     pub crash_info: CrashInfo<H>,
@@ -166,15 +206,25 @@ pub struct State<H: HashPolicy> {
 }
 
 impl<H: HashPolicy> State<H> {
-    pub fn new(node_count: usize, node_slot_count: usize) -> Self {
+    /// Create a new state. `role_node_counts` is a list of (role NameId, count) pairs.
+    /// Nodes are laid out sequentially: all nodes of the first role, then all of the second, etc.
+    pub fn new(role_node_counts: &[(NameId, usize)], node_slot_count: usize) -> Self {
+        let mut nodes = Vector::new();
+        let mut global_index = 0usize;
+        for &(role, count) in role_node_counts {
+            for _ in 0..count {
+                let node_id = NodeId {
+                    role,
+                    index: global_index,
+                };
+                let mut env = Env::<H>::with_slots(node_slot_count);
+                env.set(0, Value::<H>::node(node_id)); // Slot 0 = self
+                nodes.push_back(env);
+                global_index += 1;
+            }
+        }
         Self {
-            nodes: (0..node_count)
-                .map(|i| {
-                    let mut env = Env::<H>::with_slots(node_slot_count);
-                    env.set(0, Value::<H>::node(i)); // Slot 0 = self
-                    env
-                })
-                .collect(),
+            nodes,
             runnable_tasks: Vector::new(),
             channels: ImHashMap::new(),
             crash_info: CrashInfo {
@@ -297,12 +347,12 @@ impl<H: HashPolicy> Continuation<H> {
                     }
                 };
                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                    let mut node_env = state.nodes[reader.node].clone();
+                    let mut node_env = state.nodes[reader.node.index].clone();
                     // Note: store errors in continuations are logged but ignored (fire-and-forget)
                     if let Err(e) = store(&lhs, val, &mut reader.env, &mut node_env) {
                         log::warn!("Store failed in async continuation: {}", e);
                     }
-                    state.nodes[reader.node] = node_env;
+                    state.nodes[reader.node.index] = node_env;
                     state.runnable_tasks.push_back(Runnable::Record(reader));
                 } else {
                     chan.buffer.push_back(val);
