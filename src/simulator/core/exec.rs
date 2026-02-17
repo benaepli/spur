@@ -207,7 +207,10 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
         }
         Label::Break(target) => Ok(Some(StepOutcome::Continue(*target))),
         Label::Continue(target) => Ok(Some(StepOutcome::Continue(*target))),
-        Label::PersistData(_expr, next) => {
+        Label::PersistData(_, _expr, next) => {
+            todo!()
+        }
+        Label::RetrieveData(_, _lhs, next) => {
             todo!()
         }
         Label::DiscardData(next) => {
@@ -464,7 +467,8 @@ pub fn exec<H: HashPolicy, L: Logger>(
             | Label::Cond(_, _, _)
             | Label::Return(_)
             | Label::Print(_, _)
-            | Label::PersistData(_, _)
+            | Label::PersistData(_, _, _)
+            | Label::RetrieveData(_, _, _)
             | Label::DiscardData(_)
             | Label::Break(_)
             | Label::ForLoopIn(_, _, _, _, _) => {

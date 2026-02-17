@@ -1,5 +1,5 @@
 use crate::analysis::resolver::{BuiltinFn, NameId};
-use crate::analysis::type_id::TypeIdMap;
+use crate::analysis::type_id::{TypeId, TypeIdMap};
 use crate::analysis::types::{
     TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit,
     TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram,
@@ -133,7 +133,8 @@ pub enum Label {
         Vertex,  /* next_vertex */
     ),
     Print(Expr, Vertex /* next_vertex */),
-    PersistData(Expr, Vertex /* next_vertex */),
+    PersistData(TypeId, Expr, Vertex /* next_vertex */),
+    RetrieveData(TypeId, Lhs, Vertex /* next_vertex */),
     DiscardData(Vertex /* next_vertex */),
     Break(Vertex /* break_target_vertex */),
     Continue(Vertex /* continue_target_vertex */),
@@ -238,6 +239,9 @@ pub struct Compiler {
 
     /// Ordered list of role (NameId, original_name)
     roles: Vec<(NameId, String)>,
+
+    /// Type ID map for looking up TypeIds during compilation
+    type_ids: TypeIdMap,
 }
 
 impl Default for Compiler {
@@ -266,6 +270,7 @@ impl Compiler {
             current_local_defaults: Vec::new(),
             max_node_slots: 1,
             roles: Vec::new(),
+            type_ids: TypeIdMap::new(),
         }
     }
 
@@ -388,6 +393,8 @@ impl Compiler {
         self.next_name_id = next_name_id;
         // Initialize id_to_name from the resolver's map
         self.id_to_name = program.id_to_name;
+        // Store type_ids for use during compilation
+        self.type_ids = type_ids;
 
         // Build func_sync_map and compile all top-level definitions
         for def in &program.top_level_defs {
@@ -433,7 +440,7 @@ impl Compiler {
             vertex_to_span: self.vertex_to_span,
             max_node_slots: self.max_node_slots,
             roles: self.roles,
-            type_ids,
+            type_ids: self.type_ids,
         }
     }
 
@@ -675,6 +682,7 @@ impl Compiler {
             PersistData(e) => {
                 self.scan_expr_and_assign_slots(e);
             }
+            RetrieveData(_) => {}
             DiscardData => {}
             Not(e)
             | Negate(e)
@@ -2079,7 +2087,8 @@ impl Compiler {
                     self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
 
                 let e_tmp = self.alloc_temp_slot();
-                let persist_label = Label::PersistData(Expr::Var(e_tmp), assign_vertex);
+                let type_id = self.type_ids.get(&e.ty).copied().unwrap_or(TypeId(0));
+                let persist_label = Label::PersistData(type_id, Expr::Var(e_tmp), assign_vertex);
                 let persist_vertex = self.add_label(persist_label);
 
                 self.compile_expr_to_value(
@@ -2091,6 +2100,10 @@ impl Compiler {
                     return_target,
                     return_slot,
                 )
+            }
+            TypedExprKind::RetrieveData(inner_type) => {
+                let type_id = self.type_ids.get(inner_type).copied().unwrap_or(TypeId(0));
+                self.add_label(Label::RetrieveData(type_id, target, next_vertex))
             }
             TypedExprKind::DiscardData => {
                 let assign_vertex =
@@ -2518,6 +2531,7 @@ impl Compiler {
             | TypedExprKind::Recv(_)
             | TypedExprKind::Match(_, _)
             | TypedExprKind::PersistData(_)
+            | TypedExprKind::RetrieveData(_)
             | TypedExprKind::DiscardData
             | TypedExprKind::VariantLit(_, _, _) => {
                 unreachable!(

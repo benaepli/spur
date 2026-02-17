@@ -271,6 +271,7 @@ pub enum ResolvedExprKind {
     Unwrap(Box<ResolvedExpr>),
     StructLit(NameId, Vec<(String, ResolvedExpr)>),
     PersistData(Box<ResolvedExpr>),
+    RetrieveData(ResolvedTypeDef),
     DiscardData,
 }
 
@@ -998,6 +999,9 @@ impl Resolver {
             }
             ExprKind::PersistData(e) => {
                 ResolvedExprKind::PersistData(Box::new(self.resolve_expr(*e)?))
+            }
+            ExprKind::RetrieveData(td) => {
+                ResolvedExprKind::RetrieveData(self.resolve_type_def(td)?)
             }
             ExprKind::DiscardData => ResolvedExprKind::DiscardData,
             ExprKind::Unwrap(e) => ResolvedExprKind::Unwrap(Box::new(self.resolve_expr(*e)?)),

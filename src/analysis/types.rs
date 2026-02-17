@@ -111,6 +111,7 @@ pub enum TypedExprKind {
 
     WrapInOptional(Box<TypedExpr>), // Internal representation of widening.
     PersistData(Box<TypedExpr>),
+    RetrieveData(Type),
     DiscardData,
 }
 

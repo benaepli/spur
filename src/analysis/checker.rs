@@ -1126,6 +1126,14 @@ impl TypeChecker {
                     span,
                 })
             }
+            ResolvedExprKind::RetrieveData(type_def) => {
+                let inner_type = self.resolve_type(&type_def)?;
+                Ok(TypedExpr {
+                    kind: TypedExprKind::RetrieveData(inner_type.clone()),
+                    ty: Type::Optional(Box::new(inner_type)),
+                    span,
+                })
+            }
             ResolvedExprKind::DiscardData => Ok(TypedExpr {
                 kind: TypedExprKind::DiscardData,
                 ty: Type::Tuple(vec![]),

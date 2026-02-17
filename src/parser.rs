@@ -265,6 +265,7 @@ pub enum ExprKind {
     FieldAccess(Box<Expr>, String),
     Unwrap(Box<Expr>),
     PersistData(Box<Expr>),
+    RetrieveData(TypeDef),
     DiscardData,
 }
 
@@ -657,6 +658,16 @@ where
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
             one_arg_builtin(TokenKind::PersistData, ExprKind::PersistData),
             zero_arg_builtin(TokenKind::DiscardData, ExprKind::DiscardData),
+            // retrieve_data<T>()
+            just(TokenKind::RetrieveData)
+                .ignore_then(
+                    type_def
+                        .clone()
+                        .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
+                )
+                .then_ignore(just(TokenKind::LeftParen))
+                .then_ignore(just(TokenKind::RightParen))
+                .map(ExprKind::RetrieveData),
             // make() for unbounded channel
             just(TokenKind::Make)
                 .ignore_then(just(TokenKind::LeftParen).ignore_then(just(TokenKind::RightParen)))

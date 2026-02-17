@@ -259,6 +259,9 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
                 register_expr(e, map, next_id);
             }
         }
+        TypedExprKind::RetrieveData(ty) => {
+            register_type(ty, map, next_id);
+        }
         TypedExprKind::Var(_, _)
         | TypedExprKind::IntLit(_)
         | TypedExprKind::StringLit(_)

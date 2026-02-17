@@ -110,7 +110,8 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             | Label::Send(_, _, next)
             | Label::Recv(_, _, next)
             | Label::SpinAwait(_, next)
-            | Label::PersistData(_, next)
+            | Label::PersistData(_, _, next)
+            | Label::RetrieveData(_, _, next)
             | Label::DiscardData(next) => {
                 edge(*next, None, None, Some("#555555"))?;
             }
@@ -262,11 +263,20 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
             header_color = "#B3E5FC"; // Light blue
             content = "<B>Continue</B>".into();
         }
-        Label::PersistData(expr, _) => {
+        Label::PersistData(type_id, expr, _) => {
             header_color = "#DCEDC8"; // Light green
             content = format!(
-                "<B>PersistData</B><BR/>{}",
+                "<B>PersistData</B><BR/>type_id: {} {}",
+                type_id.0,
                 html_escape(&pretty_expr(prog, expr))
+            );
+        }
+        Label::RetrieveData(type_id, lhs, _) => {
+            header_color = "#DCEDC8"; // Light green
+            content = format!(
+                "<B>RetrieveData</B><BR/>type_id: {} {}",
+                type_id.0,
+                html_escape(&pretty_lhs(prog, lhs))
             );
         }
         Label::DiscardData(_) => {
@@ -535,7 +545,8 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         | Label::Recv(_, _, n)
         | Label::SpinAwait(_, n)
         | Label::Print(_, n)
-        | Label::PersistData(_, n)
+        | Label::PersistData(_, _, n)
+        | Label::RetrieveData(_, _, n)
         | Label::DiscardData(n) => vec![*n],
         Label::Cond(_, t, e) => vec![*t, *e],
         Label::ForLoopIn(_, _, _, body, next) => vec![*body, *next],
