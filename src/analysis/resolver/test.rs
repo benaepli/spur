@@ -41,7 +41,7 @@ fn stmt(kind: StatementKind) -> Statement {
 
 fn var_init(name: &str, value: Expr) -> Statement {
     stmt(StatementKind::VarInit(VarInit {
-        name: name.to_string(),
+        target: VarTarget::Name(name.to_string()),
         type_def: None,
         value,
         span: dummy_span(),
@@ -212,15 +212,60 @@ fn test_resolve_block_scope() -> Result<(), ResolutionError> {
     assert_eq!(resolved_block.len(), 2);
 
     match &resolved_block[0].kind {
-        ResolvedStatementKind::VarInit(vi) => {
-            assert_eq!(vi.original_name, "x");
-        }
+        ResolvedStatementKind::VarInit(vi) => match &vi.target {
+            ResolvedVarTarget::Name(_, name) => assert_eq!(name, "x"),
+            _ => panic!("expected Name target"),
+        },
         _ => panic!("expected VarInit"),
     }
 
     // "x" should not be available outside the block if resolve_block handles scoping correctly
     let err = resolver.resolve_expr(var_expr("x")).unwrap_err();
     assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "x"));
+
+    Ok(())
+}
+
+#[test]
+fn test_resolve_tuple_destructuring() -> Result<(), ResolutionError> {
+    let mut resolver = Resolver::new();
+
+    // var (x, y) = (1, 2)
+    let stmt = stmt(StatementKind::VarInit(VarInit {
+        target: VarTarget::Tuple(vec!["x".to_string(), "y".to_string()]),
+        type_def: None,
+        value: expr(ExprKind::TupleLit(vec![int_lit(1), int_lit(2)])),
+        span: dummy_span(),
+    }));
+
+    let resolved = resolver.resolve_statement(stmt)?;
+
+    match resolved.kind {
+        ResolvedStatementKind::VarInit(vi) => {
+            match vi.target {
+                ResolvedVarTarget::Tuple(names) => {
+                    assert_eq!(names.len(), 2);
+                    assert_eq!(names[0].1, "x");
+                    assert_eq!(names[1].1, "y");
+
+                    // Ensure variables are declared in scope
+                    let x_res = resolver.resolve_expr(var_expr("x"))?;
+                    match x_res.kind {
+                        ResolvedExprKind::Var(id, _) => assert_eq!(id, names[0].0),
+                        _ => panic!("expected Var x"),
+                    }
+
+                    let y_res = resolver.resolve_expr(var_expr("y"))?;
+                    match y_res.kind {
+                        ResolvedExprKind::Var(id, _) => assert_eq!(id, names[1].0),
+                        _ => panic!("expected Var y"),
+                    }
+                }
+                _ => panic!("expected Tuple target"),
+            }
+        }
+        _ => panic!("expected VarInit"),
+    }
 
     Ok(())
 }
@@ -337,7 +382,7 @@ fn test_variable_used_before_declaration_in_same_expression() {
 
     // Try to use variable in its own initializer
     let var_init_stmt = stmt(StatementKind::VarInit(VarInit {
-        name: "x".to_string(),
+        target: VarTarget::Name("x".to_string()),
         type_def: None,
         value: bin_op(BinOp::Add, var_expr("x"), int_lit(1)),
         span: dummy_span(),

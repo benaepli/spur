@@ -168,9 +168,14 @@ pub struct TypedIfBranch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum TypedVarTarget {
+    Name(NameId, String),
+    Tuple(Vec<(NameId, String, Type)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypedVarInit {
-    pub name: NameId,
-    pub original_name: String,
+    pub target: TypedVarTarget,
     pub type_def: Type,
     pub value: TypedExpr,
     pub span: Span,

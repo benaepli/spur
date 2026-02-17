@@ -9,7 +9,7 @@ use crate::analysis::types::{
     Type, TypedAssignment, TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop,
     TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam, TypedIfBranch, TypedMatchArm,
     TypedPattern, TypedPatternKind, TypedProgram, TypedRoleDef, TypedStatement, TypedStatementKind,
-    TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
+    TypedTopLevelDef, TypedUserFuncCall, TypedVarInit, TypedVarTarget,
 };
 use crate::parser::{BinOp, Span};
 use std::collections::HashMap;
@@ -452,10 +452,38 @@ impl TypeChecker {
             (typed_val, inferred_ty)
         };
 
-        self.add_var(var_init.name, type_def.clone());
+        let target = match var_init.target {
+            crate::analysis::resolver::ResolvedVarTarget::Name(name_id, name) => {
+                self.add_var(name_id, type_def.clone());
+                TypedVarTarget::Name(name_id, name)
+            }
+            crate::analysis::resolver::ResolvedVarTarget::Tuple(names) => match &type_def {
+                Type::Tuple(types) => {
+                    if names.len() != types.len() {
+                        return Err(TypeError::PatternMismatch {
+                            pattern_ty: format!("tuple of {} elements", names.len()),
+                            iterable_ty: type_def.clone(),
+                            span: var_init.span,
+                        });
+                    }
+                    let mut elements = Vec::new();
+                    for ((name_id, name), ty) in names.into_iter().zip(types.iter()) {
+                        self.add_var(name_id, ty.clone());
+                        elements.push((name_id, name, ty.clone()));
+                    }
+                    TypedVarTarget::Tuple(elements)
+                }
+                _ => {
+                    return Err(TypeError::NotATuple {
+                        ty: type_def.clone(),
+                        span: var_init.span,
+                    });
+                }
+            },
+        };
+
         Ok(TypedVarInit {
-            name: var_init.name,
-            original_name: var_init.original_name,
+            target,
             type_def,
             value: typed_value,
             span: var_init.span,

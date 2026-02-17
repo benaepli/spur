@@ -45,8 +45,14 @@ pub struct FuncParam {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum VarTarget {
+    Name(String),
+    Tuple(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct VarInit {
-    pub name: String,
+    pub target: VarTarget,
     pub type_def: Option<TypeDef>,
     pub value: Expr,
     pub span: Span,
@@ -814,8 +820,18 @@ where
         )
     });
 
+    let var_target = choice((
+        ident
+            .separated_by(just(TokenKind::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+            .map(VarTarget::Tuple),
+        ident.map(VarTarget::Name),
+    ));
+
     let var_init_core = just(TokenKind::Var)
-        .ignore_then(ident)
+        .ignore_then(var_target.clone())
         .then(
             just(TokenKind::Colon)
                 .ignore_then(type_def.clone())
@@ -823,8 +839,8 @@ where
         )
         .then_ignore(just(TokenKind::Equal))
         .then(expr.clone())
-        .map_with(|((name, type_def), value), e| VarInit {
-            name,
+        .map_with(|((target, type_def), value), e| VarInit {
+            target,
             type_def,
             value,
             span: e.span(),
@@ -976,7 +992,7 @@ where
     });
 
     let var_init = just(TokenKind::Var)
-        .ignore_then(ident)
+        .ignore_then(var_target.clone())
         .then(
             just(TokenKind::Colon)
                 .ignore_then(type_def.clone())
@@ -985,8 +1001,8 @@ where
         .then_ignore(just(TokenKind::Equal))
         .then(expr.clone())
         .then_ignore(just(TokenKind::Semicolon).or_not())
-        .map_with(|((name, type_def), value), e| VarInit {
-            name,
+        .map_with(|((target, type_def), value), e| VarInit {
+            target,
             type_def,
             value,
             span: e.span(),

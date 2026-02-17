@@ -88,9 +88,14 @@ pub struct ResolvedFuncParam {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedVarTarget {
+    Name(NameId, String),
+    Tuple(Vec<(NameId, String)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedVarInit {
-    pub name: NameId,
-    pub original_name: String,
+    pub target: ResolvedVarTarget,
     pub type_def: Option<ResolvedTypeDef>,
     pub value: ResolvedExpr,
     pub span: Span,
@@ -599,10 +604,24 @@ impl Resolver {
             .map(|t| self.resolve_type_def(t))
             .transpose()?;
         let value = self.resolve_expr(init.value)?;
-        let name_id = self.declare_var(&init.name, init.span)?;
+        let target = match init.target {
+            VarTarget::Name(name) => {
+                let name_id = self.declare_var(&name, init.span)?;
+                ResolvedVarTarget::Name(name_id, name)
+            }
+            VarTarget::Tuple(names) => {
+                let resolved = names
+                    .into_iter()
+                    .map(|name| {
+                        let name_id = self.declare_var(&name, init.span)?;
+                        Ok((name_id, name))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                ResolvedVarTarget::Tuple(resolved)
+            }
+        };
         Ok(ResolvedVarInit {
-            name: name_id,
-            original_name: init.name,
+            target,
             type_def,
             value,
             span: init.span,

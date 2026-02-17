@@ -3,6 +3,7 @@ use crate::analysis::types::{
     TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit,
     TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram,
     TypedStatement, TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
+    TypedVarTarget,
 };
 use crate::parser::{BinOp, Span};
 use ecow::EcoString;
@@ -268,8 +269,18 @@ impl Compiler {
         self.next_node_slot = 1; // Slot 0 reserved for 'self'
 
         for init in var_inits {
-            self.node_slots.insert(init.name, self.next_node_slot);
-            self.next_node_slot += 1;
+            match &init.target {
+                TypedVarTarget::Name(name, _) => {
+                    self.node_slots.insert(*name, self.next_node_slot);
+                    self.next_node_slot += 1;
+                }
+                TypedVarTarget::Tuple(elements) => {
+                    for (name, _, _) in elements {
+                        self.node_slots.insert(*name, self.next_node_slot);
+                        self.next_node_slot += 1;
+                    }
+                }
+            }
         }
 
         if self.next_node_slot > self.max_node_slots {
@@ -435,10 +446,20 @@ impl Compiler {
         // Build the init chain backwards
         // These assign to NODE slots, not local slots
         for init in inits.iter().rev() {
-            let node_slot = self.resolve_slot(init.name);
+            let lhs = match &init.target {
+                TypedVarTarget::Name(name, _) => Lhs::Var(self.resolve_slot(*name)),
+                TypedVarTarget::Tuple(elements) => {
+                    let slots = elements
+                        .iter()
+                        .map(|(name, _, _)| self.resolve_slot(*name))
+                        .collect();
+                    Lhs::Tuple(slots)
+                }
+            };
+
             next_vertex = self.compile_expr_to_value(
                 &init.value,
-                Lhs::Var(node_slot),
+                lhs,
                 next_vertex,
                 final_vertex,
                 final_vertex,
@@ -531,12 +552,26 @@ impl Compiler {
     fn scan_stmt_and_assign_slots(&mut self, stmt: &TypedStatement) {
         match &stmt.kind {
             TypedStatementKind::VarInit(init) => {
-                let name_str = self
-                    .id_to_name
-                    .get(&init.name)
-                    .cloned()
-                    .unwrap_or_else(|| format!("var_{}", init.name.0));
-                self.alloc_local_slot(init.name, &name_str, Expr::Nil);
+                match &init.target {
+                    TypedVarTarget::Name(name, _) => {
+                        let name_str = self
+                            .id_to_name
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(|| format!("var_{}", name.0));
+                        self.alloc_local_slot(*name, &name_str, Expr::Nil);
+                    }
+                    TypedVarTarget::Tuple(elements) => {
+                        for (name, _, _) in elements {
+                            let name_str = self
+                                .id_to_name
+                                .get(name)
+                                .cloned()
+                                .unwrap_or_else(|| format!("var_{}", name.0));
+                            self.alloc_local_slot(*name, &name_str, Expr::Nil);
+                        }
+                    }
+                }
                 self.scan_expr_and_assign_slots(&init.value);
             }
             TypedStatementKind::Assignment(assign) => {
@@ -563,12 +598,26 @@ impl Compiler {
             TypedStatementKind::ForLoop(fl) => {
                 match &fl.init {
                     Some(TypedForLoopInit::VarInit(init)) => {
-                        let name_str = self
-                            .id_to_name
-                            .get(&init.name)
-                            .cloned()
-                            .unwrap_or_else(|| format!("var_{}", init.name.0));
-                        self.alloc_local_slot(init.name, &name_str, Expr::Nil);
+                        match &init.target {
+                            TypedVarTarget::Name(name, _) => {
+                                let name_str = self
+                                    .id_to_name
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("var_{}", name.0));
+                                self.alloc_local_slot(*name, &name_str, Expr::Nil);
+                            }
+                            TypedVarTarget::Tuple(elements) => {
+                                for (name, _, _) in elements {
+                                    let name_str = self
+                                        .id_to_name
+                                        .get(name)
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("var_{}", name.0));
+                                    self.alloc_local_slot(*name, &name_str, Expr::Nil);
+                                }
+                            }
+                        }
                         self.scan_expr_and_assign_slots(&init.value);
                     }
                     Some(TypedForLoopInit::Assignment(assign)) => {
@@ -746,11 +795,21 @@ impl Compiler {
 
         let result = match &stmt.kind {
             TypedStatementKind::VarInit(init) => {
-                // Compile the value, assigning to the new variable's slot
-                let slot = self.resolve_slot(init.name);
+                let lhs = match &init.target {
+                    TypedVarTarget::Name(name, _) => Lhs::Var(self.resolve_slot(*name)),
+                    TypedVarTarget::Tuple(elements) => {
+                        let slots = elements
+                            .iter()
+                            .map(|(name, _, _)| self.resolve_slot(*name))
+                            .collect();
+                        Lhs::Tuple(slots)
+                    }
+                };
+
+                // Compile the value, assigning to the new variable's slot(s)
                 self.compile_expr_to_value(
                     &init.value,
-                    Lhs::Var(slot),
+                    lhs,
                     next_vertex,
                     break_target,
                     continue_target,
@@ -891,10 +950,19 @@ impl Compiler {
 
         match &loop_stmt.init {
             Some(TypedForLoopInit::VarInit(vi)) => {
-                let slot = self.resolve_slot(vi.name);
+                let lhs = match &vi.target {
+                    TypedVarTarget::Name(name, _) => Lhs::Var(self.resolve_slot(*name)),
+                    TypedVarTarget::Tuple(elements) => {
+                        let slots = elements
+                            .iter()
+                            .map(|(name, _, _)| self.resolve_slot(*name))
+                            .collect();
+                        Lhs::Tuple(slots)
+                    }
+                };
                 self.compile_expr_to_value(
                     &vi.value,
-                    Lhs::Var(slot),
+                    lhs,
                     loop_head_vertex,
                     next_vertex,
                     next_vertex,
