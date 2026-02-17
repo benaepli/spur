@@ -41,8 +41,20 @@ pub struct Record<H: HashPolicy> {
     pub origin_node: NodeId,
     pub continuation: Continuation<H>,
     pub env: Env<H>, // Just local env, node env is in State
+    /// Original entry point for crash re-delivery.
+    pub entry_pc: Vertex,
+    /// Original local env for crash re-delivery.
+    pub initial_env: Env<H>,
     pub x: f64,
     pub policy: UpdatePolicy,
+}
+
+impl<H: HashPolicy> Record<H> {
+    /// Reset pc and env to their initial values for crash re-delivery.
+    pub fn reset(&mut self) {
+        self.pc = self.entry_pc;
+        self.env = self.initial_env.clone();
+    }
 }
 
 impl<H: HashPolicy> Hash for Record<H> {
@@ -52,6 +64,8 @@ impl<H: HashPolicy> Hash for Record<H> {
         self.origin_node.hash(state);
         self.continuation.hash(state);
         self.env.hash(state);
+        self.entry_pc.hash(state);
+        self.initial_env.hash(state);
         self.policy.hash(state);
     }
 }

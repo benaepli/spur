@@ -98,6 +98,8 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
             if state.crash_info.currently_crashed.contains(&dest_node) {
                 if let Runnable::Record(r) = other {
                     if src_node != dest_node {
+                        let mut r = r;
+                        r.reset();
                         state.crash_info.queued_messages.push_back((dest_node, r));
                     }
                 }

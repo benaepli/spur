@@ -104,6 +104,8 @@ fn recover_node<H: HashPolicy, L: Logger>(
         node: node_id,
         origin_node: node_id,
         continuation: Continuation::Recover,
+        entry_pc: recover_fn.entry,
+        initial_env: env.clone(),
         env,
         x: 0.0,
         policy: UpdatePolicy::Identity,
@@ -198,6 +200,8 @@ fn crash_node<H: HashPolicy>(
                         .currently_crashed
                         .contains(&record.origin_node);
                     if is_external && origin_alive {
+                        let mut record = record;
+                        record.reset();
                         state
                             .crash_info
                             .queued_messages
@@ -335,6 +339,8 @@ fn schedule_client_op<H: HashPolicy>(
             op_name: op_name.to_string(),
             unique_id: op_id,
         },
+        entry_pc: op_func.entry,
+        initial_env: env.clone(),
         env,
         x: 0.4,
         policy: UpdatePolicy::Identity,

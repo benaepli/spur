@@ -78,12 +78,15 @@ fn make_record_with_cont(
         role: NameId(0),
         index: 0,
     };
+    let env = Env::<WithHashing>::with_slots(local_slots);
     Record {
         pc,
         node: nid,
         origin_node: nid,
         continuation,
-        env: Env::<WithHashing>::with_slots(local_slots),
+        entry_pc: pc,
+        initial_env: env.clone(),
+        env,
         x: 0.5,
         policy: UpdatePolicy::Identity,
     }

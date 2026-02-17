@@ -236,6 +236,8 @@ impl<H: HashPolicy> ModelChecker<H> {
                 .contains(&record.node)
             {
                 if record.origin_node != record.node {
+                    let mut record = record;
+                    record.reset();
                     next_state
                         .crash_info
                         .queued_messages
@@ -504,6 +506,8 @@ impl<H: HashPolicy> ModelChecker<H> {
                 Runnable::Record(record) => {
                     if record.node == node_id {
                         if record.origin_node != record.node {
+                            let mut record = record;
+                            record.reset();
                             state
                                 .crash_info
                                 .queued_messages
@@ -587,6 +591,8 @@ impl<H: HashPolicy> ModelChecker<H> {
                 node: node_id,
                 origin_node: node_id,
                 continuation: Continuation::Recover,
+                entry_pc: recover_fn.entry,
+                initial_env: env.clone(),
                 env,
                 x: 0.0,
                 policy: UpdatePolicy::Identity,
@@ -636,6 +642,8 @@ impl<H: HashPolicy> ModelChecker<H> {
                     op_name: "Write".to_string(),
                     unique_id: op_id,
                 },
+                entry_pc: func.entry,
+                initial_env: env.clone(),
                 env,
                 x: 0.5,
                 policy: UpdatePolicy::Identity,
@@ -676,6 +684,8 @@ impl<H: HashPolicy> ModelChecker<H> {
                     op_name: "Read".to_string(),
                     unique_id: op_id,
                 },
+                entry_pc: func.entry,
+                initial_env: env.clone(),
                 env,
                 x: 0.5,
                 policy: UpdatePolicy::Identity,

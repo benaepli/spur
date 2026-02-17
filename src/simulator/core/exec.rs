@@ -138,6 +138,8 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     node: target_node,
                     origin_node: node_id,
                     continuation: Continuation::Async { chan_id },
+                    entry_pc: func_info.entry,
+                    initial_env: callee_locals.clone(),
                     env: callee_locals,
                     x: 0.5,
                     policy: UpdatePolicy::Identity,
