@@ -1,4 +1,5 @@
 use crate::analysis::resolver::NameId;
+use crate::analysis::type_id::TypeId;
 use crate::compiler::cfg::{Lhs, Vertex};
 use crate::simulator::core::eval::store;
 use crate::simulator::core::values::{ChannelId, Env, Value};
@@ -201,6 +202,8 @@ pub struct State<H: HashPolicy> {
     pub runnable_tasks: Vector<Runnable<H>>,
     pub channels: ImHashMap<ChannelId, ChannelState<H>>,
     pub crash_info: CrashInfo<H>,
+    /// Per-node durable storage that survives crashes. Keyed by node index.
+    pub persisted_data: ImHashMap<usize, (TypeId, Value<H>)>,
     next_channel_id: usize,
     next_unique_id: usize,
 }
@@ -232,6 +235,7 @@ impl<H: HashPolicy> State<H> {
                 queued_messages: Vector::new(),
                 current_step: 0,
             },
+            persisted_data: ImHashMap::new(),
             next_channel_id: 0,
             next_unique_id: 0,
         }
@@ -271,6 +275,11 @@ impl<H: HashPolicy> State<H> {
 
         // crash_info
         h ^= compute_hash(&self.crash_info);
+
+        // Persisted data: Order-independent XOR
+        for (&node_idx, (tid, val)) in self.persisted_data.iter() {
+            h ^= H::mix(compute_hash(&(node_idx, tid.0)), 2000) ^ H::mix(val.sig, 2001);
+        }
 
         h
     }

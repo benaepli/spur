@@ -74,4 +74,7 @@ pub enum RuntimeError {
 
     #[error("role not found: {0}")]
     RoleNotFound(String),
+
+    #[error("persist type mismatch: stored type_id {stored}, expected type_id {expected}")]
+    PersistTypeMismatch { stored: u32, expected: u32 },
 }

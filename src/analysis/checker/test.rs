@@ -423,3 +423,33 @@ fn test_check_match_expression_valid() -> Result<(), TypeError> {
 
     Ok(())
 }
+#[test]
+fn test_persist_non_trivially_copyable_fails() {
+    let mut checker = setup_checker();
+    // persist_data(make(chan<int>))
+    let expr = ResolvedExpr {
+        kind: ResolvedExprKind::PersistData(Box::new(ResolvedExpr {
+            kind: ResolvedExprKind::MakeChannel,
+            span: dummy_span(),
+        })),
+        span: dummy_span(),
+    };
+
+    let err = checker.infer_expr(expr).unwrap_err();
+    assert!(matches!(err, TypeError::NonTriviallyCopyable { .. }));
+}
+
+#[test]
+fn test_retrieve_non_trivially_copyable_fails() {
+    let mut checker = setup_checker();
+    // retrieve_data<chan<int>>()
+    let expr = ResolvedExpr {
+        kind: ResolvedExprKind::RetrieveData(ResolvedTypeDef::Chan(Box::new(
+            ResolvedTypeDef::Named(id(0)), // int
+        ))),
+        span: dummy_span(),
+    };
+
+    let err = checker.infer_expr(expr).unwrap_err();
+    assert!(matches!(err, TypeError::NonTriviallyCopyable { .. }));
+}

@@ -207,14 +207,30 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
         }
         Label::Break(target) => Ok(Some(StepOutcome::Continue(*target))),
         Label::Continue(target) => Ok(Some(StepOutcome::Continue(*target))),
-        Label::PersistData(_, _expr, next) => {
-            todo!()
+        Label::PersistData(type_id, expr, next) => {
+            let val = eval(local_env, node_env, expr, &program.id_to_name)?;
+            state.persisted_data.insert(node_id.index, (*type_id, val));
+            Ok(Some(StepOutcome::Continue(*next)))
         }
-        Label::RetrieveData(_, _lhs, next) => {
-            todo!()
+        Label::RetrieveData(type_id, lhs, next) => {
+            let result = match state.persisted_data.get(&node_id.index) {
+                Some((stored_tid, val)) => {
+                    if stored_tid != type_id {
+                        return Err(RuntimeError::PersistTypeMismatch {
+                            stored: stored_tid.0,
+                            expected: type_id.0,
+                        });
+                    }
+                    Value::option_some(val.clone())
+                }
+                None => Value::option_none(),
+            };
+            store(lhs, result, local_env, node_env)?;
+            Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::DiscardData(next) => {
-            todo!()
+            state.persisted_data.remove(&node_id.index);
+            Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::ForLoopIn(lhs, expr, iter_state_slot, body, next) => {
             let iter_slot_idx = match iter_state_slot {

@@ -44,8 +44,10 @@ pub fn compile(input: &str, name: &str) -> Result<cfg::Program, anyhow::Error> {
         Ok(r) => r,
     };
 
-    let _trivially_copyable_map =
-        crate::analysis::trivially_copyable::compute_trivially_copyable(&typed);
+    let _trivially_copyable_map = crate::analysis::trivially_copyable::compute_trivially_copyable(
+        &typed.struct_defs,
+        &typed.enum_defs,
+    );
 
     let type_ids = crate::analysis::type_id::assign_type_ids(&typed);
 

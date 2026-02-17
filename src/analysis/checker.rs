@@ -5,6 +5,9 @@ use crate::analysis::resolver::{
     ResolvedStatementKind, ResolvedTopLevelDef, ResolvedTypeDef, ResolvedTypeDefStmtKind,
     ResolvedUserFuncCall, ResolvedVarInit,
 };
+use crate::analysis::trivially_copyable::{
+    TriviallyCopyableMap, compute_trivially_copyable, is_trivially_copyable,
+};
 use crate::analysis::types::{
     Type, TypedAssignment, TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop,
     TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam, TypedIfBranch, TypedMatchArm,
@@ -137,6 +140,9 @@ pub enum TypeError {
         found: Type,
         span: Span,
     },
+
+    #[error("Type `{ty}` is not trivially copyable, but it is required to be")]
+    NonTriviallyCopyable { ty: Type, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +170,7 @@ pub struct TypeChecker {
     current_return_type: Option<Type>,
     current_func_is_sync: bool,
     loop_depth: usize,
+    trivially_copyable: TriviallyCopyableMap,
 }
 
 impl TypeChecker {
@@ -227,6 +234,7 @@ impl TypeChecker {
             current_return_type: None,
             current_func_is_sync: false,
             loop_depth: 0,
+            trivially_copyable: TriviallyCopyableMap::new(),
         }
     }
 
@@ -275,6 +283,8 @@ impl TypeChecker {
                 _ => {}
             }
         }
+
+        self.trivially_copyable = compute_trivially_copyable(&struct_defs, &enum_defs);
 
         Ok(TypedProgram {
             top_level_defs: typed_top_levels,
@@ -1120,6 +1130,12 @@ impl TypeChecker {
             }),
             ResolvedExprKind::PersistData(expr) => {
                 let typed_e = self.infer_expr(*expr)?;
+                if !is_trivially_copyable(&typed_e.ty, &self.trivially_copyable) {
+                    return Err(TypeError::NonTriviallyCopyable {
+                        ty: typed_e.ty,
+                        span,
+                    });
+                }
                 Ok(TypedExpr {
                     kind: TypedExprKind::PersistData(Box::new(typed_e)),
                     ty: Type::Tuple(vec![]),
@@ -1128,6 +1144,12 @@ impl TypeChecker {
             }
             ResolvedExprKind::RetrieveData(type_def) => {
                 let inner_type = self.resolve_type(&type_def)?;
+                if !is_trivially_copyable(&inner_type, &self.trivially_copyable) {
+                    return Err(TypeError::NonTriviallyCopyable {
+                        ty: inner_type,
+                        span,
+                    });
+                }
                 Ok(TypedExpr {
                     kind: TypedExprKind::RetrieveData(inner_type.clone()),
                     ty: Type::Optional(Box::new(inner_type)),

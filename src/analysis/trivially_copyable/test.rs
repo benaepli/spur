@@ -48,7 +48,7 @@ fn test_struct_all_primitives_is_trivial() {
         ],
     );
 
-    let map = compute_trivially_copyable(&program);
+    let map = compute_trivially_copyable(&program.struct_defs, &program.enum_defs);
     assert_eq!(map[&struct_id], TriviallyCopyable::Trivial);
 }
 
@@ -64,7 +64,7 @@ fn test_struct_with_chan_field_is_non_trivial() {
         ],
     );
 
-    let map = compute_trivially_copyable(&program);
+    let map = compute_trivially_copyable(&program.struct_defs, &program.enum_defs);
     assert_eq!(map[&struct_id], TriviallyCopyable::NonTrivial);
 }
 
@@ -89,7 +89,7 @@ fn test_struct_containing_non_trivial_struct_is_non_trivial() {
         )],
     );
 
-    let map = compute_trivially_copyable(&program);
+    let map = compute_trivially_copyable(&program.struct_defs, &program.enum_defs);
     assert_eq!(map[&inner_id], TriviallyCopyable::NonTrivial);
     assert_eq!(map[&outer_id], TriviallyCopyable::NonTrivial);
 }
@@ -106,7 +106,7 @@ fn test_enum_with_chan_payload_is_non_trivial() {
         ],
     );
 
-    let map = compute_trivially_copyable(&program);
+    let map = compute_trivially_copyable(&program.struct_defs, &program.enum_defs);
     assert_eq!(map[&enum_id], TriviallyCopyable::NonTrivial);
 }
 
@@ -119,7 +119,7 @@ fn test_enum_without_chan_is_trivial() {
         vec![("A".to_string(), None), ("B".to_string(), Some(Type::Int))],
     );
 
-    let map = compute_trivially_copyable(&program);
+    let map = compute_trivially_copyable(&program.struct_defs, &program.enum_defs);
     assert_eq!(map[&enum_id], TriviallyCopyable::Trivial);
 }
 

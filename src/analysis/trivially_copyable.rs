@@ -2,7 +2,7 @@
 mod test;
 
 use crate::analysis::resolver::NameId;
-use crate::analysis::types::{Type, TypedProgram};
+use crate::analysis::types::Type;
 use std::collections::HashMap;
 
 /// Whether a type can be trivially duplicated without ownership concerns.
@@ -15,25 +15,28 @@ pub enum TriviallyCopyable {
 /// Maps user-defined type NameIds to their trivial copyability.
 pub type TriviallyCopyableMap = HashMap<NameId, TriviallyCopyable>;
 
-/// Compute the trivial copyability of all user-defined types in a typed program.
+/// Compute the trivial copyability of all user-defined types.
 ///
 /// Uses fixed-point iteration: initially assume all types are trivially copyable,
 /// then repeatedly check until no changes occur. This correctly handles mutually
 /// recursive type definitions.
-pub fn compute_trivially_copyable(program: &TypedProgram) -> TriviallyCopyableMap {
+pub fn compute_trivially_copyable(
+    struct_defs: &HashMap<NameId, Vec<(String, Type)>>,
+    enum_defs: &HashMap<NameId, Vec<(String, Option<Type>)>>,
+) -> TriviallyCopyableMap {
     let mut map = TriviallyCopyableMap::new();
 
-    for name_id in program.struct_defs.keys() {
+    for name_id in struct_defs.keys() {
         map.insert(*name_id, TriviallyCopyable::Trivial);
     }
-    for name_id in program.enum_defs.keys() {
+    for name_id in enum_defs.keys() {
         map.insert(*name_id, TriviallyCopyable::Trivial);
     }
 
     loop {
         let mut changed = false;
 
-        for (name_id, fields) in &program.struct_defs {
+        for (name_id, fields) in struct_defs {
             if map[name_id] == TriviallyCopyable::NonTrivial {
                 continue; // Already non-trivial, can't change.
             }
@@ -46,7 +49,7 @@ pub fn compute_trivially_copyable(program: &TypedProgram) -> TriviallyCopyableMa
             }
         }
 
-        for (name_id, variants) in &program.enum_defs {
+        for (name_id, variants) in enum_defs {
             if map[name_id] == TriviallyCopyable::NonTrivial {
                 continue;
             }
@@ -94,7 +97,8 @@ pub fn is_trivially_copyable(ty: &Type, map: &TriviallyCopyableMap) -> bool {
         // Roles are just identifiers.
         Type::Role(_, _) => true,
 
-        Type::EmptyList | Type::EmptyMap | Type::UnknownChannel => true,
+        Type::UnknownChannel => false,
+        Type::EmptyList | Type::EmptyMap => true,
         Type::Nil => true,
         Type::Never => true,
     }

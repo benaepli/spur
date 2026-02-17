@@ -443,6 +443,17 @@ pub fn report_type_errors(
                 .with_notes(vec![
                     "help: all match arms must evaluate to the same type".to_string(),
                 ]),
+
+            TypeError::NonTriviallyCopyable { ty, span } => Diagnostic::error()
+                .with_message(format!("type `{}` is not trivially copyable", ty))
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("type `{}` cannot be persisted or retrieved", ty)),
+                ])
+                .with_notes(vec![
+                    "help: only trivially copyable types (int, string, bool, lists/maps/structs of these) can be used with persist_data and retrieve_data".to_string(),
+                    "note: channels and types containing channels are not trivially copyable".to_string(),
+                ]),
         };
 
         term::emit_to_write_style(&mut writer_lock, &config, &files, &diagnostic)?;
