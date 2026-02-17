@@ -1118,6 +1118,19 @@ impl TypeChecker {
                 ty: Type::Int,
                 span,
             }),
+            ResolvedExprKind::PersistData(expr) => {
+                let typed_e = self.infer_expr(*expr)?;
+                Ok(TypedExpr {
+                    kind: TypedExprKind::PersistData(Box::new(typed_e)),
+                    ty: Type::Tuple(vec![]),
+                    span,
+                })
+            }
+            ResolvedExprKind::DiscardData => Ok(TypedExpr {
+                kind: TypedExprKind::DiscardData,
+                ty: Type::Tuple(vec![]),
+                span,
+            }),
             ResolvedExprKind::StringLit(s) => Ok(TypedExpr {
                 kind: TypedExprKind::StringLit(s),
                 ty: Type::String,

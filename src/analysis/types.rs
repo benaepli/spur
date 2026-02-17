@@ -1,8 +1,9 @@
 use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::parser::{BinOp, Span};
+use serde::Serialize;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub enum Type {
     Int,
     String,
@@ -109,6 +110,8 @@ pub enum TypedExprKind {
     StructLit(NameId, Vec<(String, TypedExpr)>),
 
     WrapInOptional(Box<TypedExpr>), // Internal representation of widening.
+    PersistData(Box<TypedExpr>),
+    DiscardData,
 }
 
 #[derive(Debug, Clone, PartialEq)]

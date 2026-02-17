@@ -264,6 +264,8 @@ pub enum ExprKind {
     TupleAccess(Box<Expr>, usize),
     FieldAccess(Box<Expr>, String),
     Unwrap(Box<Expr>),
+    PersistData(Box<Expr>),
+    DiscardData,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -653,6 +655,8 @@ where
             one_arg_builtin(TokenKind::Head, ExprKind::Head),
             one_arg_builtin(TokenKind::Tail, ExprKind::Tail),
             one_arg_builtin(TokenKind::Len, ExprKind::Len),
+            one_arg_builtin(TokenKind::PersistData, ExprKind::PersistData),
+            zero_arg_builtin(TokenKind::DiscardData, ExprKind::DiscardData),
             // make() for unbounded channel
             just(TokenKind::Make)
                 .ignore_then(just(TokenKind::LeftParen).ignore_then(just(TokenKind::RightParen)))

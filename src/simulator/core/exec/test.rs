@@ -42,6 +42,7 @@ impl TestProgramBuilder {
             vertex_to_span: HashMap::new(),
             max_node_slots: 2,
             roles: vec![],
+            type_ids: HashMap::new(),
         }
     }
 }

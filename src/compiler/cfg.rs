@@ -1,4 +1,5 @@
 use crate::analysis::resolver::{BuiltinFn, NameId};
+use crate::analysis::type_id::TypeIdMap;
 use crate::analysis::types::{
     TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit,
     TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram,
@@ -132,6 +133,8 @@ pub enum Label {
         Vertex,  /* next_vertex */
     ),
     Print(Expr, Vertex /* next_vertex */),
+    PersistData(Expr, Vertex /* next_vertex */),
+    DiscardData(Vertex /* next_vertex */),
     Break(Vertex /* break_target_vertex */),
     Continue(Vertex /* continue_target_vertex */),
 }
@@ -178,6 +181,9 @@ pub struct Program {
 
     /// Ordered list of role (NameId, original_name) pairs, in declaration order.
     pub roles: Vec<(NameId, String)>,
+
+    /// Maps each structurally distinct Type to a unique TypeId.
+    pub type_ids: TypeIdMap,
 }
 
 impl Program {
@@ -377,7 +383,7 @@ impl Compiler {
     }
 
     /// The main entry point.
-    pub fn compile_program(mut self, program: TypedProgram) -> Program {
+    pub fn compile_program(mut self, program: TypedProgram, type_ids: TypeIdMap) -> Program {
         let next_name_id = program.next_name_id;
         self.next_name_id = next_name_id;
         // Initialize id_to_name from the resolver's map
@@ -427,6 +433,7 @@ impl Compiler {
             vertex_to_span: self.vertex_to_span,
             max_node_slots: self.max_node_slots,
             roles: self.roles,
+            type_ids,
         }
     }
 
@@ -665,6 +672,10 @@ impl Compiler {
                 self.scan_expr_and_assign_slots(l);
                 self.scan_expr_and_assign_slots(r);
             }
+            PersistData(e) => {
+                self.scan_expr_and_assign_slots(e);
+            }
+            DiscardData => {}
             Not(e)
             | Negate(e)
             | Head(e)
@@ -2063,6 +2074,31 @@ impl Compiler {
 
             TypedExprKind::SetTimer => self.add_label(Label::SetTimer(target, next_vertex)),
 
+            TypedExprKind::PersistData(e) => {
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+
+                let e_tmp = self.alloc_temp_slot();
+                let persist_label = Label::PersistData(Expr::Var(e_tmp), assign_vertex);
+                let persist_vertex = self.add_label(persist_label);
+
+                self.compile_expr_to_value(
+                    e,
+                    Lhs::Var(e_tmp),
+                    persist_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            }
+            TypedExprKind::DiscardData => {
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+                let discard_label = Label::DiscardData(assign_vertex);
+                self.add_label(discard_label)
+            }
+
             _ => {
                 // Desugar the simple expression
                 let sim_expr = self.convert_simple_expr(expr);
@@ -2452,6 +2488,7 @@ impl Compiler {
             TypedExprKind::UnwrapOptional(e) => Expr::Unwrap(Box::new(self.convert_simple_expr(e))),
 
             TypedExprKind::WrapInOptional(e) => Expr::Some(Box::new(self.convert_simple_expr(e))),
+
             // Desugar: `MyStruct { ... }` -> `EMap { ... }`
             TypedExprKind::StructLit(_, fields) => Expr::Map(
                 fields
@@ -2480,6 +2517,8 @@ impl Compiler {
             | TypedExprKind::Send(_, _)
             | TypedExprKind::Recv(_)
             | TypedExprKind::Match(_, _)
+            | TypedExprKind::PersistData(_)
+            | TypedExprKind::DiscardData
             | TypedExprKind::VariantLit(_, _, _) => {
                 unreachable!(
                     "Cannot have complex expression inside a simple expression. \

@@ -111,6 +111,8 @@ pub enum TokenKind {
     Recv,
     SetTimer,
     Store,
+    PersistData,
+    DiscardData,
 }
 
 impl fmt::Display for TokenKind {
@@ -188,6 +190,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Recv => write!(f, "recv"),
             TokenKind::SetTimer => write!(f, "set_timer"),
             TokenKind::Store => write!(f, "store"),
+            TokenKind::PersistData => write!(f, "persist_data"),
+            TokenKind::DiscardData => write!(f, "discard_data"),
         }
     }
 }
@@ -231,6 +235,8 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "recv" => TokenKind::Recv,
     "set_timer" => TokenKind::SetTimer,
     "store" => TokenKind::Store,
+    "persist_data" => TokenKind::PersistData,
+    "discard_data" => TokenKind::DiscardData,
 };
 
 fn is_special_char(ch: char) -> bool {

@@ -207,6 +207,12 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
         }
         Label::Break(target) => Ok(Some(StepOutcome::Continue(*target))),
         Label::Continue(target) => Ok(Some(StepOutcome::Continue(*target))),
+        Label::PersistData(_expr, next) => {
+            todo!()
+        }
+        Label::DiscardData(next) => {
+            todo!()
+        }
         Label::ForLoopIn(lhs, expr, iter_state_slot, body, next) => {
             let iter_slot_idx = match iter_state_slot {
                 VarSlot::Local(idx, _) => *idx,
@@ -458,6 +464,8 @@ pub fn exec<H: HashPolicy, L: Logger>(
             | Label::Cond(_, _, _)
             | Label::Return(_)
             | Label::Print(_, _)
+            | Label::PersistData(_, _)
+            | Label::DiscardData(_)
             | Label::Break(_)
             | Label::ForLoopIn(_, _, _, _, _) => {
                 unreachable!(

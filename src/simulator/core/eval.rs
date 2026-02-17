@@ -1,7 +1,6 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, VarSlot};
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::core::state::NodeId;
 use crate::simulator::core::values::{Env, Value, ValueKind, hash_map_entry};
 use crate::simulator::hash_utils::HashPolicy;
 use ecow::EcoString;

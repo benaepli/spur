@@ -270,6 +270,8 @@ pub enum ResolvedExprKind {
     FieldAccess(Box<ResolvedExpr>, String),
     Unwrap(Box<ResolvedExpr>),
     StructLit(NameId, Vec<(String, ResolvedExpr)>),
+    PersistData(Box<ResolvedExpr>),
+    DiscardData,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -994,6 +996,10 @@ impl Resolver {
             ExprKind::FieldAccess(e, name) => {
                 ResolvedExprKind::FieldAccess(Box::new(self.resolve_expr(*e)?), name)
             }
+            ExprKind::PersistData(e) => {
+                ResolvedExprKind::PersistData(Box::new(self.resolve_expr(*e)?))
+            }
+            ExprKind::DiscardData => ResolvedExprKind::DiscardData,
             ExprKind::Unwrap(e) => ResolvedExprKind::Unwrap(Box::new(self.resolve_expr(*e)?)),
             ExprKind::Match(expr, arms) => {
                 let resolved_expr = Box::new(self.resolve_expr(*expr)?);

@@ -47,9 +47,11 @@ pub fn compile(input: &str, name: &str) -> Result<cfg::Program, anyhow::Error> {
     let _trivially_copyable_map =
         crate::analysis::trivially_copyable::compute_trivially_copyable(&typed);
 
+    let type_ids = crate::analysis::type_id::assign_type_ids(&typed);
+
     // Compile to CFG
     let cfg_compiler = CfgCompiler::new();
-    let program = cfg_compiler.compile_program(typed);
+    let program = cfg_compiler.compile_program(typed, type_ids);
 
     Ok(program)
 }
