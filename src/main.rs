@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use spur::compiler;
 use spur::debug::SimulatorDebugger;
-use spur::simulator::explorer::run_explorer_genetic;
+use spur::simulator::explorer::{run_explorer, run_explorer_genetic};
 use spur::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
 use std::collections::HashMap;
 use std::fs;
@@ -51,12 +51,23 @@ enum Commands {
         /// Output directory for results
         #[arg(short, long)]
         output_dir: PathBuf,
+        /// Explorer type to use
+        #[arg(short, long, value_enum, default_value_t = ExplorerType::Genetic)]
+        explorer: ExplorerType,
         /// Skip confirmation prompt for directory deletion
         #[arg(short = 'y', long)]
         yes: bool,
     },
     /// Debug simulation results
     Debug(DebugArgs),
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum ExplorerType {
+    /// Standard exhaustive explorer
+    Standard,
+    /// Genetic algorithm-based explorer
+    Genetic,
 }
 
 #[derive(Parser)]
@@ -94,8 +105,9 @@ fn main() {
             spec,
             config,
             output_dir,
+            explorer,
             yes,
-        } => run_explore(spec, config, output_dir, yes),
+        } => run_explore(spec, config, output_dir, explorer, yes),
         Commands::Debug(args) => match args.command {
             DebugSubcommands::Logs {
                 db,
@@ -157,6 +169,7 @@ fn run_explore(
     spec_path: PathBuf,
     config_path: PathBuf,
     output_dir: PathBuf,
+    explorer_type: ExplorerType,
     yes: bool,
 ) -> Result<()> {
     let source_code = fs::read_to_string(&spec_path)
@@ -201,8 +214,12 @@ fn run_explore(
         .to_str()
         .context("Config path contains invalid UTF-8")?;
 
-    let global_state = run_explorer_genetic(&program, config_path_str, db_path_str)
-        .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?;
+    let global_state = match explorer_type {
+        ExplorerType::Standard => run_explorer(&program, config_path_str, db_path_str)
+            .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
+        ExplorerType::Genetic => run_explorer_genetic(&program, config_path_str, db_path_str)
+            .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
+    };
 
     let elapsed = start.elapsed();
 

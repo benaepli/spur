@@ -1,4 +1,3 @@
-use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
     Env, Logger, NodeId, RuntimeError, State, Value, exec_sync_on_node, make_local_env,
@@ -55,9 +54,6 @@ pub struct ExplorerConfig {
     #[serde(rename = "num_servers")]
     pub num_servers_range: Range,
 
-    #[serde(rename = "num_clients")]
-    pub num_clients_range: Range,
-
     #[serde(rename = "num_write_ops")]
     pub num_write_ops_range: Range,
 
@@ -91,9 +87,6 @@ impl ExplorerConfig {
         self.num_servers_range
             .validate()
             .map_err(|e| format!("num_servers range error: {}", e))?;
-        self.num_clients_range
-            .validate()
-            .map_err(|e| format!("num_clients range error: {}", e))?;
         self.num_write_ops_range
             .validate()
             .map_err(|e| format!("num_write_ops range error: {}", e))?;
@@ -125,7 +118,6 @@ fn default_use_coverage_scheduling() -> bool {
 #[derive(Debug, Clone)]
 pub struct SingleRunConfig {
     pub num_servers: i32,
-    pub num_clients: i32,
     pub num_write_ops: i32,
     pub num_read_ops: i32,
     pub num_timeouts: i32,
@@ -142,9 +134,6 @@ impl SingleRunConfig {
         SingleRunConfig {
             num_servers: rng.random_range(
                 constraints.num_servers_range.min..=constraints.num_servers_range.max,
-            ),
-            num_clients: rng.random_range(
-                constraints.num_clients_range.min..=constraints.num_clients_range.max,
             ),
             num_write_ops: rng.random_range(
                 constraints.num_write_ops_range.min..=constraints.num_write_ops_range.max,
@@ -183,7 +172,6 @@ impl SingleRunConfig {
         };
 
         new_config.num_servers = mutate_int(self.num_servers, &constraints.num_servers_range);
-        new_config.num_clients = mutate_int(self.num_clients, &constraints.num_clients_range);
         new_config.num_write_ops = mutate_int(self.num_write_ops, &constraints.num_write_ops_range);
         new_config.num_read_ops = mutate_int(self.num_read_ops, &constraints.num_read_ops_range);
         new_config.num_timeouts = mutate_int(self.num_timeouts, &constraints.num_timeouts_range);
@@ -204,7 +192,6 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
     program: &Program,
     logger: &mut L,
     num_servers: usize,
-    num_clients: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
 ) -> Result<State<H>, RuntimeError> {
@@ -215,43 +202,9 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
         .find(|(_, name)| name == "Node")
         .map(|(id, _)| *id)
         .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
-    let client_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "ClientInterface")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
 
-    let role_node_counts = vec![(server_role, num_servers), (client_role, num_clients)];
+    let role_node_counts = vec![(server_role, num_servers)];
     let mut state = State::<H>::new(&role_node_counts, program.max_node_slots as usize);
-
-    if let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
-        for i in 0..num_clients {
-            let client_index = num_servers + i;
-            let client_node_id = NodeId {
-                role: client_role,
-                index: client_index,
-            };
-            let node_env = &state.nodes[client_index];
-            let mut env = make_local_env(
-                init_fn,
-                vec![],
-                &Env::<H>::default(),
-                node_env,
-                &program.id_to_name,
-            );
-            exec_sync_on_node(
-                &mut state,
-                logger,
-                program,
-                &mut env,
-                client_node_id,
-                init_fn.entry,
-                global_snapshot,
-                local_coverage,
-            )?;
-        }
-    }
 
     if let Some(init_fn) = program.get_func_by_name("Node.BASE_NODE_INIT") {
         for i in 0..num_servers {
@@ -355,7 +308,6 @@ pub fn run_single_simulation(
     let global_snapshot = global_state.coverage.snapshot();
     let gen_config = GeneratorConfig {
         num_servers: config.num_servers,
-        num_clients: config.num_clients,
         num_write_ops: config.num_write_ops,
         num_read_ops: config.num_read_ops,
         num_timeouts: config.num_timeouts,
@@ -373,10 +325,8 @@ pub fn run_single_simulation(
         None
     };
 
-    // Create PathState with free_clients initialized
     // Use NoHashing for exec_plan mode (no state deduplication needed)
     let num_servers = config.num_servers as usize;
-    let num_clients = config.num_clients as usize;
 
     let server_role = program
         .roles
@@ -391,19 +341,18 @@ pub fn run_single_simulation(
         .map(|(id, _)| *id)
         .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
 
-    let role_node_counts = vec![(server_role, num_servers), (client_role, num_clients)];
+    let role_node_counts = vec![(server_role, num_servers)];
     let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing>::new(
         &role_node_counts,
         program.max_node_slots as usize,
+        client_role,
     );
-    path_state.free_clients = (0..num_clients).map(|i| (num_servers + i) as i32).collect();
 
     // Initialize state
     path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _>(
         program,
         &mut path_state.logs,
         num_servers,
-        num_clients,
         Some(&global_snapshot),
         &mut path_state.coverage,
     )?;
@@ -448,12 +397,12 @@ pub fn run_single_simulation(
     Ok(plan_score)
 }
 
-/// Runs a single simulation configuration.
+/// Runs the standard exhaustive explorer.
 pub fn run_explorer(
     program: &Program,
     config_json_path: &str,
     output_path: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Arc<GlobalState>, Box<dyn Error>> {
     info!("Starting Execution Explorer...");
     info!("Config: {}", config_json_path);
 
@@ -479,7 +428,6 @@ pub fn run_explorer(
         let config = config_producer;
 
         let all_servers = config.num_servers_range.expand();
-        let all_clients = config.num_clients_range.expand();
         let all_writes = config.num_write_ops_range.expand();
         let all_reads = config.num_read_ops_range.expand();
         let all_timeouts = config.num_timeouts_range.expand();
@@ -489,7 +437,6 @@ pub fn run_explorer(
         let mut config_counter = 0;
         let mut run_counter = 0;
         let total_configs = all_servers.len()
-            * all_clients.len()
             * all_writes.len()
             * all_reads.len()
             * all_timeouts.len()
@@ -500,47 +447,43 @@ pub fn run_explorer(
         info!("Runs per config: {}", config.num_runs_per_config);
 
         for &num_servers in &all_servers {
-            for &num_clients in &all_clients {
-                for &num_writes in &all_writes {
-                    for &num_reads in &all_reads {
-                        for &num_timeouts in &all_timeouts {
-                            for &num_crashes in &all_crashes {
-                                for &density in all_densities {
-                                    config_counter += 1;
+            for &num_writes in &all_writes {
+                for &num_reads in &all_reads {
+                    for &num_timeouts in &all_timeouts {
+                        for &num_crashes in &all_crashes {
+                            for &density in all_densities {
+                                config_counter += 1;
 
-                                    let run_config = SingleRunConfig {
-                                        num_servers,
-                                        num_clients,
-                                        num_write_ops: num_writes,
-                                        num_read_ops: num_reads,
-                                        num_timeouts,
-                                        num_crashes,
-                                        dependency_density: density,
-                                        randomly_delay_msgs: config.randomly_delay_msgs,
-                                        use_coverage_scheduling: config.use_coverage_scheduling,
-                                        max_iterations: config.max_iterations,
-                                    };
+                                let run_config = SingleRunConfig {
+                                    num_servers,
+                                    num_write_ops: num_writes,
+                                    num_read_ops: num_reads,
+                                    num_timeouts,
+                                    num_crashes,
+                                    dependency_density: density,
+                                    randomly_delay_msgs: config.randomly_delay_msgs,
+                                    use_coverage_scheduling: config.use_coverage_scheduling,
+                                    max_iterations: config.max_iterations,
+                                };
 
-                                    info!("{}", "=".repeat(70));
-                                    info!(
-                                        "Queuing Config {}/{}: s{}_c{}_w{}_r{}_t{}_crash{}_d{:.2}",
-                                        config_counter,
-                                        total_configs,
-                                        num_servers,
-                                        num_clients,
-                                        num_writes,
-                                        num_reads,
-                                        num_timeouts,
-                                        num_crashes,
-                                        density
-                                    );
-                                    info!("{}", "=".repeat(70));
+                                info!("{}", "=".repeat(70));
+                                info!(
+                                    "Queuing Config {}/{}: s{}_w{}_r{}_t{}_crash{}_d{:.2}",
+                                    config_counter,
+                                    total_configs,
+                                    num_servers,
+                                    num_writes,
+                                    num_reads,
+                                    num_timeouts,
+                                    num_crashes,
+                                    density
+                                );
+                                info!("{}", "=".repeat(70));
 
-                                    for _ in 1..=config.num_runs_per_config {
-                                        run_counter += 1;
-                                        if sender.send((run_counter, run_config.clone())).is_err() {
-                                            return;
-                                        }
+                                for _ in 1..=config.num_runs_per_config {
+                                    run_counter += 1;
+                                    if sender.send((run_counter, run_config.clone())).is_err() {
+                                        return;
                                     }
                                 }
                             }
@@ -578,7 +521,7 @@ pub fn run_explorer(
     }
 
     info!("Execution explorer finished.");
-    Ok(())
+    Ok(global_state)
 }
 
 /// Runs the genetic algorithm-based explorer.

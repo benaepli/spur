@@ -38,6 +38,39 @@ impl Logger for Logs {
     }
 }
 
+/// A pool that dynamically creates client nodes on demand and recycles them.
+#[derive(Debug)]
+pub struct ClientPool {
+    free_clients: Vec<NodeId>,
+    client_role: NameId,
+    node_slot_count: usize,
+}
+
+impl ClientPool {
+    pub fn new(client_role: NameId, node_slot_count: usize) -> Self {
+        Self {
+            free_clients: Vec::new(),
+            client_role,
+            node_slot_count,
+        }
+    }
+
+    /// Get a client node — reuses a free one or creates a new one.
+    /// Returns (NodeId, bool) where the boolean is true if the node was newly created.
+    pub fn get<H: HashPolicy>(&mut self, state: &mut State<H>) -> (NodeId, bool) {
+        if let Some(node_id) = self.free_clients.pop() {
+            (node_id, false)
+        } else {
+            (state.add_node(self.client_role, self.node_slot_count), true)
+        }
+    }
+
+    /// Return a client node to the pool for reuse.
+    pub fn release(&mut self, node_id: NodeId) {
+        self.free_clients.push(node_id);
+    }
+}
+
 /// Wrapper around State that adds path-execution tracking fields.
 #[derive(Debug)]
 pub struct PathState<H: HashPolicy> {
@@ -45,17 +78,21 @@ pub struct PathState<H: HashPolicy> {
     pub coverage: LocalCoverage,
     pub logs: Logs,
     pub history: Vec<Operation<H>>,
-    pub free_clients: Vec<i32>,
+    pub client_pool: ClientPool,
 }
 
 impl<H: HashPolicy> PathState<H> {
-    pub fn new(role_node_counts: &[(NameId, usize)], node_slot_count: usize) -> Self {
+    pub fn new(
+        role_node_counts: &[(NameId, usize)],
+        node_slot_count: usize,
+        client_role: NameId,
+    ) -> Self {
         Self {
             state: State::<H>::new(role_node_counts, node_slot_count),
             coverage: LocalCoverage::new(),
             logs: Logs::default(),
             history: Vec::new(),
-            free_clients: Vec::new(),
+            client_pool: ClientPool::new(client_role, node_slot_count),
         }
     }
 }
@@ -162,12 +199,6 @@ pub fn exec_plan<H: HashPolicy>(
         .find(|(_, name)| name == "Node")
         .map(|(id, _)| *id)
         .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
-    let client_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "ClientInterface")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
 
     let validate_node = |state: &State<H>,
                          index: usize,
@@ -209,40 +240,60 @@ pub fn exec_plan<H: HashPolicy>(
         for (node_idx, event) in ready_events {
             match &event.action {
                 EventAction::ClientRequest(op_spec) => {
-                    if let Some(client_id) = path_state.free_clients.pop() {
-                        op_id_counter += 1;
-                        in_progress.insert(op_id_counter, node_idx);
+                    op_id_counter += 1;
+                    in_progress.insert(op_id_counter, node_idx);
 
-                        // Validate client node
-                        let client_node_id = validate_node(
-                            &path_state.state,
-                            client_id as usize,
-                            client_role,
-                            "ClientInterface",
-                        )?;
+                    // Get a client node from the pool (creates one if needed)
+                    let (client_node_id, is_new) =
+                        path_state.client_pool.get(&mut path_state.state);
 
-                        // Validate target server in op_spec
-                        let target_idx = match op_spec {
-                            ClientOpSpec::Write(t, _, _) => *t as usize,
-                            ClientOpSpec::Read(t, _) => *t as usize,
-                            ClientOpSpec::SimulateTimeout(t) => *t as usize,
-                        };
-                        validate_node(&path_state.state, target_idx, server_role, "Node")?;
-
-                        schedule_client_op(
-                            &mut path_state.state,
-                            &mut path_state.history,
-                            &program,
-                            op_id_counter,
-                            op_spec,
-                            client_node_id,
-                            server_role,
-                        )?;
-                    } else {
-                        if let Err(e) = engine.mark_as_ready(node_idx) {
-                            warn!("Failed to mark event as ready: {}", e);
+                    if is_new {
+                        if let Some(init_fn) =
+                            program.get_func_by_name("ClientInterface.BASE_NODE_INIT")
+                        {
+                            let mut env = make_local_env(
+                                init_fn,
+                                vec![],
+                                &Env::<H>::default(),
+                                &path_state.state.nodes[client_node_id.index],
+                                &program.id_to_name,
+                            );
+                            if let Err(e) = crate::simulator::core::exec_sync_on_node(
+                                &mut path_state.state,
+                                &mut path_state.logs,
+                                &program,
+                                &mut env,
+                                client_node_id,
+                                init_fn.entry,
+                                global_snapshot,
+                                &mut path_state.coverage,
+                            ) {
+                                log::warn!(
+                                    "Failed to initialize dynamic client node {}: {}",
+                                    client_node_id,
+                                    e
+                                );
+                            }
                         }
                     }
+
+                    // Validate target server in op_spec
+                    let target_idx = match op_spec {
+                        ClientOpSpec::Write(t, _, _) => *t as usize,
+                        ClientOpSpec::Read(t, _) => *t as usize,
+                        ClientOpSpec::SimulateTimeout(t) => *t as usize,
+                    };
+                    validate_node(&path_state.state, target_idx, server_role, "Node")?;
+
+                    schedule_client_op(
+                        &mut path_state.state,
+                        &mut path_state.history,
+                        &program,
+                        op_id_counter,
+                        op_spec,
+                        client_node_id,
+                        server_role,
+                    )?;
                 }
                 EventAction::CrashNode(node_id) => {
                     let nid =
@@ -287,7 +338,10 @@ pub fn exec_plan<H: HashPolicy>(
             match result {
                 ScheduleResult::None => {}
                 ScheduleResult::ClientOp(result) => {
-                    path_state.free_clients.push(result.client_id);
+                    path_state.client_pool.release(NodeId {
+                        role: path_state.client_pool.client_role,
+                        index: result.client_id as usize,
+                    });
                     path_state.history.push(Operation {
                         client_id: result.client_id,
                         op_action: result.op_name,

@@ -21,7 +21,6 @@ enum PairPos {
 /// Configuration for the plan generator.
 pub struct GeneratorConfig {
     pub num_servers: i32,
-    pub num_clients: i32,
     // Client operations
     pub num_write_ops: i32,
     pub num_read_ops: i32,
@@ -106,9 +105,10 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
 
                 // Serialization: this crash depends on previous recovery of same server
                 if let EventAction::CrashNode(s) = action1
-                    && let Some(&prev_recover) = last_recovery.get(s) {
-                        graph.add_edge(prev_recover, idx1, ());
-                    }
+                    && let Some(&prev_recover) = last_recovery.get(s)
+                {
+                    graph.add_edge(prev_recover, idx1, ());
+                }
                 if let EventAction::RecoverNode(s) = action2 {
                     last_recovery.insert(*s, idx2);
                 }

@@ -1,4 +1,3 @@
-use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::checker::state::{Budget, SearchNode};
 use crate::simulator::core::{
@@ -28,7 +27,6 @@ impl Logger for SearchLogger {
 pub struct CheckerConfig {
     pub max_depth: u32,
     pub num_servers: usize,
-    pub num_clients: usize,
     pub initial_budget: Budget,
     pub keys: Vec<EcoString>,
 }
@@ -143,7 +141,7 @@ impl<H: HashPolicy> ModelChecker<H> {
         );
     }
 
-    fn expand(&self, node: SearchNode<H>) -> Vec<SearchNode<H>> {
+    fn expand(&self, mut node: SearchNode<H>) -> Vec<SearchNode<H>> {
         let mut successors = Vec::new();
 
         // Runnable items
@@ -372,13 +370,39 @@ impl<H: HashPolicy> ModelChecker<H> {
                 log::error!("Role 'ClientInterface' not found");
                 return Vec::new();
             };
-            for client_idx in
-                self.config.num_servers..self.config.num_servers + self.config.num_clients
+            // Create a single dynamic client for this write expansion
             {
-                let client_node_id = NodeId {
-                    role: client_role,
-                    index: client_idx,
-                };
+                let client_node_id = node
+                    .state
+                    .add_node(client_role, self.program.max_node_slots as usize);
+
+                if let Some(init_fn) = self
+                    .program
+                    .get_func_by_name("ClientInterface.BASE_NODE_INIT")
+                {
+                    let mut env = make_local_env(
+                        init_fn,
+                        vec![],
+                        &Env::<H>::default(),
+                        &node.state.nodes[client_node_id.index],
+                        &self.program.id_to_name,
+                    );
+                    let mut temp_logger = SearchLogger::default();
+                    let mut temp_coverage = LocalCoverage::new();
+                    if let Err(e) = exec_sync_on_node(
+                        &mut node.state,
+                        &mut temp_logger,
+                        &self.program,
+                        &mut env,
+                        client_node_id,
+                        init_fn.entry,
+                        None,
+                        &mut temp_coverage,
+                    ) {
+                        warn!("Failed to initialize dynamic client node in checker: {}", e);
+                    }
+                }
+
                 let server_node_id = NodeId {
                     role: server_role,
                     index: 0,
@@ -397,7 +421,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                     ) {
                         let mut succ = self.make_successor(&node, next_state, 1.0);
                         succ.history.push(Operation::<H> {
-                            client_id: client_idx as i32,
+                            client_id: client_node_id.index as i32,
                             op_action: "ClientInterface.Write".to_string(),
                             kind: OpKind::Invocation,
                             payload: vec![
@@ -435,13 +459,42 @@ impl<H: HashPolicy> ModelChecker<H> {
                 log::error!("Role 'ClientInterface' not found");
                 return Vec::new();
             };
-            for client_idx in
-                self.config.num_servers..self.config.num_servers + self.config.num_clients
+            // Create a single dynamic client for this read expansion
             {
-                let client_node_id = NodeId {
-                    role: client_role,
-                    index: client_idx,
-                };
+                let client_node_id = node
+                    .state
+                    .add_node(client_role, self.program.max_node_slots as usize);
+
+                if let Some(init_fn) = self
+                    .program
+                    .get_func_by_name("ClientInterface.BASE_NODE_INIT")
+                {
+                    let mut env = make_local_env(
+                        init_fn,
+                        vec![],
+                        &Env::<H>::default(),
+                        &node.state.nodes[client_node_id.index],
+                        &self.program.id_to_name,
+                    );
+                    let mut temp_logger = SearchLogger::default();
+                    let mut temp_coverage = LocalCoverage::new();
+                    if let Err(e) = exec_sync_on_node(
+                        &mut node.state,
+                        &mut temp_logger,
+                        &self.program,
+                        &mut env,
+                        client_node_id,
+                        init_fn.entry,
+                        None,
+                        &mut temp_coverage,
+                    ) {
+                        warn!(
+                            "Failed to initialize dynamic client node in checker (reads): {}",
+                            e
+                        );
+                    }
+                }
+
                 let server_node_id = NodeId {
                     role: server_role,
                     index: 0,
@@ -459,7 +512,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                     ) {
                         let mut succ = self.make_successor(&node, next_state, 1.0);
                         succ.history.push(Operation::<H> {
-                            client_id: client_idx as i32,
+                            client_id: client_node_id.index as i32,
                             op_action: "ClientInterface.Read".to_string(),
                             kind: OpKind::Invocation,
                             payload: vec![

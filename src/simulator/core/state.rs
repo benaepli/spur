@@ -284,6 +284,17 @@ impl<H: HashPolicy> State<H> {
         }
     }
 
+    /// Dynamically add a new node with the given role.
+    /// Returns the NodeId of the newly created node.
+    pub fn add_node(&mut self, role: NameId, node_slot_count: usize) -> NodeId {
+        let index = self.nodes.len();
+        let node_id = NodeId { role, index };
+        let mut env = Env::<H>::with_slots(node_slot_count);
+        env.set(0, Value::<H>::node(node_id)); // Slot 0 = self
+        self.nodes.push_back(env);
+        node_id
+    }
+
     pub fn alloc_channel_id(&mut self) -> usize {
         let id = self.next_channel_id;
         self.next_channel_id += 1;
