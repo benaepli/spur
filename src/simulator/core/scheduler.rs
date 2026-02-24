@@ -1,10 +1,16 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::core::exec::exec;
-use crate::simulator::core::state::{ClientOpResult, Logger, NodeId, Runnable, State};
-use crate::simulator::core::values::Value;
-use crate::simulator::coverage::{LocalCoverage, VertexMap};
+use crate::simulator::core::eval::make_local_env;
+use crate::simulator::core::exec::{exec, exec_sync_on_node};
+use crate::simulator::core::state::{
+    Continuation, Logger, NodeId, Record, Runnable, ScheduleResult, State, UpdatePolicy,
+};
+use crate::simulator::core::values::{Env, Value};
+use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
+use crate::simulator::path::Topology;
+use crate::simulator::path::TopologyInfo;
+use log::warn;
 use rand::Rng;
 
 pub fn schedule_runnable<H: HashPolicy, L: Logger>(
@@ -18,10 +24,12 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
     randomly_delay_msgs: bool,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
-) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
+    topology: &TopologyInfo,
+    global_state: &GlobalState,
+) -> Result<ScheduleResult<H>, RuntimeError> {
     let len = state.runnable_tasks.len();
     if len == 0 {
-        return Ok(None); // Halt equivalent
+        return Ok(ScheduleResult::None); // Halt equivalent
     }
 
     let mut rng = rand::rng();
@@ -53,10 +61,27 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
     let runnable = state.runnable_tasks.remove(idx);
 
     match runnable {
+        Runnable::Crash { node_id } => {
+            crash_node(state, node_id);
+            Ok(ScheduleResult::Crash { node_id })
+        }
+        Runnable::Recover { node_id } => {
+            recover_crashed_node(
+                state,
+                logger,
+                program,
+                topology,
+                node_id,
+                global_state,
+                global_snapshot,
+                local_coverage,
+            )?;
+            Ok(ScheduleResult::Recover { node_id })
+        }
         Runnable::Timer(timer) => {
             // Drop timer if node is crashed
             if state.crash_info.currently_crashed.contains(&timer.node) {
-                return Ok(None);
+                return Ok(ScheduleResult::None);
             }
 
             // Send a unit value to the timer's channel to signal completion
@@ -80,7 +105,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                 }
                 state.channels.insert(timer.channel, chan);
             }
-            Ok(None)
+            Ok(ScheduleResult::None)
         }
         mut other => {
             let (src_node, dest_node, x, policy) = match &other {
@@ -92,7 +117,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                     policy,
                     ..
                 } => (*origin_node, *target, *x, policy),
-                Runnable::Timer(_) => unreachable!(),
+                _ => unreachable!(),
             };
 
             if state.crash_info.currently_crashed.contains(&dest_node) {
@@ -103,7 +128,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                         state.crash_info.queued_messages.push_back((dest_node, r));
                     }
                 }
-                return Ok(None);
+                return Ok(ScheduleResult::None);
             }
 
             // Network faults (drops / partitions)
@@ -136,7 +161,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                 }
 
                 if !should_deliver {
-                    return Ok(None);
+                    return Ok(ScheduleResult::None);
                 }
 
                 // Latency / delay
@@ -148,14 +173,17 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                         _ => unreachable!(),
                     }
                     state.runnable_tasks.push_back(other);
-                    return Ok(None);
+                    return Ok(ScheduleResult::None);
                 }
             }
 
             match other {
                 Runnable::Record(r) => {
                     let result = exec(state, logger, program, r, global_snapshot, local_coverage)?;
-                    Ok(result)
+                    match result {
+                        Some(client_op) => Ok(ScheduleResult::ClientOp(client_op)),
+                        None => Ok(ScheduleResult::None),
+                    }
                 }
                 Runnable::ChannelSend {
                     channel, message, ..
@@ -180,10 +208,208 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                         }
                         state.channels.insert(channel, chan);
                     }
-                    Ok(None)
+                    Ok(ScheduleResult::None)
                 }
                 _ => unreachable!(),
             }
         }
     }
+}
+
+fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
+    if state.crash_info.currently_crashed.contains(&node_id) {
+        warn!("Node {} is already crashed", node_id);
+        return;
+    }
+    state.crash_info.currently_crashed.insert(node_id);
+
+    let tasks = std::mem::take(&mut state.runnable_tasks);
+    for task in tasks {
+        match task {
+            Runnable::Timer(timer) => {
+                // Drop timers for crashed nodes
+                if timer.node != node_id {
+                    state.runnable_tasks.push_back(Runnable::Timer(timer));
+                }
+            }
+            Runnable::Record(record) => {
+                if record.node == node_id {
+                    let is_external = record.origin_node != record.node;
+                    let origin_alive = !state
+                        .crash_info
+                        .currently_crashed
+                        .contains(&record.origin_node);
+                    if is_external && origin_alive {
+                        let mut record = record;
+                        record.reset();
+                        state
+                            .crash_info
+                            .queued_messages
+                            .push_back((node_id, record));
+                    }
+                } else {
+                    state.runnable_tasks.push_back(Runnable::Record(record));
+                }
+            }
+            Runnable::ChannelSend { target, .. } => {
+                // If target is the crashed node, drop it.
+                // If target is another node, keep it.
+                if target != node_id {
+                    state.runnable_tasks.push_back(task);
+                }
+            }
+            // Keep other crash/recover runnables for different nodes
+            Runnable::Crash { node_id: nid } | Runnable::Recover { node_id: nid } => {
+                if nid != node_id {
+                    state.runnable_tasks.push_back(task);
+                }
+            }
+        }
+    }
+}
+
+fn recover_crashed_node<H: HashPolicy, L: Logger>(
+    state: &mut State<H>,
+    logger: &mut L,
+    program: &Program,
+    topology: &TopologyInfo,
+    node_id: NodeId,
+    global_state: &GlobalState,
+    global_snapshot: Option<&VertexMap>,
+    local_coverage: &mut LocalCoverage,
+) -> Result<(), RuntimeError> {
+    if !state.crash_info.currently_crashed.contains(&node_id) {
+        warn!("Node {} is not crashed", node_id);
+        return Ok(());
+    }
+    state.crash_info.currently_crashed.remove(&node_id);
+
+    state.nodes[node_id.index] = Env::<H>::default();
+    reinit_node(
+        topology,
+        state,
+        logger,
+        program,
+        node_id,
+        global_state,
+        global_snapshot,
+        local_coverage,
+    )?;
+
+    let queued = std::mem::take(&mut state.crash_info.queued_messages);
+    for (dest, record) in queued {
+        if dest == node_id {
+            state.runnable_tasks.push_back(Runnable::Record(record));
+        } else {
+            state.crash_info.queued_messages.push_back((dest, record));
+        }
+    }
+    Ok(())
+}
+
+fn reinit_node<H: HashPolicy, L: Logger>(
+    topology: &TopologyInfo,
+    state: &mut State<H>,
+    logger: &mut L,
+    prog: &Program,
+    node_id: NodeId,
+    global_state: &GlobalState,
+    global_snapshot: Option<&VertexMap>,
+    local_coverage: &mut LocalCoverage,
+) -> Result<(), RuntimeError> {
+    use crate::compiler::cfg::{SELF_SLOT, VarSlot};
+
+    let init_fn = prog
+        .get_func_by_name("Node.BASE_NODE_INIT")
+        .ok_or_else(|| RuntimeError::MissingRequiredFunction("Node.BASE_NODE_INIT".to_string()))?;
+
+    if let VarSlot::Node(self_idx, _) = SELF_SLOT {
+        state.nodes[node_id.index].set(self_idx, Value::<H>::node(node_id));
+    }
+
+    let node_env = &state.nodes[node_id.index];
+    let mut env = make_local_env(
+        init_fn,
+        vec![],
+        &Env::<H>::default(),
+        node_env,
+        &prog.id_to_name,
+    );
+
+    exec_sync_on_node(
+        state,
+        logger,
+        prog,
+        &mut env,
+        node_id,
+        init_fn.entry,
+        global_snapshot,
+        local_coverage,
+    )?;
+
+    recover_node(
+        topology,
+        state,
+        logger,
+        prog,
+        node_id,
+        global_state,
+        global_snapshot,
+        local_coverage,
+    )
+}
+
+fn recover_node<H: HashPolicy, L: Logger>(
+    topology: &TopologyInfo,
+    state: &mut State<H>,
+    logger: &mut L,
+    prog: &Program,
+    node_id: NodeId,
+    _global_state: &GlobalState,
+    global_snapshot: Option<&VertexMap>,
+    local_coverage: &mut LocalCoverage,
+) -> Result<(), RuntimeError> {
+    let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
+        return Ok(());
+    };
+
+    let actuals = match topology.topology {
+        Topology::Full => vec![
+            Value::<H>::int(node_id.index as i64),
+            Value::<H>::list(
+                (0..topology.num_servers)
+                    .map(|j| {
+                        Value::<H>::node(NodeId {
+                            role: node_id.role,
+                            index: j as usize,
+                        })
+                    })
+                    .collect(),
+            ),
+        ],
+    };
+
+    let node_env = &state.nodes[node_id.index];
+    let env = make_local_env(
+        recover_fn,
+        actuals,
+        &Env::<H>::default(),
+        node_env,
+        &prog.id_to_name,
+    );
+
+    let record = Record {
+        pc: recover_fn.entry,
+        node: node_id,
+        origin_node: node_id,
+        continuation: Continuation::Recover,
+        entry_pc: recover_fn.entry,
+        initial_env: env.clone(),
+        env,
+        x: 0.0,
+        policy: UpdatePolicy::Identity,
+    };
+
+    exec(state, logger, prog, record, global_snapshot, local_coverage)?;
+    Ok(())
 }

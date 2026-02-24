@@ -155,6 +155,12 @@ pub enum Runnable<H: HashPolicy> {
         policy: UpdatePolicy,
         pc: Vertex,
     },
+    Crash {
+        node_id: NodeId,
+    },
+    Recover {
+        node_id: NodeId,
+    },
 }
 
 impl<H: HashPolicy> Hash for Runnable<H> {
@@ -186,6 +192,14 @@ impl<H: HashPolicy> Hash for Runnable<H> {
                 policy.hash(state);
                 pc.hash(state);
             }
+            Runnable::Crash { node_id } => {
+                3u8.hash(state);
+                node_id.hash(state);
+            }
+            Runnable::Recover { node_id } => {
+                4u8.hash(state);
+                node_id.hash(state);
+            }
         }
     }
 }
@@ -197,6 +211,7 @@ impl<H: HashPolicy> Runnable<H> {
             Runnable::Timer(t) => t.node,
             Runnable::Record(r) => r.node,
             Runnable::ChannelSend { target, .. } => *target,
+            Runnable::Crash { node_id } | Runnable::Recover { node_id } => *node_id,
         }
     }
 
@@ -206,8 +221,22 @@ impl<H: HashPolicy> Runnable<H> {
             Runnable::Timer(t) => t.pc,
             Runnable::Record(r) => r.pc,
             Runnable::ChannelSend { pc, .. } => *pc,
+            Runnable::Crash { .. } | Runnable::Recover { .. } => usize::MAX,
         }
     }
+}
+
+/// Result from scheduling a single runnable item.
+#[derive(Debug)]
+pub enum ScheduleResult<H: HashPolicy> {
+    /// Nothing notable happened.
+    None,
+    /// A client operation completed.
+    ClientOp(ClientOpResult<H>),
+    /// A crash was executed on the given node.
+    Crash { node_id: NodeId },
+    /// A recovery was executed on the given node.
+    Recover { node_id: NodeId },
 }
 
 #[derive(Debug, Clone)]

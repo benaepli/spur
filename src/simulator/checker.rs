@@ -227,6 +227,10 @@ impl<H: HashPolicy> ModelChecker<H> {
                     successors.push(succ);
                     continue;
                 }
+                // Crash/Recover runnables are handled as regular runnable items
+                Runnable::Crash { .. } | Runnable::Recover { .. } => {
+                    continue;
+                }
             };
 
             // Handle crashed nodes (drop or queue message)
@@ -521,6 +525,11 @@ impl<H: HashPolicy> ModelChecker<H> {
                     // If target is the crashed node, drop it.
                     // If target is another node, keep it.
                     if target != node_id {
+                        state.runnable_tasks.push_back(task);
+                    }
+                }
+                Runnable::Crash { node_id: nid } | Runnable::Recover { node_id: nid } => {
+                    if nid != node_id {
                         state.runnable_tasks.push_back(task);
                     }
                 }
