@@ -3,11 +3,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use spur::compiler;
 use spur::debug::SimulatorDebugger;
 use spur::simulator::explorer::{run_explorer, run_explorer_genetic};
+use spur::simulator::history::LogBackend;
 use spur::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -54,6 +57,9 @@ enum Commands {
         /// Explorer type to use
         #[arg(short, long, value_enum, default_value_t = ExplorerType::Genetic)]
         explorer: ExplorerType,
+        /// Logging backend for simulation history
+        #[arg(long, value_enum, default_value_t = LogBackendArg::Parquet)]
+        log_backend: LogBackendArg,
         /// Skip confirmation prompt for directory deletion
         #[arg(short = 'y', long)]
         yes: bool,
@@ -68,6 +74,23 @@ pub enum ExplorerType {
     Standard,
     /// Genetic algorithm-based explorer
     Genetic,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum LogBackendArg {
+    /// Parquet files (default, fast write performance)
+    Parquet,
+    /// DuckDB database file
+    Duckdb,
+}
+
+impl From<LogBackendArg> for LogBackend {
+    fn from(arg: LogBackendArg) -> Self {
+        match arg {
+            LogBackendArg::Parquet => LogBackend::Parquet,
+            LogBackendArg::Duckdb => LogBackend::DuckDB,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -106,8 +129,9 @@ fn main() {
             config,
             output_dir,
             explorer,
+            log_backend,
             yes,
-        } => run_explore(spec, config, output_dir, explorer, yes),
+        } => run_explore(spec, config, output_dir, explorer, log_backend.into(), yes),
         Commands::Debug(args) => match args.command {
             DebugSubcommands::Logs {
                 db,
@@ -170,6 +194,7 @@ fn run_explore(
     config_path: PathBuf,
     output_dir: PathBuf,
     explorer_type: ExplorerType,
+    backend: LogBackend,
     yes: bool,
 ) -> Result<()> {
     let source_code = fs::read_to_string(&spec_path)
@@ -203,22 +228,52 @@ fn run_explore(
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("Failed to create directory '{}'", output_dir.display()))?;
 
-    let db_path = output_dir.join("results.duckdb");
+    // Determine output path: Parquet uses the directory, DuckDB uses a file inside it
+    let output_path_str: String = match &backend {
+        LogBackend::Parquet => output_dir
+            .to_str()
+            .context("Output dir contains invalid UTF-8")?
+            .to_string(),
+        LogBackend::DuckDB => {
+            let db_path = output_dir.join("results.duckdb");
+            db_path
+                .to_str()
+                .context("Database path contains invalid UTF-8")?
+                .to_string()
+        }
+    };
     let start = Instant::now();
 
-    let db_path_str = db_path
-        .to_str()
-        .context("Database path contains invalid UTF-8")?;
+    // Install Ctrl+C handler for graceful shutdown
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = cancelled.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\nReceived Ctrl+C, shutting down gracefully...");
+        cancelled_clone.store(true, Ordering::SeqCst);
+    })
+    .context("Failed to set Ctrl+C handler")?;
 
     let config_path_str = config_path
         .to_str()
         .context("Config path contains invalid UTF-8")?;
 
     let global_state = match explorer_type {
-        ExplorerType::Standard => run_explorer(&program, config_path_str, db_path_str)
-            .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
-        ExplorerType::Genetic => run_explorer_genetic(&program, config_path_str, db_path_str)
-            .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
+        ExplorerType::Standard => run_explorer(
+            &program,
+            config_path_str,
+            &output_path_str,
+            backend,
+            &cancelled,
+        )
+        .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
+        ExplorerType::Genetic => run_explorer_genetic(
+            &program,
+            config_path_str,
+            &output_path_str,
+            backend,
+            &cancelled,
+        )
+        .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
     };
 
     let elapsed = start.elapsed();
@@ -251,7 +306,6 @@ fn run_explore(
         elapsed,
         output_dir.display()
     );
-    println!("  - Database: {}", db_path.display());
     println!("  - Coverage heatmap: {}", heatmap_path.display());
     println!("  - CFG: {}", cfg_path.display());
 

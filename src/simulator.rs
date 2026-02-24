@@ -3,5 +3,5 @@ mod core;
 mod coverage;
 pub mod explorer;
 mod hash_utils;
-mod history;
+pub mod history;
 mod path;

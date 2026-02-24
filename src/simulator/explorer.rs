@@ -3,7 +3,9 @@ use crate::simulator::core::{
     Env, Logger, NodeId, RuntimeError, State, Value, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
-use crate::simulator::history::{HistoryWriter, serialize_history, serialize_logs};
+use crate::simulator::history::{
+    HistoryWriter, LogBackend, create_writer, serialize_history, serialize_logs,
+};
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
 use crossbeam::channel;
@@ -15,7 +17,7 @@ use rayon::prelude::ParallelBridge;
 use serde::Deserialize;
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{fs, thread};
 
 const CANON_LIMIT: usize = 8;
@@ -300,7 +302,7 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
 /// Runs a single simulation configuration and returns the plan score.
 pub fn run_single_simulation(
     program: &Program,
-    writer: &HistoryWriter,
+    writer: &Arc<dyn HistoryWriter>,
     global_state: &GlobalState,
     run_id: i64,
     config: &SingleRunConfig,
@@ -402,6 +404,8 @@ pub fn run_explorer(
     program: &Program,
     config_json_path: &str,
     output_path: &str,
+    backend: LogBackend,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Arc<GlobalState>, Box<dyn Error>> {
     info!("Starting Execution Explorer...");
     info!("Config: {}", config_json_path);
@@ -414,15 +418,12 @@ pub fn run_explorer(
         .validate()
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
-    if std::path::Path::new(output_path).exists() {
-        fs::remove_file(output_path)?;
-    }
-
-    let writer = Arc::new(HistoryWriter::new(output_path)?);
+    let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
 
     let (sender, receiver) = channel::bounded::<(i64, SingleRunConfig)>(100);
 
     let config_producer = config.clone();
+    let cancelled_producer = cancelled.clone();
 
     thread::spawn(move || {
         let config = config_producer;
@@ -446,12 +447,15 @@ pub fn run_explorer(
         info!("Total unique configurations: {}", total_configs);
         info!("Runs per config: {}", config.num_runs_per_config);
 
-        for &num_servers in &all_servers {
+        'outer: for &num_servers in &all_servers {
             for &num_writes in &all_writes {
                 for &num_reads in &all_reads {
                     for &num_timeouts in &all_timeouts {
                         for &num_crashes in &all_crashes {
                             for &density in all_densities {
+                                if cancelled_producer.load(Ordering::Relaxed) {
+                                    break 'outer;
+                                }
                                 config_counter += 1;
 
                                 let run_config = SingleRunConfig {
@@ -516,9 +520,7 @@ pub fn run_explorer(
         });
 
     // Shutdown the writer, waiting for all pending writes to complete
-    if let Ok(w) = Arc::try_unwrap(writer) {
-        w.shutdown();
-    }
+    writer.shutdown();
 
     info!("Execution explorer finished.");
     Ok(global_state)
@@ -530,6 +532,8 @@ pub fn run_explorer_genetic(
     program: &Program,
     config_json_path: &str,
     output_path: &str,
+    backend: LogBackend,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Arc<GlobalState>, Box<dyn Error>> {
     info!("Starting Genetic Execution Explorer...");
     info!("Config: {}", config_json_path);
@@ -542,11 +546,7 @@ pub fn run_explorer_genetic(
         .validate()
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
-    if std::path::Path::new(output_path).exists() {
-        fs::remove_file(output_path)?;
-    }
-
-    let writer = Arc::new(HistoryWriter::new(output_path)?);
+    let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
     let global_state = Arc::new(GlobalState::new(1_000_000));
     let run_counter = Arc::new(AtomicI64::new(0));
 
@@ -555,6 +555,13 @@ pub fn run_explorer_genetic(
         .collect();
 
     for generation in 0..config.num_generations {
+        if cancelled.load(Ordering::Relaxed) {
+            info!(
+                "Cancelled by user, stopping after generation {}",
+                generation
+            );
+            break;
+        }
         info!(
             "=== Generation {}/{} ===",
             generation + 1,
@@ -608,9 +615,7 @@ pub fn run_explorer_genetic(
         );
     }
 
-    if let Ok(w) = Arc::try_unwrap(writer) {
-        w.shutdown();
-    }
+    writer.shutdown();
 
     info!("Genetic explorer finished.");
     Ok(global_state)

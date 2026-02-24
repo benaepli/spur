@@ -28,6 +28,7 @@ scalable_cuckoo_filter = "0.5.1"
 nauty-pet = "0.14.0"
 parquet = "58.0.0"
 arrow = "58.0.0"
+ctrlc = "3.4"
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

@@ -1,14 +1,22 @@
 use crate::simulator::core::{ChannelId, LogEntry, OpKind, Operation, Value, ValueKind};
+use arrow::array::{Int32Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use duckdb::{Connection, params};
 use log::error;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use serde_json::{Value as JsonValue, json};
 use std::error::Error;
-use std::path::Path;
-use std::sync::mpsc::{self, Sender};
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-/// A pre-serialized operation ready for database insertion.
+/// A pre-serialized operation ready for database / file insertion.
 /// JSON serialization is done by worker threads before sending to the writer.
 pub struct PersistableOp {
     pub unique_id: i64,
@@ -171,6 +179,30 @@ pub fn save_history_to_csv<H: crate::simulator::hash_utils::HashPolicy, P: AsRef
     Ok(())
 }
 
+// ─── HistoryWriter trait ──────────────────────────────────────────────────────
+
+/// Command sent to the background history writer thread.
+pub enum HistoryCommand {
+    Write {
+        run_id: i64,
+        history: Vec<PersistableOp>,
+        logs: Vec<PersistableLog>,
+    },
+    Shutdown,
+}
+
+/// The abstract interface for logging simulation history.
+/// Implementations must be Send + Sync so they can be wrapped in `Arc<dyn HistoryWriter>`.
+pub trait HistoryWriter: Send + Sync {
+    /// Sends a pre-serialized history and logs write request to the background thread.
+    fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>);
+
+    /// Shuts down the background writer, waiting for all pending writes to complete.
+    fn shutdown(&self);
+}
+
+// ─── DuckDB backend ───────────────────────────────────────────────────────────
+
 /// Initialize the DuckDB database with the required tables.
 pub fn init_db(conn: &Connection) -> Result<(), duckdb::Error> {
     conn.execute_batch(
@@ -208,7 +240,6 @@ pub fn init_db(conn: &Connection) -> Result<(), duckdb::Error> {
     Ok(())
 }
 
-/// Saves pre-serialized history to the DuckDB database using bulk Appender API.
 fn save_history_db(
     conn: &Connection,
     run_id: i64,
@@ -257,24 +288,14 @@ fn save_logs_db(
     Ok(())
 }
 
-/// Command sent to the background history writer thread.
-pub enum HistoryCommand {
-    Write {
-        run_id: i64,
-        history: Vec<PersistableOp>,
-        logs: Vec<PersistableLog>,
-    },
-    Shutdown,
-}
-
 /// A background writer that serializes all DuckDB writes to a single thread.
-pub struct HistoryWriter {
+pub struct DuckDBWriter {
     sender: Sender<HistoryCommand>,
-    handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl HistoryWriter {
-    /// Creates a new HistoryWriter, opening and initializing the DuckDB database.
+impl DuckDBWriter {
+    /// Creates a new DuckDBWriter, opening and initializing the DuckDB database.
     /// The connection is then moved to a background thread that processes write requests.
     pub fn new(db_path: &str) -> Result<Self, Box<dyn Error>> {
         let conn = Connection::open(db_path)?;
@@ -304,12 +325,13 @@ impl HistoryWriter {
 
         Ok(Self {
             sender,
-            handle: Some(handle),
+            handle: Mutex::new(Some(handle)),
         })
     }
+}
 
-    /// Sends a pre-serialized history and logs write request to the background thread.
-    pub fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>) {
+impl HistoryWriter for DuckDBWriter {
+    fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>) {
         if let Err(e) = self.sender.send(HistoryCommand::Write {
             run_id,
             history,
@@ -323,15 +345,302 @@ impl HistoryWriter {
         }
     }
 
-    /// Shuts down the background writer, waiting for all pending writes to complete.
-    pub fn shutdown(mut self) {
+    fn shutdown(&self) {
         if let Err(e) = self.sender.send(HistoryCommand::Shutdown) {
-            log::error!("Failed to send shutdown command to history writer: {}", e);
+            log::error!("Failed to send shutdown command to DuckDB writer: {}", e);
         }
-        if let Some(h) = self.handle.take() {
-            if let Err(e) = h.join() {
-                log::error!("History writer thread panicked during shutdown: {:?}", e);
+        if let Ok(mut guard) = self.handle.lock() {
+            if let Some(h) = guard.take() {
+                if let Err(e) = h.join() {
+                    log::error!("DuckDB writer thread panicked: {:?}", e);
+                }
             }
         }
+    }
+}
+
+// ─── Parquet backend ──────────────────────────────────────────────────────────
+
+fn executions_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("run_id", DataType::Int64, false),
+        Field::new("seq_num", DataType::Int64, false),
+        Field::new("unique_id", DataType::Int64, false),
+        Field::new("client_id", DataType::Int64, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("action", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+fn logs_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("run_id", DataType::Int64, false),
+        Field::new("seq_num", DataType::Int64, false),
+        Field::new("node_id", DataType::Int64, false),
+        Field::new("step", DataType::Int32, false),
+        Field::new("content", DataType::Utf8, false),
+    ]))
+}
+
+/// Writes a batch of PersistableOps into an open ArrowWriter for the executions table.
+fn append_executions_batch(
+    writer: &mut ArrowWriter<File>,
+    run_id: i64,
+    ops: &[PersistableOp],
+) -> Result<(), Box<dyn Error>> {
+    let n = ops.len();
+    let run_ids = Int64Array::from(vec![run_id; n]);
+    let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
+    let unique_ids: Int64Array = ops.iter().map(|o| o.unique_id).collect::<Vec<_>>().into();
+    let client_ids: Int64Array = ops.iter().map(|o| o.client_id).collect::<Vec<_>>().into();
+    let kinds: StringArray = ops.iter().map(|o| o.kind).collect::<Vec<_>>().into();
+    let actions: StringArray = ops
+        .iter()
+        .map(|o| o.action.as_str())
+        .collect::<Vec<_>>()
+        .into();
+    let payloads: StringArray = ops
+        .iter()
+        .map(|o| o.payload_json.as_str())
+        .collect::<Vec<_>>()
+        .into();
+
+    let batch = RecordBatch::try_new(
+        executions_schema(),
+        vec![
+            Arc::new(run_ids),
+            Arc::new(seq_nums),
+            Arc::new(unique_ids),
+            Arc::new(client_ids),
+            Arc::new(kinds),
+            Arc::new(actions),
+            Arc::new(payloads),
+        ],
+    )?;
+    writer.write(&batch)?;
+    Ok(())
+}
+
+/// Writes a batch of PersistableLogs into an open ArrowWriter for the logs table.
+fn append_logs_batch(
+    writer: &mut ArrowWriter<File>,
+    run_id: i64,
+    logs: &[PersistableLog],
+) -> Result<(), Box<dyn Error>> {
+    let n = logs.len();
+    let run_ids = Int64Array::from(vec![run_id; n]);
+    let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
+    let node_ids: Int64Array = logs.iter().map(|l| l.node_id).collect::<Vec<_>>().into();
+    let steps: Int32Array = logs.iter().map(|l| l.step).collect::<Vec<_>>().into();
+    let contents: StringArray = logs
+        .iter()
+        .map(|l| l.content.as_str())
+        .collect::<Vec<_>>()
+        .into();
+
+    let batch = RecordBatch::try_new(
+        logs_schema(),
+        vec![
+            Arc::new(run_ids),
+            Arc::new(seq_nums),
+            Arc::new(node_ids),
+            Arc::new(steps),
+            Arc::new(contents),
+        ],
+    )?;
+    writer.write(&batch)?;
+    Ok(())
+}
+
+/// Number of writes between file rotations. Each batch is finalized (footer
+/// written) before a new file is opened, so all completed batches survive
+/// process termination.
+const PARQUET_ROTATION_INTERVAL: usize = 25_000;
+
+/// A background writer that serializes all Parquet writes to a single thread.
+/// Outputs batched files into `executions/` and `logs/` subdirectories.
+pub struct ParquetWriter {
+    sender: Sender<HistoryCommand>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Helper: creates a new ArrowWriter for the given path and schema.
+fn open_parquet_writer(
+    path: &Path,
+    schema: Arc<Schema>,
+) -> Result<ArrowWriter<File>, Box<dyn Error>> {
+    let file = File::create(path)?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    Ok(ArrowWriter::try_new(file, schema, Some(props))?)
+}
+
+/// Helper: formats a batch file name like `batch_0001.parquet`.
+fn batch_filename(batch_num: usize) -> String {
+    format!("batch_{:04}.parquet", batch_num)
+}
+
+impl ParquetWriter {
+    /// Creates a new ParquetWriter.
+    /// `output_dir` is the base directory. Files are written into
+    /// `output_dir/executions/batch_NNNN.parquet` and `output_dir/logs/batch_NNNN.parquet`.
+    pub fn new(output_dir: &Path) -> Result<Self, Box<dyn Error>> {
+        let exec_dir = output_dir.join("executions");
+        let logs_dir = output_dir.join("logs");
+        std::fs::create_dir_all(&exec_dir)?;
+        std::fs::create_dir_all(&logs_dir)?;
+
+        let exec_schema = executions_schema();
+        let logs_schema_arc = logs_schema();
+
+        let mut exec_writer =
+            open_parquet_writer(&exec_dir.join(batch_filename(1)), exec_schema.clone())?;
+        let mut log_writer =
+            open_parquet_writer(&logs_dir.join(batch_filename(1)), logs_schema_arc.clone())?;
+
+        let (sender, receiver) = mpsc::channel::<HistoryCommand>();
+
+        let handle = thread::spawn(move || {
+            let mut writes_in_batch: usize = 0;
+            let mut batch_num: usize = 1;
+
+            while let Ok(cmd) = receiver.recv() {
+                match cmd {
+                    HistoryCommand::Write {
+                        run_id,
+                        history,
+                        logs,
+                    } => {
+                        if !history.is_empty() {
+                            if let Err(e) =
+                                append_executions_batch(&mut exec_writer, run_id, &history)
+                            {
+                                error!(
+                                    "failed to save executions parquet for run {}: {}",
+                                    run_id, e
+                                );
+                            }
+                        }
+                        if !logs.is_empty() {
+                            if let Err(e) = append_logs_batch(&mut log_writer, run_id, &logs) {
+                                error!("failed to save logs parquet for run {}: {}", run_id, e);
+                            }
+                        }
+
+                        writes_in_batch += 1;
+
+                        // Rotate: finalize current files and open new ones
+                        if writes_in_batch >= PARQUET_ROTATION_INTERVAL {
+                            if let Err(e) = exec_writer.finish() {
+                                error!("failed to finalize executions batch {}: {}", batch_num, e);
+                            }
+                            if let Err(e) = log_writer.finish() {
+                                error!("failed to finalize logs batch {}: {}", batch_num, e);
+                            }
+
+                            batch_num += 1;
+                            writes_in_batch = 0;
+
+                            match open_parquet_writer(
+                                &exec_dir.join(batch_filename(batch_num)),
+                                exec_schema.clone(),
+                            ) {
+                                Ok(w) => exec_writer = w,
+                                Err(e) => {
+                                    error!(
+                                        "failed to open new executions batch {}: {}",
+                                        batch_num, e
+                                    );
+                                    break;
+                                }
+                            }
+                            match open_parquet_writer(
+                                &logs_dir.join(batch_filename(batch_num)),
+                                logs_schema_arc.clone(),
+                            ) {
+                                Ok(w) => log_writer = w,
+                                Err(e) => {
+                                    error!("failed to open new logs batch {}: {}", batch_num, e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    HistoryCommand::Shutdown => {
+                        if let Err(e) = exec_writer.finish() {
+                            error!("failed to finalize executions batch {}: {}", batch_num, e);
+                        }
+                        if let Err(e) = log_writer.finish() {
+                            error!("failed to finalize logs batch {}: {}", batch_num, e);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            sender,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+}
+
+impl HistoryWriter for ParquetWriter {
+    fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>) {
+        if let Err(e) = self.sender.send(HistoryCommand::Write {
+            run_id,
+            history,
+            logs,
+        }) {
+            log::error!(
+                "Failed to send parquet write command for run {}: {}",
+                run_id,
+                e
+            );
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Err(e) = self.sender.send(HistoryCommand::Shutdown) {
+            log::error!("Failed to send shutdown command to parquet writer: {}", e);
+        }
+        if let Ok(mut guard) = self.handle.lock() {
+            if let Some(h) = guard.take() {
+                if let Err(e) = h.join() {
+                    log::error!("Parquet writer thread panicked: {:?}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Which storage backend to use for logging history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogBackend {
+    Parquet,
+    DuckDB,
+}
+
+impl Default for LogBackend {
+    fn default() -> Self {
+        LogBackend::Parquet
+    }
+}
+
+/// Creates the appropriate HistoryWriter for the given backend.
+pub fn create_writer(
+    backend: LogBackend,
+    output_path: &str,
+) -> Result<Box<dyn HistoryWriter>, Box<dyn Error>> {
+    match backend {
+        LogBackend::Parquet => {
+            let dir = PathBuf::from(output_path);
+            std::fs::create_dir_all(&dir)?;
+            Ok(Box::new(ParquetWriter::new(&dir)?))
+        }
+        LogBackend::DuckDB => Ok(Box::new(DuckDBWriter::new(output_path)?)),
     }
 }
