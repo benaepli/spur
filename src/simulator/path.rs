@@ -129,6 +129,10 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         .get_func_by_name("Node.BASE_NODE_INIT")
         .ok_or_else(|| RuntimeError::MissingRequiredFunction("Node.BASE_NODE_INIT".to_string()))?;
 
+    if let VarSlot::Node(self_idx, _) = SELF_SLOT {
+        state.nodes[node_id.index].set(self_idx, Value::<H>::node(node_id));
+    }
+
     let node_env = &state.nodes[node_id.index];
     let mut env = make_local_env(
         init_fn,
@@ -137,9 +141,6 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         node_env,
         &prog.id_to_name,
     );
-    if let VarSlot::Node(self_idx, _) = SELF_SLOT {
-        env.set(self_idx, Value::<H>::node(node_id));
-    }
 
     exec_sync_on_node(
         state,

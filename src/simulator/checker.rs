@@ -539,6 +539,10 @@ impl<H: HashPolicy> ModelChecker<H> {
         state.nodes[node_id.index] = Env::<H>::default();
 
         if let Some(init_fn) = self.program.get_func_by_name("Node.BASE_NODE_INIT") {
+            if let VarSlot::Node(self_idx, _) = SELF_SLOT {
+                state.nodes[node_id.index].set(self_idx, Value::<H>::node(node_id));
+            }
+
             let mut env = make_local_env(
                 init_fn,
                 vec![],
@@ -546,9 +550,6 @@ impl<H: HashPolicy> ModelChecker<H> {
                 &state.nodes[node_id.index],
                 &self.program.id_to_name,
             );
-            if let VarSlot::Node(self_idx, _) = SELF_SLOT {
-                env.set(self_idx, Value::<H>::node(node_id));
-            }
             if let Err(e) = exec_sync_on_node(
                 state,
                 logger,
