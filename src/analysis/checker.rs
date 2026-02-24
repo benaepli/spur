@@ -15,6 +15,7 @@ use crate::analysis::types::{
     TypedTopLevelDef, TypedUserFuncCall, TypedVarInit, TypedVarTarget,
 };
 use crate::parser::{BinOp, Span};
+use chumsky::span::Span as ChumskySpan;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -1128,6 +1129,66 @@ impl TypeChecker {
                 ty: Type::Int,
                 span,
             }),
+            ResolvedExprKind::StringLit(s) => Ok(TypedExpr {
+                kind: TypedExprKind::StringLit(s),
+                ty: Type::String,
+                span,
+            }),
+            ResolvedExprKind::FString(exprs) => {
+                let mut curr_expr: Option<TypedExpr> = None;
+                for e in exprs {
+                    let mut typed_e = self.infer_expr(e)?;
+
+                    if typed_e.ty == Type::Int {
+                        typed_e = TypedExpr {
+                            span: typed_e.span,
+                            ty: Type::String,
+                            kind: TypedExprKind::FuncCall(TypedFuncCall::Builtin(
+                                crate::analysis::resolver::BuiltinFn::IntToString,
+                                vec![typed_e],
+                                Type::String,
+                            )),
+                        };
+                    } else if typed_e.ty == Type::Bool {
+                        typed_e = TypedExpr {
+                            span: typed_e.span,
+                            ty: Type::String,
+                            kind: TypedExprKind::FuncCall(TypedFuncCall::Builtin(
+                                crate::analysis::resolver::BuiltinFn::BoolToString,
+                                vec![typed_e],
+                                Type::String,
+                            )),
+                        };
+                    } else if typed_e.ty != Type::String {
+                        return Err(TypeError::Mismatch {
+                            expected: Type::String,
+                            found: typed_e.ty,
+                            span: typed_e.span,
+                        });
+                    }
+
+                    if let Some(prev) = curr_expr {
+                        let combined_span = prev.span.union(typed_e.span);
+                        curr_expr = Some(TypedExpr {
+                            kind: TypedExprKind::BinOp(
+                                BinOp::Add,
+                                Box::new(prev),
+                                Box::new(typed_e),
+                            ),
+                            ty: Type::String,
+                            span: combined_span,
+                        });
+                    } else {
+                        curr_expr = Some(typed_e);
+                    }
+                }
+
+                curr_expr.ok_or_else(|| TypeError::Mismatch {
+                    expected: Type::String,
+                    found: Type::Tuple(vec![]),
+                    span,
+                })
+            }
             ResolvedExprKind::PersistData(expr) => {
                 let typed_e = self.infer_expr(*expr)?;
                 if !is_trivially_copyable(&typed_e.ty, &self.trivially_copyable) {
@@ -1159,11 +1220,6 @@ impl TypeChecker {
             ResolvedExprKind::DiscardData => Ok(TypedExpr {
                 kind: TypedExprKind::DiscardData,
                 ty: Type::Tuple(vec![]),
-                span,
-            }),
-            ResolvedExprKind::StringLit(s) => Ok(TypedExpr {
-                kind: TypedExprKind::StringLit(s),
-                ty: Type::String,
                 span,
             }),
             ResolvedExprKind::BoolLit(b) => Ok(TypedExpr {

@@ -218,6 +218,7 @@ pub enum ExprKind {
     Var(String),
     IntLit(i64),
     StringLit(String),
+    FString(Vec<Expr>),
     BoolLit(bool),
     NilLit,
 
@@ -500,6 +501,33 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
         };
+        // A FString is FStringStart followed by zero or more (Expr, FStringPart), followed by Expr, FStringEnd
+        let fstring_parser = select! { TokenKind::FStringStart(s) => s }
+            .then(
+                expr.clone()
+                    .then(select! { TokenKind::FStringPart(s) => s })
+                    .repeated()
+                    .collect::<Vec<(Expr, String)>>(),
+            )
+            .then(expr.clone())
+            .then(select! { TokenKind::FStringEnd(s) => s })
+            .map_with(|(((start_str, middle_pairs), last_expr), end_str), e| {
+                let mut elements = Vec::new();
+                if !start_str.is_empty() {
+                    elements.push(Expr::new(ExprKind::StringLit(start_str), e.span()));
+                }
+                for (mid_expr, mid_str) in middle_pairs {
+                    elements.push(mid_expr);
+                    if !mid_str.is_empty() {
+                        elements.push(Expr::new(ExprKind::StringLit(mid_str), e.span()));
+                    }
+                }
+                elements.push(last_expr);
+                if !end_str.is_empty() {
+                    elements.push(Expr::new(ExprKind::StringLit(end_str), e.span()));
+                }
+                ExprKind::FString(elements)
+            });
 
         let func_call = ident.then(args()).map_with(|(name, args), e| FuncCall {
             name,
@@ -679,6 +707,7 @@ where
             match_expr,
             named_dot_access,
             ident.map(ExprKind::Var),
+            fstring_parser,
             tuple_lit,
         ))
         .map_with(|kind, e| Expr::new(kind, e.span()));

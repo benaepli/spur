@@ -24,7 +24,7 @@ where
         let diagnostic = Diagnostic::error()
             .with_message(error.to_string())
             .with_labels(vec![
-                Label::primary(file_id, span.start..span.end).with_message(error.to_string()),
+                Label::primary(file_id, span.start..span.end).with_message(error.to_string())
             ]);
         term::emit_to_write_style(&mut writer.lock(), &config, &files, &diagnostic)?;
     }

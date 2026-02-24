@@ -190,7 +190,7 @@ fn run_explore(
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("Failed to create directory '{}'", output_dir.display()))?;
 
-    let db_path = output_dir.join("results.db");
+    let db_path = output_dir.join("results.duckdb");
     let start = Instant::now();
 
     let db_path_str = db_path

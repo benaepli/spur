@@ -68,8 +68,12 @@ pub enum TokenKind {
     ColonEqual,
 
     // Literals
+    // Literals
     Identifier(String),
     String(String),
+    FStringStart(String),
+    FStringPart(String),
+    FStringEnd(String),
     Integer(i64),
 
     // Keywords
@@ -152,6 +156,9 @@ impl fmt::Display for TokenKind {
             TokenKind::ColonEqual => write!(f, ":="),
             TokenKind::Identifier(s) => write!(f, "{}", s),
             TokenKind::String(s) => write!(f, "\"{}\"", s),
+            TokenKind::FStringStart(s) => write!(f, "f\"{} {{", s),
+            TokenKind::FStringPart(s) => write!(f, "}} {} {{", s),
+            TokenKind::FStringEnd(s) => write!(f, "}} {}\"", s),
             TokenKind::Integer(i) => write!(f, "{}", i),
             TokenKind::ClientInterface => write!(f, "ClientInterface"),
             TokenKind::Enum => write!(f, "enum"),
@@ -282,6 +289,13 @@ pub enum LexError {
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     position: usize,
+    brace_stack: Vec<BraceContext>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum BraceContext {
+    Normal,
+    FStringInterpolation,
 }
 
 impl<'a> Lexer<'a> {
@@ -290,6 +304,7 @@ impl<'a> Lexer<'a> {
         Self {
             input: input.chars().peekable(),
             position: 0,
+            brace_stack: Vec::new(),
         }
     }
 
@@ -343,7 +358,77 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn parse_string(&mut self, start: usize) -> Result<TokenKind, LexError> {
+    fn parse_fstring(&mut self, start: usize, is_resuming: bool) -> Result<TokenKind, LexError> {
+        let mut value = String::new();
+
+        loop {
+            let ch = self
+                .input
+                .next()
+                .ok_or(LexError::UnterminatedString(start))?;
+            self.position += 1;
+            match ch {
+                '"' => {
+                    if is_resuming {
+                        return Ok(TokenKind::FStringEnd(value));
+                    } else {
+                        return Ok(TokenKind::String(value));
+                    }
+                }
+                '{' => {
+                    self.brace_stack.push(BraceContext::FStringInterpolation);
+                    if is_resuming {
+                        return Ok(TokenKind::FStringPart(value));
+                    } else {
+                        return Ok(TokenKind::FStringStart(value));
+                    }
+                }
+                '\\' => {
+                    // Handle escape sequences
+                    match self.input.next() {
+                        Some('"') => {
+                            value.push('"');
+                            self.position += 1;
+                        }
+                        Some('\\') => {
+                            value.push('\\');
+                            self.position += 1;
+                        }
+                        Some('{') => {
+                            value.push('{');
+                            self.position += 1;
+                        }
+                        Some('}') => {
+                            value.push('}');
+                            self.position += 1;
+                        }
+                        Some('n') => {
+                            value.push('\n');
+                            self.position += 1;
+                        }
+                        Some('t') => {
+                            value.push('\t');
+                            self.position += 1;
+                        }
+                        Some(ch) => {
+                            // For other characters, include the backslash
+                            value.push('\\');
+                            value.push(ch);
+                            self.position += 1;
+                        }
+                        None => {
+                            return Err(LexError::UnterminatedString(start));
+                        }
+                    }
+                }
+                ch => {
+                    value.push(ch);
+                }
+            }
+        }
+    }
+
+    fn parse_raw_string(&mut self, start: usize) -> Result<TokenKind, LexError> {
         let mut value = String::new();
 
         loop {
@@ -442,8 +527,20 @@ impl<'a> Iterator for Lexer<'a> {
         let result = match ch {
             '(' => Ok(TokenKind::LeftParen),
             ')' => Ok(TokenKind::RightParen),
-            '{' => Ok(TokenKind::LeftBrace),
-            '}' => Ok(TokenKind::RightBrace),
+            '{' => {
+                self.brace_stack.push(BraceContext::Normal);
+                Ok(TokenKind::LeftBrace)
+            }
+            '}' => {
+                match self.brace_stack.pop() {
+                    Some(BraceContext::FStringInterpolation) => {
+                        // The closing brace was the end of an f-string interpolation block.
+                        // We must immediately drop back into parsing the rest of the f-string.
+                        self.parse_fstring(self.position, true)
+                    }
+                    _ => Ok(TokenKind::RightBrace),
+                }
+            }
             '[' => Ok(TokenKind::LeftBracket),
             ']' => Ok(TokenKind::RightBracket),
             ',' => Ok(TokenKind::Comma),
@@ -536,7 +633,13 @@ impl<'a> Iterator for Lexer<'a> {
                 }
             }
 
-            '"' => self.parse_string(start),
+            '"' => self.parse_fstring(start, false),
+
+            's' if self.input.peek() == Some(&'"') => {
+                self.input.next(); // consume the '"'
+                self.position += 1;
+                self.parse_raw_string(start)
+            }
 
             '0'..='9' => self.parse_number(start, ch),
 
@@ -616,6 +719,59 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(tokens.len(), 2);
         assert!(matches!(tokens[0].kind, TokenKind::String(_)));
+    }
+
+    #[test]
+    fn test_raw_strings() {
+        let input = r#"s"raw {string}" s"another raw string""#;
+        let mut lexer = Lexer::new(input);
+        let (tokens, errors) = lexer.collect_all();
+
+        assert!(
+            errors.is_empty(),
+            "Lexer errors in raw strings: {:?}",
+            errors
+        );
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(
+            tokens[0].kind,
+            TokenKind::String("raw {string}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_f_strings() {
+        let input = r#""hello {name} world" "nested { if true { "foo" } else { "bar" } }""#;
+        let mut lexer = Lexer::new(input);
+        let (tokens, errors) = lexer.collect_all();
+
+        assert!(errors.is_empty(), "Lexer errors in f-strings: {:?}", errors);
+
+        assert_eq!(
+            tokens[0].kind,
+            TokenKind::FStringStart("hello ".to_string())
+        );
+        assert_eq!(tokens[1].kind, TokenKind::Identifier("name".to_string()));
+        assert_eq!(tokens[2].kind, TokenKind::FStringEnd(" world".to_string()));
+
+        assert_eq!(
+            tokens[3].kind,
+            TokenKind::FStringStart("nested ".to_string())
+        );
+        assert_eq!(tokens[4].kind, TokenKind::If);
+        assert_eq!(tokens[5].kind, TokenKind::True);
+
+        assert_eq!(tokens[6].kind, TokenKind::LeftBrace);
+        assert_eq!(tokens[7].kind, TokenKind::String("foo".to_string()));
+        assert_eq!(tokens[8].kind, TokenKind::RightBrace);
+
+        assert_eq!(tokens[9].kind, TokenKind::Else);
+        assert_eq!(tokens[10].kind, TokenKind::LeftBrace);
+        assert_eq!(tokens[11].kind, TokenKind::String("bar".to_string()));
+        assert_eq!(tokens[12].kind, TokenKind::RightBrace);
+
+        assert_eq!(tokens[13].kind, TokenKind::FStringEnd("".to_string()));
+        assert_eq!(tokens.len(), 14);
     }
 
     #[test]

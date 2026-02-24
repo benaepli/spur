@@ -236,6 +236,7 @@ pub enum ResolvedExprKind {
     Var(NameId, String),
     IntLit(i64),
     StringLit(String),
+    FString(Vec<ResolvedExpr>),
     BoolLit(bool),
     NilLit,
 
@@ -883,6 +884,13 @@ impl Resolver {
             ExprKind::Var(name) => ResolvedExprKind::Var(self.lookup_var(&name, span)?, name),
             ExprKind::IntLit(i) => ResolvedExprKind::IntLit(i),
             ExprKind::StringLit(s) => ResolvedExprKind::StringLit(s),
+            ExprKind::FString(exprs) => {
+                let resolved_exprs = exprs
+                    .into_iter()
+                    .map(|e| self.resolve_expr(e))
+                    .collect::<Result<_, _>>()?;
+                ResolvedExprKind::FString(resolved_exprs)
+            }
             ExprKind::BoolLit(b) => ResolvedExprKind::BoolLit(b),
             ExprKind::NilLit => ResolvedExprKind::NilLit,
             ExprKind::BinOp(op, l, r) => ResolvedExprKind::BinOp(
