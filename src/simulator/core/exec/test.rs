@@ -2,7 +2,7 @@ use super::*;
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Cfg, Expr, Instr, Label, Lhs, Program, VarSlot};
 use crate::simulator::core::state::{
-    Continuation, LogEntry, Logger, NodeId, Record, State, UpdatePolicy,
+    Continuation, LogEntry, Logger, NodeId, Record, SchedulePolicy, State,
 };
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::LocalCoverage;
@@ -87,8 +87,7 @@ fn make_record_with_cont(
         entry_pc: pc,
         initial_env: env.clone(),
         env,
-        x: 0.5,
-        policy: UpdatePolicy::Identity,
+        priority: 0.5,
     }
 }
 
@@ -116,6 +115,7 @@ fn test_assign_then_cond_true() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
 }
@@ -144,6 +144,7 @@ fn test_assign_then_cond_false() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
 }
@@ -173,6 +174,7 @@ fn test_arithmetic_assignment() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
 }
@@ -206,6 +208,7 @@ fn test_multiple_assigns() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
 }
@@ -232,6 +235,7 @@ fn test_node_slot_assignment() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
     assert_eq!(state.nodes[0].get(1), &Value::<WithHashing>::int(42));
@@ -263,6 +267,7 @@ fn test_copy_instruction() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
 }
@@ -286,6 +291,7 @@ fn test_print_instruction() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
     assert_eq!(logger.entries.len(), 1);
@@ -329,6 +335,7 @@ fn test_for_loop_in_list() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
 }
@@ -352,6 +359,7 @@ fn test_pause_yields() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
@@ -388,6 +396,7 @@ fn test_coverage_records_transitions() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
     assert!(coverage.unique_edges() >= 2);
 }
@@ -421,6 +430,7 @@ fn test_channel_send_recv() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -447,6 +457,7 @@ fn test_recv_blocks_on_empty() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
 
     assert!(result.is_ok());
@@ -514,6 +525,7 @@ fn test_for_loop_map_destructuring() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -557,6 +569,7 @@ fn test_tuple_assignment() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -589,6 +602,7 @@ fn test_runtime_type_error() {
         record,
         None,
         &mut coverage,
+        &SchedulePolicy::Fixed,
     );
 
     assert!(result.is_err());

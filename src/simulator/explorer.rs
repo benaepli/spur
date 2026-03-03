@@ -1,10 +1,11 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Env, Logger, NodeId, RuntimeError, State, Value, exec_sync_on_node, make_local_env,
+    Env, Logger, NodeId, RuntimeError, SchedulePolicy, State, Value, exec_sync_on_node,
+    make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::history::{
-    HistoryWriter, LogBackend, create_writer, serialize_history, serialize_logs,
+    HistoryWriter, LogBackend, create_writer, serialize_history, serialize_logs, serialize_traces,
 };
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
@@ -71,8 +72,6 @@ pub struct ExplorerConfig {
     #[serde(rename = "dependency_density")]
     pub dependency_density_values: Vec<f64>,
 
-    #[serde(default)]
-    pub randomly_delay_msgs: bool,
     #[serde(default = "default_use_coverage_scheduling")]
     pub use_coverage_scheduling: bool,
     pub num_runs_per_config: i32,
@@ -82,6 +81,9 @@ pub struct ExplorerConfig {
     pub population_size: usize,
     #[serde(default = "default_num_generations")]
     pub num_generations: usize,
+
+    #[serde(default)]
+    pub schedule_policy: SchedulePolicy,
 }
 
 impl ExplorerConfig {
@@ -125,9 +127,9 @@ pub struct SingleRunConfig {
     pub num_timeouts: i32,
     pub num_crashes: i32,
     pub dependency_density: f64,
-    pub randomly_delay_msgs: bool,
     pub use_coverage_scheduling: bool,
     pub max_iterations: i32,
+    pub schedule_policy: SchedulePolicy,
 }
 
 impl SingleRunConfig {
@@ -153,9 +155,9 @@ impl SingleRunConfig {
                 .dependency_density_values
                 .choose(&mut rng)
                 .unwrap_or(&0.5),
-            randomly_delay_msgs: constraints.randomly_delay_msgs,
             use_coverage_scheduling: constraints.use_coverage_scheduling,
             max_iterations: constraints.max_iterations,
+            schedule_policy: constraints.schedule_policy.clone(),
         }
     }
 
@@ -231,6 +233,7 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
                 init_fn.entry,
                 global_snapshot,
                 local_coverage,
+                &SchedulePolicy::Fixed,
             )?;
         }
     }
@@ -294,6 +297,7 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
             init_fn.entry,
             global_snapshot,
             local_coverage,
+            &SchedulePolicy::Fixed,
         )?;
     }
     Ok(())
@@ -379,10 +383,10 @@ pub fn run_single_simulation(
         plan,
         config.max_iterations,
         topology_info,
-        config.randomly_delay_msgs,
         global_state,
         Some(&global_snapshot),
         run_id,
+        &config.schedule_policy,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -393,8 +397,9 @@ pub fn run_single_simulation(
     }
 
     let serialized = serialize_history(&path_state.history);
-    let serialized_logs = serialize_logs(&path_state.logs.0);
-    writer.write(run_id, serialized, serialized_logs);
+    let serialized_logs = serialize_logs(&path_state.logs.entries);
+    let serialized_traces = serialize_traces(&path_state.logs.traces);
+    writer.write(run_id, serialized, serialized_logs, serialized_traces);
 
     Ok(plan_score)
 }
@@ -465,9 +470,9 @@ pub fn run_explorer(
                                     num_timeouts,
                                     num_crashes,
                                     dependency_density: density,
-                                    randomly_delay_msgs: config.randomly_delay_msgs,
                                     use_coverage_scheduling: config.use_coverage_scheduling,
                                     max_iterations: config.max_iterations,
+                                    schedule_policy: config.schedule_policy.clone(),
                                 };
 
                                 info!("{}", "=".repeat(70));

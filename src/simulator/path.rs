@@ -1,8 +1,9 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, Record, Runnable, RuntimeError,
-    ScheduleResult, State, UpdatePolicy, Value, make_local_env, schedule_runnable,
+    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, Record, Runnable,
+    RunnableCategory, RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value,
+    make_local_env, schedule_runnable,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
@@ -28,13 +29,19 @@ pub struct TopologyInfo {
     pub num_servers: i32,
 }
 
-/// Newtype wrapper for log entries that implements Logger.
+/// Newtype wrapper for log and trace entries that implements Logger.
 #[derive(Debug, Default)]
-pub struct Logs(pub Vec<LogEntry>);
+pub struct Logs {
+    pub entries: Vec<LogEntry>,
+    pub traces: Vec<TraceEntry>,
+}
 
 impl Logger for Logs {
     fn log(&mut self, entry: LogEntry) {
-        self.0.push(entry);
+        self.entries.push(entry);
+    }
+    fn log_trace(&mut self, entry: TraceEntry) {
+        self.traces.push(entry);
     }
 }
 
@@ -105,6 +112,7 @@ fn schedule_client_op<H: HashPolicy>(
     op_spec: &ClientOpSpec,
     client_node_id: NodeId,
     server_role: NameId,
+    policy: &SchedulePolicy,
 ) -> Result<(), RuntimeError> {
     let client_id = client_node_id.index as i32;
     let (op_name, actuals) = match op_spec {
@@ -157,6 +165,7 @@ fn schedule_client_op<H: HashPolicy>(
         unique_id: op_id,
     });
 
+    let mut rng = rand::rng();
     state.runnable_tasks.push_back(Runnable::Record(Record {
         pc: op_func.entry,
         node: client_node_id,
@@ -169,8 +178,7 @@ fn schedule_client_op<H: HashPolicy>(
         entry_pc: op_func.entry,
         initial_env: env.clone(),
         env,
-        x: 0.4,
-        policy: UpdatePolicy::Identity,
+        priority: policy.sample(&mut rng, RunnableCategory::Record),
     }));
     Ok(())
 }
@@ -181,10 +189,10 @@ pub fn exec_plan<H: HashPolicy>(
     plan: ExecutionPlan,
     max_iterations: i32,
     topology: TopologyInfo,
-    randomly_delay_msgs: bool,
     global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
     run_id: i64,
+    policy: &SchedulePolicy,
 ) -> Result<(), RuntimeError> {
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
@@ -267,6 +275,7 @@ pub fn exec_plan<H: HashPolicy>(
                                 init_fn.entry,
                                 global_snapshot,
                                 &mut path_state.coverage,
+                                policy,
                             ) {
                                 log::warn!(
                                     "Failed to initialize dynamic client node {}: {}",
@@ -293,24 +302,30 @@ pub fn exec_plan<H: HashPolicy>(
                         op_spec,
                         client_node_id,
                         server_role,
+                        policy,
                     )?;
                 }
                 EventAction::CrashNode(node_id) => {
                     let nid =
                         validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
-                    path_state
-                        .state
-                        .runnable_tasks
-                        .push_back(Runnable::Crash { node_id: nid });
+                    let mut rng = rand::rng();
+                    path_state.state.runnable_tasks.push_back(Runnable::Crash {
+                        node_id: nid,
+                        priority: policy.sample(&mut rng, RunnableCategory::Crash),
+                    });
                     pending_crash_recover.insert(nid.index, node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
                     let nid =
                         validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
+                    let mut rng = rand::rng();
                     path_state
                         .state
                         .runnable_tasks
-                        .push_back(Runnable::Recover { node_id: nid });
+                        .push_back(Runnable::Recover {
+                            node_id: nid,
+                            priority: policy.sample(&mut rng, RunnableCategory::Recover),
+                        });
                     pending_crash_recover.insert(nid.index, node_idx);
                 }
             }
@@ -325,14 +340,11 @@ pub fn exec_plan<H: HashPolicy>(
                 &mut path_state.logs,
                 &program,
                 false,
-                false,
-                false,
-                &[],
-                randomly_delay_msgs,
                 global_snapshot,
                 &mut path_state.coverage,
                 &topology,
                 global_state,
+                policy,
             )?;
 
             match result {

@@ -1,4 +1,6 @@
-use crate::simulator::core::{ChannelId, LogEntry, OpKind, Operation, Value, ValueKind};
+use crate::simulator::core::{
+    ChannelId, LogEntry, OpKind, Operation, TraceEntry, TraceKind, Value, ValueKind,
+};
 use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -38,6 +40,41 @@ pub fn serialize_logs(logs: &[LogEntry]) -> Vec<PersistableLog> {
             node_id: l.node.index as i64,
             content: l.content.clone(),
             step: l.step,
+        })
+        .collect()
+}
+
+pub struct PersistableTrace {
+    pub node_id: i64,
+    pub step: i32,
+    pub function_name: String,
+    pub trace_kind: &'static str,
+    pub payload: String,
+    pub schedulable_count: i64,
+}
+
+pub fn serialize_traces(traces: &[TraceEntry]) -> Vec<PersistableTrace> {
+    traces
+        .par_iter()
+        .map(|t| {
+            let payload = if t.payload.is_empty() {
+                "[]".to_string()
+            } else {
+                let items: Vec<JsonValue> =
+                    t.payload.iter().map(|s| JsonValue::String(s.clone())).collect();
+                serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+            };
+            PersistableTrace {
+                node_id: t.node.index as i64,
+                step: t.step,
+                function_name: t.function_name.clone(),
+                trace_kind: match t.kind {
+                    TraceKind::Enter => "Enter",
+                    TraceKind::Exit => "Exit",
+                },
+                payload,
+                schedulable_count: t.schedulable_count as i64,
+            }
         })
         .collect()
 }
@@ -187,6 +224,7 @@ pub enum HistoryCommand {
         run_id: i64,
         history: Vec<PersistableOp>,
         logs: Vec<PersistableLog>,
+        traces: Vec<PersistableTrace>,
     },
     Shutdown,
 }
@@ -194,8 +232,14 @@ pub enum HistoryCommand {
 /// The abstract interface for logging simulation history.
 /// Implementations must be Send + Sync so they can be wrapped in `Arc<dyn HistoryWriter>`.
 pub trait HistoryWriter: Send + Sync {
-    /// Sends a pre-serialized history and logs write request to the background thread.
-    fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>);
+    /// Sends a pre-serialized history, logs, and traces write request to the background thread.
+    fn write(
+        &self,
+        run_id: i64,
+        history: Vec<PersistableOp>,
+        logs: Vec<PersistableLog>,
+        traces: Vec<PersistableTrace>,
+    );
 
     /// Shuts down the background writer, waiting for all pending writes to complete.
     fn shutdown(&self);
@@ -234,7 +278,21 @@ pub fn init_db(conn: &Connection) -> Result<(), duckdb::Error> {
             PRIMARY KEY (run_id, seq_num)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_run_logs ON logs(run_id);",
+        CREATE INDEX IF NOT EXISTS idx_run_logs ON logs(run_id);
+
+        CREATE TABLE IF NOT EXISTS traces (
+            run_id INTEGER REFERENCES runs(run_id),
+            seq_num INTEGER,
+            node_id INTEGER,
+            step INTEGER,
+            function_name TEXT,
+            trace_kind TEXT,
+            payload TEXT,
+            schedulable_count INTEGER,
+            PRIMARY KEY (run_id, seq_num)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_run_traces ON traces(run_id);",
     )?;
 
     Ok(())
@@ -288,6 +346,30 @@ fn save_logs_db(
     Ok(())
 }
 
+fn save_traces_db(
+    conn: &Connection,
+    run_id: i64,
+    traces: &[PersistableTrace],
+) -> Result<(), Box<dyn Error>> {
+    let mut appender = conn.appender("traces")?;
+
+    for (seq_num, t) in traces.iter().enumerate() {
+        appender.append_row(params![
+            run_id,
+            seq_num as i64,
+            t.node_id,
+            t.step,
+            &t.function_name,
+            t.trace_kind,
+            &t.payload,
+            t.schedulable_count
+        ])?;
+    }
+
+    appender.flush()?;
+    Ok(())
+}
+
 /// A background writer that serializes all DuckDB writes to a single thread.
 pub struct DuckDBWriter {
     sender: Sender<HistoryCommand>,
@@ -310,12 +392,18 @@ impl DuckDBWriter {
                         run_id,
                         history,
                         logs,
+                        traces,
                     } => {
                         if let Err(e) = save_history_db(&conn, run_id, &history) {
                             error!("failed to save history for run {}: {}", run_id, e);
                         }
                         if let Err(e) = save_logs_db(&conn, run_id, &logs) {
                             error!("failed to save logs for run {}: {}", run_id, e);
+                        }
+                        if !traces.is_empty() {
+                            if let Err(e) = save_traces_db(&conn, run_id, &traces) {
+                                error!("failed to save traces for run {}: {}", run_id, e);
+                            }
                         }
                     }
                     HistoryCommand::Shutdown => break,
@@ -331,11 +419,18 @@ impl DuckDBWriter {
 }
 
 impl HistoryWriter for DuckDBWriter {
-    fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>) {
+    fn write(
+        &self,
+        run_id: i64,
+        history: Vec<PersistableOp>,
+        logs: Vec<PersistableLog>,
+        traces: Vec<PersistableTrace>,
+    ) {
         if let Err(e) = self.sender.send(HistoryCommand::Write {
             run_id,
             history,
             logs,
+            traces,
         }) {
             log::error!(
                 "Failed to send history write command for run {}: {}",
@@ -453,6 +548,68 @@ fn append_logs_batch(
     Ok(())
 }
 
+fn traces_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("run_id", DataType::Int64, false),
+        Field::new("seq_num", DataType::Int64, false),
+        Field::new("node_id", DataType::Int64, false),
+        Field::new("step", DataType::Int32, false),
+        Field::new("function_name", DataType::Utf8, false),
+        Field::new("trace_kind", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+        Field::new("schedulable_count", DataType::Int64, false),
+    ]))
+}
+
+/// Writes a batch of PersistableTraces into an open ArrowWriter for the traces table.
+fn append_traces_batch(
+    writer: &mut ArrowWriter<File>,
+    run_id: i64,
+    traces: &[PersistableTrace],
+) -> Result<(), Box<dyn Error>> {
+    let n = traces.len();
+    let run_ids = Int64Array::from(vec![run_id; n]);
+    let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
+    let node_ids: Int64Array = traces.iter().map(|t| t.node_id).collect::<Vec<_>>().into();
+    let steps: Int32Array = traces.iter().map(|t| t.step).collect::<Vec<_>>().into();
+    let func_names: StringArray = traces
+        .iter()
+        .map(|t| t.function_name.as_str())
+        .collect::<Vec<_>>()
+        .into();
+    let kinds: StringArray = traces
+        .iter()
+        .map(|t| t.trace_kind)
+        .collect::<Vec<_>>()
+        .into();
+    let payloads: StringArray = traces
+        .iter()
+        .map(|t| t.payload.as_str())
+        .collect::<Vec<_>>()
+        .into();
+    let sched_counts: Int64Array = traces
+        .iter()
+        .map(|t| t.schedulable_count)
+        .collect::<Vec<_>>()
+        .into();
+
+    let batch = RecordBatch::try_new(
+        traces_schema(),
+        vec![
+            Arc::new(run_ids),
+            Arc::new(seq_nums),
+            Arc::new(node_ids),
+            Arc::new(steps),
+            Arc::new(func_names),
+            Arc::new(kinds),
+            Arc::new(payloads),
+            Arc::new(sched_counts),
+        ],
+    )?;
+    writer.write(&batch)?;
+    Ok(())
+}
+
 /// Number of writes between file rotations. Each batch is finalized (footer
 /// written) before a new file is opened, so all completed batches survive
 /// process termination.
@@ -489,16 +646,21 @@ impl ParquetWriter {
     pub fn new(output_dir: &Path) -> Result<Self, Box<dyn Error>> {
         let exec_dir = output_dir.join("executions");
         let logs_dir = output_dir.join("logs");
+        let traces_dir = output_dir.join("traces");
         std::fs::create_dir_all(&exec_dir)?;
         std::fs::create_dir_all(&logs_dir)?;
+        std::fs::create_dir_all(&traces_dir)?;
 
         let exec_schema = executions_schema();
         let logs_schema_arc = logs_schema();
+        let traces_schema_arc = traces_schema();
 
         let mut exec_writer =
             open_parquet_writer(&exec_dir.join(batch_filename(1)), exec_schema.clone())?;
         let mut log_writer =
             open_parquet_writer(&logs_dir.join(batch_filename(1)), logs_schema_arc.clone())?;
+        let mut trace_writer =
+            open_parquet_writer(&traces_dir.join(batch_filename(1)), traces_schema_arc.clone())?;
 
         let (sender, receiver) = mpsc::channel::<HistoryCommand>();
 
@@ -512,6 +674,7 @@ impl ParquetWriter {
                         run_id,
                         history,
                         logs,
+                        traces,
                     } => {
                         if !history.is_empty() {
                             if let Err(e) =
@@ -528,6 +691,16 @@ impl ParquetWriter {
                                 error!("failed to save logs parquet for run {}: {}", run_id, e);
                             }
                         }
+                        if !traces.is_empty() {
+                            if let Err(e) =
+                                append_traces_batch(&mut trace_writer, run_id, &traces)
+                            {
+                                error!(
+                                    "failed to save traces parquet for run {}: {}",
+                                    run_id, e
+                                );
+                            }
+                        }
 
                         writes_in_batch += 1;
 
@@ -538,6 +711,9 @@ impl ParquetWriter {
                             }
                             if let Err(e) = log_writer.finish() {
                                 error!("failed to finalize logs batch {}: {}", batch_num, e);
+                            }
+                            if let Err(e) = trace_writer.finish() {
+                                error!("failed to finalize traces batch {}: {}", batch_num, e);
                             }
 
                             batch_num += 1;
@@ -566,6 +742,16 @@ impl ParquetWriter {
                                     break;
                                 }
                             }
+                            match open_parquet_writer(
+                                &traces_dir.join(batch_filename(batch_num)),
+                                traces_schema_arc.clone(),
+                            ) {
+                                Ok(w) => trace_writer = w,
+                                Err(e) => {
+                                    error!("failed to open new traces batch {}: {}", batch_num, e);
+                                    break;
+                                }
+                            }
                         }
                     }
                     HistoryCommand::Shutdown => {
@@ -574,6 +760,9 @@ impl ParquetWriter {
                         }
                         if let Err(e) = log_writer.finish() {
                             error!("failed to finalize logs batch {}: {}", batch_num, e);
+                        }
+                        if let Err(e) = trace_writer.finish() {
+                            error!("failed to finalize traces batch {}: {}", batch_num, e);
                         }
                         break;
                     }
@@ -589,11 +778,18 @@ impl ParquetWriter {
 }
 
 impl HistoryWriter for ParquetWriter {
-    fn write(&self, run_id: i64, history: Vec<PersistableOp>, logs: Vec<PersistableLog>) {
+    fn write(
+        &self,
+        run_id: i64,
+        history: Vec<PersistableOp>,
+        logs: Vec<PersistableLog>,
+        traces: Vec<PersistableTrace>,
+    ) {
         if let Err(e) = self.sender.send(HistoryCommand::Write {
             run_id,
             history,
             logs,
+            traces,
         }) {
             log::error!(
                 "Failed to send parquet write command for run {}: {}",

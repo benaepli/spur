@@ -445,6 +445,7 @@ impl TypeChecker {
             name: func.name,
             original_name: func.original_name,
             is_sync: sig.is_sync,
+            is_traced: func.is_traced,
             params: typed_params,
             return_type: sig.return_type,
             body: typed_body,

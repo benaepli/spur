@@ -5,9 +5,117 @@ use crate::simulator::core::eval::store;
 use crate::simulator::core::values::{ChannelId, Env, Value};
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
+use rand::Rng;
+use rand_distr::{Beta, Distribution};
+use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
-use serde::Serialize;
+/// Defines the priority band for a category of runnable.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PriorityBand {
+    pub center: f64,
+    pub width: f64,
+}
+
+impl PriorityBand {
+    pub fn fixed(value: f64) -> Self {
+        Self {
+            center: value,
+            width: 0.0,
+        }
+    }
+}
+
+/// Which category of runnable is being sampled.
+#[derive(Debug, Clone, Copy)]
+pub enum RunnableCategory {
+    Record,
+    Timer,
+    ChannelSend,
+    Crash,
+    Recover,
+}
+
+/// Configures how base priorities are sampled for new runnables.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum SchedulePolicy {
+    /// Fixed priorities per category (legacy behavior).
+    Fixed,
+    /// Sample from Beta(α, β) mapped into per-category bands.
+    Shaped {
+        alpha: f64,
+        beta: f64,
+        record: PriorityBand,
+        timer: PriorityBand,
+        channel_send: PriorityBand,
+        crash: PriorityBand,
+        recover: PriorityBand,
+    },
+}
+
+impl Default for SchedulePolicy {
+    fn default() -> Self {
+        SchedulePolicy::Shaped {
+            alpha: 0.5,
+            beta: 0.5, // Arcsine distribution — favors tails
+            record: PriorityBand {
+                center: 0.5,
+                width: 0.15,
+            },
+            timer: PriorityBand {
+                center: 0.25,
+                width: 0.10,
+            },
+            channel_send: PriorityBand {
+                center: 0.5,
+                width: 0.15,
+            },
+            crash: PriorityBand {
+                center: 1.0,
+                width: 0.05,
+            },
+            recover: PriorityBand {
+                center: 1.0,
+                width: 0.05,
+            },
+        }
+    }
+}
+
+impl SchedulePolicy {
+    /// Sample a priority value for the given runnable category.
+    pub fn sample(&self, rng: &mut impl Rng, cat: RunnableCategory) -> f64 {
+        match self {
+            SchedulePolicy::Fixed => match cat {
+                RunnableCategory::Record => 0.5,
+                RunnableCategory::Timer => 0.25,
+                RunnableCategory::ChannelSend => 0.5,
+                RunnableCategory::Crash | RunnableCategory::Recover => 1.0,
+            },
+            SchedulePolicy::Shaped {
+                alpha,
+                beta,
+                record,
+                timer,
+                channel_send,
+                crash,
+                recover,
+            } => {
+                let band = match cat {
+                    RunnableCategory::Record => record,
+                    RunnableCategory::Timer => timer,
+                    RunnableCategory::ChannelSend => channel_send,
+                    RunnableCategory::Crash => crash,
+                    RunnableCategory::Recover => recover,
+                };
+                let dist = Beta::new(*alpha, *beta).unwrap();
+                let sample = dist.sample(rng);
+                (band.center + band.width * (2.0 * sample - 1.0)).clamp(0.0, 1.0)
+            }
+        }
+    }
+}
 
 /// A node identifier pairing the role's NameId with a positional index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
@@ -29,9 +137,26 @@ pub struct LogEntry {
     pub step: i32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum TraceKind {
+    Enter,
+    Exit,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceEntry {
+    pub node: NodeId,
+    pub function_name: String,
+    pub kind: TraceKind,
+    pub payload: Vec<String>,
+    pub schedulable_count: usize,
+    pub step: i32,
+}
+
 /// Trait for handling Print statement output during execution.
 pub trait Logger {
     fn log(&mut self, entry: LogEntry);
+    fn log_trace(&mut self, _entry: TraceEntry) {}
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,8 +170,7 @@ pub struct Record<H: HashPolicy> {
     pub entry_pc: Vertex,
     /// Original local env for crash re-delivery.
     pub initial_env: Env<H>,
-    pub x: f64,
-    pub policy: UpdatePolicy,
+    pub priority: f64,
 }
 
 impl<H: HashPolicy> Record<H> {
@@ -66,22 +190,6 @@ impl<H: HashPolicy> Hash for Record<H> {
         self.env.hash(state);
         self.entry_pc.hash(state);
         self.initial_env.hash(state);
-        self.policy.hash(state);
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Hash)]
-pub enum UpdatePolicy {
-    Identity,
-    Halve,
-}
-
-impl UpdatePolicy {
-    pub fn update(&self, x: f64) -> f64 {
-        match self {
-            UpdatePolicy::Identity => x,
-            UpdatePolicy::Halve => x / 2.0,
-        }
     }
 }
 
@@ -135,11 +243,20 @@ pub struct Operation<H: HashPolicy> {
     pub unique_id: i32,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Timer {
     pub pc: Vertex,
     pub node: NodeId,
     pub channel: ChannelId,
+    pub priority: f64,
+}
+
+impl Hash for Timer {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.pc.hash(state);
+        self.node.hash(state);
+        self.channel.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,15 +268,16 @@ pub enum Runnable<H: HashPolicy> {
         channel: ChannelId,
         message: Value<H>,
         origin_node: NodeId,
-        x: f64,
-        policy: UpdatePolicy,
         pc: Vertex,
+        priority: f64,
     },
     Crash {
         node_id: NodeId,
+        priority: f64,
     },
     Recover {
         node_id: NodeId,
+        priority: f64,
     },
 }
 
@@ -179,24 +297,21 @@ impl<H: HashPolicy> Hash for Runnable<H> {
                 channel,
                 message,
                 origin_node,
-                x,
-                policy,
                 pc,
+                ..
             } => {
                 2u8.hash(state);
                 target.hash(state);
                 channel.hash(state);
                 message.hash(state);
                 origin_node.hash(state);
-                x.to_bits().hash(state); // f64 hash via bits
-                policy.hash(state);
                 pc.hash(state);
             }
-            Runnable::Crash { node_id } => {
+            Runnable::Crash { node_id, .. } => {
                 3u8.hash(state);
                 node_id.hash(state);
             }
-            Runnable::Recover { node_id } => {
+            Runnable::Recover { node_id, .. } => {
                 4u8.hash(state);
                 node_id.hash(state);
             }
@@ -211,7 +326,7 @@ impl<H: HashPolicy> Runnable<H> {
             Runnable::Timer(t) => t.node,
             Runnable::Record(r) => r.node,
             Runnable::ChannelSend { target, .. } => *target,
-            Runnable::Crash { node_id } | Runnable::Recover { node_id } => *node_id,
+            Runnable::Crash { node_id, .. } | Runnable::Recover { node_id, .. } => *node_id,
         }
     }
 
@@ -222,6 +337,17 @@ impl<H: HashPolicy> Runnable<H> {
             Runnable::Record(r) => r.pc,
             Runnable::ChannelSend { pc, .. } => *pc,
             Runnable::Crash { .. } | Runnable::Recover { .. } => usize::MAX,
+        }
+    }
+
+    /// Get the scheduling priority for this runnable.
+    pub fn priority(&self) -> f64 {
+        match self {
+            Runnable::Record(r) => r.priority,
+            Runnable::Timer(t) => t.priority,
+            Runnable::ChannelSend { priority, .. } => *priority,
+            Runnable::Crash { priority, .. } => *priority,
+            Runnable::Recover { priority, .. } => *priority,
         }
     }
 }

@@ -1,8 +1,8 @@
 use crate::compiler::cfg::{Program, SELF_SLOT, VarSlot};
 use crate::simulator::checker::state::{Budget, SearchNode};
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, Record, Runnable, State,
-    UpdatePolicy, Value, exec, exec_sync_on_node, make_local_env,
+    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, Record, Runnable,
+    SchedulePolicy, State, Value, exec, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage};
 use crate::simulator::hash_utils::HashPolicy;
@@ -190,10 +190,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                     target,
                     channel,
                     message,
-                    origin_node,
-                    x,
-                    policy,
-                    pc,
+                    ..
                 } => {
                     if next_state.crash_info.currently_crashed.contains(&target) {
                         continue;
@@ -221,7 +218,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                         next_state.channels.insert(channel, chan);
                     }
                     // Create successor
-                    let succ = self.make_successor(&node, next_state, x);
+                    let succ = self.make_successor(&node, next_state, 0.5);
                     successors.push(succ);
                     continue;
                 }
@@ -260,17 +257,18 @@ impl<H: HashPolicy> ModelChecker<H> {
                 record,
                 None,
                 &mut coverage,
+                &SchedulePolicy::Fixed,
             );
 
             match result {
                 Ok(None) => {
-                    let cost_delta = 1.0 - coverage.novelty_score();
+                    let cost_delta = 1.0 - coverage.plan_score();
                     let mut succ = self.make_successor(&node, next_state, cost_delta);
                     succ.logs.extend(logger.logs);
                     successors.push(succ);
                 }
                 Ok(Some(client_res)) => {
-                    let cost_delta = 1.0 - coverage.novelty_score();
+                    let cost_delta = 1.0 - coverage.plan_score();
                     let mut succ = self.make_successor(&node, next_state, cost_delta);
                     succ.history.push(Operation::<H> {
                         client_id: client_res.client_id,
@@ -398,6 +396,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                         init_fn.entry,
                         None,
                         &mut temp_coverage,
+                        &SchedulePolicy::Fixed,
                     ) {
                         warn!("Failed to initialize dynamic client node in checker: {}", e);
                     }
@@ -487,6 +486,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                         init_fn.entry,
                         None,
                         &mut temp_coverage,
+                        &SchedulePolicy::Fixed,
                     ) {
                         warn!(
                             "Failed to initialize dynamic client node in checker (reads): {}",
@@ -581,7 +581,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                         state.runnable_tasks.push_back(task);
                     }
                 }
-                Runnable::Crash { node_id: nid } | Runnable::Recover { node_id: nid } => {
+                Runnable::Crash { node_id: nid, .. } | Runnable::Recover { node_id: nid, .. } => {
                     if nid != node_id {
                         state.runnable_tasks.push_back(task);
                     }
@@ -621,6 +621,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 init_fn.entry,
                 None,
                 coverage,
+                &SchedulePolicy::Fixed,
             ) {
                 warn!("Failed to re-initialize node {}: {}", node_id, e);
             }
@@ -657,8 +658,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 entry_pc: recover_fn.entry,
                 initial_env: env.clone(),
                 env,
-                x: 0.0,
-                policy: UpdatePolicy::Identity,
+                priority: 0.5,
             };
             state.runnable_tasks.push_back(Runnable::Record(record));
         }
@@ -708,8 +708,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 entry_pc: func.entry,
                 initial_env: env.clone(),
                 env,
-                x: 0.5,
-                policy: UpdatePolicy::Identity,
+                priority: 0.5,
             };
             state.runnable_tasks.push_back(Runnable::Record(record));
             true
@@ -750,8 +749,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 entry_pc: func.entry,
                 initial_env: env.clone(),
                 env,
-                x: 0.5,
-                policy: UpdatePolicy::Identity,
+                priority: 0.5,
             };
             state.runnable_tasks.push_back(Runnable::Record(record));
             true

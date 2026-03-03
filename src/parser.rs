@@ -31,6 +31,7 @@ pub struct RoleDef {
 pub struct FuncDef {
     pub name: String,
     pub is_sync: bool,
+    pub is_traced: bool,
     pub params: Vec<FuncParam>,
     pub return_type: Option<TypeDef>,
     pub body: Vec<Statement>,
@@ -1065,8 +1066,10 @@ where
         .allow_trailing()
         .collect::<Vec<_>>();
 
-    let func_def = just(TokenKind::Async)
+    let func_def = just(TokenKind::At)
+        .then(just(TokenKind::Identifier("trace".into())))
         .or_not()
+        .then(just(TokenKind::Async).or_not())
         .then_ignore(just(TokenKind::Func))
         .then(ident)
         .then(func_params.delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)))
@@ -1083,9 +1086,10 @@ where
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
         )
         .map_with(
-            |((((is_async_opt, name), params), return_type), body), e| FuncDef {
+            |(((((is_traced_opt, is_async_opt), name), params), return_type), body), e| FuncDef {
                 name,
                 is_sync: is_async_opt.is_none(),
+                is_traced: is_traced_opt.is_some(),
                 params,
                 return_type,
                 body,

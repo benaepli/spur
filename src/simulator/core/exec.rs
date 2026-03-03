@@ -2,8 +2,8 @@ use crate::compiler::cfg::{Instr, Label, Lhs, Program, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{eval, make_local_env, store};
 use crate::simulator::core::state::{
-    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, Record, Runnable, State,
-    Timer, UpdatePolicy,
+    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, Record, Runnable,
+    RunnableCategory, SchedulePolicy, State, Timer, TraceEntry, TraceKind,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
@@ -18,6 +18,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
     start_pc: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    policy: &SchedulePolicy,
 ) -> Result<Value<H>, RuntimeError> {
     let mut node_env = state.nodes[node_id.index].clone();
     let result = exec_sync_inner(
@@ -30,6 +31,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
         node_id,
         global_snapshot,
         local_coverage,
+        policy,
     );
     state.nodes[node_id.index] = node_env;
     result
@@ -50,6 +52,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     node_id: NodeId,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    policy: &SchedulePolicy,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
     match label {
         Label::Instr(instr, next) => match instr {
@@ -95,6 +98,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     node_id,
                     global_snapshot,
                     local_coverage,
+                    policy,
                 )?;
 
                 store(lhs, val, local_env, node_env)?;
@@ -133,6 +137,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     &program.id_to_name,
                 );
 
+                let mut rng = rand::rng();
                 let new_record = Record {
                     pc: func_info.entry,
                     node: target_node,
@@ -141,8 +146,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     entry_pc: func_info.entry,
                     initial_env: callee_locals.clone(),
                     env: callee_locals,
-                    x: 0.5,
-                    policy: UpdatePolicy::Identity,
+                    priority: policy.sample(&mut rng, RunnableCategory::Record),
                 };
 
                 if state.crash_info.currently_crashed.contains(&target_node) {
@@ -174,10 +178,12 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             store(lhs, Value::channel(cid), local_env, node_env)?;
 
             // Create a timer that will fire when scheduled
+            let mut rng = rand::rng();
             let timer = Timer {
                 pc: *next,
                 node: node_id,
                 channel: cid,
+                priority: policy.sample(&mut rng, RunnableCategory::Timer),
             };
             state.runnable_tasks.push_back(Runnable::Timer(timer));
             Ok(Some(StepOutcome::Continue(*next)))
@@ -292,6 +298,36 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 }),
             }
         }
+        Label::TraceEnter(func_name, param_exprs, next) => {
+            let payload: Vec<String> = param_exprs
+                .iter()
+                .map(|e| {
+                    eval(local_env, node_env, e, &program.id_to_name)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|_| "<error>".to_string())
+                })
+                .collect();
+            logger.log_trace(TraceEntry {
+                node: node_id,
+                function_name: func_name.clone(),
+                kind: TraceKind::Enter,
+                payload,
+                schedulable_count: state.runnable_tasks.len(),
+                step: state.crash_info.current_step,
+            });
+            Ok(Some(StepOutcome::Continue(*next)))
+        }
+        Label::TraceExit(func_name, next) => {
+            logger.log_trace(TraceEntry {
+                node: node_id,
+                function_name: func_name.clone(),
+                kind: TraceKind::Exit,
+                payload: vec![],
+                schedulable_count: state.runnable_tasks.len(),
+                step: state.crash_info.current_step,
+            });
+            Ok(Some(StepOutcome::Continue(*next)))
+        }
         _ => Ok(None),
     }
 }
@@ -306,6 +342,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
     node_id: NodeId,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    policy: &SchedulePolicy,
 ) -> Result<Value<H>, RuntimeError> {
     let mut pc = start_pc;
     let mut prev_pc = pc;
@@ -327,6 +364,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
             node_id,
             global_snapshot,
             local_coverage,
+            policy,
         )? {
             match outcome {
                 StepOutcome::Continue(next) => {
@@ -351,6 +389,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
     mut record: Record<H>,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    policy: &SchedulePolicy,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let mut local_env = record.env;
     let mut node_env = state.nodes[record.node.index].clone();
@@ -377,6 +416,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
             record.node,
             global_snapshot,
             local_coverage,
+            policy,
         )? {
             match outcome {
                 StepOutcome::Continue(next) => {
@@ -399,14 +439,14 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 let val = eval(&local_env, &node_env, val_expr, &program.id_to_name)?;
                 if cid.node != record.node {
                     // Remote Send
+                    let mut rng = rand::rng();
                     state.runnable_tasks.push_back(Runnable::ChannelSend {
                         target: cid.node,
                         channel: cid,
                         message: val,
                         origin_node: record.node,
-                        x: record.x,
-                        policy: record.policy.clone(),
                         pc: *next,
+                        priority: policy.sample(&mut rng, RunnableCategory::ChannelSend),
                     });
                     // Non-blocking, proceed
                     record.pc = *next;
@@ -489,7 +529,9 @@ pub fn exec<H: HashPolicy, L: Logger>(
             | Label::RetrieveData(_, _, _)
             | Label::DiscardData(_)
             | Label::Break(_)
-            | Label::ForLoopIn(_, _, _, _, _) => {
+            | Label::ForLoopIn(_, _, _, _, _)
+            | Label::TraceEnter(_, _, _)
+            | Label::TraceExit(_, _) => {
                 unreachable!(
                     "Label {:?} should have been handled by execute_common_label or is missing implementation in exec loop",
                     label

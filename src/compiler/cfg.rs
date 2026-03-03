@@ -138,6 +138,8 @@ pub enum Label {
     DiscardData(Vertex /* next_vertex */),
     Break(Vertex /* break_target_vertex */),
     Continue(Vertex /* continue_target_vertex */),
+    TraceEnter(String /* func_name */, Vec<Expr> /* param exprs */, Vertex /* next */),
+    TraceExit(String /* func_name */, Vertex /* next */),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -508,6 +510,7 @@ impl Compiler {
             .map(|p| (p.name, p.original_name.clone()))
             .collect();
         let param_count = params.len() as u32;
+        let is_traced = func.is_traced;
 
         // Begin the function - this assigns slots to parameters
         self.begin_function(&params);
@@ -519,20 +522,7 @@ impl Compiler {
         let return_slot = self.alloc_temp_slot();
         let final_return_vertex = self.add_label(Label::Return(Expr::Var(return_slot)));
 
-        let body_entry = self.compile_block(
-            &func.body,
-            final_return_vertex,
-            final_return_vertex, // `break_target` (breaks go to end of function)
-            final_return_vertex, // `continue_target`
-            final_return_vertex, // `return_target`
-            return_slot,
-        );
-
-        let entry = self.add_label(Label::Instr(
-            Instr::Assign(Lhs::Var(return_slot), Expr::Unit),
-            body_entry,
-        ));
-
+        // Build the qualified name early so we can use it for trace labels
         let qualifier = self.func_qualifier_map.get(&func.name).unwrap_or_else(|| {
             panic!(
                 "Function qualifier not found for function '{}'. \
@@ -540,9 +530,44 @@ impl Compiler {
                 func.original_name
             )
         });
+        let qualified_name = format!("{}.{}", qualifier, func.original_name);
+
+        // If traced, insert TraceExit before the final return and use it as
+        // the return_target so all return paths funnel through it.
+        let effective_return_target = if is_traced {
+            self.add_label(Label::TraceExit(qualified_name.clone(), final_return_vertex))
+        } else {
+            final_return_vertex
+        };
+
+        let body_entry = self.compile_block(
+            &func.body,
+            effective_return_target,
+            effective_return_target, // `break_target` (breaks go to end of function)
+            effective_return_target, // `continue_target`
+            effective_return_target, // `return_target`
+            return_slot,
+        );
+
+        // If traced, insert TraceEnter after the return-slot init and before the body.
+        let after_init = if is_traced {
+            let param_exprs: Vec<Expr> = (0..param_count)
+                .map(|i| {
+                    let name_id = params[i as usize].0;
+                    Expr::Var(VarSlot::Local(i, name_id))
+                })
+                .collect();
+            self.add_label(Label::TraceEnter(qualified_name.clone(), param_exprs, body_entry))
+        } else {
+            body_entry
+        };
+
+        let entry = self.add_label(Label::Instr(
+            Instr::Assign(Lhs::Var(return_slot), Expr::Unit),
+            after_init,
+        ));
 
         // Use the existing func.name NameId from the resolver, not a new one
-        let qualified_name = format!("{}.{}", qualifier, func.original_name);
         self.func_name_to_id.insert(qualified_name, func.name);
 
         FunctionInfo {

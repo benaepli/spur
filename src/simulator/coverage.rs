@@ -13,8 +13,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-const STEP_PENALTY: f64 = 0.0001;
-
 #[derive(Debug, Default, Clone)]
 pub struct VertexMap {
     vertices: ImMap<Vertex, u64>,
@@ -86,9 +84,13 @@ impl LocalCoverage {
         self.record(from, to)
     }
 
-    /// Returns the final plan score: novelty minus step penalty.
+    /// Returns the normalized plan score: mean novelty per step.
+    /// Returns a value in [0, 1] where 1 means every transition was maximally novel.
     pub fn plan_score(&self) -> f64 {
-        self.novelty_score - (self.total as f64 * STEP_PENALTY)
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.novelty_score / self.total as f64
     }
 
     /// Returns the raw novelty score.
@@ -227,5 +229,69 @@ impl GlobalState {
             .lock()
             .expect("Mutex poisoned - this indicates a panic occurred while holding the lock")
             .contains(item)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plan_score_empty_coverage() {
+        let coverage = LocalCoverage::new();
+        assert_eq!(coverage.plan_score(), 0.0);
+    }
+
+    #[test]
+    fn test_plan_score_normalized_range() {
+        let mut coverage = LocalCoverage::new();
+        // Record transitions with maximum rarity (1.0)
+        coverage.record_with_rarity(0, 1, 1.0);
+        coverage.record_with_rarity(1, 2, 1.0);
+        coverage.record_with_rarity(2, 3, 0.5);
+
+        let score = coverage.plan_score();
+        assert!(score >= 0.0, "plan_score should be >= 0, got {}", score);
+        assert!(score <= 1.0, "plan_score should be <= 1, got {}", score);
+    }
+
+    #[test]
+    fn test_plan_score_independent_of_length() {
+        // Two runs with identical per-step rarity but different lengths
+        let mut short = LocalCoverage::new();
+        short.record_with_rarity(0, 1, 0.8);
+        short.record_with_rarity(1, 2, 0.8);
+
+        let mut long = LocalCoverage::new();
+        for i in 0..100 {
+            long.record_with_rarity(i, i + 1, 0.8);
+        }
+
+        let diff = (short.plan_score() - long.plan_score()).abs();
+        assert!(
+            diff < 1e-10,
+            "Same per-step rarity should give same plan_score: short={}, long={}, diff={}",
+            short.plan_score(),
+            long.plan_score(),
+            diff
+        );
+    }
+
+    #[test]
+    fn test_plan_score_higher_for_rarer_transitions() {
+        let mut novel = LocalCoverage::new();
+        novel.record_with_rarity(0, 1, 1.0);
+        novel.record_with_rarity(1, 2, 1.0);
+
+        let mut common = LocalCoverage::new();
+        common.record_with_rarity(0, 1, 0.1);
+        common.record_with_rarity(1, 2, 0.1);
+
+        assert!(
+            novel.plan_score() > common.plan_score(),
+            "Novel transitions should score higher: novel={}, common={}",
+            novel.plan_score(),
+            common.plan_score()
+        );
     }
 }

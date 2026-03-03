@@ -3,7 +3,8 @@ use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::make_local_env;
 use crate::simulator::core::exec::{exec, exec_sync_on_node};
 use crate::simulator::core::state::{
-    Continuation, Logger, NodeId, Record, Runnable, ScheduleResult, State, UpdatePolicy,
+    Continuation, Logger, NodeId, Record, Runnable, RunnableCategory, SchedulePolicy,
+    ScheduleResult, State,
 };
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
@@ -18,14 +19,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
     logger: &mut L,
     program: &Program,
     randomly_drop_msgs: bool,
-    cut_tail_from_mid: bool,
-    sever_all_but_mid: bool,
-    partition_away_nodes: &[NodeId],
-    randomly_delay_msgs: bool,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     topology: &TopologyInfo,
     global_state: &GlobalState,
+    policy: &SchedulePolicy,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     let len = state.runnable_tasks.len();
     if len == 0 {
@@ -34,38 +32,37 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
 
     let mut rng = rand::rng();
 
-    // Select task index using either tournament selection or random
-    let idx = if let Some(snapshot) = global_snapshot {
-        if len > 1 {
-            // Tournament selection with K=3
-            const K: usize = 3;
-            let mut best_idx = rng.random_range(0..len);
-            let mut best_score = snapshot.novelty_score(state.runnable_tasks[best_idx].pc());
+    // Combined score: novelty (exploration) + priority (urgency)
+    let score = |r: &Runnable<H>| -> f64 {
+        let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
+        0.25 * novelty + 0.75 * r.priority()
+    };
 
-            for _ in 1..K.min(len) {
-                let candidate_idx = rng.random_range(0..len);
-                let score = snapshot.novelty_score(state.runnable_tasks[candidate_idx].pc());
-                if score > best_score {
-                    best_idx = candidate_idx;
-                    best_score = score;
-                }
+    let idx = if len > 1 {
+        const K: usize = 10;
+        let mut best_idx = rng.random_range(0..len);
+        let mut best_score = score(&state.runnable_tasks[best_idx]);
+        for _ in 1..K.min(len) {
+            let i = rng.random_range(0..len);
+            let s = score(&state.runnable_tasks[i]);
+            if s > best_score {
+                best_idx = i;
+                best_score = s;
             }
-            best_idx
-        } else {
-            0
         }
+        best_idx
     } else {
-        rng.random_range(0..len)
+        0
     };
 
     let runnable = state.runnable_tasks.remove(idx);
 
     match runnable {
-        Runnable::Crash { node_id } => {
+        Runnable::Crash { node_id, .. } => {
             crash_node(state, node_id);
             Ok(ScheduleResult::Crash { node_id })
         }
-        Runnable::Recover { node_id } => {
+        Runnable::Recover { node_id, .. } => {
             recover_crashed_node(
                 state,
                 logger,
@@ -75,6 +72,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                 global_state,
                 global_snapshot,
                 local_coverage,
+                policy,
             )?;
             Ok(ScheduleResult::Recover { node_id })
         }
@@ -107,16 +105,14 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
             }
             Ok(ScheduleResult::None)
         }
-        mut other => {
-            let (src_node, dest_node, x, policy) = match &other {
-                Runnable::Record(r) => (r.origin_node, r.node, r.x, &r.policy),
+        other => {
+            let (src_node, dest_node) = match &other {
+                Runnable::Record(r) => (r.origin_node, r.node),
                 Runnable::ChannelSend {
                     origin_node,
                     target,
-                    x,
-                    policy,
                     ..
-                } => (*origin_node, *target, *x, policy),
+                } => (*origin_node, *target),
                 _ => unreachable!(),
             };
 
@@ -131,55 +127,23 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                 return Ok(ScheduleResult::None);
             }
 
-            // Network faults (drops / partitions)
+            // Network faults (random drops)
             let is_remote = src_node != dest_node;
-            if is_remote {
-                let mut should_deliver = true;
-                if randomly_drop_msgs && rng.random::<f64>() < 0.3 {
-                    should_deliver = false;
-                }
-
-                if cut_tail_from_mid
-                    && ((src_node.index == 2 && dest_node.index == 1)
-                        || (dest_node.index == 2 && src_node.index == 1))
-                {
-                    should_deliver = false;
-                }
-
-                if sever_all_but_mid {
-                    if dest_node.index == 2 && src_node.index != 1 {
-                        should_deliver = false;
-                    } else if src_node.index == 2 && dest_node.index != 1 {
-                        should_deliver = false;
-                    }
-                }
-
-                if partition_away_nodes.contains(&src_node)
-                    || partition_away_nodes.contains(&dest_node)
-                {
-                    should_deliver = false;
-                }
-
-                if !should_deliver {
-                    return Ok(ScheduleResult::None);
-                }
-
-                // Latency / delay
-                if randomly_delay_msgs && rng.random::<f64>() < x {
-                    let new_x = policy.update(x);
-                    match &mut other {
-                        Runnable::Record(r) => r.x = new_x,
-                        Runnable::ChannelSend { x, .. } => *x = new_x,
-                        _ => unreachable!(),
-                    }
-                    state.runnable_tasks.push_back(other);
-                    return Ok(ScheduleResult::None);
-                }
+            if is_remote && randomly_drop_msgs && rng.random::<f64>() < 0.3 {
+                return Ok(ScheduleResult::None);
             }
 
             match other {
                 Runnable::Record(r) => {
-                    let result = exec(state, logger, program, r, global_snapshot, local_coverage)?;
+                    let result = exec(
+                        state,
+                        logger,
+                        program,
+                        r,
+                        global_snapshot,
+                        local_coverage,
+                        policy,
+                    )?;
                     match result {
                         Some(client_op) => Ok(ScheduleResult::ClientOp(client_op)),
                         None => Ok(ScheduleResult::None),
@@ -259,7 +223,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
                 }
             }
             // Keep other crash/recover runnables for different nodes
-            Runnable::Crash { node_id: nid } | Runnable::Recover { node_id: nid } => {
+            Runnable::Crash { node_id: nid, .. } | Runnable::Recover { node_id: nid, .. } => {
                 if nid != node_id {
                     state.runnable_tasks.push_back(task);
                 }
@@ -277,6 +241,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
     global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    policy: &SchedulePolicy,
 ) -> Result<(), RuntimeError> {
     if !state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is not crashed", node_id);
@@ -294,6 +259,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
         global_state,
         global_snapshot,
         local_coverage,
+        policy,
     )?;
 
     let queued = std::mem::take(&mut state.crash_info.queued_messages);
@@ -316,6 +282,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
     global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    policy: &SchedulePolicy,
 ) -> Result<(), RuntimeError> {
     use crate::compiler::cfg::{SELF_SLOT, VarSlot};
 
@@ -345,6 +312,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         init_fn.entry,
         global_snapshot,
         local_coverage,
+        policy,
     )?;
 
     recover_node(
@@ -356,6 +324,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         global_state,
         global_snapshot,
         local_coverage,
+        policy,
     )
 }
 
@@ -368,6 +337,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
     _global_state: &GlobalState,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    policy: &SchedulePolicy,
 ) -> Result<(), RuntimeError> {
     let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
         return Ok(());
@@ -398,6 +368,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
         &prog.id_to_name,
     );
 
+    let mut rng = rand::rng();
     let record = Record {
         pc: recover_fn.entry,
         node: node_id,
@@ -406,10 +377,17 @@ fn recover_node<H: HashPolicy, L: Logger>(
         entry_pc: recover_fn.entry,
         initial_env: env.clone(),
         env,
-        x: 0.0,
-        policy: UpdatePolicy::Identity,
+        priority: policy.sample(&mut rng, RunnableCategory::Record),
     };
 
-    exec(state, logger, prog, record, global_snapshot, local_coverage)?;
+    exec(
+        state,
+        logger,
+        prog,
+        record,
+        global_snapshot,
+        local_coverage,
+        policy,
+    )?;
     Ok(())
 }
