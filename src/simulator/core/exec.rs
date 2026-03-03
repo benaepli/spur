@@ -55,6 +55,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
     causal_operation_id: Option<i32>,
+    pending_trace_id: &mut Option<i64>,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
     match label {
         Label::Instr(instr, next) => match instr {
@@ -151,6 +152,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     env: callee_locals,
                     priority: policy.sample(&mut rng, RunnableCategory::Record),
                     causal_operation_id,
+                    trace_id: pending_trace_id.take(),
                 };
 
                 if state.crash_info.currently_crashed.contains(&target_node) {
@@ -303,7 +305,9 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             }
         }
         Label::TraceEnter(func_name, param_exprs, trace_id_lhs, next) => {
-            let id = state.alloc_unique_id() as i64;
+            let id = pending_trace_id
+                .take()
+                .unwrap_or_else(|| state.alloc_unique_id() as i64);
             store(trace_id_lhs, Value::int(id), local_env, node_env)?;
             let payload: Vec<String> = param_exprs
                 .iter()
@@ -341,6 +345,29 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             });
             Ok(Some(StepOutcome::Continue(*next)))
         }
+        Label::TraceDispatch(func_name, param_exprs, next) => {
+            let id = state.alloc_unique_id() as i64;
+            *pending_trace_id = Some(id);
+            let payload: Vec<String> = param_exprs
+                .iter()
+                .map(|e| {
+                    eval(local_env, node_env, e, &program.id_to_name)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|_| "<error>".to_string())
+                })
+                .collect();
+            logger.log_trace(TraceEntry {
+                node: node_id,
+                function_name: func_name.clone(),
+                kind: TraceKind::Dispatch,
+                payload,
+                schedulable_count: state.runnable_tasks.len(),
+                step: state.crash_info.current_step,
+                trace_id: id,
+                causal_operation_id: causal_operation_id.map(|id| id as i64),
+            });
+            Ok(Some(StepOutcome::Continue(*next)))
+        }
         _ => Ok(None),
     }
 }
@@ -360,6 +387,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
 ) -> Result<Value<H>, RuntimeError> {
     let mut pc = start_pc;
     let mut prev_pc = pc;
+    let mut pending_trace_id = None;
     loop {
         if pc != prev_pc {
             let rarity = global_snapshot.map_or(1.0, |s| s.novelty_score(pc));
@@ -380,6 +408,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
             local_coverage,
             policy,
             causal_operation_id,
+            &mut pending_trace_id,
         )? {
             match outcome {
                 StepOutcome::Continue(next) => {
@@ -407,6 +436,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
     policy: &SchedulePolicy,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let causal_operation_id = record.causal_operation_id;
+    let mut pending_trace_id = record.trace_id;
     let mut local_env = record.env;
     let mut node_env = state.nodes[record.node.index].clone();
 
@@ -434,6 +464,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
             local_coverage,
             policy,
             causal_operation_id,
+            &mut pending_trace_id,
         )? {
             match outcome {
                 StepOutcome::Continue(next) => {
@@ -548,7 +579,8 @@ pub fn exec<H: HashPolicy, L: Logger>(
             | Label::Break(_)
             | Label::ForLoopIn(_, _, _, _, _)
             | Label::TraceEnter(_, _, _, _)
-            | Label::TraceExit(_, _, _, _) => {
+            | Label::TraceExit(_, _, _, _)
+            | Label::TraceDispatch(_, _, _) => {
                 unreachable!(
                     "Label {:?} should have been handled by execute_common_label or is missing implementation in exec loop",
                     label

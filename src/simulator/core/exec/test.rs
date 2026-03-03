@@ -89,6 +89,7 @@ fn make_record_with_cont(
         env,
         priority: 0.5,
         causal_operation_id: None,
+        trace_id: None,
     }
 }
 

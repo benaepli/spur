@@ -74,6 +74,7 @@ pub fn serialize_traces(traces: &[TraceEntry]) -> Vec<PersistableTrace> {
                 step: t.step,
                 function_name: t.function_name.clone(),
                 trace_kind: match t.kind {
+                    TraceKind::Dispatch => "Dispatch",
                     TraceKind::Enter => "Enter",
                     TraceKind::Exit => "Exit",
                 },

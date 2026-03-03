@@ -180,6 +180,7 @@ fn schedule_client_op<H: HashPolicy>(
         env,
         priority: policy.sample(&mut rng, RunnableCategory::Record),
         causal_operation_id: Some(op_id),
+        trace_id: None,
     }));
     Ok(())
 }

@@ -379,6 +379,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
         env,
         priority: policy.sample(&mut rng, RunnableCategory::Record),
         causal_operation_id: None,
+        trace_id: None,
     };
 
     exec(

@@ -660,6 +660,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 env,
                 priority: 0.5,
                 causal_operation_id: None,
+                trace_id: None,
             };
             state.runnable_tasks.push_back(Runnable::Record(record));
         }
@@ -711,6 +712,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 env,
                 priority: 0.5,
                 causal_operation_id: Some(op_id),
+                trace_id: None,
             };
             state.runnable_tasks.push_back(Runnable::Record(record));
             true
@@ -753,6 +755,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                 env,
                 priority: 0.5,
                 causal_operation_id: Some(op_id),
+                trace_id: None,
             };
             state.runnable_tasks.push_back(Runnable::Record(record));
             true

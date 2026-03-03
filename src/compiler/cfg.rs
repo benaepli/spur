@@ -138,6 +138,11 @@ pub enum Label {
     DiscardData(Vertex /* next_vertex */),
     Break(Vertex /* break_target_vertex */),
     Continue(Vertex /* continue_target_vertex */),
+    TraceDispatch(
+        String,    /* func_name */
+        Vec<Expr>, /* param exprs */
+        Vertex,    /* next */
+    ),
     TraceEnter(
         String,    /* func_name */
         Vec<Expr>, /* param exprs */
@@ -216,6 +221,7 @@ pub struct Compiler {
     rpc_map: HashMap<NameId, FunctionInfo>,
 
     func_sync_map: HashMap<NameId, bool>,
+    func_traced_map: HashMap<NameId, bool>,
     func_qualifier_map: HashMap<NameId, String>,
 
     /// Mapping from qualified function name strings to NameId
@@ -268,6 +274,7 @@ impl Compiler {
             cfg: Vec::new(),
             rpc_map: HashMap::new(),
             func_sync_map: HashMap::new(),
+            func_traced_map: HashMap::new(),
             func_qualifier_map: HashMap::new(),
             func_name_to_id: HashMap::new(),
             id_to_name: HashMap::new(),
@@ -416,6 +423,7 @@ impl Compiler {
                     self.roles.push((role.name, qualifier.clone()));
                     for func in &role.func_defs {
                         self.func_sync_map.insert(func.name, func.is_sync);
+                        self.func_traced_map.insert(func.name, func.is_traced);
                         self.func_qualifier_map.insert(func.name, qualifier.clone());
                     }
                 }
@@ -2437,15 +2445,26 @@ impl Compiler {
 
         // The simulator's Async handler automatically creates a channel/future and stores it in `target`.
         let async_label = Label::Instr(
-            Instr::Async(target, node_expr, func_name, arg_exprs),
+            Instr::Async(target, node_expr, func_name.clone(), arg_exprs.clone()),
             next_vertex,
         );
         let async_vertex = self.add_label(async_label);
 
+        let effective_async_target = if self
+            .func_traced_map
+            .get(&call.name)
+            .copied()
+            .unwrap_or(false)
+        {
+            self.add_label(Label::TraceDispatch(func_name, arg_exprs, async_vertex))
+        } else {
+            async_vertex
+        };
+
         let args_entry_vertex = self.compile_expr_list_recursive(
             call.args.iter(),
             arg_tmps,
-            async_vertex,
+            effective_async_target,
             break_target,
             continue_target,
             return_target,

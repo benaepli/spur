@@ -113,6 +113,7 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             | Label::PersistData(_, _, next)
             | Label::RetrieveData(_, _, next)
             | Label::DiscardData(next)
+            | Label::TraceDispatch(_, _, next)
             | Label::TraceEnter(_, _, _, next)
             | Label::TraceExit(_, _, _, next) => {
                 edge(*next, None, None, Some("#555555"))?;
@@ -284,6 +285,15 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
         Label::DiscardData(_) => {
             header_color = "#DCEDC8"; // Light green
             content = "<B>DiscardData</B>".into();
+        }
+        Label::TraceDispatch(func_name, params, _) => {
+            header_color = "#CE93D8"; // Deep purple
+            let args_str: Vec<_> = params.iter().map(|a| pretty_expr(prog, a)).collect();
+            content = format!(
+                "<B>TraceDispatch</B><BR/>{}({})",
+                html_escape(func_name),
+                html_escape(&args_str.join(", ")),
+            );
         }
         Label::TraceEnter(func_name, params, trace_id_lhs, _) => {
             header_color = "#F3E5F5"; // Light purple
@@ -568,6 +578,7 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         | Label::PersistData(_, _, n)
         | Label::RetrieveData(_, _, n)
         | Label::DiscardData(n)
+        | Label::TraceDispatch(_, _, n)
         | Label::TraceEnter(_, _, _, n)
         | Label::TraceExit(_, _, _, n) => vec![*n],
         Label::Cond(_, t, e) => vec![*t, *e],
