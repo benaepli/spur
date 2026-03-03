@@ -32,6 +32,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
         policy,
+        None, // top-level sync calls have no causal client op
     );
     state.nodes[node_id.index] = node_env;
     result
@@ -53,6 +54,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    causal_operation_id: Option<i32>,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
     match label {
         Label::Instr(instr, next) => match instr {
@@ -99,6 +101,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     global_snapshot,
                     local_coverage,
                     policy,
+                    causal_operation_id,
                 )?;
 
                 store(lhs, val, local_env, node_env)?;
@@ -147,6 +150,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     initial_env: callee_locals.clone(),
                     env: callee_locals,
                     priority: policy.sample(&mut rng, RunnableCategory::Record),
+                    causal_operation_id,
                 };
 
                 if state.crash_info.currently_crashed.contains(&target_node) {
@@ -317,6 +321,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 schedulable_count: state.runnable_tasks.len(),
                 step: state.crash_info.current_step,
                 trace_id: id,
+                causal_operation_id: causal_operation_id.map(|id| id as i64),
             });
             Ok(Some(StepOutcome::Continue(*next)))
         }
@@ -332,6 +337,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 schedulable_count: state.runnable_tasks.len(),
                 step: state.crash_info.current_step,
                 trace_id,
+                causal_operation_id: causal_operation_id.map(|id| id as i64),
             });
             Ok(Some(StepOutcome::Continue(*next)))
         }
@@ -350,6 +356,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    causal_operation_id: Option<i32>,
 ) -> Result<Value<H>, RuntimeError> {
     let mut pc = start_pc;
     let mut prev_pc = pc;
@@ -372,6 +379,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
             global_snapshot,
             local_coverage,
             policy,
+            causal_operation_id,
         )? {
             match outcome {
                 StepOutcome::Continue(next) => {
@@ -398,6 +406,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
+    let causal_operation_id = record.causal_operation_id;
     let mut local_env = record.env;
     let mut node_env = state.nodes[record.node.index].clone();
 
@@ -424,6 +433,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
             global_snapshot,
             local_coverage,
             policy,
+            causal_operation_id,
         )? {
             match outcome {
                 StepOutcome::Continue(next) => {

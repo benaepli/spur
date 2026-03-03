@@ -88,6 +88,7 @@ fn make_record_with_cont(
         initial_env: env.clone(),
         env,
         priority: 0.5,
+        causal_operation_id: None,
     }
 }
 

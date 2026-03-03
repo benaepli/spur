@@ -52,6 +52,7 @@ pub struct PersistableTrace {
     pub payload: String,
     pub schedulable_count: i64,
     pub trace_id: i64,
+    pub causal_operation_id: Option<i64>,
 }
 
 pub fn serialize_traces(traces: &[TraceEntry]) -> Vec<PersistableTrace> {
@@ -79,6 +80,7 @@ pub fn serialize_traces(traces: &[TraceEntry]) -> Vec<PersistableTrace> {
                 payload,
                 schedulable_count: t.schedulable_count as i64,
                 trace_id: t.trace_id,
+                causal_operation_id: t.causal_operation_id,
             }
         })
         .collect()
@@ -295,6 +297,7 @@ pub fn init_db(conn: &Connection) -> Result<(), duckdb::Error> {
             payload TEXT,
             schedulable_count INTEGER,
             trace_id INTEGER,
+            causal_operation_id INTEGER,
             PRIMARY KEY (run_id, seq_num)
         );
 
@@ -369,7 +372,8 @@ fn save_traces_db(
             t.trace_kind,
             &t.payload,
             t.schedulable_count,
-            t.trace_id
+            t.trace_id,
+            t.causal_operation_id
         ])?;
     }
 
@@ -566,6 +570,7 @@ fn traces_schema() -> Arc<Schema> {
         Field::new("payload", DataType::Utf8, false),
         Field::new("schedulable_count", DataType::Int64, false),
         Field::new("trace_id", DataType::Int64, false),
+        Field::new("causal_operation_id", DataType::Int64, true),
     ]))
 }
 
@@ -601,6 +606,11 @@ fn append_traces_batch(
         .collect::<Vec<_>>()
         .into();
     let trace_ids: Int64Array = traces.iter().map(|t| t.trace_id).collect::<Vec<_>>().into();
+    let causal_op_ids: Int64Array = traces
+        .iter()
+        .map(|t| t.causal_operation_id)
+        .collect::<Vec<Option<i64>>>()
+        .into();
 
     let batch = RecordBatch::try_new(
         traces_schema(),
@@ -614,6 +624,7 @@ fn append_traces_batch(
             Arc::new(payloads),
             Arc::new(sched_counts),
             Arc::new(trace_ids),
+            Arc::new(causal_op_ids),
         ],
     )?;
     writer.write(&batch)?;

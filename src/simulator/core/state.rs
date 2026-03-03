@@ -139,6 +139,7 @@ pub struct LogEntry {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TraceKind {
+    Dispatch,
     Enter,
     Exit,
 }
@@ -152,6 +153,7 @@ pub struct TraceEntry {
     pub schedulable_count: usize,
     pub step: i32,
     pub trace_id: i64,
+    pub causal_operation_id: Option<i64>,
 }
 
 /// Trait for handling Print statement output during execution.
@@ -172,6 +174,9 @@ pub struct Record<H: HashPolicy> {
     /// Original local env for crash re-delivery.
     pub initial_env: Env<H>,
     pub priority: f64,
+    /// Links this record (and its traces) back to the client operation that caused it.
+    pub causal_operation_id: Option<i32>,
+    pub trace_id: Option<i64>,
 }
 
 impl<H: HashPolicy> Record<H> {
