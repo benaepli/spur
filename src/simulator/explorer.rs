@@ -8,6 +8,7 @@ use crate::simulator::history::{
     HistoryWriter, LogBackend, create_writer, serialize_history, serialize_logs, serialize_traces,
 };
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
+use crate::simulator::path::plan::ExecutionPlan;
 use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
 use crossbeam::channel;
 use log::{debug, error, info, warn};
@@ -528,6 +529,151 @@ pub fn run_explorer(
     writer.shutdown();
 
     info!("Execution explorer finished.");
+    Ok(global_state)
+}
+
+/// Runs a single simulation with a pre-built execution plan.
+fn run_single_plan(
+    program: &Program,
+    writer: &Arc<dyn HistoryWriter>,
+    global_state: &GlobalState,
+    run_id: i64,
+    plan: &ExecutionPlan,
+    num_servers: i32,
+    max_iterations: i32,
+    policy: &SchedulePolicy,
+) -> Result<f64, Box<dyn Error>> {
+    let global_snapshot = global_state.coverage.snapshot();
+    let num_servers_usize = num_servers as usize;
+
+    let server_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "Node")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
+    let client_role = program
+        .roles
+        .iter()
+        .find(|(_, name)| name == "ClientInterface")
+        .map(|(id, _)| *id)
+        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
+
+    let role_node_counts = vec![(server_role, num_servers_usize)];
+    let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing>::new(
+        &role_node_counts,
+        program.max_node_slots as usize,
+        client_role,
+    );
+
+    path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _>(
+        program,
+        &mut path_state.logs,
+        num_servers_usize,
+        Some(&global_snapshot),
+        &mut path_state.coverage,
+    )?;
+
+    let topology_info = TopologyInfo {
+        topology: Topology::Full,
+        num_servers,
+    };
+
+    init_topology::<crate::simulator::hash_utils::NoHashing, _>(
+        &mut path_state.state,
+        &mut path_state.logs,
+        program,
+        num_servers_usize,
+        Some(&global_snapshot),
+        &mut path_state.coverage,
+    )?;
+
+    exec_plan(
+        &mut path_state,
+        program.clone(),
+        plan.clone(),
+        max_iterations,
+        topology_info,
+        global_state,
+        Some(&global_snapshot),
+        run_id,
+        policy,
+    )?;
+
+    let plan_score = path_state.coverage.plan_score();
+    global_state.coverage.merge(&path_state.coverage);
+
+    let serialized = serialize_history(&path_state.history);
+    let serialized_logs = serialize_logs(&path_state.logs.entries);
+    let serialized_traces = serialize_traces(&path_state.logs.traces);
+    writer.write(run_id, serialized, serialized_logs, serialized_traces);
+
+    Ok(plan_score)
+}
+
+/// Runs a user-specified execution plan `num_runs` times.
+pub fn run_plan(
+    program: &Program,
+    config_json_path: &str,
+    output_path: &str,
+    backend: LogBackend,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<Arc<GlobalState>, Box<dyn Error>> {
+    use crate::simulator::plan_config::PlanFileConfig;
+
+    info!("Starting Plan Runner...");
+    info!("Plan config: {}", config_json_path);
+
+    let config_json = fs::read_to_string(config_json_path)?;
+    let config: PlanFileConfig = serde_json::from_str(&config_json)?;
+    config
+        .validate()
+        .map_err(|e| format!("Plan validation failed: {}", e))?;
+
+    let plan = config
+        .to_execution_plan()
+        .map_err(|e| format!("Failed to build execution plan: {}", e))?;
+
+    info!(
+        "Plan has {} events, {} dependencies",
+        plan.node_count(),
+        plan.edge_count()
+    );
+    info!("Running {} times with {} servers", config.num_runs, config.num_servers);
+
+    let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
+    let global_state = Arc::new(GlobalState::new(1_000_000));
+
+    let runs: Vec<i64> = (1..=config.num_runs as i64).collect();
+
+    runs.par_iter().for_each(|&run_id| {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        let start = std::time::Instant::now();
+        match run_single_plan(
+            program,
+            &writer,
+            &global_state,
+            run_id,
+            &plan,
+            config.num_servers,
+            config.max_iterations,
+            &config.schedule_policy,
+        ) {
+            Ok(_) => {
+                debug!(
+                    "Run {} Success ({:.4}s)",
+                    run_id,
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => error!("Run {} failed: {}", run_id, e),
+        }
+    });
+
+    writer.shutdown();
+    info!("Plan runner finished.");
     Ok(global_state)
 }
 

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use spur::compiler;
 use spur::debug::SimulatorDebugger;
-use spur::simulator::explorer::{run_explorer, run_explorer_genetic};
+use spur::simulator::explorer::{run_explorer, run_explorer_genetic, run_plan};
 use spur::simulator::history::LogBackend;
 use spur::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
 use std::collections::HashMap;
@@ -57,6 +57,23 @@ enum Commands {
         /// Explorer type to use
         #[arg(short, long, value_enum, default_value_t = ExplorerType::Genetic)]
         explorer: ExplorerType,
+        /// Logging backend for simulation history
+        #[arg(long, value_enum, default_value_t = LogBackendArg::Parquet)]
+        log_backend: LogBackendArg,
+        /// Skip confirmation prompt for directory deletion
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Run a user-specified DAG plan
+    RunPlan {
+        /// Input specification file (.spur)
+        spec: PathBuf,
+        /// Plan configuration JSON file
+        #[arg(short = 'p', long)]
+        plan: PathBuf,
+        /// Output directory for results
+        #[arg(short, long)]
+        output_dir: PathBuf,
         /// Logging backend for simulation history
         #[arg(long, value_enum, default_value_t = LogBackendArg::Parquet)]
         log_backend: LogBackendArg,
@@ -132,6 +149,13 @@ fn main() {
             log_backend,
             yes,
         } => run_explore(spec, config, output_dir, explorer, log_backend.into(), yes),
+        Commands::RunPlan {
+            spec,
+            plan,
+            output_dir,
+            log_backend,
+            yes,
+        } => run_run_plan(spec, plan, output_dir, log_backend.into(), yes),
         Commands::Debug(args) => match args.command {
             DebugSubcommands::Logs {
                 db,
@@ -303,6 +327,115 @@ fn run_explore(
 
     println!(
         "Explorer finished in {:.2?}. Results saved to {}",
+        elapsed,
+        output_dir.display()
+    );
+    println!("  - Coverage heatmap: {}", heatmap_path.display());
+    println!("  - CFG: {}", cfg_path.display());
+
+    Ok(())
+}
+
+fn run_run_plan(
+    spec_path: PathBuf,
+    plan_path: PathBuf,
+    output_dir: PathBuf,
+    backend: LogBackend,
+    yes: bool,
+) -> Result<()> {
+    let source_code = fs::read_to_string(&spec_path)
+        .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
+
+    let program = compiler::compile(&source_code, spec_path.to_string_lossy().as_ref())
+        .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
+
+    // Handle output directory
+    if output_dir.exists() {
+        if !yes {
+            print!(
+                "Output directory '{}' already exists and will be deleted. Continue? [y/N] ",
+                output_dir.display()
+            );
+            io::stdout().flush().context("Failed to flush stdout")?;
+
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .context("Failed to read from stdin")?;
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+        fs::remove_dir_all(&output_dir)
+            .with_context(|| format!("Failed to remove directory '{}'", output_dir.display()))?;
+    }
+
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("Failed to create directory '{}'", output_dir.display()))?;
+
+    let output_path_str: String = match &backend {
+        LogBackend::Parquet => output_dir
+            .to_str()
+            .context("Output dir contains invalid UTF-8")?
+            .to_string(),
+        LogBackend::DuckDB => {
+            let db_path = output_dir.join("results.duckdb");
+            db_path
+                .to_str()
+                .context("Database path contains invalid UTF-8")?
+                .to_string()
+        }
+    };
+    let start = Instant::now();
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = cancelled.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\nReceived Ctrl+C, shutting down gracefully...");
+        cancelled_clone.store(true, Ordering::SeqCst);
+    })
+    .context("Failed to set Ctrl+C handler")?;
+
+    let plan_path_str = plan_path
+        .to_str()
+        .context("Plan path contains invalid UTF-8")?;
+
+    let global_state = run_plan(
+        &program,
+        plan_path_str,
+        &output_path_str,
+        backend,
+        &cancelled,
+    )
+    .map_err(|e| anyhow::anyhow!("Plan runner failed: {}", e))?;
+
+    let elapsed = start.elapsed();
+
+    // Generate coverage heatmap
+    let vertex_coverage: HashMap<usize, u64> = global_state
+        .coverage
+        .vertices_snapshot()
+        .into_iter()
+        .collect();
+
+    let byte_hits = vertex_coverage_to_byte_coverage(
+        &vertex_coverage,
+        &program.vertex_to_span,
+        source_code.len(),
+    );
+
+    let html = render_html_heatmap(&source_code, &byte_hits);
+    let heatmap_path = output_dir.join("coverage.html");
+
+    fs::write(&heatmap_path, html).context("Failed to write coverage heatmap")?;
+
+    let cfg_path = output_dir.join("cfg.svg");
+    let svg = render_svg(&program).map_err(|e| anyhow::anyhow!("Failed to render SVG: {}", e))?;
+    fs::write(&cfg_path, svg).context("Failed to write CFG SVG")?;
+
+    println!(
+        "Plan runner finished in {:.2?}. Results saved to {}",
         elapsed,
         output_dir.display()
     );
