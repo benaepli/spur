@@ -113,8 +113,8 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             | Label::PersistData(_, _, next)
             | Label::RetrieveData(_, _, next)
             | Label::DiscardData(next)
-            | Label::TraceEnter(_, _, next)
-            | Label::TraceExit(_, next) => {
+            | Label::TraceEnter(_, _, _, next)
+            | Label::TraceExit(_, _, _, next) => {
                 edge(*next, None, None, Some("#555555"))?;
             }
             Label::Pause(next) => {
@@ -285,18 +285,23 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
             header_color = "#DCEDC8"; // Light green
             content = "<B>DiscardData</B>".into();
         }
-        Label::TraceEnter(func_name, params, _) => {
+        Label::TraceEnter(func_name, params, trace_id_lhs, _) => {
             header_color = "#F3E5F5"; // Light purple
             let args_str: Vec<_> = params.iter().map(|a| pretty_expr(prog, a)).collect();
             content = format!(
-                "<B>TraceEnter</B><BR/>{}({})",
+                "<B>TraceEnter</B><BR/>{}({}) [tid={}]",
                 html_escape(func_name),
-                html_escape(&args_str.join(", "))
+                html_escape(&args_str.join(", ")),
+                html_escape(&pretty_lhs(prog, trace_id_lhs)),
             );
         }
-        Label::TraceExit(func_name, _) => {
+        Label::TraceExit(func_name, _trace_id_expr, return_val_expr, _) => {
             header_color = "#F3E5F5"; // Light purple
-            content = format!("<B>TraceExit</B><BR/>{}", html_escape(func_name));
+            content = format!(
+                "<B>TraceExit</B><BR/>{} ret={}",
+                html_escape(func_name),
+                html_escape(&pretty_expr(prog, return_val_expr)),
+            );
         }
     }
 
@@ -563,8 +568,8 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         | Label::PersistData(_, _, n)
         | Label::RetrieveData(_, _, n)
         | Label::DiscardData(n)
-        | Label::TraceEnter(_, _, n)
-        | Label::TraceExit(_, n) => vec![*n],
+        | Label::TraceEnter(_, _, _, n)
+        | Label::TraceExit(_, _, _, n) => vec![*n],
         Label::Cond(_, t, e) => vec![*t, *e],
         Label::ForLoopIn(_, _, _, body, next) => vec![*body, *next],
         Label::Break(t) => vec![*t],

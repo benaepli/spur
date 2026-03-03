@@ -298,7 +298,9 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 }),
             }
         }
-        Label::TraceEnter(func_name, param_exprs, next) => {
+        Label::TraceEnter(func_name, param_exprs, trace_id_lhs, next) => {
+            let id = state.alloc_unique_id() as i64;
+            store(trace_id_lhs, Value::int(id), local_env, node_env)?;
             let payload: Vec<String> = param_exprs
                 .iter()
                 .map(|e| {
@@ -314,17 +316,22 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 payload,
                 schedulable_count: state.runnable_tasks.len(),
                 step: state.crash_info.current_step,
+                trace_id: id,
             });
             Ok(Some(StepOutcome::Continue(*next)))
         }
-        Label::TraceExit(func_name, next) => {
+        Label::TraceExit(func_name, trace_id_expr, return_val_expr, next) => {
+            let trace_id =
+                eval(local_env, node_env, trace_id_expr, &program.id_to_name)?.as_int()?;
+            let return_val = eval(local_env, node_env, return_val_expr, &program.id_to_name)?;
             logger.log_trace(TraceEntry {
                 node: node_id,
                 function_name: func_name.clone(),
                 kind: TraceKind::Exit,
-                payload: vec![],
+                payload: vec![return_val.to_string()],
                 schedulable_count: state.runnable_tasks.len(),
                 step: state.crash_info.current_step,
+                trace_id,
             });
             Ok(Some(StepOutcome::Continue(*next)))
         }
@@ -530,8 +537,8 @@ pub fn exec<H: HashPolicy, L: Logger>(
             | Label::DiscardData(_)
             | Label::Break(_)
             | Label::ForLoopIn(_, _, _, _, _)
-            | Label::TraceEnter(_, _, _)
-            | Label::TraceExit(_, _) => {
+            | Label::TraceEnter(_, _, _, _)
+            | Label::TraceExit(_, _, _, _) => {
                 unreachable!(
                     "Label {:?} should have been handled by execute_common_label or is missing implementation in exec loop",
                     label

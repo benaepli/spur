@@ -51,6 +51,7 @@ pub struct PersistableTrace {
     pub trace_kind: &'static str,
     pub payload: String,
     pub schedulable_count: i64,
+    pub trace_id: i64,
 }
 
 pub fn serialize_traces(traces: &[TraceEntry]) -> Vec<PersistableTrace> {
@@ -60,8 +61,11 @@ pub fn serialize_traces(traces: &[TraceEntry]) -> Vec<PersistableTrace> {
             let payload = if t.payload.is_empty() {
                 "[]".to_string()
             } else {
-                let items: Vec<JsonValue> =
-                    t.payload.iter().map(|s| JsonValue::String(s.clone())).collect();
+                let items: Vec<JsonValue> = t
+                    .payload
+                    .iter()
+                    .map(|s| JsonValue::String(s.clone()))
+                    .collect();
                 serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
             };
             PersistableTrace {
@@ -74,6 +78,7 @@ pub fn serialize_traces(traces: &[TraceEntry]) -> Vec<PersistableTrace> {
                 },
                 payload,
                 schedulable_count: t.schedulable_count as i64,
+                trace_id: t.trace_id,
             }
         })
         .collect()
@@ -289,6 +294,7 @@ pub fn init_db(conn: &Connection) -> Result<(), duckdb::Error> {
             trace_kind TEXT,
             payload TEXT,
             schedulable_count INTEGER,
+            trace_id INTEGER,
             PRIMARY KEY (run_id, seq_num)
         );
 
@@ -362,7 +368,8 @@ fn save_traces_db(
             &t.function_name,
             t.trace_kind,
             &t.payload,
-            t.schedulable_count
+            t.schedulable_count,
+            t.trace_id
         ])?;
     }
 
@@ -558,6 +565,7 @@ fn traces_schema() -> Arc<Schema> {
         Field::new("trace_kind", DataType::Utf8, false),
         Field::new("payload", DataType::Utf8, false),
         Field::new("schedulable_count", DataType::Int64, false),
+        Field::new("trace_id", DataType::Int64, false),
     ]))
 }
 
@@ -592,6 +600,7 @@ fn append_traces_batch(
         .map(|t| t.schedulable_count)
         .collect::<Vec<_>>()
         .into();
+    let trace_ids: Int64Array = traces.iter().map(|t| t.trace_id).collect::<Vec<_>>().into();
 
     let batch = RecordBatch::try_new(
         traces_schema(),
@@ -604,6 +613,7 @@ fn append_traces_batch(
             Arc::new(kinds),
             Arc::new(payloads),
             Arc::new(sched_counts),
+            Arc::new(trace_ids),
         ],
     )?;
     writer.write(&batch)?;
@@ -659,8 +669,10 @@ impl ParquetWriter {
             open_parquet_writer(&exec_dir.join(batch_filename(1)), exec_schema.clone())?;
         let mut log_writer =
             open_parquet_writer(&logs_dir.join(batch_filename(1)), logs_schema_arc.clone())?;
-        let mut trace_writer =
-            open_parquet_writer(&traces_dir.join(batch_filename(1)), traces_schema_arc.clone())?;
+        let mut trace_writer = open_parquet_writer(
+            &traces_dir.join(batch_filename(1)),
+            traces_schema_arc.clone(),
+        )?;
 
         let (sender, receiver) = mpsc::channel::<HistoryCommand>();
 
@@ -692,13 +704,9 @@ impl ParquetWriter {
                             }
                         }
                         if !traces.is_empty() {
-                            if let Err(e) =
-                                append_traces_batch(&mut trace_writer, run_id, &traces)
+                            if let Err(e) = append_traces_batch(&mut trace_writer, run_id, &traces)
                             {
-                                error!(
-                                    "failed to save traces parquet for run {}: {}",
-                                    run_id, e
-                                );
+                                error!("failed to save traces parquet for run {}: {}", run_id, e);
                             }
                         }
 

@@ -151,6 +151,7 @@ pub struct TraceEntry {
     pub payload: Vec<String>,
     pub schedulable_count: usize,
     pub step: i32,
+    pub trace_id: i64,
 }
 
 /// Trait for handling Print statement output during execution.

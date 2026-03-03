@@ -138,8 +138,18 @@ pub enum Label {
     DiscardData(Vertex /* next_vertex */),
     Break(Vertex /* break_target_vertex */),
     Continue(Vertex /* continue_target_vertex */),
-    TraceEnter(String /* func_name */, Vec<Expr> /* param exprs */, Vertex /* next */),
-    TraceExit(String /* func_name */, Vertex /* next */),
+    TraceEnter(
+        String,    /* func_name */
+        Vec<Expr>, /* param exprs */
+        Lhs,       /* trace_id_slot */
+        Vertex,    /* next */
+    ),
+    TraceExit(
+        String, /* func_name */
+        Expr,   /* trace_id_expr */
+        Expr,   /* return_val_expr */
+        Vertex, /* next */
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -532,10 +542,23 @@ impl Compiler {
         });
         let qualified_name = format!("{}.{}", qualifier, func.original_name);
 
+        // If traced, allocate a hidden slot for the trace invocation ID.
+        let trace_id_slot = if is_traced {
+            Some(self.alloc_temp_slot())
+        } else {
+            None
+        };
+
         // If traced, insert TraceExit before the final return and use it as
         // the return_target so all return paths funnel through it.
         let effective_return_target = if is_traced {
-            self.add_label(Label::TraceExit(qualified_name.clone(), final_return_vertex))
+            let tid_slot = trace_id_slot.unwrap();
+            self.add_label(Label::TraceExit(
+                qualified_name.clone(),
+                Expr::Var(tid_slot),
+                Expr::Var(return_slot),
+                final_return_vertex,
+            ))
         } else {
             final_return_vertex
         };
@@ -551,13 +574,19 @@ impl Compiler {
 
         // If traced, insert TraceEnter after the return-slot init and before the body.
         let after_init = if is_traced {
+            let tid_slot = trace_id_slot.unwrap();
             let param_exprs: Vec<Expr> = (0..param_count)
                 .map(|i| {
                     let name_id = params[i as usize].0;
                     Expr::Var(VarSlot::Local(i, name_id))
                 })
                 .collect();
-            self.add_label(Label::TraceEnter(qualified_name.clone(), param_exprs, body_entry))
+            self.add_label(Label::TraceEnter(
+                qualified_name.clone(),
+                param_exprs,
+                Lhs::Var(tid_slot),
+                body_entry,
+            ))
         } else {
             body_entry
         };
