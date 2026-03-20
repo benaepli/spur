@@ -73,7 +73,9 @@ ID
 
 pattern_list ::= pattern ( ',' pattern )* ','?
 
-expr ::= coalescing_expr
+expr ::= send_expr
+
+send_expr ::= coalescing_expr ( '>-' coalescing_expr )?
 
 coalescing_expr ::= boolean_or_expr ( '??' boolean_or_expr )*
 
@@ -206,8 +208,6 @@ Spur supports two function types for concurrency: `sync` (default) and `async`.
 
 By default, all functions are synchronous. A sync func is a blocking, atomic call that:
 
-- Cannot make RPC calls
-- Cannot call async functions
 - Cannot use channel operations (`send` and `recv`)
 
 A function can be explicitly marked as asynchronous with the `async` keyword:
@@ -221,8 +221,7 @@ async func my_async_call() -> int {
 Calling an async func does not block execution and immediately returns a `chan<T>`.
 To get the actual return value, you must receive from the channel, which will pause the current task.
 
-This sync-first model, where most operations are blocking, can result in issues around concurrent processing.\
-To address this, we provide a `lock` type.
+This sync-first model, where most operations are blocking, can result in issues around concurrent processing.
 
 ### RPCs
 
@@ -256,11 +255,12 @@ var ch = make(10);  // Creates a channel with buffer size 10
 
 #### Sending Values
 
-Send values to a channel using the `send()` function:
+Send values to a channel using the `>-` operator or the `send()` function:
 
 ```
-send(ch, 42);       // Send the value 42 to channel ch
-send(msg_chan, "hello");  // Send a string to msg_chan
+42 >- ch;                // Send the value 42 to channel ch
+"hello" >- msg_chan;      // Send a string to msg_chan
+send(ch, 42);            // Equivalent builtin form
 ```
 
 #### Receiving Values
@@ -276,7 +276,7 @@ Both forms block until a value is available on the channel.
 
 #### Restrictions
 
-Channel operations (`send` and `recv`) cannot be used inside sync functions (non-async). Attempting to do so will result in a compile-time error. This ensures that synchronous functions remain non-blocking and atomic.
+Channel operations (`>-`, `send`, `<-`, and `recv`) cannot be used inside sync functions (non-async). Attempting to do so will result in a compile-time error. This ensures that synchronous functions remain non-blocking and atomic.
 
 #### Channel Behavior During Crashes
 

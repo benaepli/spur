@@ -859,10 +859,27 @@ where
         let and_expr = build_binary_op(comparison, just(TokenKind::And).to(BinOp::And));
         let or_expr = build_binary_op(and_expr, just(TokenKind::Or).to(BinOp::Or));
 
-        build_binary_op(
+        let coalesce_expr = build_binary_op(
             or_expr,
             just(TokenKind::QuestionQuestion).to(BinOp::Coalesce),
-        )
+        );
+
+        // val >- chan (infix send, lowest precedence)
+        coalesce_expr
+            .clone()
+            .then(
+                just(TokenKind::SendArrow)
+                    .ignore_then(coalesce_expr.clone())
+                    .or_not(),
+            )
+            .map(|(lhs, rhs_opt)| {
+                if let Some(rhs) = rhs_opt {
+                    let span = lhs.span.union(rhs.span);
+                    Expr::new(ExprKind::Send(Box::new(rhs), Box::new(lhs)), span)
+                } else {
+                    lhs
+                }
+            })
     });
 
     let var_target = choice((
@@ -1033,7 +1050,21 @@ where
         ))
         .then_ignore(just(TokenKind::Semicolon).or_not());
 
-        choice((cond_stmts, for_loop, for_in_loop, simple_stmt))
+        choice((cond_stmts, for_loop, for_in_loop, simple_stmt)).recover_with(
+            skip_then_retry_until(
+                any_ref().ignored(),
+                choice((
+                    just(TokenKind::Semicolon).ignored(),
+                    just(TokenKind::RightBrace).ignored(),
+                    just(TokenKind::If).ignored(),
+                    just(TokenKind::For).ignored(),
+                    just(TokenKind::Var).ignored(),
+                    just(TokenKind::Return).ignored(),
+                    just(TokenKind::Break).ignored(),
+                    just(TokenKind::Continue).ignored(),
+                )),
+            ),
+        )
     });
 
     let var_init = just(TokenKind::Var)
@@ -1181,7 +1212,16 @@ where
             })
         });
 
-    let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type)));
+    let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type)))
+        .recover_with(skip_then_retry_until(
+            any_ref().ignored(),
+            choice((
+                just(TokenKind::Role).ignored(),
+                just(TokenKind::ClientInterface).ignored(),
+                just(TokenKind::Type).ignored(),
+                end(),
+            )),
+        ));
 
     top_level_def
         .repeated()
@@ -1325,6 +1365,62 @@ mod tests {
                     _ => panic!("Expected match expression"),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_infix_send() {
+        let source = "role R { async func f() { val >- ch; } }";
+        let program = parse(source);
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::Expr(expr) = &func.body[0].kind {
+                match &expr.kind {
+                    ExprKind::Send(chan, val) => {
+                        match &chan.kind {
+                            ExprKind::Var(name) => assert_eq!(name, "ch"),
+                            _ => panic!("Expected Var for channel"),
+                        }
+                        match &val.kind {
+                            ExprKind::Var(name) => assert_eq!(name, "val"),
+                            _ => panic!("Expected Var for value"),
+                        }
+                    }
+                    _ => panic!("Expected Send expression, got {:?}", expr.kind),
+                }
+            } else {
+                panic!("Expected expression statement");
+            }
+        } else {
+            panic!("Expected role definition");
+        }
+    }
+
+    #[test]
+    fn test_infix_send_precedence() {
+        let source = "role R { async func f() { x + 1 >- ch; } }";
+        let program = parse(source);
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::Expr(expr) = &func.body[0].kind {
+                match &expr.kind {
+                    ExprKind::Send(chan, val) => {
+                        match &chan.kind {
+                            ExprKind::Var(name) => assert_eq!(name, "ch"),
+                            _ => panic!("Expected Var for channel"),
+                        }
+                        match &val.kind {
+                            ExprKind::BinOp(BinOp::Add, _, _) => {}
+                            _ => panic!("Expected BinOp::Add for value, got {:?}", val.kind),
+                        }
+                    }
+                    _ => panic!("Expected Send expression, got {:?}", expr.kind),
+                }
+            } else {
+                panic!("Expected expression statement");
+            }
+        } else {
+            panic!("Expected role definition");
         }
     }
 }

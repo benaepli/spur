@@ -1,36 +1,87 @@
 pub mod cfg;
 
-use crate::analysis::checker::TypeChecker;
+use crate::analysis::checker::{TypeChecker, TypeError};
 use crate::analysis::format::{report_resolution_errors, report_type_errors};
-use crate::analysis::resolver::Resolver;
+use crate::analysis::resolver::{ResolutionError, Resolver};
+use crate::analysis::{trivially_copyable, type_id};
 use crate::compiler::cfg::Compiler as CfgCompiler;
-use crate::lexer::Lexer;
+use crate::lexer::{LexError, Lexer};
 use crate::parser::parse_program;
 use crate::{lexer, parser};
-use anyhow::anyhow;
 
-pub fn compile(input: &str, name: &str) -> Result<cfg::Program, anyhow::Error> {
-    let mut lexer = Lexer::new(input);
-    let (lexed, errors) = lexer.collect_all();
-    lexer::format::report_errors(input, &errors, name)?;
-    if !errors.is_empty() {
-        return Err(errors[0].clone().into());
+/// Result of compilation that always carries diagnostics and optionally a program.
+pub struct CompileResult {
+    pub program: Option<cfg::Program>,
+    pub lex_errors: Vec<LexError>,
+    pub parse_errors: Vec<String>,
+    pub resolution_errors: Vec<ResolutionError>,
+    pub type_errors: Vec<TypeError>,
+}
+
+impl CompileResult {
+    /// Returns true if any errors were encountered during compilation.
+    pub fn has_errors(&self) -> bool {
+        !self.lex_errors.is_empty()
+            || !self.parse_errors.is_empty()
+            || !self.resolution_errors.is_empty()
+            || !self.type_errors.is_empty()
     }
+
+    /// Converts into a Result, returning the program if no errors, or an error otherwise.
+    pub fn into_program(self) -> Result<cfg::Program, anyhow::Error> {
+        if !self.lex_errors.is_empty() {
+            return Err(self.lex_errors[0].clone().into());
+        }
+        if !self.parse_errors.is_empty() {
+            return Err(anyhow::anyhow!("{}", self.parse_errors[0]));
+        }
+        if !self.resolution_errors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "resolution error: {}",
+                self.resolution_errors[0]
+            ));
+        }
+        if !self.type_errors.is_empty() {
+            return Err(anyhow::anyhow!("type error: {}", self.type_errors[0]));
+        }
+        self.program
+            .ok_or_else(|| anyhow::anyhow!("no output generated"))
+    }
+}
+
+pub fn compile(input: &str, name: &str) -> CompileResult {
+    let mut result = CompileResult {
+        program: None,
+        lex_errors: Vec::new(),
+        parse_errors: Vec::new(),
+        resolution_errors: Vec::new(),
+        type_errors: Vec::new(),
+    };
+
+    let mut lexer = Lexer::new(input);
+    let (lexed, lex_errors) = lexer.collect_all();
+    if !lex_errors.is_empty() {
+        let _ = lexer::format::report_errors(input, &lex_errors, name);
+    }
+    result.lex_errors = lex_errors;
+
     let parsed = parse_program(&lexed);
     if parsed.has_errors() {
-        parser::format::report_errors(input, parsed.errors(), name)?;
-        return Err(anyhow!("parsing error"));
+        let _ = parser::format::report_errors(input, parsed.errors(), name);
+        result.parse_errors = parsed.errors().map(|e| e.to_string()).collect();
     }
     let parsed = match parsed.into_output() {
-        None => return Err(anyhow!("no output generated")),
+        None => return result,
         Some(v) => v,
     };
+
     let resolver = Resolver::new();
     let prepopulated_types = resolver.get_pre_populated_types().clone();
     let resolved = match resolver.resolve_program(parsed) {
         Err(e) => {
-            let _ = report_resolution_errors(input, &[e], name);
-            return Err(anyhow!("resolution error"));
+            let _ = report_resolution_errors(input, &[e.clone()], name);
+            result.resolution_errors.push(e);
+            return result;
         }
         Ok(r) => r,
     };
@@ -38,22 +89,21 @@ pub fn compile(input: &str, name: &str) -> Result<cfg::Program, anyhow::Error> {
     let mut type_checker = TypeChecker::new(prepopulated_types);
     let typed = match type_checker.check_program(resolved.clone()) {
         Err(e) => {
-            let _ = report_type_errors(input, &[e], name);
-            return Err(anyhow!("type checking error"));
+            let _ = report_type_errors(input, &[e.clone()], name);
+            result.type_errors.push(e);
+            return result;
         }
         Ok(r) => r,
     };
 
-    let _trivially_copyable_map = crate::analysis::trivially_copyable::compute_trivially_copyable(
-        &typed.struct_defs,
-        &typed.enum_defs,
-    );
+    let _trivially_copyable_map =
+        trivially_copyable::compute_trivially_copyable(&typed.struct_defs, &typed.enum_defs);
 
-    let type_ids = crate::analysis::type_id::assign_type_ids(&typed);
+    let type_ids = type_id::assign_type_ids(&typed);
 
-    // Compile to CFG
     let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(typed, type_ids);
+    result.program = Some(program);
 
-    Ok(program)
+    result
 }

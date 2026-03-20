@@ -64,6 +64,7 @@ pub enum TokenKind {
     GreaterEqual,
     Arrow,
     LeftArrow,
+    SendArrow,
     FatArrow,
     ColonEqual,
 
@@ -152,6 +153,7 @@ impl fmt::Display for TokenKind {
             TokenKind::GreaterEqual => write!(f, ">="),
             TokenKind::Arrow => write!(f, "->"),
             TokenKind::LeftArrow => write!(f, "<-"),
+            TokenKind::SendArrow => write!(f, ">-"),
             TokenKind::FatArrow => write!(f, "=>"),
             TokenKind::ColonEqual => write!(f, ":="),
             TokenKind::Identifier(s) => write!(f, "{}", s),
@@ -280,9 +282,9 @@ fn is_special_char(ch: char) -> bool {
 #[derive(Error, Debug, PartialEq, Clone)]
 pub enum LexError {
     #[error("unexpected character")]
-    UnexpectedChar(usize),
+    UnexpectedChar(Span),
     #[error("unterminated string")]
-    UnterminatedString(usize),
+    UnterminatedString(Span),
 }
 
 /// A lexical analyzer that converts source code into a stream of tokens.
@@ -362,10 +364,13 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
 
         loop {
-            let ch = self
-                .input
-                .next()
-                .ok_or(LexError::UnterminatedString(start))?;
+            let ch = self.input.next().ok_or_else(|| {
+                LexError::UnterminatedString(Span {
+                    context: (),
+                    start,
+                    end: self.position,
+                })
+            })?;
             self.position += 1;
             match ch {
                 '"' => {
@@ -417,7 +422,11 @@ impl<'a> Lexer<'a> {
                             self.position += 1;
                         }
                         None => {
-                            return Err(LexError::UnterminatedString(start));
+                            return Err(LexError::UnterminatedString(Span {
+                                context: (),
+                                start,
+                                end: self.position,
+                            }));
                         }
                     }
                 }
@@ -432,10 +441,13 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
 
         loop {
-            let ch = self
-                .input
-                .next()
-                .ok_or(LexError::UnterminatedString(start))?;
+            let ch = self.input.next().ok_or_else(|| {
+                LexError::UnterminatedString(Span {
+                    context: (),
+                    start,
+                    end: self.position,
+                })
+            })?;
             self.position += 1;
             match ch {
                 '"' => return Ok(TokenKind::String(value)),
@@ -465,7 +477,11 @@ impl<'a> Lexer<'a> {
                             self.position += 1;
                         }
                         None => {
-                            return Err(LexError::UnterminatedString(start));
+                            return Err(LexError::UnterminatedString(Span {
+                                context: (),
+                                start,
+                                end: self.position,
+                            }));
                         }
                     }
                 }
@@ -490,10 +506,13 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        num_str
-            .parse()
-            .map(TokenKind::Integer)
-            .map_err(|_| LexError::UnexpectedChar(start))
+        num_str.parse().map(TokenKind::Integer).map_err(|_| {
+            LexError::UnexpectedChar(Span {
+                context: (),
+                start,
+                end: self.position,
+            })
+        })
     }
 
     fn parse_identifier(&mut self, first: char) -> TokenKind {
@@ -618,6 +637,8 @@ impl<'a> Iterator for Lexer<'a> {
             '>' => {
                 if self.match_next('=') {
                     Ok(TokenKind::GreaterEqual)
+                } else if self.match_next('-') {
+                    Ok(TokenKind::SendArrow)
                 } else {
                     Ok(TokenKind::Greater)
                 }
@@ -645,7 +666,11 @@ impl<'a> Iterator for Lexer<'a> {
 
             ch if ch.is_alphabetic() || ch == '_' => Ok(self.parse_identifier(ch)),
 
-            _ => Err(LexError::UnexpectedChar(start)),
+            _ => Err(LexError::UnexpectedChar(Span {
+                context: (),
+                start,
+                end: start + 1,
+            })),
         };
 
         let end = self.position;
@@ -772,6 +797,33 @@ mod tests {
 
         assert_eq!(tokens[13].kind, TokenKind::FStringEnd("".to_string()));
         assert_eq!(tokens.len(), 14);
+    }
+
+    #[test]
+    fn test_send_arrow() {
+        let input = "x >- ch";
+        let mut lexer = Lexer::new(input);
+        let (tokens, errors) = lexer.collect_all();
+
+        assert!(errors.is_empty());
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].kind, TokenKind::Identifier("x".to_string()));
+        assert_eq!(tokens[1].kind, TokenKind::SendArrow);
+        assert_eq!(tokens[2].kind, TokenKind::Identifier("ch".to_string()));
+    }
+
+    #[test]
+    fn test_greater_minus_with_space() {
+        let input = "x > -y";
+        let mut lexer = Lexer::new(input);
+        let (tokens, errors) = lexer.collect_all();
+
+        assert!(errors.is_empty());
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens[0].kind, TokenKind::Identifier("x".to_string()));
+        assert_eq!(tokens[1].kind, TokenKind::Greater);
+        assert_eq!(tokens[2].kind, TokenKind::Minus);
+        assert_eq!(tokens[3].kind, TokenKind::Identifier("y".to_string()));
     }
 
     #[test]

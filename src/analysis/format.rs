@@ -356,7 +356,7 @@ pub fn report_type_errors(
                 .with_message("send cannot be used in sync function")
                 .with_labels(vec![
                     Label::primary(file_id, span.start..span.end)
-                        .with_message("send (`<-`) not allowed here"),
+                        .with_message("send (`>-`) not allowed here"),
                 ])
                 .with_notes(vec![
                     "help: send can only be used in async functions, but this function is marked as `sync`".to_string(),

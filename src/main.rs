@@ -201,6 +201,7 @@ fn run_compile(spec_path: PathBuf, output_path: PathBuf) -> Result<()> {
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
     let program = compiler::compile(&source_code, spec_path.to_string_lossy().as_ref())
+        .into_program()
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
     let json =
@@ -218,6 +219,7 @@ fn run_check(spec_path: PathBuf) -> Result<()> {
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
     compiler::compile(&source_code, spec_path.to_string_lossy().as_ref())
+        .into_program()
         .map_err(|e| anyhow::anyhow!("Check failed: {}", e))?;
 
     println!("Successfully checked {}", spec_path.display());
@@ -229,6 +231,7 @@ fn run_graph(spec_path: PathBuf, output_path: PathBuf) -> Result<()> {
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
     let program = compiler::compile(&source_code, spec_path.to_string_lossy().as_ref())
+        .into_program()
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
     let svg = render_svg(&program).map_err(|e| anyhow::anyhow!("Failed to render SVG: {}", e))?;
@@ -252,6 +255,7 @@ fn run_explore(
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
     let program = compiler::compile(&source_code, spec_path.to_string_lossy().as_ref())
+        .into_program()
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
     // Handle output directory
@@ -374,6 +378,7 @@ fn run_run_plan(
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
     let program = compiler::compile(&source_code, spec_path.to_string_lossy().as_ref())
+        .into_program()
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
     // Handle output directory
