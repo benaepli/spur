@@ -1,0 +1,261 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "Spur",
+	"scopeName": "source.spur",
+	"patterns": [
+		{
+			"include": "#comments"
+		},
+		{
+			"include": "#annotations"
+		},
+		{
+			"include": "#raw-strings"
+		},
+		{
+			"include": "#f-strings"
+		},
+		{
+			"include": "#declarations"
+		},
+		{
+			"include": "#keywords"
+		},
+		{
+			"include": "#function-calls"
+		},
+		{
+			"include": "#constants"
+		},
+		{
+			"include": "#punctuation"
+		},
+		{
+			"include": "#variables"
+		}
+	],
+	"repository": {
+		"comments": {
+			"patterns": [
+				{
+					"name": "comment.line.double-slash.spur",
+					"begin": "//",
+					"end": "$\n?",
+					"beginCaptures": {
+						"0": {
+							"name": "punctuation.definition.comment.spur"
+						}
+					}
+				}
+			]
+		},
+		"annotations": {
+			"match": "(@)([a-zA-Z_][a-zA-Z0-9_]*)",
+			"captures": {
+				"1": {
+					"name": "punctuation.definition.annotation.spur"
+				},
+				"2": {
+					"name": "storage.modifier.annotation.spur"
+				}
+			}
+		},
+		"raw-strings": {
+			"name": "string.quoted.double.raw.spur",
+			"begin": "s\"",
+			"end": "\"",
+			"beginCaptures": {
+				"0": {
+					"name": "punctuation.definition.string.begin.spur"
+				}
+			},
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.string.end.spur"
+				}
+			},
+			"patterns": [
+				{
+					"name": "constant.character.escape.spur",
+					"match": "\\\\."
+				}
+			]
+		},
+		"f-strings": {
+			"name": "string.quoted.double.spur",
+			"begin": "\"",
+			"end": "\"",
+			"beginCaptures": {
+				"0": {
+					"name": "punctuation.definition.string.begin.spur"
+				}
+			},
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.string.end.spur"
+				}
+			},
+			"patterns": [
+				{
+					"name": "constant.character.escape.spur",
+					"match": "\\\\."
+				},
+				{
+					"name": "meta.interpolation.spur",
+					"begin": "\\{",
+					"end": "\\}",
+					"beginCaptures": {
+						"0": {
+							"name": "punctuation.section.interpolation.begin.spur"
+						}
+					},
+					"endCaptures": {
+						"0": {
+							"name": "punctuation.section.interpolation.end.spur"
+						}
+					},
+					"patterns": [
+						{
+							"include": "source.spur"
+						}
+					]
+				}
+			]
+		},
+		"keywords": {
+			"patterns": [
+				{
+					"name": "keyword.control.spur",
+					"match": "\\b(if|else|for|in|return|break|continue|var|match|enum)\\b"
+				},
+				{
+					"name": "storage.type.spur",
+					"match": "\\b(func|async|map|list|chan|role|ClientInterface|type|options)\\b"
+				},
+				{
+					"name": "storage.type.primitive.spur",
+					"match": "\\b(bool|string|int)\\b"
+				},
+				{
+					"name": "support.function.builtin.spur",
+					"match": "\\b(append|prepend|len|min|println|int_to_string|exists|head|tail|erase|store|make|send|recv|rpc_call|set_timer|persist_data|discard_data|retrieve_data)\\b"
+				},
+				{
+					"name": "keyword.operator.spur",
+					"match": ":=|<-|->|>-|=>|\\?\\.?|\\?\\?|==|!=|<=|>=|\\b(and|or)\\b|[<>=!+\\-*/=%]"
+				}
+			]
+		},
+		"constants": {
+			"patterns": [
+				{
+					"name": "constant.language.spur",
+					"match": "\\b(true|false|nil)\\b"
+				},
+				{
+					"name": "constant.numeric.integer.spur",
+					"match": "\\b-?[0-9]+\\b"
+				}
+			]
+		},
+		"declarations": {
+			"patterns": [
+				{
+					"name": "meta.function.declaration.spur",
+					"match": "(?:\\b(async)\\s+)?\\b(func)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+					"captures": {
+						"1": {
+							"name": "storage.modifier.spur"
+						},
+						"2": {
+							"name": "storage.type.function.spur"
+						},
+						"3": {
+							"name": "entity.name.function.spur"
+						}
+					}
+				},
+				{
+					"name": "meta.role.declaration.spur",
+					"match": "\\b(role)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+					"captures": {
+						"1": {
+							"name": "storage.type.spur"
+						},
+						"2": {
+							"name": "entity.name.type.class.spur"
+						}
+					}
+				},
+				{
+					"name": "meta.type.declaration.spur",
+					"match": "\\b(type)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(enum)?",
+					"captures": {
+						"1": {
+							"name": "storage.type.spur"
+						},
+						"2": {
+							"name": "entity.name.type.spur"
+						},
+						"3": {
+							"name": "storage.type.spur"
+						}
+					}
+				},
+				{
+					"name": "meta.client.declaration.spur",
+					"match": "\\b(ClientInterface)\\b",
+					"captures": {
+						"1": {
+							"name": "storage.type.spur"
+						}
+					}
+				}
+			]
+		},
+		"function-calls": {
+			"match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*\\()",
+			"captures": {
+				"1": {
+					"name": "support.function.spur"
+				}
+			}
+		},
+		"variables": {
+			"name": "variable.other.language.spur",
+			"match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
+		},
+		"punctuation": {
+			"patterns": [
+				{
+					"name": "punctuation.terminator.statement.spur",
+					"match": ";"
+				},
+				{
+					"name": "punctuation.separator.comma.spur",
+					"match": ","
+				},
+				{
+					"name": "punctuation.accessor.spur",
+					"match": ":"
+				},
+				{
+					"name": "punctuation.accessor.dot.spur",
+					"match": "\\."
+				},
+				{
+					"name": "punctuation.section.block.spur",
+					"match": "[{}]"
+				},
+				{
+					"name": "punctuation.section.group.spur",
+					"match": "[()]"
+				},
+				{
+					"name": "punctuation.section.list.spur",
+					"match": "[\\[\\]]"
+				}
+			]
+		}
+	}
+}

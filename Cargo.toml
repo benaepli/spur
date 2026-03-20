@@ -1,5 +1,5 @@
 [workspace]
-members = ["spur-core", "spur-cli", "spur-lsp"]
+members = ["spur-core", "spur-cli", "spur-lsp", "xtask"]
 resolver = "3"
 
 [profile.release]

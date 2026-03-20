@@ -8,3 +8,9 @@
 .DS_Store
 
 output.json
+
+# VS Code extension
+/editors/code/out
+/editors/code/node_modules
+/editors/code/server
+/editors/code/*.vsix

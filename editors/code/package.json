@@ -1,0 +1,66 @@
+{
+  "name": "spur",
+  "displayName": "Spur VSCode",
+  "description": "VSCode support for Spur with Language Server Protocol integration.",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benaepli/spur.git"
+  },
+  "publisher": "baepli",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:spur"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "spur",
+        "aliases": [
+          "Spur"
+        ],
+        "extensions": [
+          ".spur"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "spur",
+        "scopeName": "source.spur",
+        "path": "./syntaxes/spur.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Spur",
+      "properties": {
+        "spur.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the spur-lsp binary. If empty, the extension looks for `server/spur-lsp` inside the extension directory."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "@vscode/vsce": "^3.0.0"
+  }
+}
