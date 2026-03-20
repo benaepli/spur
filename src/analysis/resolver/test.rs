@@ -52,7 +52,7 @@ fn var_init(name: &str, value: Expr) -> Statement {
 impl Resolver {
     // Expose declaring a type for testing purposes
     fn declare_test_type(&mut self, name: &str) -> NameId {
-        self.declare_type(name, dummy_span()).unwrap()
+        self.declare_type(name, dummy_span())
     }
 }
 
@@ -73,36 +73,34 @@ fn named_dot(first: &str, second: &str, payload: Option<Expr>) -> Expr {
 }
 
 #[test]
-fn test_resolve_literals() -> Result<(), ResolutionError> {
+fn test_resolve_literals() {
     let mut resolver = Resolver::new();
 
-    let res_int = resolver.resolve_expr(int_lit(42))?;
+    let res_int = resolver.resolve_expr(int_lit(42));
     match res_int.kind {
         ResolvedExprKind::IntLit(val) => assert_eq!(val, 42),
         _ => panic!("expected IntLit"),
     }
 
-    let res_str = resolver.resolve_expr(str_lit("hello"))?;
+    let res_str = resolver.resolve_expr(str_lit("hello"));
     match res_str.kind {
         ResolvedExprKind::StringLit(val) => assert_eq!(val, "hello"),
         _ => panic!("expected StringLit"),
     }
 
-    let res_bool = resolver.resolve_expr(bool_lit(true))?;
+    let res_bool = resolver.resolve_expr(bool_lit(true));
     match res_bool.kind {
         ResolvedExprKind::BoolLit(val) => assert_eq!(val, true),
         _ => panic!("expected BoolLit"),
     }
-
-    Ok(())
 }
 
 #[test]
-fn test_resolve_binop() -> Result<(), ResolutionError> {
+fn test_resolve_binop() {
     let mut resolver = Resolver::new();
 
     let op = bin_op(BinOp::Add, int_lit(1), int_lit(2));
-    let res = resolver.resolve_expr(op)?;
+    let res = resolver.resolve_expr(op);
 
     match res.kind {
         ResolvedExprKind::BinOp(op, l, r) => {
@@ -118,19 +116,17 @@ fn test_resolve_binop() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected BinOp"),
     }
-
-    Ok(())
 }
 
 #[test]
-fn test_resolve_variable_scope() -> Result<(), ResolutionError> {
+fn test_resolve_variable_scope() {
     let mut resolver = Resolver::new();
 
     // Declare a variable
-    let id = resolver.declare_var("x", dummy_span())?;
+    let id = resolver.declare_var("x", dummy_span());
 
     // Resolve usage of the variable
-    let res = resolver.resolve_expr(var_expr("x"))?;
+    let res = resolver.resolve_expr(var_expr("x"));
 
     match res.kind {
         ResolvedExprKind::Var(resolved_id, name) => {
@@ -139,33 +135,35 @@ fn test_resolve_variable_scope() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected Var"),
     }
-
-    Ok(())
 }
 
 #[test]
 fn test_resolve_undefined_variable() {
     let mut resolver = Resolver::new();
-    let err = resolver.resolve_expr(var_expr("undefined")).unwrap_err();
+    let res = resolver.resolve_expr(var_expr("undefined"));
 
-    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "undefined"));
+    assert!(matches!(res.kind, ResolvedExprKind::Error));
+    assert_eq!(resolver.errors.len(), 1);
+    assert!(
+        matches!(resolver.errors[0], ResolutionError::NameNotFound(ref name, _) if name == "undefined")
+    );
 }
 
 #[test]
-fn test_resolve_shadowing() -> Result<(), ResolutionError> {
+fn test_resolve_shadowing() {
     let mut resolver = Resolver::new();
 
     // Outer scope
     resolver.enter_scope();
-    let id1 = resolver.declare_var("x", dummy_span())?;
+    let id1 = resolver.declare_var("x", dummy_span());
 
     // Inner scope
     resolver.enter_scope();
-    let id2 = resolver.declare_var("x", dummy_span())?;
+    let id2 = resolver.declare_var("x", dummy_span());
 
     assert_ne!(id1, id2);
 
-    let res = resolver.resolve_expr(var_expr("x"))?;
+    let res = resolver.resolve_expr(var_expr("x"));
     match res.kind {
         ResolvedExprKind::Var(resolved_id, _) => {
             assert_eq!(resolved_id, id2, "Should resolve to inner variable");
@@ -176,7 +174,7 @@ fn test_resolve_shadowing() -> Result<(), ResolutionError> {
     resolver.exit_scope();
 
     // Back to outer scope
-    let res = resolver.resolve_expr(var_expr("x"))?;
+    let res = resolver.resolve_expr(var_expr("x"));
     match res.kind {
         ResolvedExprKind::Var(resolved_id, _) => {
             assert_eq!(resolved_id, id1, "Should resolve to outer variable");
@@ -185,7 +183,6 @@ fn test_resolve_shadowing() -> Result<(), ResolutionError> {
     }
 
     resolver.exit_scope();
-    Ok(())
 }
 
 #[test]
@@ -193,14 +190,17 @@ fn test_resolve_duplicate_variable_same_scope() {
     let mut resolver = Resolver::new();
 
     resolver.enter_scope();
-    resolver.declare_var("x", dummy_span()).unwrap();
-    let err = resolver.declare_var("x", dummy_span()).unwrap_err();
+    resolver.declare_var("x", dummy_span());
+    resolver.declare_var("x", dummy_span());
 
-    assert!(matches!(err, ResolutionError::DuplicateName(name, _) if name == "x"));
+    assert_eq!(resolver.errors.len(), 1);
+    assert!(
+        matches!(resolver.errors[0], ResolutionError::DuplicateName(ref name, _) if name == "x")
+    );
 }
 
 #[test]
-fn test_resolve_block_scope() -> Result<(), ResolutionError> {
+fn test_resolve_block_scope() {
     let mut resolver = Resolver::new();
 
     let block = vec![
@@ -208,7 +208,7 @@ fn test_resolve_block_scope() -> Result<(), ResolutionError> {
         stmt(StatementKind::Expr(var_expr("x"))),
     ];
 
-    let resolved_block = resolver.resolve_block(block)?;
+    let resolved_block = resolver.resolve_block(block);
     assert_eq!(resolved_block.len(), 2);
 
     match &resolved_block[0].kind {
@@ -220,14 +220,16 @@ fn test_resolve_block_scope() -> Result<(), ResolutionError> {
     }
 
     // "x" should not be available outside the block if resolve_block handles scoping correctly
-    let err = resolver.resolve_expr(var_expr("x")).unwrap_err();
-    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "x"));
-
-    Ok(())
+    let res = resolver.resolve_expr(var_expr("x"));
+    assert!(matches!(res.kind, ResolvedExprKind::Error));
+    assert_eq!(resolver.errors.len(), 1);
+    assert!(
+        matches!(resolver.errors[0], ResolutionError::NameNotFound(ref name, _) if name == "x")
+    );
 }
 
 #[test]
-fn test_resolve_tuple_destructuring() -> Result<(), ResolutionError> {
+fn test_resolve_tuple_destructuring() {
     let mut resolver = Resolver::new();
 
     // var (x, y) = (1, 2)
@@ -238,7 +240,7 @@ fn test_resolve_tuple_destructuring() -> Result<(), ResolutionError> {
         span: dummy_span(),
     }));
 
-    let resolved = resolver.resolve_statement(stmt)?;
+    let resolved = resolver.resolve_statement(stmt);
 
     match resolved.kind {
         ResolvedStatementKind::VarInit(vi) => {
@@ -249,13 +251,13 @@ fn test_resolve_tuple_destructuring() -> Result<(), ResolutionError> {
                     assert_eq!(names[1].1, "y");
 
                     // Ensure variables are declared in scope
-                    let x_res = resolver.resolve_expr(var_expr("x"))?;
+                    let x_res = resolver.resolve_expr(var_expr("x"));
                     match x_res.kind {
                         ResolvedExprKind::Var(id, _) => assert_eq!(id, names[0].0),
                         _ => panic!("expected Var x"),
                     }
 
-                    let y_res = resolver.resolve_expr(var_expr("y"))?;
+                    let y_res = resolver.resolve_expr(var_expr("y"));
                     match y_res.kind {
                         ResolvedExprKind::Var(id, _) => assert_eq!(id, names[1].0),
                         _ => panic!("expected Var y"),
@@ -266,12 +268,10 @@ fn test_resolve_tuple_destructuring() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected VarInit"),
     }
-
-    Ok(())
 }
 
 #[test]
-fn test_resolve_function_call() -> Result<(), ResolutionError> {
+fn test_resolve_function_call() {
     let mut resolver = Resolver::new();
 
     // We need a role context or client context to resolve user functions.
@@ -287,7 +287,7 @@ fn test_resolve_function_call() -> Result<(), ResolutionError> {
         span: dummy_span(),
     });
 
-    let res = resolver.resolve_expr(expr(call))?;
+    let res = resolver.resolve_expr(expr(call));
 
     match res.kind {
         ResolvedExprKind::FuncCall(ResolvedFuncCall::User(user_call)) => {
@@ -297,12 +297,10 @@ fn test_resolve_function_call() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected User FuncCall"),
     }
-
-    Ok(())
 }
 
 #[test]
-fn test_resolve_builtin_function_call() -> Result<(), ResolutionError> {
+fn test_resolve_builtin_function_call() {
     let mut resolver = Resolver::new();
 
     let call = ExprKind::FuncCall(FuncCall {
@@ -311,7 +309,7 @@ fn test_resolve_builtin_function_call() -> Result<(), ResolutionError> {
         span: dummy_span(),
     });
 
-    let res = resolver.resolve_expr(expr(call))?;
+    let res = resolver.resolve_expr(expr(call));
 
     match res.kind {
         ResolvedExprKind::FuncCall(ResolvedFuncCall::Builtin(builtin, args, _)) => {
@@ -320,8 +318,6 @@ fn test_resolve_builtin_function_call() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected Builtin FuncCall"),
     }
-
-    Ok(())
 }
 
 #[test]
@@ -371,8 +367,12 @@ fn test_undefined_function() {
         span: dummy_span(),
     });
 
-    let err = resolver.resolve_expr(expr(call)).unwrap_err();
-    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "undefined_func"));
+    let res = resolver.resolve_expr(expr(call));
+    assert!(matches!(res.kind, ResolvedExprKind::Error));
+    assert_eq!(resolver.errors.len(), 1);
+    assert!(
+        matches!(resolver.errors[0], ResolutionError::NameNotFound(ref name, _) if name == "undefined_func")
+    );
 }
 
 #[test]
@@ -388,30 +388,44 @@ fn test_variable_used_before_declaration_in_same_expression() {
         span: dummy_span(),
     }));
 
-    let err = resolver.resolve_statement(var_init_stmt).unwrap_err();
-    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "x"));
+    let res = resolver.resolve_statement(var_init_stmt);
+    match res.kind {
+        ResolvedStatementKind::VarInit(vi) => match vi.value.kind {
+            ResolvedExprKind::BinOp(op, l, r) => {
+                assert_eq!(op, BinOp::Add);
+                assert!(matches!(l.kind, ResolvedExprKind::Error));
+                assert!(matches!(r.kind, ResolvedExprKind::IntLit(1)));
+            }
+            _ => panic!("Expected BinOp"),
+        },
+        _ => panic!("Expected VarInit statement"),
+    }
+    assert_eq!(resolver.errors.len(), 1);
+    assert!(
+        matches!(resolver.errors[0], ResolutionError::NameNotFound(ref name, _) if name == "x")
+    );
 }
 
 #[test]
-fn test_nested_scope_variable_isolation() -> Result<(), ResolutionError> {
+fn test_nested_scope_variable_isolation() {
     let mut resolver = Resolver::new();
 
     // Outer scope
     resolver.enter_scope();
-    let outer_id = resolver.declare_var("outer", dummy_span())?;
+    let outer_id = resolver.declare_var("outer", dummy_span());
 
     // Inner scope
     resolver.enter_scope();
-    let inner_id = resolver.declare_var("inner", dummy_span())?;
+    let inner_id = resolver.declare_var("inner", dummy_span());
 
     // Both should be visible in inner scope
-    let res_inner = resolver.resolve_expr(var_expr("inner"))?;
+    let res_inner = resolver.resolve_expr(var_expr("inner"));
     match res_inner.kind {
         ResolvedExprKind::Var(id, _) => assert_eq!(id, inner_id),
         _ => panic!("expected Var"),
     }
 
-    let res_outer = resolver.resolve_expr(var_expr("outer"))?;
+    let res_outer = resolver.resolve_expr(var_expr("outer"));
     match res_outer.kind {
         ResolvedExprKind::Var(id, _) => assert_eq!(id, outer_id),
         _ => panic!("expected Var"),
@@ -420,27 +434,30 @@ fn test_nested_scope_variable_isolation() -> Result<(), ResolutionError> {
     resolver.exit_scope();
 
     // Back to outer scope - inner should not be visible
-    let err = resolver.resolve_expr(var_expr("inner")).unwrap_err();
-    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "inner"));
+    let res = resolver.resolve_expr(var_expr("inner"));
+    assert!(matches!(res.kind, ResolvedExprKind::Error));
+    assert_eq!(resolver.errors.len(), 1);
+    assert!(
+        matches!(resolver.errors[0], ResolutionError::NameNotFound(ref name, _) if name == "inner")
+    );
 
     // But outer should still be visible
-    let res_outer = resolver.resolve_expr(var_expr("outer"))?;
+    let res_outer = resolver.resolve_expr(var_expr("outer"));
     match res_outer.kind {
         ResolvedExprKind::Var(id, _) => assert_eq!(id, outer_id),
         _ => panic!("expected Var"),
     }
 
     resolver.exit_scope();
-    Ok(())
 }
 
 #[test]
-fn test_list_literal_resolution() -> Result<(), ResolutionError> {
+fn test_list_literal_resolution() {
     let mut resolver = Resolver::new();
 
     let list = expr(ExprKind::ListLit(vec![int_lit(1), int_lit(2), int_lit(3)]));
 
-    let res = resolver.resolve_expr(list)?;
+    let res = resolver.resolve_expr(list);
     match res.kind {
         ResolvedExprKind::ListLit(items) => {
             assert_eq!(items.len(), 3);
@@ -453,12 +470,10 @@ fn test_list_literal_resolution() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected ListLit"),
     }
-
-    Ok(())
 }
 
 #[test]
-fn test_map_literal_resolution() -> Result<(), ResolutionError> {
+fn test_map_literal_resolution() {
     let mut resolver = Resolver::new();
 
     let map = expr(ExprKind::MapLit(vec![
@@ -466,19 +481,17 @@ fn test_map_literal_resolution() -> Result<(), ResolutionError> {
         (str_lit("b"), int_lit(2)),
     ]));
 
-    let res = resolver.resolve_expr(map)?;
+    let res = resolver.resolve_expr(map);
     match res.kind {
         ResolvedExprKind::MapLit(pairs) => {
             assert_eq!(pairs.len(), 2);
         }
         _ => panic!("expected MapLit"),
     }
-
-    Ok(())
 }
 
 #[test]
-fn test_resolve_variant_literal() -> Result<(), ResolutionError> {
+fn test_resolve_variant_literal() {
     let mut resolver = Resolver::new();
 
     // Declare Enum type "E"
@@ -487,7 +500,7 @@ fn test_resolve_variant_literal() -> Result<(), ResolutionError> {
     // Case 1: Unambiguous VariantLit (already parsed as VariantLit)
     // E.V1
     let expr1 = variant_lit("E", "V1", None);
-    let res1 = resolver.resolve_expr(expr1)?;
+    let res1 = resolver.resolve_expr(expr1);
     match res1.kind {
         ResolvedExprKind::VariantLit(type_id, variant_name, payload) => {
             assert_eq!(type_id, enum_id);
@@ -496,12 +509,10 @@ fn test_resolve_variant_literal() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected VariantLit"),
     }
-
-    Ok(())
 }
 
 #[test]
-fn test_resolve_ambiguous_variant_literal() -> Result<(), ResolutionError> {
+fn test_resolve_ambiguous_variant_literal() {
     let mut resolver = Resolver::new();
 
     // Declare Enum type "E"
@@ -510,7 +521,7 @@ fn test_resolve_ambiguous_variant_literal() -> Result<(), ResolutionError> {
     // Case 2: Ambiguous NamedDotAccess resolving to VariantLit
     // E.V1, where E is a Type
     let expr1 = named_dot("E", "V1", None);
-    let res1 = resolver.resolve_expr(expr1)?;
+    let res1 = resolver.resolve_expr(expr1);
     match res1.kind {
         ResolvedExprKind::VariantLit(type_id, variant_name, payload) => {
             assert_eq!(type_id, enum_id);
@@ -519,21 +530,19 @@ fn test_resolve_ambiguous_variant_literal() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected VariantLit"),
     }
-
-    Ok(())
 }
 
 #[test]
-fn test_resolve_ambiguous_field_access() -> Result<(), ResolutionError> {
+fn test_resolve_ambiguous_field_access() {
     let mut resolver = Resolver::new();
 
     // Declare variable "x"
-    let var_id = resolver.declare_var("x", dummy_span())?;
+    let var_id = resolver.declare_var("x", dummy_span());
 
     // Case 3: Ambiguous NamedDotAccess resolving to FieldAccess
     // x.f, where x is a variable
     let expr1 = named_dot("x", "f", None);
-    let res1 = resolver.resolve_expr(expr1)?;
+    let res1 = resolver.resolve_expr(expr1);
     match res1.kind {
         ResolvedExprKind::FieldAccess(target, field_name) => {
             match target.kind {
@@ -544,8 +553,6 @@ fn test_resolve_ambiguous_field_access() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected FieldAccess"),
     }
-
-    Ok(())
 }
 
 #[test]
@@ -554,31 +561,38 @@ fn test_resolve_ambiguous_error_unknown_base() {
 
     // Unknown.f
     let expr1 = named_dot("Unknown", "f", None);
-    let err = resolver.resolve_expr(expr1).unwrap_err();
+    let res = resolver.resolve_expr(expr1);
 
     // Should fail as NameNotFound (neither type nor variable)
-    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "Unknown"));
+    assert!(matches!(res.kind, ResolvedExprKind::Error));
+    assert_eq!(resolver.errors.len(), 1);
+    assert!(
+        matches!(resolver.errors[0], ResolutionError::NameNotFound(ref name, _) if name == "Unknown")
+    );
 }
 
 #[test]
-fn test_resolve_ambiguous_error_field_access_with_payload() -> Result<(), ResolutionError> {
+fn test_resolve_ambiguous_error_field_access_with_payload() {
     let mut resolver = Resolver::new();
 
     // Declare variable "x"
-    resolver.declare_var("x", dummy_span())?;
+    resolver.declare_var("x", dummy_span());
 
     let expr1 = named_dot("x", "f", Some(int_lit(42)));
-    let err = resolver.resolve_expr(expr1).unwrap_err();
-    assert!(matches!(err, ResolutionError::NameNotFound(name, _) if name == "x"));
+    let res = resolver.resolve_expr(expr1);
 
-    Ok(())
+    assert!(matches!(res.kind, ResolvedExprKind::Error));
+    assert_eq!(resolver.errors.len(), 1);
+    assert!(
+        matches!(resolver.errors[0], ResolutionError::NameNotFound(ref name, _) if name == "x")
+    );
 }
 
 #[test]
-fn test_resolve_match_expression() -> Result<(), ResolutionError> {
+fn test_resolve_match_expression() {
     let mut resolver = Resolver::new();
     let enum_id = resolver.declare_test_type("E");
-    let var_id = resolver.declare_var("x", dummy_span())?;
+    let var_id = resolver.declare_var("x", dummy_span());
 
     let match_expr = ExprKind::Match(
         Box::new(var_expr("x")),
@@ -592,7 +606,7 @@ fn test_resolve_match_expression() -> Result<(), ResolutionError> {
         }],
     );
 
-    let res = resolver.resolve_expr(expr(match_expr))?;
+    let res = resolver.resolve_expr(expr(match_expr));
     match res.kind {
         ResolvedExprKind::Match(scrutinee, arms) => {
             match scrutinee.kind {
@@ -611,6 +625,4 @@ fn test_resolve_match_expression() -> Result<(), ResolutionError> {
         }
         _ => panic!("expected Match"),
     }
-
-    Ok(())
 }

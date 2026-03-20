@@ -588,6 +588,13 @@ impl TypeChecker {
                 };
                 Ok((typed_stmt, false))
             }
+            ResolvedStatementKind::Error => Ok((
+                TypedStatement {
+                    kind: TypedStatementKind::Error,
+                    span,
+                },
+                false,
+            )),
         }
     }
 
@@ -1645,6 +1652,11 @@ impl TypeChecker {
             ResolvedExprKind::StructLit(struct_id, fields) => {
                 self.check_struct_literal(struct_id, fields, span)
             }
+            ResolvedExprKind::Error => Ok(TypedExpr {
+                kind: TypedExprKind::Error,
+                ty: Type::Error,
+                span,
+            }),
             ResolvedExprKind::RpcCall(target, call) => {
                 let typed_target = self.infer_expr(*target)?;
                 let role_id = match &typed_target.ty {
@@ -1705,6 +1717,11 @@ impl TypeChecker {
         expected: &Type,
     ) -> Result<TypedExpr, TypeError> {
         let actual = &typed_expr.ty;
+
+        // Error types are compatible with anything — suppress cascading errors
+        if matches!(expected, Type::Error) || matches!(actual, Type::Error) {
+            return Ok(typed_expr);
+        }
 
         if actual == expected {
             return Ok(typed_expr);
@@ -2255,6 +2272,11 @@ impl TypeChecker {
         actual: &Type,
         span: Span,
     ) -> Result<(), TypeError> {
+        // Error types are compatible with anything — suppress cascading errors
+        if matches!(expected, Type::Error) || matches!(actual, Type::Error) {
+            return Ok(());
+        }
+
         if expected == actual {
             return Ok(());
         }

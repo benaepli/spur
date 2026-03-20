@@ -23,6 +23,7 @@ pub enum Type {
     UnknownChannel,
     Nil,
     Never, // For diverging expressions (return, break, etc.)
+    Error, // Unknown type due to earlier error — unifies with anything
 }
 
 impl std::fmt::Display for Type {
@@ -51,6 +52,7 @@ impl std::fmt::Display for Type {
             Type::UnknownChannel => write!(f, "unknown channel"),
             Type::Nil => write!(f, "nil"),
             Type::Never => write!(f, "!"),
+            Type::Error => write!(f, "<error>"),
         }
     }
 }
@@ -113,6 +115,7 @@ pub enum TypedExprKind {
     PersistData(Box<TypedExpr>),
     RetrieveData(Type),
     DiscardData,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +157,7 @@ pub enum TypedStatementKind {
     ForInLoop(TypedForInLoop),
     Break,
     Continue,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq)]

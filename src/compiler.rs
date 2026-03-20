@@ -77,14 +77,11 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
 
     let resolver = Resolver::new();
     let prepopulated_types = resolver.get_pre_populated_types().clone();
-    let resolved = match resolver.resolve_program(parsed) {
-        Err(e) => {
-            let _ = report_resolution_errors(input, &[e.clone()], name);
-            result.resolution_errors.push(e);
-            return result;
-        }
-        Ok(r) => r,
-    };
+    let (resolved, resolution_errors) = resolver.resolve_program(parsed);
+    if !resolution_errors.is_empty() {
+        let _ = report_resolution_errors(input, &resolution_errors, name);
+    }
+    result.resolution_errors = resolution_errors;
 
     let mut type_checker = TypeChecker::new(prepopulated_types);
     let typed = match type_checker.check_program(resolved.clone()) {

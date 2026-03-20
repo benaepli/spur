@@ -718,6 +718,7 @@ impl Compiler {
             }
             TypedStatementKind::Break => {}
             TypedStatementKind::Continue => {}
+            TypedStatementKind::Error => {}
         }
     }
 
@@ -811,6 +812,7 @@ impl Compiler {
                 }
             }
             Var(_, _) | IntLit(_) | StringLit(_) | BoolLit(_) | NilLit | SetTimer => {}
+            Error => {}
         }
     }
 
@@ -954,6 +956,9 @@ impl Compiler {
             }
             TypedStatementKind::Break => self.add_label(Label::Break(break_target)),
             TypedStatementKind::Continue => self.add_label(Label::Continue(continue_target)),
+            TypedStatementKind::Error => {
+                unreachable!("Error statements should not reach CFG generation")
+            }
         };
 
         // Restore previous span
@@ -2512,6 +2517,9 @@ impl Compiler {
             }
             TypedExprKind::TupleLit(items) => {
                 Expr::Tuple(items.iter().map(|e| self.convert_simple_expr(e)).collect())
+            }
+            TypedExprKind::Error => {
+                unreachable!("Error expressions should not reach CFG generation")
             }
             // Desugar: `append(l, i)` -> `EListAppend(l, i)`
             TypedExprKind::Append(l, i) => Expr::ListAppend(

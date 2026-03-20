@@ -99,7 +99,8 @@ fn register_type(ty: &Type, map: &mut TypeIdMap, next_id: &mut u32) {
         | Type::EmptyMap
         | Type::UnknownChannel
         | Type::Nil
-        | Type::Never => {}
+        | Type::Never
+        | Type::Error => {}
     }
 }
 
@@ -174,6 +175,7 @@ fn register_stmt(stmt: &TypedStatement, map: &mut TypeIdMap, next_id: &mut u32) 
             register_body(&fl.body, map, next_id);
         }
         TypedStatementKind::Break | TypedStatementKind::Continue => {}
+        TypedStatementKind::Error => {}
     }
 }
 
@@ -269,7 +271,8 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
         | TypedExprKind::NilLit
         | TypedExprKind::MakeChannel
         | TypedExprKind::SetTimer
-        | TypedExprKind::DiscardData => {}
+        | TypedExprKind::DiscardData
+        | TypedExprKind::Error => {}
     }
 }
 
