@@ -6,14 +6,14 @@ use crate::analysis::resolver::{ResolutionError, Resolver};
 use crate::analysis::{trivially_copyable, type_id};
 use crate::compiler::cfg::Compiler as CfgCompiler;
 use crate::lexer::{LexError, Lexer};
-use crate::parser::parse_program;
+use crate::parser::{ParseError, parse_program};
 use crate::{lexer, parser};
 
 /// Result of compilation that always carries diagnostics and optionally a program.
 pub struct CompileResult {
     pub program: Option<cfg::Program>,
     pub lex_errors: Vec<LexError>,
-    pub parse_errors: Vec<String>,
+    pub parse_errors: Vec<ParseError>,
     pub resolution_errors: Vec<ResolutionError>,
     pub type_errors: Vec<TypeError>,
 }
@@ -33,7 +33,7 @@ impl CompileResult {
             return Err(self.lex_errors[0].clone().into());
         }
         if !self.parse_errors.is_empty() {
-            return Err(anyhow::anyhow!("{}", self.parse_errors[0]));
+            return Err(anyhow::anyhow!("{}", self.parse_errors[0].message));
         }
         if !self.resolution_errors.is_empty() {
             return Err(anyhow::anyhow!(
@@ -68,7 +68,10 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     let parsed = parse_program(&lexed);
     if parsed.has_errors() {
         let _ = parser::format::report_errors(input, parsed.errors(), name);
-        result.parse_errors = parsed.errors().map(|e| e.to_string()).collect();
+        result.parse_errors = parsed.errors().map(|e| ParseError {
+            message: e.to_string(),
+            span: *e.span(),
+        }).collect();
     }
     let parsed = match parsed.into_output() {
         None => return result,

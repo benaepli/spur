@@ -8,6 +8,18 @@ use chumsky::span::SimpleSpan;
 pub type Span = SimpleSpan<usize>;
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ParseError {
+    pub message: String,
+    pub span: Span,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub top_level_defs: Vec<TopLevelDef>,
     pub span: Span,

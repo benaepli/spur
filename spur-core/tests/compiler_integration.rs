@@ -29,7 +29,7 @@ fn test_all_spec_files_compile() -> anyhow::Result<()> {
             .contents_utf8()
             .context(format!("Failed to read {} as UTF-8", file_name))?;
 
-        spur::compiler::compile(source, file_name)
+        spur_core::compiler::compile(source, file_name)
             .into_program()
             .context(format!("Failed to compile {}", file_name))?;
     }

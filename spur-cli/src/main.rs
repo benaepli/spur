@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use spur::compiler;
-use spur::debug::SimulatorDebugger;
-use spur::simulator::explorer::{run_explorer, run_explorer_genetic, run_plan};
-use spur::simulator::history::LogBackend;
-use spur::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
+use spur_core::compiler;
+use spur_core::debug::SimulatorDebugger;
+use spur_core::simulator::explorer::{run_explorer, run_explorer_genetic, run_plan};
+use spur_core::simulator::history::LogBackend;
+use spur_core::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
