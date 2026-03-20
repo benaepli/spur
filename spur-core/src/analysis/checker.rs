@@ -1,18 +1,18 @@
 use crate::analysis::resolver::{
-    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedCondStmts, ResolvedExpr,
-    ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall, ResolvedFuncDef,
-    ResolvedPattern, ResolvedPatternKind, ResolvedProgram, ResolvedRoleDef, ResolvedStatement,
-    ResolvedStatementKind, ResolvedTopLevelDef, ResolvedTypeDef, ResolvedTypeDefStmtKind,
-    ResolvedUserFuncCall, ResolvedVarInit,
+    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedBlock, ResolvedCondExpr,
+    ResolvedExpr, ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall,
+    ResolvedFuncDef, ResolvedPattern, ResolvedPatternKind, ResolvedProgram, ResolvedRoleDef,
+    ResolvedStatement, ResolvedStatementKind, ResolvedTopLevelDef, ResolvedTypeDef,
+    ResolvedTypeDefStmtKind, ResolvedUserFuncCall, ResolvedVarInit,
 };
 use crate::analysis::trivially_copyable::{
     TriviallyCopyableMap, compute_trivially_copyable, is_trivially_copyable,
 };
 use crate::analysis::types::{
-    Type, TypedAssignment, TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop,
-    TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam, TypedIfBranch, TypedMatchArm,
-    TypedPattern, TypedPatternKind, TypedProgram, TypedRoleDef, TypedStatement, TypedStatementKind,
-    TypedTopLevelDef, TypedUserFuncCall, TypedVarInit, TypedVarTarget,
+    Type, TypedAssignment, TypedBlock, TypedCondExpr, TypedExpr, TypedExprKind, TypedForInLoop,
+    TypedForLoop, TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam, TypedIfBranch,
+    TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram, TypedRoleDef, TypedStatement,
+    TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit, TypedVarTarget,
 };
 use crate::parser::{BinOp, Span};
 use chumsky::span::Span as ChumskySpan;
@@ -479,7 +479,8 @@ impl TypeChecker {
             });
         }
 
-        let (typed_body, has_return) = self.check_block(func.body);
+        let typed_body = self.check_block(func.body);
+        let has_return = typed_body.statements.iter().any(|s| matches!(s.kind, TypedStatementKind::Return(_)));
 
         if sig.return_type != Type::Tuple(vec![]) && !has_return {
             self.emit(TypeError::MissingReturn(func.span));
@@ -580,14 +581,6 @@ impl TypeChecker {
     ) -> (TypedStatement, bool) {
         let span = stmt.span;
         match stmt.kind {
-            ResolvedStatementKind::Conditional(cond) => {
-                let (typed_cond, returns) = self.check_conditional(cond);
-                let typed_stmt = TypedStatement {
-                    kind: TypedStatementKind::Conditional(typed_cond),
-                    span,
-                };
-                (typed_stmt, returns)
-            }
             ResolvedStatementKind::VarInit(var_init) => {
                 let typed_var_init = self.check_var_init(var_init);
                 let typed_stmt = TypedStatement {
@@ -671,7 +664,7 @@ impl TypeChecker {
         }
     }
 
-    fn check_block(
+    fn check_tailless_block(
         &mut self,
         block: Vec<ResolvedStatement>,
     ) -> (Vec<TypedStatement>, bool) {
@@ -689,51 +682,64 @@ impl TypeChecker {
         (typed_stmts, has_return)
     }
 
-    fn check_conditional(
-        &mut self,
-        cond: ResolvedCondStmts,
-    ) -> (TypedCondStmts, bool) {
+    fn check_block(&mut self, block: ResolvedBlock) -> TypedBlock {
+        self.enter_scope();
+        let mut typed_stmts = Vec::new();
+        for stmt in block.statements {
+            let (typed_stmt, _) = self.check_statement(stmt);
+            typed_stmts.push(typed_stmt);
+        }
+        let (tail_expr, block_ty) = if let Some(tail) = block.tail_expr {
+            let typed_tail = self.infer_expr(*tail);
+            let ty = typed_tail.ty.clone();
+            (Some(Box::new(typed_tail)), ty)
+        } else {
+            (None, Type::Tuple(vec![]))
+        };
+        self.exit_scope();
+        TypedBlock {
+            statements: typed_stmts,
+            tail_expr,
+            ty: block_ty,
+            span: block.span,
+        }
+    }
+
+    fn check_conditional(&mut self, cond: ResolvedCondExpr, span: Span) -> TypedExpr {
         let typed_if_cond = self.check_expr(cond.if_branch.condition, &Type::Bool);
-        let (typed_if_body, if_returns) = self.check_block(cond.if_branch.body);
+        let typed_if_body = self.check_block(cond.if_branch.body);
+        let if_ty = typed_if_body.ty.clone();
         let typed_if_branch = TypedIfBranch {
             condition: typed_if_cond,
             body: typed_if_body,
             span: cond.if_branch.span,
         };
 
-        let mut all_branches_return = if_returns;
         let mut typed_elseif_branches = Vec::new();
         for elseif in cond.elseif_branches {
             let typed_elseif_cond = self.check_expr(elseif.condition, &Type::Bool);
-            let (typed_elseif_body, elseif_returns) = self.check_block(elseif.body);
-
+            let typed_elseif_body = self.check_block(elseif.body);
             typed_elseif_branches.push(TypedIfBranch {
                 condition: typed_elseif_cond,
                 body: typed_elseif_body,
                 span: elseif.span,
             });
-            all_branches_return = all_branches_return && elseif_returns;
         }
 
-        let typed_else_branch;
-        if let Some(else_body) = cond.else_branch {
-            let (typed_body, else_returns) = self.check_block(else_body);
-            typed_else_branch = Some(typed_body);
-            all_branches_return = all_branches_return && else_returns;
-        } else {
-            typed_else_branch = None;
-            all_branches_return = false;
-        }
+        let typed_else_branch = cond.else_branch.map(|b| self.check_block(b));
 
-        (
-            TypedCondStmts {
+        let cond_ty = if typed_else_branch.is_some() { if_ty } else { Type::Tuple(vec![]) };
+
+        TypedExpr {
+            kind: TypedExprKind::Conditional(Box::new(TypedCondExpr {
                 if_branch: typed_if_branch,
                 elseif_branches: typed_elseif_branches,
                 else_branch: typed_else_branch,
                 span: cond.span,
-            },
-            all_branches_return,
-        )
+            })),
+            ty: cond_ty,
+            span,
+        }
     }
 
     fn check_for_loop(&mut self, for_loop: ResolvedForLoop) -> TypedForLoop {
@@ -1141,44 +1147,20 @@ impl TypeChecker {
         for arm in arms {
             self.enter_scope();
             let typed_pattern = self.check_pattern(arm.pattern, &scrutinee_ty);
-
-            let mut typed_body = Vec::new();
-            let mut arm_diverges = false;
-
-            for stmt in arm.body {
-                let (typed_stmt, stmt_returns) = self.check_statement(stmt);
-                typed_body.push(typed_stmt);
-                if stmt_returns {
-                    arm_diverges = true;
-                }
-            }
-
-            // Determine type of the arm if it doesn't diverge
-            let arm_ty = if arm_diverges {
-                None
-            } else if let Some(last_stmt) = typed_body.last() {
-                match &last_stmt.kind {
-                    TypedStatementKind::Expr(e) => Some(e.ty.clone()),
-                    _ => Some(Type::Tuple(vec![])),
-                }
-            } else {
-                Some(Type::Tuple(vec![]))
-            };
-
+            let typed_body = self.check_block(arm.body);
+            let arm_ty = typed_body.ty.clone();
             self.exit_scope();
 
-            if let Some(ty) = arm_ty {
-                if let Some(prev_ty) = &match_ty {
-                    if *prev_ty != ty && !matches!(prev_ty, Type::Error) && !matches!(ty, Type::Error) {
-                        self.emit(TypeError::MatchArmTypeMismatch {
-                            expected: prev_ty.clone(),
-                            found: ty,
-                            span: arm.span,
-                        });
-                    }
-                } else {
-                    match_ty = Some(ty);
+            if let Some(prev_ty) = &match_ty {
+                if *prev_ty != arm_ty && !matches!(prev_ty, Type::Error) && !matches!(arm_ty, Type::Error) {
+                    self.emit(TypeError::MatchArmTypeMismatch {
+                        expected: prev_ty.clone(),
+                        found: arm_ty,
+                        span: arm.span,
+                    });
                 }
+            } else {
+                match_ty = Some(arm_ty);
             }
 
             typed_arms.push(TypedMatchArm {
@@ -1416,6 +1398,7 @@ impl TypeChecker {
                 self.check_variant_lit(enum_id, variant_name, payload, span)
             }
             ResolvedExprKind::Match(scrutinee, arms) => self.check_match(*scrutinee, arms, span),
+            ResolvedExprKind::Conditional(cond) => self.check_conditional(*cond, span),
             ResolvedExprKind::FuncCall(call) => match call {
                 ResolvedFuncCall::User(user_call) => {
                     let sig = match self.func_signatures.get(&user_call.name) {

@@ -2,9 +2,9 @@
 mod test;
 
 use crate::analysis::types::{
-    Type, TypedExpr, TypedExprKind, TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern,
-    TypedPatternKind, TypedProgram, TypedStatement, TypedStatementKind, TypedTopLevelDef,
-    TypedVarInit, TypedVarTarget,
+    Type, TypedBlock, TypedExpr, TypedExprKind, TypedFuncCall, TypedFuncDef, TypedMatchArm,
+    TypedPattern, TypedPatternKind, TypedProgram, TypedStatement, TypedStatementKind,
+    TypedTopLevelDef, TypedVarInit, TypedVarTarget,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -118,10 +118,20 @@ fn register_func_def(func: &TypedFuncDef, map: &mut TypeIdMap, next_id: &mut u32
         register_type(&param.ty, map, next_id);
     }
     register_type(&func.return_type, map, next_id);
-    register_body(&func.body, map, next_id);
+    register_block(&func.body, map, next_id);
 }
 
-fn register_body(body: &[TypedStatement], map: &mut TypeIdMap, next_id: &mut u32) {
+fn register_block(block: &TypedBlock, map: &mut TypeIdMap, next_id: &mut u32) {
+    register_type(&block.ty, map, next_id);
+    for stmt in &block.statements {
+        register_stmt(stmt, map, next_id);
+    }
+    if let Some(tail) = &block.tail_expr {
+        register_expr(tail, map, next_id);
+    }
+}
+
+fn register_tailless_body(body: &[TypedStatement], map: &mut TypeIdMap, next_id: &mut u32) {
     for stmt in body {
         register_stmt(stmt, map, next_id);
     }
@@ -142,17 +152,6 @@ fn register_stmt(stmt: &TypedStatement, map: &mut TypeIdMap, next_id: &mut u32) 
         TypedStatementKind::Return(expr) => {
             register_expr(expr, map, next_id);
         }
-        TypedStatementKind::Conditional(cond) => {
-            register_expr(&cond.if_branch.condition, map, next_id);
-            register_body(&cond.if_branch.body, map, next_id);
-            for branch in &cond.elseif_branches {
-                register_expr(&branch.condition, map, next_id);
-                register_body(&branch.body, map, next_id);
-            }
-            if let Some(body) = &cond.else_branch {
-                register_body(body, map, next_id);
-            }
-        }
         TypedStatementKind::ForLoop(fl) => {
             match &fl.init {
                 Some(crate::analysis::types::TypedForLoopInit::VarInit(init)) => {
@@ -171,12 +170,12 @@ fn register_stmt(stmt: &TypedStatement, map: &mut TypeIdMap, next_id: &mut u32) 
                 register_expr(&inc.target, map, next_id);
                 register_expr(&inc.value, map, next_id);
             }
-            register_body(&fl.body, map, next_id);
+            register_tailless_body(&fl.body, map, next_id);
         }
         TypedStatementKind::ForInLoop(fl) => {
             register_pattern(&fl.pattern, map, next_id);
             register_expr(&fl.iterable, map, next_id);
-            register_body(&fl.body, map, next_id);
+            register_tailless_body(&fl.body, map, next_id);
         }
         TypedStatementKind::Break | TypedStatementKind::Continue => {}
         TypedStatementKind::Error => {}
@@ -258,6 +257,17 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
                 register_match_arm(arm, map, next_id);
             }
         }
+        TypedExprKind::Conditional(cond) => {
+            register_expr(&cond.if_branch.condition, map, next_id);
+            register_block(&cond.if_branch.body, map, next_id);
+            for branch in &cond.elseif_branches {
+                register_expr(&branch.condition, map, next_id);
+                register_block(&branch.body, map, next_id);
+            }
+            if let Some(else_block) = &cond.else_branch {
+                register_block(else_block, map, next_id);
+            }
+        }
         TypedExprKind::VariantLit(_, _, payload) => {
             if let Some(p) = payload {
                 register_expr(p, map, next_id);
@@ -285,7 +295,7 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
 
 fn register_match_arm(arm: &TypedMatchArm, map: &mut TypeIdMap, next_id: &mut u32) {
     register_pattern(&arm.pattern, map, next_id);
-    register_body(&arm.body, map, next_id);
+    register_block(&arm.body, map, next_id);
 }
 
 fn register_pattern(pat: &TypedPattern, map: &mut TypeIdMap, next_id: &mut u32) {

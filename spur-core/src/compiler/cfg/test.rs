@@ -47,6 +47,15 @@ fn dummy_ctx() -> CompileCtx {
     }
 }
 
+fn make_block(statements: Vec<TypedStatement>, tail_expr: Option<TypedExpr>) -> TypedBlock {
+    TypedBlock {
+        statements,
+        tail_expr: tail_expr.map(Box::new),
+        ty: Type::Nil,
+        span: dummy_span(),
+    }
+}
+
 #[test]
 fn test_compile_simple_literals() {
     let mut compiler = Compiler::new();
@@ -229,44 +238,26 @@ fn test_compile_assignment() {
 fn test_compile_if_statement() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
+    let target = dummy_target();
     let next = dummy_vertex();
 
-    let var_name = id(10);
-    compiler.alloc_local_slot(var_name, "x", Expr::Nil);
-
-    let stmt = TypedStatement {
-        kind: TypedStatementKind::Conditional(TypedCondStmts {
+    let cond_expr = typed_expr(
+        TypedExprKind::Conditional(Box::new(TypedCondExpr {
             if_branch: TypedIfBranch {
                 condition: bool_lit(true),
-                body: vec![TypedStatement {
-                    kind: TypedStatementKind::Assignment(TypedAssignment {
-                        target: typed_expr(
-                            TypedExprKind::Var(var_name, "x".to_string()),
-                            Type::Int,
-                        ),
-                        value: int_lit(1),
-                        span: dummy_span(),
-                    }),
-                    span: dummy_span(),
-                }],
+                body: make_block(vec![], Some(int_lit(1))),
                 span: dummy_span(),
             },
             elseif_branches: vec![],
-            else_branch: Some(vec![TypedStatement {
-                kind: TypedStatementKind::Assignment(TypedAssignment {
-                    target: typed_expr(TypedExprKind::Var(var_name, "x".to_string()), Type::Int),
-                    value: int_lit(2),
-                    span: dummy_span(),
-                }),
-                span: dummy_span(),
-            }]),
+            else_branch: Some(make_block(vec![], Some(int_lit(2)))),
             span: dummy_span(),
-        }),
-        span: dummy_span(),
-    };
+        })),
+        Type::Int,
+    );
 
-    let entry = compiler.compile_statement(
-        &stmt,
+    let entry = compiler.compile_expr_to_value(
+        &cond_expr,
+        target.clone(),
         next,
         dummy_ctx(),
     );
@@ -488,67 +479,49 @@ fn test_compile_empty_map() {
 fn test_compile_nested_if_statements() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
+    let target = dummy_target();
     let next = dummy_vertex();
 
-    let var_name = id(10);
-    compiler.alloc_local_slot(var_name, "x", Expr::Nil);
-
-    // Nested if: if (true) { if (false) { x = 1 } else { x = 2 } }
-    let inner_if = TypedStatement {
-        kind: TypedStatementKind::Conditional(TypedCondStmts {
+    // Nested if: if true { if false { 1 } else { 2 } } else { 3 }
+    let inner_cond = typed_expr(
+        TypedExprKind::Conditional(Box::new(TypedCondExpr {
             if_branch: TypedIfBranch {
                 condition: bool_lit(false),
-                body: vec![TypedStatement {
-                    kind: TypedStatementKind::Assignment(TypedAssignment {
-                        target: typed_expr(
-                            TypedExprKind::Var(var_name, "x".to_string()),
-                            Type::Int,
-                        ),
-                        value: int_lit(1),
-                        span: dummy_span(),
-                    }),
-                    span: dummy_span(),
-                }],
+                body: make_block(vec![], Some(int_lit(1))),
                 span: dummy_span(),
             },
             elseif_branches: vec![],
-            else_branch: Some(vec![TypedStatement {
-                kind: TypedStatementKind::Assignment(TypedAssignment {
-                    target: typed_expr(TypedExprKind::Var(var_name, "x".to_string()), Type::Int),
-                    value: int_lit(2),
-                    span: dummy_span(),
-                }),
-                span: dummy_span(),
-            }]),
+            else_branch: Some(make_block(vec![], Some(int_lit(2)))),
             span: dummy_span(),
-        }),
-        span: dummy_span(),
-    };
+        })),
+        Type::Int,
+    );
 
-    let outer_if = TypedStatement {
-        kind: TypedStatementKind::Conditional(TypedCondStmts {
+    let outer_cond = typed_expr(
+        TypedExprKind::Conditional(Box::new(TypedCondExpr {
             if_branch: TypedIfBranch {
                 condition: bool_lit(true),
-                body: vec![inner_if],
+                body: make_block(vec![], Some(inner_cond)),
                 span: dummy_span(),
             },
             elseif_branches: vec![],
-            else_branch: None,
+            else_branch: Some(make_block(vec![], Some(int_lit(3)))),
             span: dummy_span(),
-        }),
-        span: dummy_span(),
-    };
+        })),
+        Type::Int,
+    );
 
-    let entry = compiler.compile_statement(
-        &outer_if,
+    let entry = compiler.compile_expr_to_value(
+        &outer_cond,
+        target,
         next,
         dummy_ctx(),
     );
 
     // Verify outer condition is compiled
-    let outer_cond = compiler.cfg.get(entry).expect("outer cond missing");
+    let outer_label = compiler.cfg.get(entry).expect("outer cond missing");
     assert!(matches!(
-        outer_cond,
+        outer_label,
         Label::Instr(Instr::Assign(_, Expr::Bool(true)), _)
     ));
 }
@@ -679,58 +652,30 @@ fn test_compile_empty_loop_body() {
 fn test_compile_elseif_chain() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
+    let target = dummy_target();
     let next = dummy_vertex();
 
-    let var_name = id(10);
-    compiler.alloc_local_slot(var_name, "x", Expr::Nil);
-
-    let stmt = TypedStatement {
-        kind: TypedStatementKind::Conditional(TypedCondStmts {
+    let cond_expr = typed_expr(
+        TypedExprKind::Conditional(Box::new(TypedCondExpr {
             if_branch: TypedIfBranch {
                 condition: bool_lit(false),
-                body: vec![TypedStatement {
-                    kind: TypedStatementKind::Assignment(TypedAssignment {
-                        target: typed_expr(
-                            TypedExprKind::Var(var_name, "x".to_string()),
-                            Type::Int,
-                        ),
-                        value: int_lit(1),
-                        span: dummy_span(),
-                    }),
-                    span: dummy_span(),
-                }],
+                body: make_block(vec![], Some(int_lit(1))),
                 span: dummy_span(),
             },
             elseif_branches: vec![TypedIfBranch {
                 condition: bool_lit(true),
-                body: vec![TypedStatement {
-                    kind: TypedStatementKind::Assignment(TypedAssignment {
-                        target: typed_expr(
-                            TypedExprKind::Var(var_name, "x".to_string()),
-                            Type::Int,
-                        ),
-                        value: int_lit(2),
-                        span: dummy_span(),
-                    }),
-                    span: dummy_span(),
-                }],
+                body: make_block(vec![], Some(int_lit(2))),
                 span: dummy_span(),
             }],
-            else_branch: Some(vec![TypedStatement {
-                kind: TypedStatementKind::Assignment(TypedAssignment {
-                    target: typed_expr(TypedExprKind::Var(var_name, "x".to_string()), Type::Int),
-                    value: int_lit(3),
-                    span: dummy_span(),
-                }),
-                span: dummy_span(),
-            }]),
+            else_branch: Some(make_block(vec![], Some(int_lit(3)))),
             span: dummy_span(),
-        }),
-        span: dummy_span(),
-    };
+        })),
+        Type::Int,
+    );
 
-    let entry = compiler.compile_statement(
-        &stmt,
+    let entry = compiler.compile_expr_to_value(
+        &cond_expr,
+        target,
         next,
         dummy_ctx(),
     );

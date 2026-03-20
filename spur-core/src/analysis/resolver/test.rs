@@ -203,15 +203,19 @@ fn test_resolve_duplicate_variable_same_scope() {
 fn test_resolve_block_scope() {
     let mut resolver = Resolver::new();
 
-    let block = vec![
-        var_init("x", int_lit(10)),
-        stmt(StatementKind::Expr(var_expr("x"))),
-    ];
+    let block = Block {
+        statements: vec![
+            var_init("x", int_lit(10)),
+            stmt(StatementKind::Expr(var_expr("x"))),
+        ],
+        tail_expr: None,
+        span: dummy_span(),
+    };
 
     let resolved_block = resolver.resolve_block(block);
-    assert_eq!(resolved_block.len(), 2);
+    assert_eq!(resolved_block.statements.len(), 2);
 
-    match &resolved_block[0].kind {
+    match &resolved_block.statements[0].kind {
         ResolvedStatementKind::VarInit(vi) => match &vi.target {
             ResolvedVarTarget::Name(_, name) => assert_eq!(name, "x"),
             _ => panic!("expected Name target"),
@@ -601,7 +605,11 @@ fn test_resolve_match_expression() {
                 kind: PatternKind::Variant("E".to_string(), "V1".to_string(), None),
                 span: dummy_span(),
             },
-            body: vec![stmt(StatementKind::Break)],
+            body: Block {
+                statements: vec![stmt(StatementKind::Break)],
+                tail_expr: None,
+                span: dummy_span(),
+            },
             span: dummy_span(),
         }],
     );

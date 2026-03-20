@@ -388,10 +388,11 @@ fn test_check_match_expression_valid() {
             kind: ResolvedPatternKind::Variant(enum_id, "V1".to_string(), None),
             span: dummy_span(),
         },
-        body: vec![ResolvedStatement {
-            kind: ResolvedStatementKind::Expr(int_lit(1)),
+        body: ResolvedBlock {
+            statements: vec![],
+            tail_expr: Some(Box::new(int_lit(1))),
             span: dummy_span(),
-        }],
+        },
         span: dummy_span(),
     };
 
@@ -407,10 +408,11 @@ fn test_check_match_expression_valid() {
             ),
             span: dummy_span(),
         },
-        body: vec![ResolvedStatement {
-            kind: ResolvedStatementKind::Expr(expr(ResolvedExprKind::Var(id(20), "x".to_string()))),
+        body: ResolvedBlock {
+            statements: vec![],
+            tail_expr: Some(Box::new(expr(ResolvedExprKind::Var(id(20), "x".to_string())))),
             span: dummy_span(),
-        }],
+        },
         span: dummy_span(),
     };
 
