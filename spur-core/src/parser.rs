@@ -1260,7 +1260,12 @@ where
             })
         });
 
-    let free_func = func_def.clone().map(TopLevelDef::FreeFunc);
+    let free_func = func_def.clone().validate(|func, e, emitter| {
+        if !func.is_sync {
+            emitter.emit(Rich::custom(e.span(), "free functions cannot be async"));
+        }
+        TopLevelDef::FreeFunc(func)
+    });
 
     let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type), free_func))
         .recover_with(skip_then_retry_until(
