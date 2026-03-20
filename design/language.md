@@ -3,73 +3,82 @@
 ## EBNF Grammar
 
 ```ebnf
-program ::= top_level_def* client_def EOF
+program ::= top_level_def* EOF
 
 top_level_def ::=
-role_def
-| type_def_stmt
+  role_def
+  | client_def
+  | type_def_stmt
+  | func_def
 
 role_def ::= 'role' ID '{' var_inits func_defs '}'
 client_def ::= 'ClientInterface' '{' var_inits func_defs '}'
 
 func_defs ::= ( func_def )*
-func_def ::= ( 'async' )? 'func' ID '(' func_params? ')' ( '->' type_def )? '{' statements '}'
+func_def ::= ( '@trace' )? ( 'async' )? 'func' ID '(' func_params? ')' ( '->' type_def )? '{' statements '}'
 
 func_call ::= ID '(' args? ')'
 args ::= expr ( ',' expr )* ','?
 
-var_inits ::= ( var_init ';' )*
-var_init ::= 'var' ID ( ':' type_def )? '=' expr
+var_inits ::= ( var_init ';'? )*
+var_init ::= 'var' var_target ( ':' type_def )? '=' expr
+var_target ::= ID | '(' ID ( ',' ID )* ','? ')'
 
 func_params ::= ID ':' type_def ( ',' ID ':' type_def )* ','?
 
 type_def_list ::= type_def ( ',' type_def )* ','?
 
-type_def_stmt ::= 'type' ID ( struct_body | type_alias ) ';'
+type_def_stmt ::= 'type' ID ( struct_body | enum_def | type_alias ) ';'?
 struct_body ::= '{' field_defs? '}'
 field_defs ::= field_def ( ';' field_def )* ';'?
 field_def ::= ID ':' type_def
+
+enum_def ::= 'enum' '{' enum_variants '}'
+enum_variant ::= ID ( '(' type_def ')' )?
+enum_variants ::= enum_variant ( ',' enum_variant )* ','?
 
 type_alias ::= '=' type_def
 
 type_def ::= base_type ( '?' )?
 
 base_type ::=
-ID
-| 'map' '<' type_def ',' type_def '>'
-| 'list' '<' type_def '>'
-| 'chan' '<' type_def '>'
-| 'lock'
-| '(' type_def_list? ')'
+  ID
+  | 'map' '<' type_def ',' type_def '>'
+  | 'list' '<' type_def '>'
+  | 'chan' '<' type_def '>'
+  | '(' type_def_list? ')'
 
 statements ::= statement*
 statement ::=
-cond_stmts
-| var_init ';'
-| assignment ';'
-| expr ';'
-| 'return' expr ';'
-| for_loop
-| for_in_loop
-| lock_stmt
-| 'break' ';'
+  cond_stmts
+  | for_loop
+  | for_in_loop
+  | simple_stmt ';'?
+
+simple_stmt ::=
+  var_init
+  | 'break'
+  | 'continue'
+  | 'return' expr?
+  | assignment
+  | expr
 
 cond_stmts ::= if_stmt ( else_if_stmt )* ( else_stmt )?
-if_stmt ::= 'if' '(' expr ')' '{' statements '}'
-else_if_stmt ::= 'else' 'if' '(' expr ')' '{' statements '}'
+if_stmt ::= 'if' expr '{' statements '}'
+else_if_stmt ::= 'else' 'if' expr '{' statements '}'
 else_stmt ::= 'else' '{' statements '}'
 
 for_loop ::= 'for' ( ( var_init | assignment )? ';' expr? ';' assignment? | expr | ) '{' statements '}'
 for_in_loop ::= 'for' pattern 'in' expr '{' statements '}'
-lock_stmt ::= 'lock' '(' expr ')' '{' statements '}'
 
 assignment ::= ID '=' expr
 
 pattern ::=
-ID
-| '_'
-| '(' ')'
-| '(' pattern_list ')'
+  ID '.' ID ( '(' pattern ')' )?
+  | ID
+  | '_'
+  | '(' ')'
+  | '(' pattern_list ')'
 
 pattern_list ::= pattern ( ',' pattern )* ','?
 
@@ -94,42 +103,57 @@ unary_expr ::= ( '!' | '-' | '<-' ) unary_expr | primary_expr
 primary_expr ::= primary_base postfix_op*
 
 primary_base ::=
-ID
-| 'true' | 'false' | 'nil'
-| literals
-| func_call
-| struct_literal
-| collection
-| list_ops
-| 'append' '(' expr ',' expr ')'
-| 'prepend' '(' expr ',' expr ')'
-| 'store' '(' expr ',' expr ',' expr ')'
-| 'min' '(' expr ',' expr ')'
-| 'exists' '(' expr ',' expr ')'
-| 'erase' '(' expr ',' expr ')'
-| 'make' '(' expr ')'
-| 'send' '(' expr ',' expr ')'
-| 'recv' '(' expr ')'
-| 'create_lock' '(' ')'
-| '(' expr ')'
+  'true' | 'false' | 'nil'
+  | literals
+  | func_call
+  | match_expr
+  | named_dot_access
+  | struct_literal
+  | collection
+  | list_ops
+  | 'append' '(' expr ',' expr ')'
+  | 'prepend' '(' expr ',' expr ')'
+  | 'store' '(' expr ',' expr ',' expr ')'
+  | 'min' '(' expr ',' expr ')'
+  | 'exists' '(' expr ',' expr ')'
+  | 'erase' '(' expr ',' expr ')'
+  | 'persist_data' '(' expr ')'
+  | 'retrieve_data' '<' type_def '>' '(' ')'
+  | 'discard_data' '(' ')'
+  | 'make' '(' ')'
+  | 'send' '(' expr ',' expr ')'
+  | 'recv' '(' expr ')'
+  | 'set_timer' '(' ')'
+  | ID
+  | '(' expr ')'
 
 postfix_op ::=
-'[' expr ']'
-| '[' expr ':' expr ']'
-| '.' INT
-| '.' ID
-| '!'
-| '->' func_call
-| ':=' expr
+  '[' expr ']'
+  | '[' expr ':' expr ']'
+  | '.' INT
+  | '.' ID
+  | '?.' INT
+  | '?.' ID
+  | '?' '[' expr ']'
+  | '!'
+  | '->' func_call
+  | ':=' expr
 
-literals ::= STRING | INT
+match_expr ::= 'match' expr '{' match_arms '}'
+match_arms ::= match_arm ( ',' match_arm )* ','?
+match_arm ::= pattern '=>' ( '{' statements '}' | expr )
+
+named_dot_access ::= ID '.' ID ( '(' expr ')' )?
+
+literals ::= STRING | INT | fstring
+fstring ::= FSTRING_START ( expr FSTRING_PART )* expr FSTRING_END
 
 collection ::= '{' kv_pairs? '}' | list_lit | tuple_lit
 kv_pairs ::= ( expr ':' expr ) ( ',' expr ':' expr )* ','?
 
 tuple_lit ::=
-'(' ')'
-| '(' expr ',' items? ')'
+  '(' ')'
+  | '(' expr ',' items? ')'
 
 items ::= expr ( ',' expr )* ','?
 list_lit ::= '[' items? ']'
@@ -150,7 +174,7 @@ The type system is composed of:
 - Primitives: `int`, `string`, `bool`
 - Tuples and the unit type: `()`, `(T)`, `(T, U)`, etc.
 - Collections: `list<T>`, `map<K, V>`
-- Concurrency: `chan<T>` and `lock`
+- Concurrency: `chan<T>`
 - Optional types: `T?`, which can be either `nil` or a value of type `T`
 
 ## Reference and Value Semantics
@@ -247,10 +271,10 @@ var msg_chan: chan<string>;
 
 #### Creating Channels
 
-Use the `make()` function to create a new channel with a specified buffer size:
+Use the `make()` function to create a new channel:
 
 ```
-var ch = make(10);  // Creates a channel with buffer size 10
+var ch = make();
 ```
 
 #### Sending Values

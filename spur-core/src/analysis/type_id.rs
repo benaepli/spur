@@ -2,9 +2,9 @@
 mod test;
 
 use crate::analysis::types::{
-    Type, TypedExpr, TypedExprKind, TypedFuncCall, TypedMatchArm, TypedPattern, TypedPatternKind,
-    TypedProgram, TypedStatement, TypedStatementKind, TypedTopLevelDef, TypedVarInit,
-    TypedVarTarget,
+    Type, TypedExpr, TypedExprKind, TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern,
+    TypedPatternKind, TypedProgram, TypedStatement, TypedStatementKind, TypedTopLevelDef,
+    TypedVarInit, TypedVarTarget,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -50,15 +50,11 @@ pub fn assign_type_ids(program: &TypedProgram) -> TypeIdMap {
                     register_var_init(init, &mut map, &mut next_id);
                 }
                 for func in &role.func_defs {
-                    // Register parameter types.
-                    for param in &func.params {
-                        register_type(&param.ty, &mut map, &mut next_id);
-                    }
-                    // Register return type.
-                    register_type(&func.return_type, &mut map, &mut next_id);
-                    // Walk the function body.
-                    register_body(&func.body, &mut map, &mut next_id);
+                    register_func_def(func, &mut map, &mut next_id);
                 }
+            }
+            TypedTopLevelDef::FreeFunc(func) => {
+                register_func_def(func, &mut map, &mut next_id);
             }
         }
     }
@@ -115,6 +111,14 @@ fn register_var_init(init: &TypedVarInit, map: &mut TypeIdMap, next_id: &mut u32
         }
     }
     register_expr(&init.value, map, next_id);
+}
+
+fn register_func_def(func: &TypedFuncDef, map: &mut TypeIdMap, next_id: &mut u32) {
+    for param in &func.params {
+        register_type(&param.ty, map, next_id);
+    }
+    register_type(&func.return_type, map, next_id);
+    register_body(&func.body, map, next_id);
 }
 
 fn register_body(body: &[TypedStatement], map: &mut TypeIdMap, next_id: &mut u32) {

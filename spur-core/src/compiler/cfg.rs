@@ -459,6 +459,11 @@ impl Compiler {
                         self.func_qualifier_map.insert(func.name, qualifier.clone());
                     }
                 }
+                TypedTopLevelDef::FreeFunc(func) => {
+                    self.func_sync_map.insert(func.name, true); // free functions are always sync
+                    self.func_traced_map.insert(func.name, func.is_traced);
+                    self.func_qualifier_map.insert(func.name, "__free".to_string());
+                }
             }
         }
 
@@ -479,6 +484,10 @@ impl Compiler {
                         let func_info = self.compile_func_def(func);
                         self.rpc_map.insert(func_info.name, func_info);
                     }
+                }
+                TypedTopLevelDef::FreeFunc(func) => {
+                    let func_info = self.compile_func_def(func);
+                    self.rpc_map.insert(func_info.name, func_info);
                 }
             }
         }
