@@ -163,6 +163,7 @@ fn schedule_client_op<H: HashPolicy>(
         kind: OpKind::Invocation,
         payload: actuals,
         unique_id: op_id,
+        step: state.crash_info.current_step,
     });
 
     let mut rng = rand::rng();
@@ -362,6 +363,7 @@ pub fn exec_plan<H: HashPolicy>(
                         kind: OpKind::Response,
                         payload: vec![result.value],
                         unique_id: result.unique_id,
+                        step: path_state.state.crash_info.current_step,
                     });
                 }
                 ScheduleResult::Crash { node_id } => {
@@ -371,6 +373,7 @@ pub fn exec_plan<H: HashPolicy>(
                         kind: OpKind::Crash,
                         payload: vec![Value::<H>::node(node_id)],
                         unique_id: -1,
+                        step: path_state.state.crash_info.current_step,
                     });
                     if let Some(plan_node) = pending_crash_recover.remove(&node_id.index) {
                         engine.mark_event_completed(plan_node);
@@ -383,6 +386,7 @@ pub fn exec_plan<H: HashPolicy>(
                         kind: OpKind::Recover,
                         payload: vec![Value::<H>::node(node_id)],
                         unique_id: -1,
+                        step: path_state.state.crash_info.current_step,
                     });
                     if let Some(plan_node) = pending_crash_recover.remove(&node_id.index) {
                         engine.mark_event_completed(plan_node);

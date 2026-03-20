@@ -57,6 +57,17 @@ impl SimulatorDebugger {
         }
     }
 
+    /// Returns the SQL table expression to use for `traces`.
+    fn traces_source(&self) -> String {
+        match &self.parquet_dir {
+            None => "traces".to_string(),
+            Some(dir) => {
+                let p = dir.join("traces").join("*.parquet");
+                format!("read_parquet('{}', union_by_name=true)", p.display())
+            }
+        }
+    }
+
     /// Fetches all logs for a specific node, ordered by simulation step.
     pub fn get_node_timeline(&self, run_id: i64, node_id: i64) -> Result<Vec<(i32, String)>> {
         let src = self.logs_source();
@@ -105,5 +116,113 @@ impl SimulatorDebugger {
             summary.insert(kind, count);
         }
         Ok(summary)
+    }
+
+    /// Fetches a combined, interleaved timeline of executions, logs, and traces
+    /// for a given run, ordered by simulation step.
+    pub fn get_combined_timeline(&self, run_id: i64) -> Result<Vec<CombinedEvent>> {
+        let exec_src = self.executions_source();
+        let logs_src = self.logs_source();
+        let traces_src = self.traces_source();
+
+        let query = format!(
+            "SELECT step, source, node_id, description FROM (
+                SELECT step, 'Execution' AS source, client_id AS node_id, seq_num,
+                       kind || ': ' || action AS description
+                FROM {exec_src} WHERE run_id = ?1
+              UNION ALL
+                SELECT step, 'Log' AS source, node_id, seq_num,
+                       content AS description
+                FROM {logs_src} WHERE run_id = ?1
+              UNION ALL
+                SELECT step, 'Trace' AS source, node_id, seq_num,
+                       trace_kind || ' ' || function_name 
+                         || ' [tid=' || trace_id || ']'
+                         || ' [sched=' || schedulable_count || ']'
+                         || CASE WHEN causal_operation_id IS NOT NULL THEN ' [cop=' || causal_operation_id || ']' ELSE '' END
+                       AS description
+                FROM {traces_src} WHERE run_id = ?1
+            ) ORDER BY step ASC, source ASC, seq_num ASC"
+        );
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(CombinedEvent {
+                step: row.get(0)?,
+                source: row.get(1)?,
+                node_id: row.get(2)?,
+                description: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+pub struct CombinedEvent {
+    pub step: i32,
+    pub source: String,
+    pub node_id: Option<i64>,
+    pub description: String,
+}
+
+pub struct TraceEvent {
+    pub step: i32,
+    pub node_id: i64,
+    pub trace_id: i64,
+    pub function_name: String,
+    pub trace_kind: String,
+    pub payload: String,
+    pub schedulable_count: i64,
+    pub causal_operation_id: Option<i64>,
+}
+
+impl SimulatorDebugger {
+    /// Fetches all traces for a specific run, and optionally a specific node.
+    pub fn get_traces(&self, run_id: i64, node_id: Option<i64>) -> Result<Vec<TraceEvent>> {
+        let src = self.traces_source();
+
+        if let Some(n_id) = node_id {
+            let q = format!(
+                "SELECT step, node_id, trace_id, function_name, trace_kind, payload, schedulable_count, causal_operation_id
+                 FROM {src}
+                 WHERE run_id = ?1 AND node_id = ?2
+                 ORDER BY step ASC, seq_num ASC"
+            );
+            let mut stmt = self.conn.prepare(&q)?;
+            let rows = stmt.query_map(params![run_id, n_id], |row| {
+                Ok(TraceEvent {
+                    step: row.get(0)?,
+                    node_id: row.get(1)?,
+                    trace_id: row.get(2)?,
+                    function_name: row.get(3)?,
+                    trace_kind: row.get(4)?,
+                    payload: row.get(5)?,
+                    schedulable_count: row.get(6)?,
+                    causal_operation_id: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        } else {
+            let q = format!(
+                "SELECT step, node_id, trace_id, function_name, trace_kind, payload, schedulable_count, causal_operation_id
+                 FROM {src}
+                 WHERE run_id = ?1
+                 ORDER BY step ASC, seq_num ASC"
+            );
+            let mut stmt = self.conn.prepare(&q)?;
+            let rows = stmt.query_map(params![run_id], |row| {
+                Ok(TraceEvent {
+                    step: row.get(0)?,
+                    node_id: row.get(1)?,
+                    trace_id: row.get(2)?,
+                    function_name: row.get(3)?,
+                    trace_kind: row.get(4)?,
+                    payload: row.get(5)?,
+                    schedulable_count: row.get(6)?,
+                    causal_operation_id: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        }
     }
 }

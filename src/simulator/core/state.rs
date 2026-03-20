@@ -247,6 +247,7 @@ pub struct Operation<H: HashPolicy> {
     pub kind: OpKind,
     pub payload: Vec<Value<H>>,
     pub unique_id: i32,
+    pub step: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

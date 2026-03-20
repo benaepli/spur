@@ -130,6 +130,27 @@ pub enum DebugSubcommands {
         #[arg(long)]
         node_id: Option<i64>,
     },
+    /// Show a combined timeline of executions, logs, and traces
+    Combined {
+        /// Path to the results database or Parquet directory
+        #[arg(short, long)]
+        db: PathBuf,
+        /// Run ID
+        #[arg(long)]
+        run_id: i64,
+    },
+    /// Show traces for a specific node in a run
+    Traces {
+        /// Path to the results database or Parquet directory
+        #[arg(short, long)]
+        db: PathBuf,
+        /// Run ID
+        #[arg(long)]
+        run_id: i64,
+        /// Node ID
+        #[arg(long)]
+        node_id: Option<i64>,
+    },
 }
 
 fn main() {
@@ -162,6 +183,12 @@ fn main() {
                 run_id,
                 node_id,
             } => run_debug_logs(db, run_id, node_id),
+            DebugSubcommands::Traces {
+                db,
+                run_id,
+                node_id,
+            } => run_debug_traces(db, run_id, node_id),
+            DebugSubcommands::Combined { db, run_id } => run_debug_combined(db, run_id),
         },
     };
     if result.is_err() {
@@ -485,6 +512,88 @@ fn run_debug_logs(db_path: PathBuf, run_id: i64, node_id: Option<i64>) -> Result
         }
         println!("{:-<60}", "");
     }
+
+    Ok(())
+}
+
+fn run_debug_combined(db_path: PathBuf, run_id: i64) -> Result<()> {
+    let debugger = SimulatorDebugger::new(&db_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+
+    let events = debugger
+        .get_combined_timeline(run_id)
+        .map_err(|e| anyhow::anyhow!("Failed to fetch combined timeline: {}", e))?;
+
+    if events.is_empty() {
+        println!("No events found for run {}.", run_id);
+        return Ok(());
+    }
+
+    println!("Combined timeline for Run {}:", run_id);
+    println!("{:-<80}", "");
+    for event in events {
+        let actor = match event.source.as_str() {
+            "Execution" => match event.node_id {
+                Some(id) if id >= 0 => format!("Client {:>3}", id),
+                _ => "  System  ".to_string(),
+            },
+            _ => match event.node_id {
+                Some(id) => format!("Node   {:>3}", id),
+                None => "  System  ".to_string(),
+            },
+        };
+        println!(
+            "[Step {:5}] [{:<9}] [{}] {}",
+            event.step, event.source, actor, event.description
+        );
+    }
+    println!("{:-<80}", "");
+
+    Ok(())
+}
+
+fn run_debug_traces(db_path: PathBuf, run_id: i64, node_id: Option<i64>) -> Result<()> {
+    let debugger = SimulatorDebugger::new(&db_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+
+    let traces = debugger
+        .get_traces(run_id, node_id)
+        .map_err(|e| anyhow::anyhow!("Failed to fetch traces: {}", e))?;
+
+    if traces.is_empty() {
+        if let Some(n_id) = node_id {
+            println!("No traces found for run {} and node {}.", run_id, n_id);
+        } else {
+            println!("No traces found for run {}.", run_id);
+        }
+        return Ok(());
+    }
+
+    if let Some(n_id) = node_id {
+        println!("Traces for Run {}, Node {}:", run_id, n_id);
+    } else {
+        println!("All traces for Run {}:", run_id);
+    }
+
+    println!("{:-<120}", "");
+    for t in traces {
+        let cop_str = match t.causal_operation_id {
+            Some(cop) => format!(" cop={}", cop),
+            None => "".to_string(),
+        };
+        println!(
+            "[Step {:4}] [Node {:>3}] [tid={:<3}] {:<8} {:<24} args={:<20} sched={}{}",
+            t.step,
+            t.node_id,
+            t.trace_id,
+            t.trace_kind,
+            t.function_name,
+            t.payload,
+            t.schedulable_count,
+            cop_str
+        );
+    }
+    println!("{:-<120}", "");
 
     Ok(())
 }

@@ -26,6 +26,7 @@ pub struct PersistableOp {
     pub kind: &'static str,
     pub action: String,
     pub payload_json: String,
+    pub step: i32,
 }
 
 pub struct PersistableLog {
@@ -189,6 +190,7 @@ pub fn serialize_history<H: crate::simulator::hash_utils::HashPolicy>(
             },
             action: op.op_action.clone(),
             payload_json: payload_to_json_string::<H>(&op.payload),
+            step: op.step,
         })
         .collect()
 }
@@ -272,6 +274,7 @@ pub fn init_db(conn: &Connection) -> Result<(), duckdb::Error> {
             kind TEXT,
             action TEXT,
             payload TEXT,
+            step INTEGER,
             PRIMARY KEY (run_id, seq_num)
         );
 
@@ -326,7 +329,8 @@ fn save_history_db(
             op.client_id,
             op.kind,
             &op.action,
-            &op.payload_json
+            &op.payload_json,
+            op.step
         ])?;
     }
 
@@ -477,6 +481,7 @@ fn executions_schema() -> Arc<Schema> {
         Field::new("kind", DataType::Utf8, false),
         Field::new("action", DataType::Utf8, false),
         Field::new("payload", DataType::Utf8, false),
+        Field::new("step", DataType::Int32, false),
     ]))
 }
 
@@ -512,6 +517,7 @@ fn append_executions_batch(
         .map(|o| o.payload_json.as_str())
         .collect::<Vec<_>>()
         .into();
+    let steps: Int32Array = ops.iter().map(|o| o.step).collect::<Vec<_>>().into();
 
     let batch = RecordBatch::try_new(
         executions_schema(),
@@ -523,6 +529,7 @@ fn append_executions_batch(
             Arc::new(kinds),
             Arc::new(actions),
             Arc::new(payloads),
+            Arc::new(steps),
         ],
     )?;
     writer.write(&batch)?;

@@ -276,6 +276,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                         kind: OpKind::Response,
                         payload: vec![client_res.value],
                         unique_id: client_res.unique_id,
+                        step: 0, // placeholder: checker doesn't persist to DB
                     });
                     succ.logs.extend(logger.logs);
                     successors.push(succ);
@@ -311,6 +312,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                         kind: OpKind::Crash,
                         payload: vec![Value::<H>::node(node_id)],
                         unique_id: -1,
+                        step: 0,
                     });
                     succ.best_budget.crashes -= 1;
                     successors.push(succ);
@@ -341,6 +343,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                     kind: OpKind::Recover,
                     payload: vec![Value::<H>::node(node_id)],
                     unique_id: -1,
+                    step: 0,
                 });
                 succ.logs.extend(logger.logs);
                 succ.best_budget.recovers -= 1;
@@ -429,6 +432,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                                 Value::<H>::string(EcoString::from("val1")),
                             ],
                             unique_id: op_id,
+                            step: 0,
                         });
                         succ.next_op_id += 1;
                         succ.best_budget.writes -= 1;
@@ -520,6 +524,7 @@ impl<H: HashPolicy> ModelChecker<H> {
                                 Value::<H>::string(key.clone()),
                             ],
                             unique_id: op_id,
+                            step: 0,
                         });
                         succ.next_op_id += 1;
                         succ.best_budget.reads -= 1;

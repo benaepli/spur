@@ -278,6 +278,14 @@ Both forms block until a value is available on the channel.
 
 Channel operations (`send` and `recv`) cannot be used inside sync functions (non-async). Attempting to do so will result in a compile-time error. This ensures that synchronous functions remain non-blocking and atomic.
 
+#### Channel Behavior During Crashes
+
+Channel operations are resilient, but are implicitly affected by node crashes:
+
+- When a node crashes, any channels awaiting `recv` will indefinitely pause execution until recovery.
+- If a channel tries to resolve an asynchronous continuation during a crashed state, the runtime will raise a simulator error: `"Channel not found in async continuation"`.
+- On recovery, pending continuations begin processing incoming records immediately after the _first yield point_ of `RecoverInit`. Be cautious when structuring asynchronous logic around potential crash points.
+
 ## Additional Operators
 
 ### Unwrap
