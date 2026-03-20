@@ -232,6 +232,7 @@ pub enum TypedPatternKind {
     Wildcard,
     Tuple(Vec<TypedPattern>),
     Variant(NameId, String, Option<Box<TypedPattern>>),
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -101,6 +101,6 @@ pub fn is_trivially_copyable(ty: &Type, map: &TriviallyCopyableMap) -> bool {
         Type::EmptyList | Type::EmptyMap => true,
         Type::Nil => true,
         Type::Never => true,
-        Type::Error => true, // Conservatively treat Error as trivial to avoid cascading complex logic
+        Type::Error => true,
     }
 }

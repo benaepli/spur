@@ -139,6 +139,7 @@ pub enum ResolvedTypeDef {
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
     Chan(Box<ResolvedTypeDef>),
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,6 +226,7 @@ pub enum ResolvedPatternKind {
     Wildcard,
     Tuple(Vec<ResolvedPattern>),
     Variant(NameId, String, Option<Box<ResolvedPattern>>),
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -730,16 +732,13 @@ impl Resolver {
         let span = td.span;
 
         match td.kind {
-            TypeDefKind::Named(name) => {
-                match self.lookup_type(&name, span) {
-                    Ok(id) => ResolvedTypeDef::Named(id),
-                    Err(e) => {
-                        self.emit(e);
-                        // Using a dummy NameId for poison. Type checking will catch it or it won't matter.
-                        ResolvedTypeDef::Named(NameId(usize::MAX))
-                    }
+            TypeDefKind::Named(name) => match self.lookup_type(&name, span) {
+                Ok(id) => ResolvedTypeDef::Named(id),
+                Err(e) => {
+                    self.emit(e);
+                    ResolvedTypeDef::Error
                 }
-            }
+            },
             TypeDefKind::Map(k, v) => ResolvedTypeDef::Map(
                 Box::new(self.resolve_type_def(*k)),
                 Box::new(self.resolve_type_def(*v)),
@@ -884,7 +883,10 @@ impl Resolver {
                     Ok(id) => id,
                     Err(e) => {
                         self.emit(e);
-                        NameId(usize::MAX)
+                        return ResolvedPattern {
+                            kind: ResolvedPatternKind::Error,
+                            span,
+                        };
                     }
                 };
                 let resolved_payload = payload.map(|p| Box::new(self.resolve_pattern(*p)));

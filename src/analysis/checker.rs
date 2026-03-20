@@ -840,6 +840,11 @@ impl TypeChecker {
                     })
                 }
             }
+            ResolvedPatternKind::Error => Ok(TypedPattern {
+                kind: TypedPatternKind::Error,
+                ty: expected_type.clone(),
+                span: pattern.span,
+            }),
         }
     }
 
@@ -2263,6 +2268,7 @@ impl TypeChecker {
                 let base_type = self.resolve_type(t)?;
                 Ok(Type::Chan(Box::new(base_type)))
             }
+            ResolvedTypeDef::Error => Ok(Type::Error),
         }
     }
 

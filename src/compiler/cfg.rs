@@ -2654,6 +2654,7 @@ impl Compiler {
                 // For now, we use a temp slot; match compilation needs to be added
                 Lhs::Var(self.alloc_temp_slot())
             }
+            TypedPatternKind::Error => unreachable!("Error pattern during CFG generation"),
         }
     }
 }

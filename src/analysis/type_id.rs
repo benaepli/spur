@@ -295,5 +295,6 @@ fn register_pattern(pat: &TypedPattern, map: &mut TypeIdMap, next_id: &mut u32) 
                 register_pattern(p, map, next_id);
             }
         }
+        TypedPatternKind::Error => {}
     }
 }
