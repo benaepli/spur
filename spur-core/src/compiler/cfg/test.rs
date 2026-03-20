@@ -38,6 +38,15 @@ fn dummy_vertex() -> Vertex {
     999
 }
 
+fn dummy_ctx() -> CompileCtx {
+    CompileCtx {
+        break_target: dummy_vertex(),
+        continue_target: dummy_vertex(),
+        return_target: dummy_vertex(),
+        return_slot: VarSlot::Local(0, id(0)),
+    }
+}
+
 #[test]
 fn test_compile_simple_literals() {
     let mut compiler = Compiler::new();
@@ -49,10 +58,7 @@ fn test_compile_simple_literals() {
         &int_lit(42),
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
     let label = compiler.cfg.get(entry).unwrap();
     match label {
@@ -68,10 +74,7 @@ fn test_compile_simple_literals() {
         &bool_lit(true),
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
     let label = compiler.cfg.get(entry).unwrap();
     match label {
@@ -87,10 +90,7 @@ fn test_compile_simple_literals() {
         &string_lit("hello"),
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
     let label = compiler.cfg.get(entry).unwrap();
     match label {
@@ -119,43 +119,19 @@ fn test_compile_binop_add() {
         &expr,
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
 
-    let l_label = compiler.cfg.get(entry).expect("left label missing");
-    if let Label::Instr(Instr::Assign(l_lhs, Expr::Int(1)), r_entry) = l_label {
-        let r_label = compiler.cfg.get(*r_entry).expect("right label missing");
-        if let Label::Instr(Instr::Assign(r_lhs, Expr::Int(2)), op_entry) = r_label {
-            let op_label = compiler.cfg.get(*op_entry).expect("op label missing");
-            if let Label::Instr(Instr::Assign(lhs, Expr::Plus(l_box, r_box)), n) = op_label {
-                assert_eq!(lhs, &target);
-                assert_eq!(*n, next);
-
-                if let (Expr::Var(l_var), Expr::Var(r_var)) = (l_box.as_ref(), r_box.as_ref()) {
-                    if let Lhs::Var(l_slot) = l_lhs {
-                        assert_eq!(l_slot, l_var);
-                    } else {
-                        panic!("left LHS not var");
-                    }
-                    if let Lhs::Var(r_slot) = r_lhs {
-                        assert_eq!(r_slot, r_var);
-                    } else {
-                        panic!("right LHS not var");
-                    }
-                } else {
-                    panic!("operands are not variables");
-                }
-            } else {
-                panic!("expected Assign Plus, got {:?}", op_label);
-            }
-        } else {
-            panic!("expected right Assign Int(2), got {:?}", r_label);
+    // Fast path: pure expression compiles to a single Assign
+    let label = compiler.cfg.get(entry).expect("entry label missing");
+    match label {
+        Label::Instr(Instr::Assign(lhs, Expr::Plus(l_box, r_box)), n) => {
+            assert_eq!(lhs, &target);
+            assert_eq!(*n, next);
+            assert_eq!(**l_box, Expr::Int(1));
+            assert_eq!(**r_box, Expr::Int(2));
         }
-    } else {
-        panic!("expected left Assign Int(1), got {:?}", l_label);
+        _ => panic!("expected Assign Plus(Int(1), Int(2)), got {:?}", label),
     }
 }
 
@@ -179,10 +155,7 @@ fn test_compile_short_circuit_and() {
         &expr,
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
 
     let l_label = compiler.cfg.get(entry).expect("left label missing");
@@ -236,10 +209,7 @@ fn test_compile_assignment() {
     let entry = compiler.compile_statement(
         &stmt,
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(99, id(99)),
+        dummy_ctx(),
     );
 
     let label = compiler.cfg.get(entry).expect("entry label missing");
@@ -298,10 +268,7 @@ fn test_compile_if_statement() {
     let entry = compiler.compile_statement(
         &stmt,
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(99, id(99)),
+        dummy_ctx(),
     );
 
     let l_cond = compiler.cfg.get(entry).expect("cond entry label missing");
@@ -353,10 +320,7 @@ fn test_compile_for_loop() {
     let entry = compiler.compile_statement(
         &stmt,
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(99, id(99)),
+        dummy_ctx(),
     );
 
     let head_label = compiler.cfg.get(entry).expect("head label missing");
@@ -401,10 +365,12 @@ fn test_compile_return_statement() {
     let entry = compiler.compile_statement(
         &stmt,
         dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        return_target,
-        return_slot,
+        CompileCtx {
+            break_target: dummy_vertex(),
+            continue_target: dummy_vertex(),
+            return_target,
+            return_slot,
+        },
     );
 
     let label = compiler.cfg.get(entry).expect("entry label missing");
@@ -445,10 +411,7 @@ fn test_compile_sync_function_call() {
         &typed_expr(TypedExprKind::FuncCall(call), Type::Int),
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
 
     let arg_label = compiler.cfg.get(entry).expect("arg label missing");
@@ -483,10 +446,7 @@ fn test_compile_empty_list() {
         &empty_list,
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
 
     let label = compiler.cfg.get(entry).unwrap();
@@ -511,10 +471,7 @@ fn test_compile_empty_map() {
         &empty_map,
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
 
     let label = compiler.cfg.get(entry).unwrap();
@@ -585,10 +542,7 @@ fn test_compile_nested_if_statements() {
     let entry = compiler.compile_statement(
         &outer_if,
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(99, id(99)),
+        dummy_ctx(),
     );
 
     // Verify outer condition is compiled
@@ -622,10 +576,7 @@ fn test_compile_break_in_loop() {
     let entry = compiler.compile_statement(
         &loop_stmt,
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(99, id(99)),
+        dummy_ctx(),
     );
 
     // Verify the loop is compiled and break jumps to exit
@@ -654,10 +605,7 @@ fn test_compile_complex_binop_chain() {
         &mul_expr,
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
 
     // Verify compilation produces CFG nodes
@@ -685,10 +633,7 @@ fn test_compile_short_circuit_or() {
         &expr,
         target.clone(),
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(0, id(0)),
+        dummy_ctx(),
     );
 
     // Verify short-circuit: eval left, then conditional jump
@@ -722,10 +667,7 @@ fn test_compile_empty_loop_body() {
     let entry = compiler.compile_statement(
         &loop_stmt,
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(99, id(99)),
+        dummy_ctx(),
     );
 
     // Should still compile correctly with empty body
@@ -790,10 +732,7 @@ fn test_compile_elseif_chain() {
     let entry = compiler.compile_statement(
         &stmt,
         next,
-        dummy_vertex(),
-        dummy_vertex(),
-        dummy_vertex(),
-        VarSlot::Local(99, id(99)),
+        dummy_ctx(),
     );
 
     // Verify elseif is compiled
@@ -823,10 +762,7 @@ fn test_compile_continue_in_loop() {
     let entry = compiler.compile_statement(
         &loop_stmt,
         next,
-        dummy_vertex(),
-        dummy_vertex(), // continue_target (shouldn't be used for the loop itself)
-        dummy_vertex(),
-        VarSlot::Local(99, id(99)),
+        dummy_ctx(),
     );
 
     // Verify the loop is compiled and continue jumps to loop head (since no increment)
