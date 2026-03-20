@@ -286,6 +286,46 @@ Channel operations are resilient, but are implicitly affected by node crashes:
 - If a channel tries to resolve an asynchronous continuation during a crashed state, the runtime will raise a simulator error: `"Channel not found in async continuation"`.
 - On recovery, pending continuations begin processing incoming records immediately after the _first yield point_ of `RecoverInit`. Be cautious when structuring asynchronous logic around potential crash points.
 
+## Safe Navigation
+
+The `?.` and `?[]` operators provide safe navigation on optional types, short-circuiting to `nil` if the receiver is `nil`.
+
+### Safe Field Access
+
+```
+var name: string? = person?.name;
+```
+
+If `person` is `nil`, the whole expression evaluates to `nil`. If `person` is non-nil, the field is accessed normally. The result type is always `T?` where `T` is the field type.
+
+### Safe Index Access
+
+```
+var val: int? = my_map?["key"];
+var elem: int? = my_list?[0];
+```
+
+Same nil-guarding behavior for map and list indexing. The receiver must be an optional collection type.
+
+### Safe Tuple Access
+
+```
+var first: int? = my_tuple?.0;
+```
+
+### Chaining
+
+Safe navigation operators compose with each other and with `??`:
+
+```
+var city: string? = person?.address?.city;
+var city_or_default: string = person?.address?.city ?? "unknown";
+```
+
+### Note
+
+Safe navigation is read-only. It cannot be combined with `:=` update syntax.
+
 ## Additional Operators
 
 ### Unwrap

@@ -109,6 +109,10 @@ pub enum TypedExprKind {
     TupleAccess(Box<TypedExpr>, usize),
     FieldAccess(Box<TypedExpr>, String),
 
+    SafeFieldAccess(Box<TypedExpr>, String),
+    SafeIndex(Box<TypedExpr>, Box<TypedExpr>),
+    SafeTupleAccess(Box<TypedExpr>, usize),
+
     StructLit(NameId, Vec<(String, TypedExpr)>),
 
     WrapInOptional(Box<TypedExpr>), // Internal representation of widening.

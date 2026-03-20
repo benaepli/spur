@@ -144,6 +144,9 @@ pub enum TypeError {
 
     #[error("Type `{ty}` is not trivially copyable, but it is required to be")]
     NonTriviallyCopyable { ty: Type, span: Span },
+
+    #[error("Safe navigation `?.` requires an optional type, found `{ty}`")]
+    SafeNavOnNonOptional { ty: Type, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -1851,6 +1854,162 @@ impl TypeChecker {
                         span,
                     });
                     self.error_expr(span)
+                }
+            }
+            ResolvedExprKind::SafeFieldAccess(struct_expr, field_name) => {
+                let typed_struct = self.infer_expr(*struct_expr);
+                if matches!(typed_struct.ty, Type::Error) {
+                    return self.error_expr(span);
+                }
+                match &typed_struct.ty {
+                    Type::Optional(inner) => {
+                        if let Type::Struct(struct_id, _) = inner.as_ref() {
+                            match self.get_field_type(*struct_id, &field_name, span) {
+                                Ok(field_ty) => TypedExpr {
+                                    kind: TypedExprKind::SafeFieldAccess(
+                                        Box::new(typed_struct),
+                                        field_name,
+                                    ),
+                                    ty: Type::Optional(Box::new(field_ty)),
+                                    span,
+                                },
+                                Err(e) => {
+                                    self.emit(e);
+                                    self.error_expr(span)
+                                }
+                            }
+                        } else {
+                            self.emit(TypeError::NotAStruct {
+                                ty: *inner.clone(),
+                                field_name: field_name.clone(),
+                                span,
+                            });
+                            self.error_expr(span)
+                        }
+                    }
+                    _ => {
+                        self.emit(TypeError::SafeNavOnNonOptional {
+                            ty: typed_struct.ty,
+                            span,
+                        });
+                        self.error_expr(span)
+                    }
+                }
+            }
+            ResolvedExprKind::SafeIndex(target, index) => {
+                let typed_target = self.infer_expr(*target);
+                if matches!(typed_target.ty, Type::Error) {
+                    return self.error_expr(span);
+                }
+                let target_ty = typed_target.ty.clone();
+                match &target_ty {
+                    Type::Optional(inner) => {
+                        let typed_index = self.infer_expr(*index);
+                        if matches!(typed_index.ty, Type::Error) {
+                            return self.error_expr(span);
+                        }
+                        match inner.as_ref() {
+                            Type::List(elem_ty) => {
+                                if let Err(e) = self.check_type_compatibility(&Type::Int, &typed_index.ty, span) {
+                                    self.emit(e);
+                                    return self.error_expr(span);
+                                }
+                                TypedExpr {
+                                    kind: TypedExprKind::SafeIndex(
+                                        Box::new(typed_target),
+                                        Box::new(typed_index),
+                                    ),
+                                    ty: Type::Optional(elem_ty.clone()),
+                                    span,
+                                }
+                            }
+                            Type::Map(key_ty, val_ty) => {
+                                if let Err(e) = self.check_type_compatibility(key_ty, &typed_index.ty, span) {
+                                    self.emit(e);
+                                    return self.error_expr(span);
+                                }
+                                TypedExpr {
+                                    kind: TypedExprKind::SafeIndex(
+                                        Box::new(typed_target),
+                                        Box::new(typed_index),
+                                    ),
+                                    ty: Type::Optional(val_ty.clone()),
+                                    span,
+                                }
+                            }
+                            Type::String => {
+                                if let Err(e) = self.check_type_compatibility(&Type::Int, &typed_index.ty, span) {
+                                    self.emit(e);
+                                    return self.error_expr(span);
+                                }
+                                TypedExpr {
+                                    kind: TypedExprKind::SafeIndex(
+                                        Box::new(typed_target),
+                                        Box::new(typed_index),
+                                    ),
+                                    ty: Type::Optional(Box::new(Type::String)),
+                                    span,
+                                }
+                            }
+                            _ => {
+                                self.emit(TypeError::NotIndexable {
+                                    ty: *inner.clone(),
+                                    span,
+                                });
+                                self.error_expr(span)
+                            }
+                        }
+                    }
+                    _ => {
+                        self.emit(TypeError::SafeNavOnNonOptional {
+                            ty: typed_target.ty,
+                            span,
+                        });
+                        self.error_expr(span)
+                    }
+                }
+            }
+            ResolvedExprKind::SafeTupleAccess(tuple_expr, index) => {
+                let typed_tuple = self.infer_expr(*tuple_expr);
+                if matches!(typed_tuple.ty, Type::Error) {
+                    return self.error_expr(span);
+                }
+                let tuple_ty = typed_tuple.ty.clone();
+                match &tuple_ty {
+                    Type::Optional(inner) => {
+                        if let Type::Tuple(types) = inner.as_ref() {
+                            if index < types.len() {
+                                TypedExpr {
+                                    kind: TypedExprKind::SafeTupleAccess(
+                                        Box::new(typed_tuple),
+                                        index,
+                                    ),
+                                    ty: Type::Optional(Box::new(types[index].clone())),
+                                    span,
+                                }
+                            } else {
+                                self.emit(TypeError::TupleIndexOutOfBounds {
+                                    index,
+                                    size: types.len(),
+                                    span,
+                                });
+                                self.error_expr(span)
+                            }
+                        } else {
+                            self.emit(TypeError::NotATuple {
+                                ty: *inner.clone(),
+                                span,
+                            });
+                            self.error_expr(span)
+                        }
+                    }
+                    _ => {
+                        self.emit(TypeError::SafeNavOnNonOptional {
+                            ty: typed_tuple.ty,
+                            span,
+                        });
+                        self.error_expr(span)
+                    }
                 }
             }
             ResolvedExprKind::Unwrap(e) => {

@@ -526,6 +526,8 @@ fn pretty_expr(prog: &Program, expr: &Expr) -> String {
         },
         Expr::IsVariant(e, name) => format!("is_{}({})", name, pretty_expr(prog, e)),
         Expr::VariantPayload(e) => format!("payload({})", pretty_expr(prog, e)),
+        Expr::SafeFind(l, r) => format!("{}?[{}]", pretty_expr(prog, l), pretty_expr(prog, r)),
+        Expr::SafeTupleAccess(t, i) => format!("{}?.{}", pretty_expr(prog, t), i),
     }
 }
 

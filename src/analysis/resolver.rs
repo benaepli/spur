@@ -274,6 +274,9 @@ pub enum ResolvedExprKind {
     TupleAccess(Box<ResolvedExpr>, usize),
     FieldAccess(Box<ResolvedExpr>, String),
     Unwrap(Box<ResolvedExpr>),
+    SafeFieldAccess(Box<ResolvedExpr>, String),
+    SafeIndex(Box<ResolvedExpr>, Box<ResolvedExpr>),
+    SafeTupleAccess(Box<ResolvedExpr>, usize),
     StructLit(NameId, Vec<(String, ResolvedExpr)>),
     PersistData(Box<ResolvedExpr>),
     RetrieveData(ResolvedTypeDef),
@@ -1022,6 +1025,16 @@ impl Resolver {
             }
             ExprKind::FieldAccess(e, name) => {
                 ResolvedExprKind::FieldAccess(Box::new(self.resolve_expr(*e)), name)
+            }
+            ExprKind::SafeFieldAccess(e, name) => {
+                ResolvedExprKind::SafeFieldAccess(Box::new(self.resolve_expr(*e)), name)
+            }
+            ExprKind::SafeIndex(e, i) => ResolvedExprKind::SafeIndex(
+                Box::new(self.resolve_expr(*e)),
+                Box::new(self.resolve_expr(*i)),
+            ),
+            ExprKind::SafeTupleAccess(e, i) => {
+                ResolvedExprKind::SafeTupleAccess(Box::new(self.resolve_expr(*e)), i)
             }
             ExprKind::PersistData(e) => {
                 ResolvedExprKind::PersistData(Box::new(self.resolve_expr(*e)))

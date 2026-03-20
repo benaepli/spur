@@ -427,6 +427,64 @@ pub fn eval<H: HashPolicy>(
                 }),
             }
         }
+        Expr::SafeFind(col, key) => {
+            let col_val = eval(local_env, node_env, col, role_names)?;
+            match &col_val.kind {
+                ValueKind::Option(None) => Ok(Value::<H>::option_none()),
+                ValueKind::Option(Some(inner)) => {
+                    let inner_val = Arc::unwrap_or_clone(inner.clone());
+                    let key_val = eval(local_env, node_env, key, role_names)?;
+                    match &inner_val.kind {
+                        ValueKind::Map(m) => {
+                            let result = m.get(&key_val).cloned().ok_or(RuntimeError::KeyNotFound)?;
+                            Ok(Value::<H>::option_some(result))
+                        }
+                        ValueKind::List(l) => {
+                            let idx = key_val.as_int()? as usize;
+                            let result = l.get(idx).cloned().ok_or(RuntimeError::IndexOutOfBounds {
+                                index: idx,
+                                len: l.len(),
+                            })?;
+                            Ok(Value::<H>::option_some(result))
+                        }
+                        _ => Err(RuntimeError::NotACollection {
+                            got: inner_val.type_name(),
+                        }),
+                    }
+                }
+                _ => Err(RuntimeError::TypeError {
+                    expected: "option",
+                    got: col_val.type_name(),
+                }),
+            }
+        }
+        Expr::SafeTupleAccess(tuple, idx) => {
+            let t = eval(local_env, node_env, tuple, role_names)?;
+            match &t.kind {
+                ValueKind::Option(None) => Ok(Value::<H>::option_none()),
+                ValueKind::Option(Some(inner)) => {
+                    let inner_val = Arc::unwrap_or_clone(inner.clone());
+                    if let ValueKind::Tuple(vec) = &inner_val.kind {
+                        if *idx >= vec.len() {
+                            return Err(RuntimeError::IndexOutOfBounds {
+                                index: *idx,
+                                len: vec.len(),
+                            });
+                        }
+                        Ok(Value::<H>::option_some(vec[*idx].clone()))
+                    } else {
+                        Err(RuntimeError::TypeError {
+                            expected: "tuple",
+                            got: inner_val.type_name(),
+                        })
+                    }
+                }
+                _ => Err(RuntimeError::TypeError {
+                    expected: "option",
+                    got: t.type_name(),
+                }),
+            }
+        }
     }
 }
 

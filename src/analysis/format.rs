@@ -454,6 +454,17 @@ pub fn report_type_errors(
                     "help: only trivially copyable types (int, string, bool, lists/maps/structs of these) can be used with persist_data and retrieve_data".to_string(),
                     "note: channels and types containing channels are not trivially copyable".to_string(),
                 ]),
+
+            TypeError::SafeNavOnNonOptional { ty, span } => Diagnostic::error()
+                .with_message("safe navigation on non-optional type")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(format!("type `{}` is not optional", ty)),
+                ])
+                .with_notes(vec![
+                    format!("help: the `?.` and `?[]` operators can only be used on optional types, but `{}` is not optional", ty),
+                    "note: use `.` or `[]` for non-optional access".to_string(),
+                ]),
         };
 
         term::emit_to_write_style(&mut writer_lock, &config, &files, &diagnostic)?;

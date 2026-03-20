@@ -266,6 +266,11 @@ pub enum ExprKind {
     TupleAccess(Box<Expr>, usize),
     FieldAccess(Box<Expr>, String),
     Unwrap(Box<Expr>),
+
+    // Safe navigation
+    SafeFieldAccess(Box<Expr>, String),
+    SafeIndex(Box<Expr>, Box<Expr>),
+    SafeTupleAccess(Box<Expr>, usize),
     PersistData(Box<Expr>),
     RetrieveData(TypeDef),
     DiscardData,
@@ -724,6 +729,9 @@ where
             Unwrap(Span),
             RpcCall(FuncCall),
             Update(Expr),
+            SafeFieldAccess(String, Span),
+            SafeIndex(Expr),
+            SafeTupleAccess(usize, Span),
         }
 
         let postfix_op = choice((
@@ -750,6 +758,21 @@ where
                 .ignore_then(ident)
                 .map_with(|name, e| PostfixOp::FieldAccess(name, e.span())),
             just(TokenKind::Bang).map_with(|_, e| PostfixOp::Unwrap(e.span())),
+            // Safe Tuple Access: ?.INT
+            just(TokenKind::QuestionDot)
+                .ignore_then(select! { TokenKind::Integer(i) => i as usize })
+                .map_with(|idx, e| PostfixOp::SafeTupleAccess(idx, e.span())),
+            // Safe Field Access: ?.ID
+            just(TokenKind::QuestionDot)
+                .ignore_then(ident)
+                .map_with(|name, e| PostfixOp::SafeFieldAccess(name, e.span())),
+            // Safe Index: ?[expr]
+            just(TokenKind::Question)
+                .ignore_then(
+                    expr.clone()
+                        .delimited_by(just(TokenKind::LeftBracket), just(TokenKind::RightBracket)),
+                )
+                .map(PostfixOp::SafeIndex),
             // RPC Call: -> call()
             just(TokenKind::Arrow)
                 .ignore_then(func_call.clone())
@@ -800,6 +823,18 @@ where
             PostfixOp::RpcCall(call) => {
                 let span = lhs.span.union(call.span);
                 Expr::new(ExprKind::RpcCall(Box::new(lhs), call), span)
+            }
+            PostfixOp::SafeFieldAccess(name, op_span) => {
+                let span = lhs.span.union(op_span);
+                Expr::new(ExprKind::SafeFieldAccess(Box::new(lhs), name), span)
+            }
+            PostfixOp::SafeIndex(idx) => {
+                let span = lhs.span.union(idx.span);
+                Expr::new(ExprKind::SafeIndex(Box::new(lhs), Box::new(idx)), span)
+            }
+            PostfixOp::SafeTupleAccess(idx, op_span) => {
+                let span = lhs.span.union(op_span);
+                Expr::new(ExprKind::SafeTupleAccess(Box::new(lhs), idx), span)
             }
         })
     };

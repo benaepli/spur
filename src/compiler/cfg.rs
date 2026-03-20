@@ -70,6 +70,9 @@ pub enum Expr {
     Variant(u32, EcoString, Option<Box<Expr>>), // (enum_id, variant_name, payload)
     IsVariant(Box<Expr>, EcoString),            // Check if value is a specific variant
     VariantPayload(Box<Expr>),                  // Extract payload from variant
+    // Safe navigation: nil-check then access, wrapping result in Option
+    SafeFind(Box<Expr>, Box<Expr>),
+    SafeTupleAccess(Box<Expr>, usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Hash)]
@@ -738,7 +741,8 @@ impl Compiler {
             | Exists(l, r)
             | Erase(l, r)
             | Send(l, r)
-            | Index(l, r) => {
+            | Index(l, r)
+            | SafeIndex(l, r) => {
                 self.scan_expr_and_assign_slots(l);
                 self.scan_expr_and_assign_slots(r);
             }
@@ -756,6 +760,8 @@ impl Compiler {
             | Recv(e)
             | TupleAccess(e, _)
             | FieldAccess(e, _)
+            | SafeFieldAccess(e, _)
+            | SafeTupleAccess(e, _)
             | WrapInOptional(e) => {
                 self.scan_expr_and_assign_slots(e);
             }
@@ -2040,6 +2046,70 @@ impl Compiler {
                 )
             }
 
+            TypedExprKind::SafeFieldAccess(target_expr, field) => {
+                let target_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::SafeFind(
+                    Box::new(Expr::Var(target_tmp)),
+                    Box::new(Expr::String(EcoString::from(field.as_str()))),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(
+                    target_expr,
+                    Lhs::Var(target_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            }
+
+            TypedExprKind::SafeIndex(target_expr, index_expr) => {
+                let target_tmp = self.alloc_temp_slot();
+                let index_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::SafeFind(
+                    Box::new(Expr::Var(target_tmp)),
+                    Box::new(Expr::Var(index_tmp)),
+                );
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                let index_vertex = self.compile_expr_to_value(
+                    index_expr,
+                    Lhs::Var(index_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                );
+                self.compile_expr_to_value(
+                    target_expr,
+                    Lhs::Var(target_tmp),
+                    index_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            }
+
+            TypedExprKind::SafeTupleAccess(tuple_expr, index) => {
+                let tuple_tmp = self.alloc_temp_slot();
+                let final_expr = Expr::SafeTupleAccess(Box::new(Expr::Var(tuple_tmp)), *index);
+                let assign_vertex =
+                    self.add_label(Label::Instr(Instr::Assign(target, final_expr), next_vertex));
+                self.compile_expr_to_value(
+                    tuple_expr,
+                    Lhs::Var(tuple_tmp),
+                    assign_vertex,
+                    break_target,
+                    continue_target,
+                    return_target,
+                    return_slot,
+                )
+            }
+
             TypedExprKind::StructLit(_, fields) => {
                 let (field_names, val_exprs): (Vec<_>, Vec<_>) = fields.iter().cloned().unzip();
                 let (tmps, simple_exprs) = self.compile_temp_list(val_exprs.len());
@@ -2582,6 +2652,18 @@ impl Compiler {
             TypedExprKind::UnwrapOptional(e) => Expr::Unwrap(Box::new(self.convert_simple_expr(e))),
 
             TypedExprKind::WrapInOptional(e) => Expr::Some(Box::new(self.convert_simple_expr(e))),
+
+            TypedExprKind::SafeFieldAccess(target, field) => Expr::SafeFind(
+                Box::new(self.convert_simple_expr(target)),
+                Box::new(Expr::String(EcoString::from(field.as_str()))),
+            ),
+            TypedExprKind::SafeIndex(target, index) => Expr::SafeFind(
+                Box::new(self.convert_simple_expr(target)),
+                Box::new(self.convert_simple_expr(index)),
+            ),
+            TypedExprKind::SafeTupleAccess(tuple, index) => {
+                Expr::SafeTupleAccess(Box::new(self.convert_simple_expr(tuple)), *index)
+            }
 
             // Desugar: `MyStruct { ... }` -> `EMap { ... }`
             TypedExprKind::StructLit(_, fields) => Expr::Map(

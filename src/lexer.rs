@@ -53,6 +53,7 @@ pub enum TokenKind {
     Percent,
     Bang,
     Question,
+    QuestionDot,
     QuestionQuestion,
 
     Equal,
@@ -143,6 +144,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Percent => write!(f, "%"),
             TokenKind::Bang => write!(f, "!"),
             TokenKind::Question => write!(f, "?"),
+            TokenKind::QuestionDot => write!(f, "?."),
             TokenKind::QuestionQuestion => write!(f, "??"),
             TokenKind::Equal => write!(f, "="),
             TokenKind::EqualEqual => write!(f, "=="),
@@ -617,7 +619,9 @@ impl<'a> Iterator for Lexer<'a> {
             }
 
             '?' => {
-                if self.match_next('?') {
+                if self.match_next('.') {
+                    Ok(TokenKind::QuestionDot)
+                } else if self.match_next('?') {
                     Ok(TokenKind::QuestionQuestion)
                 } else {
                     Ok(TokenKind::Question)

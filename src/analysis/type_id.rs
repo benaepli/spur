@@ -191,7 +191,8 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
         | TypedExprKind::Exists(l, r)
         | TypedExprKind::Erase(l, r)
         | TypedExprKind::Send(l, r)
-        | TypedExprKind::Index(l, r) => {
+        | TypedExprKind::Index(l, r)
+        | TypedExprKind::SafeIndex(l, r) => {
             register_expr(l, map, next_id);
             register_expr(r, map, next_id);
         }
@@ -209,6 +210,8 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
         | TypedExprKind::Recv(e)
         | TypedExprKind::TupleAccess(e, _)
         | TypedExprKind::FieldAccess(e, _)
+        | TypedExprKind::SafeFieldAccess(e, _)
+        | TypedExprKind::SafeTupleAccess(e, _)
         | TypedExprKind::WrapInOptional(e)
         | TypedExprKind::PersistData(e) => {
             register_expr(e, map, next_id);
