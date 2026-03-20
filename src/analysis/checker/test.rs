@@ -43,18 +43,17 @@ fn bool_lit(val: bool) -> ResolvedExpr {
 }
 
 #[test]
-fn test_infer_literals() -> Result<(), TypeError> {
+fn test_infer_literals() {
     let mut checker = setup_checker();
 
-    assert_eq!(checker.infer_expr(int_lit(42))?.ty, Type::Int);
-    assert_eq!(checker.infer_expr(str_lit("hello"))?.ty, Type::String);
-    assert_eq!(checker.infer_expr(bool_lit(true))?.ty, Type::Bool);
-
-    Ok(())
+    assert_eq!(checker.infer_expr(int_lit(42)).ty, Type::Int);
+    assert_eq!(checker.infer_expr(str_lit("hello")).ty, Type::String);
+    assert_eq!(checker.infer_expr(bool_lit(true)).ty, Type::Bool);
+    assert!(checker.errors.is_empty());
 }
 
 #[test]
-fn test_binop_arithmetic_valid() -> Result<(), TypeError> {
+fn test_binop_arithmetic_valid() {
     let mut checker = setup_checker();
 
     let op = expr(ResolvedExprKind::BinOp(
@@ -63,10 +62,9 @@ fn test_binop_arithmetic_valid() -> Result<(), TypeError> {
         Box::new(int_lit(20)),
     ));
 
-    let typed = checker.infer_expr(op)?;
+    let typed = checker.infer_expr(op);
     assert_eq!(typed.ty, Type::Int);
-
-    Ok(())
+    assert!(checker.errors.is_empty());
 }
 
 #[test]
@@ -79,10 +77,11 @@ fn test_binop_type_mismatch() {
         Box::new(str_lit("fail")),
     ));
 
-    let err = checker.infer_expr(op).unwrap_err();
+    let _ = checker.infer_expr(op);
 
+    assert_eq!(checker.errors.len(), 1);
     assert!(matches!(
-        err,
+        &checker.errors[0],
         TypeError::InvalidBinOp {
             op: BinOp::Add,
             left: Type::Int,
@@ -93,7 +92,7 @@ fn test_binop_type_mismatch() {
 }
 
 #[test]
-fn test_binop_logic_valid() -> Result<(), TypeError> {
+fn test_binop_logic_valid() {
     let mut checker = setup_checker();
 
     let op = expr(ResolvedExprKind::BinOp(
@@ -102,12 +101,12 @@ fn test_binop_logic_valid() -> Result<(), TypeError> {
         Box::new(bool_lit(false)),
     ));
 
-    assert_eq!(checker.infer_expr(op)?.ty, Type::Bool);
-    Ok(())
+    assert_eq!(checker.infer_expr(op).ty, Type::Bool);
+    assert!(checker.errors.is_empty());
 }
 
 #[test]
-fn test_list_inference_homogeneous() -> Result<(), TypeError> {
+fn test_list_inference_homogeneous() {
     let mut checker = setup_checker();
 
     let list = expr(ResolvedExprKind::ListLit(vec![
@@ -116,11 +115,10 @@ fn test_list_inference_homogeneous() -> Result<(), TypeError> {
         int_lit(3),
     ]));
 
-    let typed = checker.infer_expr(list)?;
+    let typed = checker.infer_expr(list);
 
     assert!(matches!(typed.ty, Type::List(inner) if *inner == Type::Int));
-
-    Ok(())
+    assert!(checker.errors.is_empty());
 }
 
 #[test]
@@ -129,23 +127,24 @@ fn test_list_inference_heterogeneous_fail() {
 
     let list = expr(ResolvedExprKind::ListLit(vec![int_lit(1), str_lit("two")]));
 
-    let err = checker.infer_expr(list).unwrap_err();
-    assert!(matches!(err, TypeError::Mismatch { .. }));
+    let _ = checker.infer_expr(list);
+    assert_eq!(checker.errors.len(), 1);
+    assert!(matches!(&checker.errors[0], TypeError::Mismatch { .. }));
 }
 
 #[test]
-fn test_empty_list_inference() -> Result<(), TypeError> {
+fn test_empty_list_inference() {
     let mut checker = setup_checker();
 
     let list = expr(ResolvedExprKind::ListLit(vec![]));
-    let typed = checker.infer_expr(list)?;
+    let typed = checker.infer_expr(list);
 
     assert_eq!(typed.ty, Type::EmptyList);
-    Ok(())
+    assert!(checker.errors.is_empty());
 }
 
 #[test]
-fn test_variable_scope_resolution() -> Result<(), TypeError> {
+fn test_variable_scope_resolution() {
     let mut checker = setup_checker();
     let var_id = id(100);
 
@@ -153,12 +152,12 @@ fn test_variable_scope_resolution() -> Result<(), TypeError> {
     checker.add_var(var_id, Type::Int);
 
     let var_expr = expr(ResolvedExprKind::Var(var_id, "x".into()));
-    let typed = checker.infer_expr(var_expr)?;
+    let typed = checker.infer_expr(var_expr);
 
     assert_eq!(typed.ty, Type::Int);
+    assert!(checker.errors.is_empty());
 
     checker.exit_scope();
-    Ok(())
 }
 
 #[test]
@@ -168,12 +167,13 @@ fn test_undefined_variable() {
 
     let var_expr = expr(ResolvedExprKind::Var(var_id, "unknown".into()));
 
-    let err = checker.infer_expr(var_expr).unwrap_err();
-    assert!(matches!(err, TypeError::UndefinedType(_)));
+    let _ = checker.infer_expr(var_expr);
+    assert_eq!(checker.errors.len(), 1);
+    assert!(matches!(&checker.errors[0], TypeError::UndefinedType(_)));
 }
 
 #[test]
-fn test_map_inference_valid() -> Result<(), TypeError> {
+fn test_map_inference_valid() {
     let mut checker = setup_checker();
 
     let map = expr(ResolvedExprKind::MapLit(vec![
@@ -181,18 +181,17 @@ fn test_map_inference_valid() -> Result<(), TypeError> {
         (str_lit("b"), int_lit(2)),
     ]));
 
-    let typed = checker.infer_expr(map)?;
+    let typed = checker.infer_expr(map);
 
     assert!(matches!(
         typed.ty,
         Type::Map(k, v) if *k == Type::String && *v == Type::Int
     ));
-
-    Ok(())
+    assert!(checker.errors.is_empty());
 }
 
 #[test]
-fn test_assignment_type_check() -> Result<(), TypeError> {
+fn test_assignment_type_check() {
     let mut checker = setup_checker();
     let var_id = id(50);
 
@@ -205,7 +204,8 @@ fn test_assignment_type_check() -> Result<(), TypeError> {
         value: int_lit(10),
         span: dummy_span(),
     };
-    checker.check_assignment(assign_ok)?;
+    checker.check_assignment(assign_ok);
+    assert!(checker.errors.is_empty());
 
     // Invalid Assignment
     let assign_bad = ResolvedAssignment {
@@ -214,15 +214,15 @@ fn test_assignment_type_check() -> Result<(), TypeError> {
         span: dummy_span(),
     };
 
-    let err = checker.check_assignment(assign_bad).unwrap_err();
-    assert!(matches!(err, TypeError::Mismatch { .. }));
+    checker.check_assignment(assign_bad);
+    assert_eq!(checker.errors.len(), 1);
+    assert!(matches!(&checker.errors[0], TypeError::Mismatch { .. }));
 
     checker.exit_scope();
-    Ok(())
 }
 
 #[test]
-fn test_function_return_validation() -> Result<(), TypeError> {
+fn test_function_return_validation() {
     let mut checker = setup_checker();
 
     checker.enter_scope();
@@ -234,19 +234,21 @@ fn test_function_return_validation() -> Result<(), TypeError> {
         span: dummy_span(),
     };
 
-    let (_, returns) = checker.check_statement(ret_stmt)?;
+    let (_, returns) = checker.check_statement(ret_stmt);
     assert!(returns, "Statement should indicate it returns");
+    assert!(checker.errors.is_empty());
+
     // Invalid Return Type
     let bad_ret = ResolvedStatement {
         kind: ResolvedStatementKind::Return(str_lit("bad")),
         span: dummy_span(),
     };
 
-    let err = checker.check_statement(bad_ret).unwrap_err();
-    assert!(matches!(err, TypeError::Mismatch { .. }));
+    let _ = checker.check_statement(bad_ret);
+    assert_eq!(checker.errors.len(), 1);
+    assert!(matches!(&checker.errors[0], TypeError::Mismatch { .. }));
 
     checker.exit_scope();
-    Ok(())
 }
 
 // Helpers for variant testing
@@ -265,7 +267,7 @@ impl TypeChecker {
 }
 
 #[test]
-fn test_check_variant_lit_no_payload() -> Result<(), TypeError> {
+fn test_check_variant_lit_no_payload() {
     let mut checker = setup_checker();
 
     // enum E { V1, V2(int) }
@@ -289,14 +291,13 @@ fn test_check_variant_lit_no_payload() -> Result<(), TypeError> {
         span: dummy_span(),
     };
 
-    let typed = checker.infer_expr(expr)?;
+    let typed = checker.infer_expr(expr);
     assert_eq!(typed.ty, Type::Enum(enum_id, "E".to_string()));
-
-    Ok(())
+    assert!(checker.errors.is_empty());
 }
 
 #[test]
-fn test_check_variant_lit_with_payload_valid() -> Result<(), TypeError> {
+fn test_check_variant_lit_with_payload_valid() {
     let mut checker = setup_checker();
     let int_id = id(0);
 
@@ -320,10 +321,9 @@ fn test_check_variant_lit_with_payload_valid() -> Result<(), TypeError> {
         span: dummy_span(),
     };
 
-    let typed = checker.infer_expr(expr)?;
+    let typed = checker.infer_expr(expr);
     assert_eq!(typed.ty, Type::Enum(enum_id, "E".to_string()));
-
-    Ok(())
+    assert!(checker.errors.is_empty());
 }
 
 #[test]
@@ -348,12 +348,13 @@ fn test_check_variant_lit_payload_mismatch() {
         span: dummy_span(),
     };
 
-    let err = checker.infer_expr(expr).unwrap_err();
-    assert!(matches!(err, TypeError::Mismatch { .. }));
+    let _ = checker.infer_expr(expr);
+    assert_eq!(checker.errors.len(), 1);
+    assert!(matches!(&checker.errors[0], TypeError::Mismatch { .. }));
 }
 
 #[test]
-fn test_check_match_expression_valid() -> Result<(), TypeError> {
+fn test_check_match_expression_valid() {
     let mut checker = setup_checker();
     let int_id = id(0);
 
@@ -418,10 +419,9 @@ fn test_check_match_expression_valid() -> Result<(), TypeError> {
         span: dummy_span(),
     };
 
-    let typed = checker.infer_expr(match_expr)?;
+    let typed = checker.infer_expr(match_expr);
     assert_eq!(typed.ty, Type::Int);
-
-    Ok(())
+    assert!(checker.errors.is_empty());
 }
 #[test]
 fn test_persist_non_trivially_copyable_fails() {
@@ -435,8 +435,9 @@ fn test_persist_non_trivially_copyable_fails() {
         span: dummy_span(),
     };
 
-    let err = checker.infer_expr(expr).unwrap_err();
-    assert!(matches!(err, TypeError::NonTriviallyCopyable { .. }));
+    let _ = checker.infer_expr(expr);
+    assert_eq!(checker.errors.len(), 1);
+    assert!(matches!(&checker.errors[0], TypeError::NonTriviallyCopyable { .. }));
 }
 
 #[test]
@@ -450,6 +451,7 @@ fn test_retrieve_non_trivially_copyable_fails() {
         span: dummy_span(),
     };
 
-    let err = checker.infer_expr(expr).unwrap_err();
-    assert!(matches!(err, TypeError::NonTriviallyCopyable { .. }));
+    let _ = checker.infer_expr(expr);
+    assert_eq!(checker.errors.len(), 1);
+    assert!(matches!(&checker.errors[0], TypeError::NonTriviallyCopyable { .. }));
 }

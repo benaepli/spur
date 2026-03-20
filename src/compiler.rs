@@ -84,14 +84,12 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     result.resolution_errors = resolution_errors;
 
     let mut type_checker = TypeChecker::new(prepopulated_types);
-    let typed = match type_checker.check_program(resolved.clone()) {
-        Err(e) => {
-            let _ = report_type_errors(input, &[e.clone()], name);
-            result.type_errors.push(e);
-            return result;
-        }
-        Ok(r) => r,
-    };
+    let (typed, type_errors) = type_checker.check_program(resolved.clone());
+    if !type_errors.is_empty() {
+        let _ = report_type_errors(input, &type_errors, name);
+        result.type_errors = type_errors;
+        return result;
+    }
 
     let _trivially_copyable_map =
         trivially_copyable::compute_trivially_copyable(&typed.struct_defs, &typed.enum_defs);

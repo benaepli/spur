@@ -172,6 +172,7 @@ pub struct TypeChecker {
     current_func_is_sync: bool,
     loop_depth: usize,
     trivially_copyable: TriviallyCopyableMap,
+    errors: Vec<TypeError>,
 }
 
 impl TypeChecker {
@@ -236,11 +237,34 @@ impl TypeChecker {
             current_func_is_sync: false,
             loop_depth: 0,
             trivially_copyable: TriviallyCopyableMap::new(),
+            errors: Vec::new(),
         }
     }
 
-    pub fn check_program(&mut self, program: ResolvedProgram) -> Result<TypedProgram, TypeError> {
-        self.collect_definitions(&program)?;
+    fn emit(&mut self, err: TypeError) {
+        self.errors.push(err);
+    }
+
+    fn error_expr(&self, span: Span) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::Error,
+            ty: Type::Error,
+            span,
+        }
+    }
+
+    fn error_stmt(&self, span: Span) -> (TypedStatement, bool) {
+        (
+            TypedStatement {
+                kind: TypedStatementKind::Error,
+                span,
+            },
+            false,
+        )
+    }
+
+    pub fn check_program(&mut self, program: ResolvedProgram) -> (TypedProgram, Vec<TypeError>) {
+        self.collect_definitions(&program);
 
         let next_name_id = program.next_name_id;
         let id_to_name = program.id_to_name;
@@ -248,7 +272,7 @@ impl TypeChecker {
         for top_level_def in program.top_level_defs {
             match top_level_def {
                 ResolvedTopLevelDef::Role(role) => {
-                    let typed_role = self.check_role_def(role)?;
+                    let typed_role = self.check_role_def(role);
                     typed_top_levels.push(TypedTopLevelDef::Role(typed_role));
                 }
                 ResolvedTopLevelDef::Type(_) => {}
@@ -263,22 +287,27 @@ impl TypeChecker {
                 TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => {
                     let resolved_fields: Vec<(String, Type)> = fields
                         .iter()
-                        .map(|f| Ok((f.name.clone(), self.resolve_type(&f.type_def)?)))
-                        .collect::<Result<_, TypeError>>()?;
+                        .filter_map(|f| {
+                            match self.resolve_type(&f.type_def) {
+                                Ok(ty) => Some((f.name.clone(), ty)),
+                                Err(_) => None,
+                            }
+                        })
+                        .collect();
                     struct_defs.insert(*name_id, resolved_fields);
                 }
                 TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Enum(variants)) => {
                     let resolved_variants: Vec<(String, Option<Type>)> = variants
                         .iter()
-                        .map(|v| {
-                            let payload_ty = v
-                                .payload
-                                .as_ref()
-                                .map(|p| self.resolve_type(p))
-                                .transpose()?;
-                            Ok((v.name.clone(), payload_ty))
+                        .filter_map(|v| {
+                            let payload_ty = match v.payload.as_ref().map(|p| self.resolve_type(p)) {
+                                Some(Ok(ty)) => Some(ty),
+                                Some(Err(_)) => return None,
+                                None => None,
+                            };
+                            Some((v.name.clone(), payload_ty))
                         })
-                        .collect::<Result<_, TypeError>>()?;
+                        .collect();
                     enum_defs.insert(*name_id, resolved_variants);
                 }
                 _ => {}
@@ -287,16 +316,17 @@ impl TypeChecker {
 
         self.trivially_copyable = compute_trivially_copyable(&struct_defs, &enum_defs);
 
-        Ok(TypedProgram {
+        let errors = std::mem::take(&mut self.errors);
+        (TypedProgram {
             top_level_defs: typed_top_levels,
             next_name_id,
             id_to_name,
             struct_defs,
             enum_defs,
-        })
+        }, errors)
     }
 
-    fn collect_definitions(&mut self, program: &ResolvedProgram) -> Result<(), TypeError> {
+    fn collect_definitions(&mut self, program: &ResolvedProgram) {
         for top_level_def in &program.top_level_defs {
             match top_level_def {
                 ResolvedTopLevelDef::Type(type_def) => {
@@ -326,7 +356,13 @@ impl TypeChecker {
         for top_level_def in &program.top_level_defs {
             if let ResolvedTopLevelDef::Role(role) = top_level_def {
                 for func in &role.func_defs {
-                    let sig = self.build_function_signature(func)?;
+                    let sig = match self.build_function_signature(func) {
+                        Ok(sig) => sig,
+                        Err(e) => {
+                            self.emit(e);
+                            continue;
+                        }
+                    };
                     let role_funcs = self
                         .role_func_signatures
                         .get_mut(&role.name)
@@ -343,8 +379,6 @@ impl TypeChecker {
                 }
             }
         }
-
-        Ok(())
     }
 
     fn build_function_signature(
@@ -370,33 +404,33 @@ impl TypeChecker {
         })
     }
 
-    fn check_role_def(&mut self, role: ResolvedRoleDef) -> Result<TypedRoleDef, TypeError> {
+    fn check_role_def(&mut self, role: ResolvedRoleDef) -> TypedRoleDef {
         self.enter_scope();
         self.current_func_is_sync = true;
 
         let mut typed_var_inits = Vec::new();
         for var_init in role.var_inits {
-            typed_var_inits.push(self.check_var_init(var_init)?);
+            typed_var_inits.push(self.check_var_init(var_init));
         }
 
         self.current_func_is_sync = false;
 
         let mut typed_func_defs = Vec::new();
         for func in role.func_defs {
-            typed_func_defs.push(self.check_func_def(func)?);
+            typed_func_defs.push(self.check_func_def(func));
         }
 
         self.exit_scope();
-        Ok(TypedRoleDef {
+        TypedRoleDef {
             name: role.name,
             original_name: role.original_name,
             var_inits: typed_var_inits,
             func_defs: typed_func_defs,
             span: role.span,
-        })
+        }
     }
 
-    fn check_func_def(&mut self, func: ResolvedFuncDef) -> Result<TypedFuncDef, TypeError> {
+    fn check_func_def(&mut self, func: ResolvedFuncDef) -> TypedFuncDef {
         let sig = self
             .func_signatures
             .get(&func.name)
@@ -424,24 +458,16 @@ impl TypeChecker {
             });
         }
 
-        let mut typed_body = Vec::new();
-        let mut has_return = false;
-        for stmt in func.body {
-            let (typed_stmt, stmt_returns) = self.check_statement(stmt)?;
-            typed_body.push(typed_stmt);
-            if stmt_returns {
-                has_return = true;
-            }
-        }
+        let (typed_body, has_return) = self.check_block(func.body);
 
         if sig.return_type != Type::Tuple(vec![]) && !has_return {
-            return Err(TypeError::MissingReturn(func.span));
+            self.emit(TypeError::MissingReturn(func.span));
         }
 
         self.current_return_type = None;
         self.current_func_is_sync = false;
         self.exit_scope();
-        Ok(TypedFuncDef {
+        TypedFuncDef {
             name: func.name,
             original_name: func.original_name,
             is_sync: sig.is_sync,
@@ -450,16 +476,26 @@ impl TypeChecker {
             return_type: sig.return_type,
             body: typed_body,
             span: func.span,
-        })
+        }
     }
 
-    fn check_var_init(&mut self, var_init: ResolvedVarInit) -> Result<TypedVarInit, TypeError> {
+    fn check_var_init(&mut self, var_init: ResolvedVarInit) -> TypedVarInit {
+        let span = var_init.span;
         let (typed_value, type_def) = if let Some(def) = var_init.type_def {
-            let expected_ty = self.resolve_type(&def)?;
-            let typed_val = self.check_expr(var_init.value, &expected_ty)?;
-            (typed_val, expected_ty)
+            match self.resolve_type(&def) {
+                Ok(expected_ty) => {
+                    let typed_val = self.check_expr(var_init.value, &expected_ty);
+                    (typed_val, expected_ty)
+                }
+                Err(e) => {
+                    self.emit(e);
+                    let typed_val = self.infer_expr(var_init.value);
+                    let ty = typed_val.ty.clone();
+                    (typed_val, ty)
+                }
+            }
         } else {
-            let typed_val = self.infer_expr(var_init.value)?;
+            let typed_val = self.infer_expr(var_init.value);
             let inferred_ty = typed_val.ty.clone();
             (typed_val, inferred_ty)
         };
@@ -472,156 +508,172 @@ impl TypeChecker {
             crate::analysis::resolver::ResolvedVarTarget::Tuple(names) => match &type_def {
                 Type::Tuple(types) => {
                     if names.len() != types.len() {
-                        return Err(TypeError::PatternMismatch {
+                        self.emit(TypeError::PatternMismatch {
                             pattern_ty: format!("tuple of {} elements", names.len()),
                             iterable_ty: type_def.clone(),
-                            span: var_init.span,
+                            span,
                         });
+                        // Still bind names with Error type so downstream code doesn't fail
+                        let mut elements = Vec::new();
+                        for (name_id, name) in names.into_iter() {
+                            self.add_var(name_id, Type::Error);
+                            elements.push((name_id, name, Type::Error));
+                        }
+                        TypedVarTarget::Tuple(elements)
+                    } else {
+                        let mut elements = Vec::new();
+                        for ((name_id, name), ty) in names.into_iter().zip(types.iter()) {
+                            self.add_var(name_id, ty.clone());
+                            elements.push((name_id, name, ty.clone()));
+                        }
+                        TypedVarTarget::Tuple(elements)
                     }
-                    let mut elements = Vec::new();
-                    for ((name_id, name), ty) in names.into_iter().zip(types.iter()) {
-                        self.add_var(name_id, ty.clone());
-                        elements.push((name_id, name, ty.clone()));
-                    }
-                    TypedVarTarget::Tuple(elements)
                 }
                 _ => {
-                    return Err(TypeError::NotATuple {
+                    self.emit(TypeError::NotATuple {
                         ty: type_def.clone(),
-                        span: var_init.span,
+                        span,
                     });
+                    // Bind names with Error type
+                    let mut elements = Vec::new();
+                    for (name_id, name) in names.into_iter() {
+                        self.add_var(name_id, Type::Error);
+                        elements.push((name_id, name, Type::Error));
+                    }
+                    TypedVarTarget::Tuple(elements)
                 }
             },
         };
 
-        Ok(TypedVarInit {
+        TypedVarInit {
             target,
             type_def,
             value: typed_value,
-            span: var_init.span,
-        })
+            span,
+        }
     }
 
     fn check_statement(
         &mut self,
         stmt: ResolvedStatement,
-    ) -> Result<(TypedStatement, bool), TypeError> {
+    ) -> (TypedStatement, bool) {
         let span = stmt.span;
         match stmt.kind {
             ResolvedStatementKind::Conditional(cond) => {
-                let (typed_cond, returns) = self.check_conditional(cond)?;
+                let (typed_cond, returns) = self.check_conditional(cond);
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::Conditional(typed_cond),
                     span,
                 };
-                Ok((typed_stmt, returns))
+                (typed_stmt, returns)
             }
             ResolvedStatementKind::VarInit(var_init) => {
-                let typed_var_init = self.check_var_init(var_init)?;
+                let typed_var_init = self.check_var_init(var_init);
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::VarInit(typed_var_init),
                     span,
                 };
-                Ok((typed_stmt, false))
+                (typed_stmt, false)
             }
             ResolvedStatementKind::Assignment(assign) => {
-                let typed_assign = self.check_assignment(assign)?;
+                let typed_assign = self.check_assignment(assign);
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::Assignment(typed_assign),
                     span,
                 };
-                Ok((typed_stmt, false))
+                (typed_stmt, false)
             }
             ResolvedStatementKind::Expr(expr) => {
-                let typed_expr = self.infer_expr(expr)?;
+                let typed_expr = self.infer_expr(expr);
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::Expr(typed_expr),
                     span,
                 };
-                Ok((typed_stmt, false))
+                (typed_stmt, false)
             }
             ResolvedStatementKind::Return(expr) => {
                 if let Some(expected_return_type) = self.current_return_type.clone() {
-                    let typed_expr = self.check_expr(expr, &expected_return_type)?;
+                    let typed_expr = self.check_expr(expr, &expected_return_type);
                     let typed_stmt = TypedStatement {
                         kind: TypedStatementKind::Return(typed_expr),
                         span,
                     };
-                    Ok((typed_stmt, true))
+                    (typed_stmt, true)
                 } else {
-                    Err(TypeError::ReturnOutsideFunction(span))
+                    self.emit(TypeError::ReturnOutsideFunction(span));
+                    self.error_stmt(span)
                 }
             }
             ResolvedStatementKind::ForLoop(for_loop) => {
-                let typed_loop = self.check_for_loop(for_loop)?;
+                let typed_loop = self.check_for_loop(for_loop);
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::ForLoop(typed_loop),
                     span,
                 };
-                Ok((typed_stmt, false))
+                (typed_stmt, false)
             }
             ResolvedStatementKind::ForInLoop(for_in_loop) => {
-                let typed_loop = self.check_for_in_loop(for_in_loop)?;
+                let typed_loop = self.check_for_in_loop(for_in_loop);
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::ForInLoop(typed_loop),
                     span,
                 };
-                Ok((typed_stmt, false))
+                (typed_stmt, false)
             }
             ResolvedStatementKind::Break => {
                 if self.loop_depth == 0 {
-                    return Err(TypeError::BreakOutsideLoop(span));
+                    self.emit(TypeError::BreakOutsideLoop(span));
                 }
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::Break,
                     span,
                 };
-                Ok((typed_stmt, false))
+                (typed_stmt, false)
             }
             ResolvedStatementKind::Continue => {
                 if self.loop_depth == 0 {
-                    return Err(TypeError::ContinueOutsideLoop(span));
+                    self.emit(TypeError::ContinueOutsideLoop(span));
                 }
                 let typed_stmt = TypedStatement {
                     kind: TypedStatementKind::Continue,
                     span,
                 };
-                Ok((typed_stmt, false))
+                (typed_stmt, false)
             }
-            ResolvedStatementKind::Error => Ok((
+            ResolvedStatementKind::Error => (
                 TypedStatement {
                     kind: TypedStatementKind::Error,
                     span,
                 },
                 false,
-            )),
+            ),
         }
     }
 
     fn check_block(
         &mut self,
         block: Vec<ResolvedStatement>,
-    ) -> Result<(Vec<TypedStatement>, bool), TypeError> {
+    ) -> (Vec<TypedStatement>, bool) {
         self.enter_scope();
         let mut typed_stmts = Vec::new();
         let mut has_return = false;
         for stmt in block {
-            let (typed_stmt, stmt_returns) = self.check_statement(stmt)?;
+            let (typed_stmt, stmt_returns) = self.check_statement(stmt);
             typed_stmts.push(typed_stmt);
             if stmt_returns {
                 has_return = true;
             }
         }
         self.exit_scope();
-        Ok((typed_stmts, has_return))
+        (typed_stmts, has_return)
     }
 
     fn check_conditional(
         &mut self,
         cond: ResolvedCondStmts,
-    ) -> Result<(TypedCondStmts, bool), TypeError> {
-        let typed_if_cond = self.check_expr(cond.if_branch.condition, &Type::Bool)?;
-        let (typed_if_body, if_returns) = self.check_block(cond.if_branch.body)?;
+    ) -> (TypedCondStmts, bool) {
+        let typed_if_cond = self.check_expr(cond.if_branch.condition, &Type::Bool);
+        let (typed_if_body, if_returns) = self.check_block(cond.if_branch.body);
         let typed_if_branch = TypedIfBranch {
             condition: typed_if_cond,
             body: typed_if_body,
@@ -631,8 +683,8 @@ impl TypeChecker {
         let mut all_branches_return = if_returns;
         let mut typed_elseif_branches = Vec::new();
         for elseif in cond.elseif_branches {
-            let typed_elseif_cond = self.check_expr(elseif.condition, &Type::Bool)?;
-            let (typed_elseif_body, elseif_returns) = self.check_block(elseif.body)?;
+            let typed_elseif_cond = self.check_expr(elseif.condition, &Type::Bool);
+            let (typed_elseif_body, elseif_returns) = self.check_block(elseif.body);
 
             typed_elseif_branches.push(TypedIfBranch {
                 condition: typed_elseif_cond,
@@ -644,7 +696,7 @@ impl TypeChecker {
 
         let typed_else_branch;
         if let Some(else_body) = cond.else_branch {
-            let (typed_body, else_returns) = self.check_block(else_body)?;
+            let (typed_body, else_returns) = self.check_block(else_body);
             typed_else_branch = Some(typed_body);
             all_branches_return = all_branches_return && else_returns;
         } else {
@@ -652,7 +704,7 @@ impl TypeChecker {
             all_branches_return = false;
         }
 
-        Ok((
+        (
             TypedCondStmts {
                 if_branch: typed_if_branch,
                 elseif_branches: typed_elseif_branches,
@@ -660,20 +712,20 @@ impl TypeChecker {
                 span: cond.span,
             },
             all_branches_return,
-        ))
+        )
     }
 
-    fn check_for_loop(&mut self, for_loop: ResolvedForLoop) -> Result<TypedForLoop, TypeError> {
+    fn check_for_loop(&mut self, for_loop: ResolvedForLoop) -> TypedForLoop {
         self.enter_scope();
         self.loop_depth += 1;
 
         let typed_init = if let Some(init) = for_loop.init {
             match init {
                 crate::analysis::resolver::ResolvedForLoopInit::VarInit(vi) => {
-                    Some(TypedForLoopInit::VarInit(self.check_var_init(vi)?))
+                    Some(TypedForLoopInit::VarInit(self.check_var_init(vi)))
                 }
                 crate::analysis::resolver::ResolvedForLoopInit::Assignment(a) => {
-                    Some(TypedForLoopInit::Assignment(self.check_assignment(a)?))
+                    Some(TypedForLoopInit::Assignment(self.check_assignment(a)))
                 }
             }
         } else {
@@ -681,189 +733,223 @@ impl TypeChecker {
         };
 
         let typed_condition = if let Some(condition) = for_loop.condition {
-            Some(self.check_expr(condition, &Type::Bool)?)
+            Some(self.check_expr(condition, &Type::Bool))
         } else {
             None
         };
 
         let typed_increment = if let Some(increment) = for_loop.increment {
-            Some(self.check_assignment(increment)?)
+            Some(self.check_assignment(increment))
         } else {
             None
         };
 
         let mut typed_body = Vec::new();
         for stmt in for_loop.body {
-            let (typed_stmt, _) = self.check_statement(stmt)?;
+            let (typed_stmt, _) = self.check_statement(stmt);
             typed_body.push(typed_stmt);
         }
 
         self.loop_depth -= 1;
         self.exit_scope();
-        Ok(TypedForLoop {
+        TypedForLoop {
             init: typed_init,
             condition: typed_condition,
             increment: typed_increment,
             body: typed_body,
             span: for_loop.span,
-        })
+        }
     }
 
     fn check_for_in_loop(
         &mut self,
         for_in_loop: ResolvedForInLoop,
-    ) -> Result<TypedForInLoop, TypeError> {
-        let typed_iterable = self.infer_expr(for_in_loop.iterable)?;
+    ) -> TypedForInLoop {
+        let typed_iterable = self.infer_expr(for_in_loop.iterable);
 
         let element_type = match &typed_iterable.ty {
             Type::List(elem_ty) => (**elem_ty).clone(),
             Type::Map(key_ty, val_ty) => Type::Tuple(vec![(**key_ty).clone(), (**val_ty).clone()]),
             _ => {
-                return Err(TypeError::NotIterable {
-                    ty: typed_iterable.ty,
+                self.emit(TypeError::NotIterable {
+                    ty: typed_iterable.ty.clone(),
                     span: for_in_loop.span,
                 });
+                Type::Error
             }
         };
 
         self.enter_scope();
         self.loop_depth += 1;
 
-        let typed_pattern = self.check_pattern(for_in_loop.pattern, &element_type)?;
+        let typed_pattern = self.check_pattern(for_in_loop.pattern, &element_type);
 
         let mut typed_body = Vec::new();
         for stmt in for_in_loop.body {
-            let (typed_stmt, _) = self.check_statement(stmt)?;
+            let (typed_stmt, _) = self.check_statement(stmt);
             typed_body.push(typed_stmt);
         }
 
         self.loop_depth -= 1;
         self.exit_scope();
-        Ok(TypedForInLoop {
+        TypedForInLoop {
             pattern: typed_pattern,
             iterable: typed_iterable,
             body: typed_body,
             span: for_in_loop.span,
-        })
+        }
     }
 
     fn check_pattern(
         &mut self,
         pattern: ResolvedPattern,
         expected_type: &Type,
-    ) -> Result<TypedPattern, TypeError> {
+    ) -> TypedPattern {
+        let error_pattern = |span| TypedPattern {
+            kind: TypedPatternKind::Error,
+            ty: expected_type.clone(),
+            span,
+        };
+
         match pattern.kind {
             ResolvedPatternKind::Var(name_id, name) => {
                 self.add_var(name_id, expected_type.clone());
-                Ok(TypedPattern {
+                TypedPattern {
                     kind: TypedPatternKind::Var(name_id, name),
                     ty: expected_type.clone(),
                     span: pattern.span,
-                })
+                }
             }
-            ResolvedPatternKind::Wildcard => Ok(TypedPattern {
+            ResolvedPatternKind::Wildcard => TypedPattern {
                 kind: TypedPatternKind::Wildcard,
                 ty: expected_type.clone(),
                 span: pattern.span,
-            }),
+            },
             ResolvedPatternKind::Tuple(patterns) => {
                 if let Type::Tuple(types) = expected_type {
                     if patterns.len() != types.len() {
-                        return Err(TypeError::PatternMismatch {
+                        self.emit(TypeError::PatternMismatch {
                             pattern_ty: format!("tuple of {} elements", patterns.len()),
                             iterable_ty: expected_type.clone(),
                             span: pattern.span,
                         });
+                        return error_pattern(pattern.span);
                     }
                     let mut typed_patterns = Vec::new();
                     for (pat, ty) in patterns.into_iter().zip(types.iter()) {
-                        typed_patterns.push(self.check_pattern(pat, ty)?);
+                        typed_patterns.push(self.check_pattern(pat, ty));
                     }
-                    Ok(TypedPattern {
+                    TypedPattern {
                         kind: TypedPatternKind::Tuple(typed_patterns),
                         ty: expected_type.clone(),
                         span: pattern.span,
-                    })
+                    }
                 } else {
-                    Err(TypeError::PatternMismatch {
+                    self.emit(TypeError::PatternMismatch {
                         pattern_ty: "tuple".to_string(),
                         iterable_ty: expected_type.clone(),
                         span: pattern.span,
-                    })
+                    });
+                    error_pattern(pattern.span)
                 }
             }
             ResolvedPatternKind::Variant(enum_id, variant_name, payload_pat) => {
                 if let Type::Enum(expected_enum_id, _) = expected_type {
                     if enum_id != *expected_enum_id {
-                        return Err(TypeError::Mismatch {
+                        self.emit(TypeError::Mismatch {
                             expected: expected_type.clone(),
                             found: Type::Enum(enum_id, "".to_string()),
                             span: pattern.span,
                         });
+                        return error_pattern(pattern.span);
                     }
 
                     let (resolved_id, _enum_name, variant_def) =
-                        self.get_resolved_enum_variant(enum_id, &variant_name, pattern.span)?;
+                        match self.get_resolved_enum_variant(enum_id, &variant_name, pattern.span) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                self.emit(e);
+                                return error_pattern(pattern.span);
+                            }
+                        };
 
                     debug_assert_eq!(resolved_id, enum_id, "enum ID mismatch after lookup");
 
                     let typed_payload = match (&variant_def.payload, payload_pat) {
                         (Some(payload_ty_def), Some(pat)) => {
-                            let payload_ty = self.resolve_type(payload_ty_def)?;
-                            Some(Box::new(self.check_pattern(*pat, &payload_ty)?))
+                            match self.resolve_type(payload_ty_def) {
+                                Ok(payload_ty) => {
+                                    Some(Box::new(self.check_pattern(*pat, &payload_ty)))
+                                }
+                                Err(e) => {
+                                    self.emit(e);
+                                    None
+                                }
+                            }
                         }
                         (None, None) => None,
                         (Some(_), None) => {
-                            return Err(TypeError::VariantExpectsPayload {
-                                variant: variant_name,
+                            self.emit(TypeError::VariantExpectsPayload {
+                                variant: variant_name.clone(),
                                 span: pattern.span,
                             });
+                            None
                         }
                         (None, Some(_)) => {
-                            return Err(TypeError::VariantExpectsNoPayload {
-                                variant: variant_name,
+                            self.emit(TypeError::VariantExpectsNoPayload {
+                                variant: variant_name.clone(),
                                 span: pattern.span,
                             });
+                            None
                         }
                     };
 
-                    Ok(TypedPattern {
+                    TypedPattern {
                         kind: TypedPatternKind::Variant(enum_id, variant_name, typed_payload),
                         ty: expected_type.clone(),
                         span: pattern.span,
-                    })
+                    }
                 } else {
-                    Err(TypeError::PatternMismatch {
+                    self.emit(TypeError::PatternMismatch {
                         pattern_ty: "enum variant".to_string(),
                         iterable_ty: expected_type.clone(),
                         span: pattern.span,
-                    })
+                    });
+                    error_pattern(pattern.span)
                 }
             }
-            ResolvedPatternKind::Error => Ok(TypedPattern {
+            ResolvedPatternKind::Error => TypedPattern {
                 kind: TypedPatternKind::Error,
                 ty: expected_type.clone(),
                 span: pattern.span,
-            }),
+            },
         }
     }
 
     fn check_assignment(
         &mut self,
         assign: ResolvedAssignment,
-    ) -> Result<TypedAssignment, TypeError> {
+    ) -> TypedAssignment {
+        let span = assign.span;
         if !self.is_valid_lvalue(&assign.target.kind) {
-            return Err(TypeError::InvalidAssignmentTarget(assign.span));
+            self.emit(TypeError::InvalidAssignmentTarget(span));
+            let typed_target = self.infer_expr(assign.target);
+            let typed_value = self.infer_expr(assign.value);
+            return TypedAssignment {
+                target: typed_target,
+                value: typed_value,
+                span,
+            };
         }
 
-        let typed_target = self.infer_expr(assign.target)?;
-        let typed_value = self.check_expr(assign.value, &typed_target.ty)?;
+        let typed_target = self.infer_expr(assign.target);
+        let typed_value = self.check_expr(assign.value, &typed_target.ty);
 
-        Ok(TypedAssignment {
+        TypedAssignment {
             target: typed_target,
             value: typed_value,
-            span: assign.span,
-        })
+            span,
+        }
     }
 
     fn is_valid_lvalue(&self, expr_kind: &ResolvedExprKind) -> bool {
@@ -958,39 +1044,58 @@ impl TypeChecker {
         variant_name: String,
         payload: Option<Box<ResolvedExpr>>,
         span: Span,
-    ) -> Result<TypedExpr, TypeError> {
+    ) -> TypedExpr {
         let (resolved_id, enum_name, variant_def) =
-            self.get_resolved_enum_variant(enum_id, &variant_name, span)?;
+            match self.get_resolved_enum_variant(enum_id, &variant_name, span) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.emit(e);
+                    return self.error_expr(span);
+                }
+            };
 
         let typed_payload = match (&variant_def.payload, payload) {
             (Some(payload_ty_def), Some(expr)) => {
-                let payload_ty = self.resolve_type(payload_ty_def)?;
-                Some(Box::new(self.check_expr(*expr, &payload_ty)?))
+                match self.resolve_type(payload_ty_def) {
+                    Ok(payload_ty) => Some(Box::new(self.check_expr(*expr, &payload_ty))),
+                    Err(e) => {
+                        self.emit(e);
+                        // Still type-check the payload expr for further errors
+                        let _ = self.infer_expr(*expr);
+                        None
+                    }
+                }
             }
             (None, None) => None,
             (Some(expected), None) => {
-                let expected_ty = self.resolve_type(expected)?;
-                return Err(TypeError::VariantPayloadMismatch {
-                    variant: variant_name,
-                    expected: expected_ty,
-                    found: Type::Tuple(vec![]), // Assumed unit/missing
-                    span,
-                });
+                match self.resolve_type(expected) {
+                    Ok(expected_ty) => {
+                        self.emit(TypeError::VariantPayloadMismatch {
+                            variant: variant_name.clone(),
+                            expected: expected_ty,
+                            found: Type::Tuple(vec![]),
+                            span,
+                        });
+                    }
+                    Err(e) => self.emit(e),
+                }
+                None
             }
             (None, Some(expr)) => {
-                let _ = self.infer_expr(*expr)?;
-                return Err(TypeError::VariantExpectsNoPayload {
-                    variant: variant_name,
+                let _ = self.infer_expr(*expr);
+                self.emit(TypeError::VariantExpectsNoPayload {
+                    variant: variant_name.clone(),
                     span,
                 });
+                None
             }
         };
 
-        Ok(TypedExpr {
+        TypedExpr {
             kind: TypedExprKind::VariantLit(resolved_id, variant_name, typed_payload),
             ty: Type::Enum(resolved_id, enum_name),
             span,
-        })
+        }
     }
 
     fn check_match(
@@ -998,13 +1103,13 @@ impl TypeChecker {
         scrutinee: ResolvedExpr,
         arms: Vec<crate::analysis::resolver::ResolvedMatchArm>,
         span: Span,
-    ) -> Result<TypedExpr, TypeError> {
-        let typed_scrutinee = self.infer_expr(scrutinee)?;
+    ) -> TypedExpr {
+        let typed_scrutinee = self.infer_expr(scrutinee);
         let scrutinee_ty = typed_scrutinee.ty.clone();
 
-        if !matches!(scrutinee_ty, Type::Enum(_, _)) {
-            return Err(TypeError::MatchScrutineeNotEnum {
-                ty: scrutinee_ty,
+        if !matches!(scrutinee_ty, Type::Enum(_, _) | Type::Error) {
+            self.emit(TypeError::MatchScrutineeNotEnum {
+                ty: scrutinee_ty.clone(),
                 span: typed_scrutinee.span,
             });
         }
@@ -1014,13 +1119,13 @@ impl TypeChecker {
 
         for arm in arms {
             self.enter_scope();
-            let typed_pattern = self.check_pattern(arm.pattern, &scrutinee_ty)?;
+            let typed_pattern = self.check_pattern(arm.pattern, &scrutinee_ty);
 
             let mut typed_body = Vec::new();
             let mut arm_diverges = false;
 
             for stmt in arm.body {
-                let (typed_stmt, stmt_returns) = self.check_statement(stmt)?;
+                let (typed_stmt, stmt_returns) = self.check_statement(stmt);
                 typed_body.push(typed_stmt);
                 if stmt_returns {
                     arm_diverges = true;
@@ -1043,8 +1148,8 @@ impl TypeChecker {
 
             if let Some(ty) = arm_ty {
                 if let Some(prev_ty) = &match_ty {
-                    if *prev_ty != ty {
-                        return Err(TypeError::MatchArmTypeMismatch {
+                    if *prev_ty != ty && !matches!(prev_ty, Type::Error) && !matches!(ty, Type::Error) {
+                        self.emit(TypeError::MatchArmTypeMismatch {
                             expected: prev_ty.clone(),
                             found: ty,
                             span: arm.span,
@@ -1065,46 +1170,46 @@ impl TypeChecker {
         // If all arms diverge, the match type is Never (the bottom type)
         let final_ty = match_ty.unwrap_or(Type::Never);
 
-        Ok(TypedExpr {
+        TypedExpr {
             kind: TypedExprKind::Match(Box::new(typed_scrutinee), typed_arms),
             ty: final_ty,
             span,
-        })
+        }
     }
 
-    fn check_expr(&mut self, expr: ResolvedExpr, expected: &Type) -> Result<TypedExpr, TypeError> {
+    fn check_expr(&mut self, expr: ResolvedExpr, expected: &Type) -> TypedExpr {
         let span = expr.span;
         match (&expr.kind, expected) {
-            (ResolvedExprKind::NilLit, Type::Optional(_)) => Ok(TypedExpr {
+            (ResolvedExprKind::NilLit, Type::Optional(_)) => TypedExpr {
                 kind: TypedExprKind::NilLit,
                 ty: expected.clone(),
                 span,
-            }),
+            },
 
             (ResolvedExprKind::ListLit(items), Type::List(elem_ty)) => {
                 let mut typed_items = Vec::new();
                 for item in items.clone() {
-                    typed_items.push(self.check_expr(item, elem_ty)?);
+                    typed_items.push(self.check_expr(item, elem_ty));
                 }
-                Ok(TypedExpr {
+                TypedExpr {
                     kind: TypedExprKind::ListLit(typed_items),
                     ty: expected.clone(),
                     span,
-                })
+                }
             }
 
             (ResolvedExprKind::MapLit(pairs), Type::Map(key_ty, val_ty)) => {
                 let mut typed_pairs = Vec::new();
                 for (key, val) in pairs.clone() {
-                    let typed_key = self.check_expr(key, key_ty)?;
-                    let typed_val = self.check_expr(val, val_ty)?;
+                    let typed_key = self.check_expr(key, key_ty);
+                    let typed_val = self.check_expr(val, val_ty);
                     typed_pairs.push((typed_key, typed_val));
                 }
-                Ok(TypedExpr {
+                TypedExpr {
                     kind: TypedExprKind::MapLit(typed_pairs),
                     ty: expected.clone(),
                     span,
-                })
+                }
             }
 
             (ResolvedExprKind::StructLit(struct_id, fields), Type::Struct(expected_id, _))
@@ -1113,44 +1218,55 @@ impl TypeChecker {
                 self.check_struct_literal(*struct_id, fields.clone(), span)
             }
 
-            (ResolvedExprKind::MakeChannel, Type::Chan(_)) => Ok(TypedExpr {
+            (ResolvedExprKind::MakeChannel, Type::Chan(_)) => TypedExpr {
                 kind: TypedExprKind::MakeChannel,
                 ty: expected.clone(),
                 span,
-            }),
+            },
 
             _ => {
-                let inferred = self.infer_expr(expr)?;
-                self.check_types_match(inferred, expected)
+                let inferred = self.infer_expr(expr);
+                match self.check_types_match(inferred, expected) {
+                    Ok(typed) => typed,
+                    Err(e) => {
+                        self.emit(e);
+                        self.error_expr(span)
+                    }
+                }
             }
         }
     }
 
-    fn infer_expr(&mut self, expr: ResolvedExpr) -> Result<TypedExpr, TypeError> {
+    fn infer_expr(&mut self, expr: ResolvedExpr) -> TypedExpr {
         let span = expr.span;
         match expr.kind {
             ResolvedExprKind::Var(name_id, name) => {
-                let ty = self.get_var_type(name_id, span)?;
-                Ok(TypedExpr {
-                    kind: TypedExprKind::Var(name_id, name),
-                    ty,
-                    span,
-                })
+                match self.get_var_type(name_id, span) {
+                    Ok(ty) => TypedExpr {
+                        kind: TypedExprKind::Var(name_id, name),
+                        ty,
+                        span,
+                    },
+                    Err(e) => {
+                        self.emit(e);
+                        self.error_expr(span)
+                    }
+                }
             }
-            ResolvedExprKind::IntLit(i) => Ok(TypedExpr {
+            ResolvedExprKind::IntLit(i) => TypedExpr {
                 kind: TypedExprKind::IntLit(i),
                 ty: Type::Int,
                 span,
-            }),
-            ResolvedExprKind::StringLit(s) => Ok(TypedExpr {
+            },
+            ResolvedExprKind::StringLit(s) => TypedExpr {
                 kind: TypedExprKind::StringLit(s),
                 ty: Type::String,
                 span,
-            }),
+            },
             ResolvedExprKind::FString(exprs) => {
                 let mut curr_expr: Option<TypedExpr> = None;
                 for e in exprs {
-                    let mut typed_e = self.infer_expr(e)?;
+                    let mut typed_e = self.infer_expr(e);
 
                     if typed_e.ty == Type::Int {
                         typed_e = TypedExpr {
@@ -1172,10 +1288,10 @@ impl TypeChecker {
                                 Type::String,
                             )),
                         };
-                    } else if typed_e.ty != Type::String {
-                        return Err(TypeError::Mismatch {
+                    } else if typed_e.ty != Type::String && typed_e.ty != Type::Error {
+                        self.emit(TypeError::Mismatch {
                             expected: Type::String,
-                            found: typed_e.ty,
+                            found: typed_e.ty.clone(),
                             span: typed_e.span,
                         });
                     }
@@ -1196,71 +1312,84 @@ impl TypeChecker {
                     }
                 }
 
-                curr_expr.ok_or_else(|| TypeError::Mismatch {
-                    expected: Type::String,
-                    found: Type::Tuple(vec![]),
-                    span,
-                })
+                match curr_expr {
+                    Some(e) => e,
+                    None => {
+                        self.emit(TypeError::Mismatch {
+                            expected: Type::String,
+                            found: Type::Tuple(vec![]),
+                            span,
+                        });
+                        self.error_expr(span)
+                    }
+                }
             }
             ResolvedExprKind::PersistData(expr) => {
-                let typed_e = self.infer_expr(*expr)?;
+                let typed_e = self.infer_expr(*expr);
                 if !is_trivially_copyable(&typed_e.ty, &self.trivially_copyable) {
-                    return Err(TypeError::NonTriviallyCopyable {
-                        ty: typed_e.ty,
+                    self.emit(TypeError::NonTriviallyCopyable {
+                        ty: typed_e.ty.clone(),
                         span,
                     });
                 }
-                Ok(TypedExpr {
+                TypedExpr {
                     kind: TypedExprKind::PersistData(Box::new(typed_e)),
                     ty: Type::Tuple(vec![]),
                     span,
-                })
+                }
             }
             ResolvedExprKind::RetrieveData(type_def) => {
-                let inner_type = self.resolve_type(&type_def)?;
-                if !is_trivially_copyable(&inner_type, &self.trivially_copyable) {
-                    return Err(TypeError::NonTriviallyCopyable {
-                        ty: inner_type,
-                        span,
-                    });
+                match self.resolve_type(&type_def) {
+                    Ok(inner_type) => {
+                        if !is_trivially_copyable(&inner_type, &self.trivially_copyable) {
+                            self.emit(TypeError::NonTriviallyCopyable {
+                                ty: inner_type.clone(),
+                                span,
+                            });
+                        }
+                        TypedExpr {
+                            kind: TypedExprKind::RetrieveData(inner_type.clone()),
+                            ty: Type::Optional(Box::new(inner_type)),
+                            span,
+                        }
+                    }
+                    Err(e) => {
+                        self.emit(e);
+                        self.error_expr(span)
+                    }
                 }
-                Ok(TypedExpr {
-                    kind: TypedExprKind::RetrieveData(inner_type.clone()),
-                    ty: Type::Optional(Box::new(inner_type)),
-                    span,
-                })
             }
-            ResolvedExprKind::DiscardData => Ok(TypedExpr {
+            ResolvedExprKind::DiscardData => TypedExpr {
                 kind: TypedExprKind::DiscardData,
                 ty: Type::Tuple(vec![]),
                 span,
-            }),
-            ResolvedExprKind::BoolLit(b) => Ok(TypedExpr {
+            },
+            ResolvedExprKind::BoolLit(b) => TypedExpr {
                 kind: TypedExprKind::BoolLit(b),
                 ty: Type::Bool,
                 span,
-            }),
-            ResolvedExprKind::NilLit => Ok(TypedExpr {
+            },
+            ResolvedExprKind::NilLit => TypedExpr {
                 kind: TypedExprKind::NilLit,
                 ty: Type::Nil,
                 span,
-            }),
+            },
             ResolvedExprKind::BinOp(op, left, right) => self.infer_binop(op, *left, *right, span),
             ResolvedExprKind::Not(e) => {
-                let typed_e = self.check_expr(*e, &Type::Bool)?;
-                Ok(TypedExpr {
+                let typed_e = self.check_expr(*e, &Type::Bool);
+                TypedExpr {
                     kind: TypedExprKind::Not(Box::new(typed_e)),
                     ty: Type::Bool,
                     span,
-                })
+                }
             }
             ResolvedExprKind::Negate(e) => {
-                let typed_e = self.check_expr(*e, &Type::Int)?;
-                Ok(TypedExpr {
+                let typed_e = self.check_expr(*e, &Type::Int);
+                TypedExpr {
                     kind: TypedExprKind::Negate(Box::new(typed_e)),
                     ty: Type::Int,
                     span,
-                })
+                }
             }
             ResolvedExprKind::VariantLit(enum_id, variant_name, payload) => {
                 self.check_variant_lit(enum_id, variant_name, payload, span)
@@ -1268,24 +1397,26 @@ impl TypeChecker {
             ResolvedExprKind::Match(scrutinee, arms) => self.check_match(*scrutinee, arms, span),
             ResolvedExprKind::FuncCall(call) => match call {
                 ResolvedFuncCall::User(user_call) => {
-                    let sig = self
-                        .func_signatures
-                        .get(&user_call.name)
-                        .ok_or(TypeError::UndefinedType(user_call.span))?
-                        .clone();
+                    let sig = match self.func_signatures.get(&user_call.name) {
+                        Some(sig) => sig.clone(),
+                        None => {
+                            self.emit(TypeError::UndefinedType(user_call.span));
+                            return self.error_expr(span);
+                        }
+                    };
 
-                    let typed_call = self.check_user_func_call(user_call, &sig)?;
+                    let typed_call = self.check_user_func_call(user_call, &sig);
                     let return_ty = if sig.is_sync {
                         sig.return_type
                     } else {
                         Type::Chan(Box::new(sig.return_type.clone()))
                     };
 
-                    Ok(TypedExpr {
+                    TypedExpr {
                         kind: TypedExprKind::FuncCall(TypedFuncCall::User(typed_call)),
                         ty: return_ty,
                         span,
-                    })
+                    }
                 }
                 ResolvedFuncCall::Builtin(builtin, args, span) => {
                     self.check_builtin_call(builtin, args, span)
@@ -1298,75 +1429,91 @@ impl TypeChecker {
                 let mut typed_items = Vec::new();
                 let mut types = Vec::new();
                 for item in items {
-                    let typed_item = self.infer_expr(item)?;
+                    let typed_item = self.infer_expr(item);
                     types.push(typed_item.ty.clone());
                     typed_items.push(typed_item);
                 }
-                Ok(TypedExpr {
+                TypedExpr {
                     kind: TypedExprKind::TupleLit(typed_items),
                     ty: Type::Tuple(types),
                     span,
-                })
+                }
             }
             ResolvedExprKind::Append(list_expr, item_expr) => {
-                let typed_list = self.infer_expr(*list_expr)?;
-                let typed_item = self.infer_expr(*item_expr)?;
+                let typed_list = self.infer_expr(*list_expr);
+                let typed_item = self.infer_expr(*item_expr);
 
                 let (list_ty, coerced_item) = match typed_list.ty.clone() {
                     Type::List(elem_ty) => {
-                        let coerced = self.check_types_match(typed_item, &elem_ty)?;
-                        (Type::List(elem_ty), coerced)
+                        match self.check_types_match(typed_item, &elem_ty) {
+                            Ok(coerced) => (Type::List(elem_ty), coerced),
+                            Err(e) => {
+                                self.emit(e);
+                                return self.error_expr(span);
+                            }
+                        }
                     }
                     Type::EmptyList => (Type::List(Box::new(typed_item.ty.clone())), typed_item),
+                    Type::Error => return self.error_expr(span),
                     _ => {
-                        return Err(TypeError::NotAList {
+                        self.emit(TypeError::NotAList {
                             ty: typed_list.ty,
                             span,
                         });
+                        return self.error_expr(span);
                     }
                 };
 
-                Ok(TypedExpr {
+                TypedExpr {
                     kind: TypedExprKind::Append(Box::new(typed_list), Box::new(coerced_item)),
                     ty: list_ty,
                     span,
-                })
+                }
             }
             ResolvedExprKind::Prepend(item_expr, list_expr) => {
-                let typed_item = self.infer_expr(*item_expr)?;
-                let typed_list = self.infer_expr(*list_expr)?;
+                let typed_item = self.infer_expr(*item_expr);
+                let typed_list = self.infer_expr(*list_expr);
 
                 let (list_ty, coerced_item) = match typed_list.ty.clone() {
                     Type::List(elem_ty) => {
-                        let coerced = self.check_types_match(typed_item, &elem_ty)?;
-                        (Type::List(elem_ty), coerced)
+                        match self.check_types_match(typed_item, &elem_ty) {
+                            Ok(coerced) => (Type::List(elem_ty), coerced),
+                            Err(e) => {
+                                self.emit(e);
+                                return self.error_expr(span);
+                            }
+                        }
                     }
                     Type::EmptyList => (Type::List(Box::new(typed_item.ty.clone())), typed_item),
+                    Type::Error => return self.error_expr(span),
                     _ => {
-                        return Err(TypeError::NotAList {
+                        self.emit(TypeError::NotAList {
                             ty: typed_list.ty,
                             span,
                         });
+                        return self.error_expr(span);
                     }
                 };
 
-                Ok(TypedExpr {
+                TypedExpr {
                     kind: TypedExprKind::Prepend(Box::new(coerced_item), Box::new(typed_list)),
                     ty: list_ty,
                     span,
-                })
+                }
             }
             ResolvedExprKind::Store(collection, key, value) => {
-                let typed_collection = self.infer_expr(*collection)?;
+                let typed_collection = self.infer_expr(*collection);
 
                 match typed_collection.ty.clone() {
                     Type::List(elem_ty) => {
-                        let typed_key = self.infer_expr(*key)?;
-                        self.check_type_compatibility(&Type::Int, &typed_key.ty, span)?;
+                        let typed_key = self.infer_expr(*key);
+                        if let Err(e) = self.check_type_compatibility(&Type::Int, &typed_key.ty, span) {
+                            self.emit(e);
+                        }
 
-                        let typed_value = self.check_expr(*value, &elem_ty)?;
+                        let typed_value = self.check_expr(*value, &elem_ty);
 
-                        Ok(TypedExpr {
+                        TypedExpr {
                             kind: TypedExprKind::Store(
                                 Box::new(typed_collection.clone()),
                                 Box::new(typed_key),
@@ -1374,13 +1521,13 @@ impl TypeChecker {
                             ),
                             ty: typed_collection.ty,
                             span,
-                        })
+                        }
                     }
                     Type::Map(key_ty, val_ty) => {
-                        let typed_key = self.check_expr(*key, &key_ty)?;
-                        let typed_value = self.check_expr(*value, &val_ty)?;
+                        let typed_key = self.check_expr(*key, &key_ty);
+                        let typed_value = self.check_expr(*value, &val_ty);
 
-                        Ok(TypedExpr {
+                        TypedExpr {
                             kind: TypedExprKind::Store(
                                 Box::new(typed_collection.clone()),
                                 Box::new(typed_key),
@@ -1388,21 +1535,32 @@ impl TypeChecker {
                             ),
                             ty: typed_collection.ty,
                             span,
-                        })
+                        }
                     }
                     Type::Struct(struct_id, _) => {
                         let key_span = key.span;
                         let field_name = if let ResolvedExprKind::StringLit(s) = &key.kind {
                             s.clone()
                         } else {
-                            return Err(TypeError::InvalidStructKeyType {
-                                found: self.infer_expr(*key)?.ty,
+                            let typed_key = self.infer_expr(*key);
+                            self.emit(TypeError::InvalidStructKeyType {
+                                found: typed_key.ty,
                                 span: key_span,
                             });
+                            let typed_value = self.infer_expr(*value);
+                            let _ = typed_value;
+                            return self.error_expr(span);
                         };
 
-                        let field_ty = self.get_field_type(struct_id, &field_name, span)?;
-                        let typed_value = self.check_expr(*value, &field_ty)?;
+                        let field_ty = match self.get_field_type(struct_id, &field_name, span) {
+                            Ok(ty) => ty,
+                            Err(e) => {
+                                self.emit(e);
+                                let _ = self.infer_expr(*value);
+                                return self.error_expr(span);
+                            }
+                        };
+                        let typed_value = self.check_expr(*value, &field_ty);
 
                         let typed_key = TypedExpr {
                             kind: TypedExprKind::StringLit(field_name),
@@ -1410,7 +1568,7 @@ impl TypeChecker {
                             span: key_span,
                         };
 
-                        Ok(TypedExpr {
+                        TypedExpr {
                             kind: TypedExprKind::Store(
                                 Box::new(typed_collection.clone()),
                                 Box::new(typed_key),
@@ -1418,168 +1576,204 @@ impl TypeChecker {
                             ),
                             ty: typed_collection.ty,
                             span,
-                        })
+                        }
                     }
-                    _ => Err(TypeError::StoreOnInvalidType {
-                        ty: typed_collection.ty,
-                        span,
-                    }),
+                    Type::Error => self.error_expr(span),
+                    _ => {
+                        self.emit(TypeError::StoreOnInvalidType {
+                            ty: typed_collection.ty,
+                            span,
+                        });
+                        self.error_expr(span)
+                    }
                 }
             }
             ResolvedExprKind::Head(list_expr) => {
-                let typed_list = self.infer_expr(*list_expr)?;
+                let typed_list = self.infer_expr(*list_expr);
                 if let Type::List(elem_ty) = typed_list.ty.clone() {
-                    Ok(TypedExpr {
+                    TypedExpr {
                         kind: TypedExprKind::Head(Box::new(typed_list)),
                         ty: *elem_ty,
                         span,
-                    })
+                    }
+                } else if matches!(typed_list.ty, Type::Error) {
+                    self.error_expr(span)
                 } else {
-                    Err(TypeError::NotAList {
+                    self.emit(TypeError::NotAList {
                         ty: typed_list.ty,
                         span,
-                    })
+                    });
+                    self.error_expr(span)
                 }
             }
             ResolvedExprKind::Tail(list_expr) => {
-                let typed_list = self.infer_expr(*list_expr)?;
+                let typed_list = self.infer_expr(*list_expr);
                 if let Type::List(_) = &typed_list.ty {
-                    Ok(TypedExpr {
+                    TypedExpr {
                         kind: TypedExprKind::Tail(Box::new(typed_list.clone())),
                         ty: typed_list.ty,
                         span,
-                    })
+                    }
+                } else if matches!(typed_list.ty, Type::Error) {
+                    self.error_expr(span)
                 } else {
-                    Err(TypeError::NotAList {
+                    self.emit(TypeError::NotAList {
                         ty: typed_list.ty,
                         span,
-                    })
+                    });
+                    self.error_expr(span)
                 }
             }
             ResolvedExprKind::Len(expr) => {
-                let typed_e = self.infer_expr(*expr)?;
+                let typed_e = self.infer_expr(*expr);
                 match typed_e.ty {
-                    Type::List(_) | Type::Map(_, _) | Type::String => Ok(TypedExpr {
+                    Type::List(_) | Type::Map(_, _) | Type::String | Type::Error => TypedExpr {
                         kind: TypedExprKind::Len(Box::new(typed_e)),
                         ty: Type::Int,
                         span,
-                    }),
-                    _ => Err(TypeError::InvalidUnaryOp {
-                        op: "len",
-                        ty: typed_e.ty,
-                        span: typed_e.span,
-                    }),
+                    },
+                    _ => {
+                        self.emit(TypeError::InvalidUnaryOp {
+                            op: "len",
+                            ty: typed_e.ty.clone(),
+                            span: typed_e.span,
+                        });
+                        self.error_expr(span)
+                    }
                 }
             }
             ResolvedExprKind::Min(left, right) => {
-                let typed_left = self.check_expr(*left, &Type::Int)?;
-                let typed_right = self.check_expr(*right, &Type::Int)?;
-                Ok(TypedExpr {
+                let typed_left = self.check_expr(*left, &Type::Int);
+                let typed_right = self.check_expr(*right, &Type::Int);
+                TypedExpr {
                     kind: TypedExprKind::Min(Box::new(typed_left), Box::new(typed_right)),
                     ty: Type::Int,
                     span,
-                })
+                }
             }
             ResolvedExprKind::Exists(map_expr, key_expr) => {
-                let typed_map = self.infer_expr(*map_expr)?;
-                let typed_key = self.infer_expr(*key_expr)?;
+                let typed_map = self.infer_expr(*map_expr);
+                let typed_key = self.infer_expr(*key_expr);
 
                 if let Type::Map(expected_key_ty, _) = &typed_map.ty {
-                    self.check_type_compatibility(expected_key_ty, &typed_key.ty, span)?;
-                    Ok(TypedExpr {
+                    if let Err(e) = self.check_type_compatibility(expected_key_ty, &typed_key.ty, span) {
+                        self.emit(e);
+                    }
+                    TypedExpr {
                         kind: TypedExprKind::Exists(Box::new(typed_map), Box::new(typed_key)),
                         ty: Type::Bool,
                         span,
-                    })
+                    }
+                } else if matches!(typed_map.ty, Type::Error) {
+                    self.error_expr(span)
                 } else {
-                    Err(TypeError::InvalidUnaryOp {
+                    self.emit(TypeError::InvalidUnaryOp {
                         op: "exists",
                         ty: typed_map.ty,
                         span,
-                    })
+                    });
+                    self.error_expr(span)
                 }
             }
             ResolvedExprKind::Erase(map_expr, key_expr) => {
-                let typed_map = self.infer_expr(*map_expr)?;
-                let typed_key = self.infer_expr(*key_expr)?;
+                let typed_map = self.infer_expr(*map_expr);
+                let typed_key = self.infer_expr(*key_expr);
 
                 if let Type::Map(expected_key_ty, _) = &typed_map.ty {
-                    self.check_type_compatibility(expected_key_ty, &typed_key.ty, span)?;
-                    Ok(TypedExpr {
+                    if let Err(e) = self.check_type_compatibility(expected_key_ty, &typed_key.ty, span) {
+                        self.emit(e);
+                    }
+                    TypedExpr {
                         kind: TypedExprKind::Erase(
                             Box::new(typed_map.clone()),
                             Box::new(typed_key),
                         ),
                         ty: typed_map.ty,
                         span,
-                    })
+                    }
+                } else if matches!(typed_map.ty, Type::Error) {
+                    self.error_expr(span)
                 } else {
-                    Err(TypeError::InvalidUnaryOp {
+                    self.emit(TypeError::InvalidUnaryOp {
                         op: "erase",
                         ty: typed_map.ty,
                         span,
-                    })
+                    });
+                    self.error_expr(span)
                 }
             }
-            ResolvedExprKind::MakeChannel => Ok(TypedExpr {
+            ResolvedExprKind::MakeChannel => TypedExpr {
                 kind: TypedExprKind::MakeChannel,
                 ty: Type::UnknownChannel,
                 span,
-            }),
+            },
             ResolvedExprKind::Send(chan_expr, val_expr) => {
                 if self.current_func_is_sync {
-                    return Err(TypeError::SendInSyncFunc { span });
+                    self.emit(TypeError::SendInSyncFunc { span });
+                    let _ = self.infer_expr(*chan_expr);
+                    let _ = self.infer_expr(*val_expr);
+                    return self.error_expr(span);
                 }
 
-                let typed_chan = self.infer_expr(*chan_expr)?;
+                let typed_chan = self.infer_expr(*chan_expr);
 
                 if let Type::Chan(inner_ty) = &typed_chan.ty {
-                    let typed_val = self.check_expr(*val_expr, inner_ty)?;
-                    Ok(TypedExpr {
+                    let typed_val = self.check_expr(*val_expr, inner_ty);
+                    TypedExpr {
                         kind: TypedExprKind::Send(Box::new(typed_chan), Box::new(typed_val)),
                         ty: Type::Tuple(vec![]),
                         span,
-                    })
+                    }
+                } else if matches!(typed_chan.ty, Type::Error) {
+                    let _ = self.infer_expr(*val_expr);
+                    self.error_expr(span)
                 } else {
-                    Err(TypeError::NotAChannel {
+                    self.emit(TypeError::NotAChannel {
                         ty: typed_chan.ty,
                         span,
-                    })
+                    });
+                    let _ = self.infer_expr(*val_expr);
+                    self.error_expr(span)
                 }
             }
             ResolvedExprKind::Recv(chan_expr) => {
                 if self.current_func_is_sync {
-                    return Err(TypeError::RecvInSyncFunc { span });
+                    self.emit(TypeError::RecvInSyncFunc { span });
+                    let _ = self.infer_expr(*chan_expr);
+                    return self.error_expr(span);
                 }
 
-                let typed_chan = self.infer_expr(*chan_expr)?;
+                let typed_chan = self.infer_expr(*chan_expr);
 
                 if let Type::Chan(inner_ty) = typed_chan.ty.clone() {
-                    Ok(TypedExpr {
+                    TypedExpr {
                         kind: TypedExprKind::Recv(Box::new(typed_chan)),
                         ty: *inner_ty,
                         span,
-                    })
+                    }
+                } else if matches!(typed_chan.ty, Type::Error) {
+                    self.error_expr(span)
                 } else {
-                    Err(TypeError::NotAChannel {
+                    self.emit(TypeError::NotAChannel {
                         ty: typed_chan.ty,
                         span,
-                    })
+                    });
+                    self.error_expr(span)
                 }
             }
-            ResolvedExprKind::SetTimer => Ok(TypedExpr {
+            ResolvedExprKind::SetTimer => TypedExpr {
                 kind: TypedExprKind::SetTimer,
                 ty: Type::Chan(Box::new(Type::Tuple(vec![]))),
                 span,
-            }),
+            },
             ResolvedExprKind::Index(target, index) => self.infer_index(*target, *index, span),
             ResolvedExprKind::Slice(target, start, end) => {
-                let typed_target = self.infer_expr(*target)?;
-                let typed_start = self.check_expr(*start, &Type::Int)?;
-                let typed_end = self.check_expr(*end, &Type::Int)?;
+                let typed_target = self.infer_expr(*target);
+                let typed_start = self.check_expr(*start, &Type::Int);
+                let typed_end = self.check_expr(*end, &Type::Int);
 
                 match typed_target.ty.clone() {
-                    Type::List(_) | Type::String => Ok(TypedExpr {
+                    Type::List(_) | Type::String => TypedExpr {
                         kind: TypedExprKind::Slice(
                             Box::new(typed_target.clone()),
                             Box::new(typed_start),
@@ -1587,109 +1781,141 @@ impl TypeChecker {
                         ),
                         ty: typed_target.ty,
                         span,
-                    }),
-                    _ => Err(TypeError::NotIndexable {
-                        ty: typed_target.ty,
-                        span,
-                    }),
+                    },
+                    Type::Error => self.error_expr(span),
+                    _ => {
+                        self.emit(TypeError::NotIndexable {
+                            ty: typed_target.ty,
+                            span,
+                        });
+                        self.error_expr(span)
+                    }
                 }
             }
             ResolvedExprKind::TupleAccess(tuple_expr, index) => {
-                let typed_tuple = self.infer_expr(*tuple_expr)?;
+                let typed_tuple = self.infer_expr(*tuple_expr);
                 if let Type::Tuple(types) = typed_tuple.ty.clone() {
                     if index < types.len() {
-                        Ok(TypedExpr {
+                        TypedExpr {
                             kind: TypedExprKind::TupleAccess(Box::new(typed_tuple), index),
                             ty: types[index].clone(),
                             span,
-                        })
+                        }
                     } else {
-                        Err(TypeError::TupleIndexOutOfBounds {
+                        self.emit(TypeError::TupleIndexOutOfBounds {
                             index,
                             size: types.len(),
                             span,
-                        })
+                        });
+                        self.error_expr(span)
                     }
+                } else if matches!(typed_tuple.ty, Type::Error) {
+                    self.error_expr(span)
                 } else {
-                    Err(TypeError::NotATuple {
+                    self.emit(TypeError::NotATuple {
                         ty: typed_tuple.ty,
                         span,
-                    })
+                    });
+                    self.error_expr(span)
                 }
             }
             ResolvedExprKind::FieldAccess(struct_expr, field_name) => {
-                let typed_struct = self.infer_expr(*struct_expr)?;
+                let typed_struct = self.infer_expr(*struct_expr);
+                if matches!(typed_struct.ty, Type::Error) {
+                    return self.error_expr(span);
+                }
                 if matches!(typed_struct.ty, Type::Optional(_)) {
-                    return Err(TypeError::NotAStruct {
+                    self.emit(TypeError::NotAStruct {
                         ty: typed_struct.ty,
                         field_name: field_name.clone(),
                         span,
                     });
+                    return self.error_expr(span);
                 }
                 if let Type::Struct(struct_id, _) = typed_struct.ty {
-                    let field_ty = self.get_field_type(struct_id, &field_name, span)?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::FieldAccess(Box::new(typed_struct), field_name),
-                        ty: field_ty,
-                        span,
-                    })
+                    match self.get_field_type(struct_id, &field_name, span) {
+                        Ok(field_ty) => TypedExpr {
+                            kind: TypedExprKind::FieldAccess(Box::new(typed_struct), field_name),
+                            ty: field_ty,
+                            span,
+                        },
+                        Err(e) => {
+                            self.emit(e);
+                            self.error_expr(span)
+                        }
+                    }
                 } else {
-                    Err(TypeError::NotAStruct {
+                    self.emit(TypeError::NotAStruct {
                         ty: typed_struct.ty,
                         field_name: field_name.clone(),
                         span,
-                    })
+                    });
+                    self.error_expr(span)
                 }
             }
             ResolvedExprKind::Unwrap(e) => {
-                let typed_e = self.infer_expr(*e)?;
+                let typed_e = self.infer_expr(*e);
                 let inner_ty = typed_e.ty.clone();
 
                 match inner_ty {
-                    Type::Optional(t) => Ok(TypedExpr {
+                    Type::Optional(t) => TypedExpr {
                         kind: TypedExprKind::UnwrapOptional(Box::new(typed_e)),
                         ty: *t,
                         span,
-                    }),
-                    _ => Err(TypeError::UnwrapOnNonOptional { ty: inner_ty, span }),
+                    },
+                    Type::Error => self.error_expr(span),
+                    _ => {
+                        self.emit(TypeError::UnwrapOnNonOptional { ty: inner_ty, span });
+                        self.error_expr(span)
+                    }
                 }
             }
             ResolvedExprKind::StructLit(struct_id, fields) => {
                 self.check_struct_literal(struct_id, fields, span)
             }
-            ResolvedExprKind::Error => Ok(TypedExpr {
+            ResolvedExprKind::Error => TypedExpr {
                 kind: TypedExprKind::Error,
                 ty: Type::Error,
                 span,
-            }),
+            },
             ResolvedExprKind::RpcCall(target, call) => {
-                let typed_target = self.infer_expr(*target)?;
+                let typed_target = self.infer_expr(*target);
                 let role_id = match &typed_target.ty {
                     Type::Role(id, _) => *id,
+                    Type::Error => return self.error_expr(span),
                     _ => {
-                        return Err(TypeError::RpcCallTargetNotRole {
-                            ty: typed_target.ty,
+                        self.emit(TypeError::RpcCallTargetNotRole {
+                            ty: typed_target.ty.clone(),
                             span: typed_target.span,
                         });
+                        return self.error_expr(span);
                     }
                 };
 
-                let role_funcs = self
-                    .role_func_signatures
-                    .get(&role_id)
-                    .ok_or(TypeError::UndefinedType(typed_target.span))?;
-
-                let (func_id, sig) = role_funcs.get(&call.original_name).ok_or_else(|| {
-                    TypeError::FieldNotFound {
-                        field_name: call.original_name.clone(),
-                        span: call.span,
+                let role_funcs = match self.role_func_signatures.get(&role_id) {
+                    Some(funcs) => funcs,
+                    None => {
+                        self.emit(TypeError::UndefinedType(typed_target.span));
+                        return self.error_expr(span);
                     }
-                })?;
+                };
+
+                let (func_id, sig) = match role_funcs.get(&call.original_name) {
+                    Some(v) => v,
+                    None => {
+                        self.emit(TypeError::FieldNotFound {
+                            field_name: call.original_name.clone(),
+                            span: call.span,
+                        });
+                        return self.error_expr(span);
+                    }
+                };
                 if sig.is_sync {
-                    return Err(TypeError::RpcCallToSyncFunc {
+                    self.emit(TypeError::RpcCallToSyncFunc {
                         func_name: call.original_name.clone(),
                         span,
                     });
+                    return self.error_expr(span);
                 }
 
                 // Clone data before mutable borrow
@@ -1697,7 +1923,7 @@ impl TypeChecker {
                 let params = sig.params.clone();
                 let return_type = sig.return_type.clone();
 
-                let typed_args = self.check_call_args(&params, call.args, call.span)?;
+                let typed_args = self.check_call_args(&params, call.args, call.span);
                 let typed_call = TypedUserFuncCall {
                     name: func_id,
                     original_name: call.original_name,
@@ -1707,11 +1933,11 @@ impl TypeChecker {
                 };
 
                 let return_ty = Type::Chan(Box::new(return_type));
-                Ok(TypedExpr {
+                TypedExpr {
                     kind: TypedExprKind::RpcCall(Box::new(typed_target), typed_call),
                     ty: return_ty,
                     span,
-                })
+                }
             }
         }
     }
@@ -1780,87 +2006,104 @@ impl TypeChecker {
         left: ResolvedExpr,
         right: ResolvedExpr,
         span: Span,
-    ) -> Result<TypedExpr, TypeError> {
+    ) -> TypedExpr {
         match op {
             BinOp::Add => {
                 // Infer types of both operands
-                let typed_left = self.infer_expr(left)?;
-                let typed_right = self.infer_expr(right)?;
+                let typed_left = self.infer_expr(left);
+                let typed_right = self.infer_expr(right);
 
                 // Both must be the same type (either Int or String)
                 match (&typed_left.ty, &typed_right.ty) {
-                    (Type::Int, Type::Int) => Ok(TypedExpr {
+                    (Type::Int, Type::Int) => TypedExpr {
                         kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                         ty: Type::Int,
                         span,
-                    }),
-                    (Type::String, Type::String) => Ok(TypedExpr {
+                    },
+                    (Type::String, Type::String) => TypedExpr {
                         kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                         ty: Type::String,
                         span,
-                    }),
-                    _ => Err(TypeError::InvalidBinOp {
-                        op: op.clone(),
-                        left: typed_left.ty.clone(),
-                        right: typed_right.ty.clone(),
-                        span,
-                    }),
+                    },
+                    _ if matches!(typed_left.ty, Type::Error) || matches!(typed_right.ty, Type::Error) => {
+                        self.error_expr(span)
+                    }
+                    _ => {
+                        self.emit(TypeError::InvalidBinOp {
+                            op: op.clone(),
+                            left: typed_left.ty.clone(),
+                            right: typed_right.ty.clone(),
+                            span,
+                        });
+                        self.error_expr(span)
+                    }
                 }
             }
             BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {
-                let typed_left = self.check_expr(left, &Type::Int)?;
-                let typed_right = self.check_expr(right, &Type::Int)?;
-                Ok(TypedExpr {
+                let typed_left = self.check_expr(left, &Type::Int);
+                let typed_right = self.check_expr(right, &Type::Int);
+                TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                     ty: Type::Int,
                     span,
-                })
+                }
             }
             BinOp::Equal | BinOp::NotEqual => {
-                let typed_left = self.infer_expr(left)?;
-                let typed_right = self.infer_expr(right)?;
+                let typed_left = self.infer_expr(left);
+                let typed_right = self.infer_expr(right);
                 let (coerced_left, coerced_right) =
-                    self.check_and_coerce_symmetric(typed_left, typed_right, op.clone(), span)?;
-                Ok(TypedExpr {
+                    match self.check_and_coerce_symmetric(typed_left, typed_right, op.clone(), span) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            self.emit(e);
+                            return self.error_expr(span);
+                        }
+                    };
+                TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(coerced_left), Box::new(coerced_right)),
                     ty: Type::Bool,
                     span,
-                })
+                }
             }
             BinOp::Less | BinOp::LessEqual | BinOp::Greater | BinOp::GreaterEqual => {
-                let typed_left = self.check_expr(left, &Type::Int)?;
-                let typed_right = self.check_expr(right, &Type::Int)?;
-                Ok(TypedExpr {
+                let typed_left = self.check_expr(left, &Type::Int);
+                let typed_right = self.check_expr(right, &Type::Int);
+                TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                     ty: Type::Bool,
                     span,
-                })
+                }
             }
             BinOp::And | BinOp::Or => {
-                let typed_left = self.check_expr(left, &Type::Bool)?;
-                let typed_right = self.check_expr(right, &Type::Bool)?;
-                Ok(TypedExpr {
+                let typed_left = self.check_expr(left, &Type::Bool);
+                let typed_right = self.check_expr(right, &Type::Bool);
+                TypedExpr {
                     kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                     ty: Type::Bool,
                     span,
-                })
+                }
             }
             BinOp::Coalesce => {
-                let typed_left = self.infer_expr(left)?;
+                let typed_left = self.infer_expr(left);
                 if let Type::Optional(inner_ty) = typed_left.ty.clone() {
-                    let typed_right = self.check_expr(right, &inner_ty)?;
-                    Ok(TypedExpr {
+                    let typed_right = self.check_expr(right, &inner_ty);
+                    TypedExpr {
                         kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
                         ty: *inner_ty,
                         span,
-                    })
+                    }
+                } else if matches!(typed_left.ty, Type::Error) {
+                    let _ = self.infer_expr(right);
+                    self.error_expr(span)
                 } else {
-                    Err(TypeError::InvalidBinOp {
+                    self.emit(TypeError::InvalidBinOp {
                         op: BinOp::Coalesce,
                         left: typed_left.ty,
                         right: Type::Nil,
                         span,
-                    })
+                    });
+                    let _ = self.infer_expr(right);
+                    self.error_expr(span)
                 }
             }
         }
@@ -1895,21 +2138,27 @@ impl TypeChecker {
         expected_params: &Vec<Type>,
         args: Vec<ResolvedExpr>,
         call_span: Span,
-    ) -> Result<Vec<TypedExpr>, TypeError> {
+    ) -> Vec<TypedExpr> {
         if args.len() != expected_params.len() {
-            return Err(TypeError::WrongNumberOfArgs {
+            self.emit(TypeError::WrongNumberOfArgs {
                 expected: expected_params.len(),
                 got: args.len(),
                 span: call_span,
             });
+            // Still type-check as many args as we can
+            let mut typed_args = Vec::new();
+            for (arg, expected_ty) in args.into_iter().zip(expected_params.iter()) {
+                typed_args.push(self.check_expr(arg, expected_ty));
+            }
+            return typed_args;
         }
 
         let mut typed_args = Vec::new();
         for (arg, expected_ty) in args.into_iter().zip(expected_params.iter()) {
-            let typed_arg = self.check_expr(arg, expected_ty)?;
+            let typed_arg = self.check_expr(arg, expected_ty);
             typed_args.push(typed_arg);
         }
-        Ok(typed_args)
+        typed_args
     }
 
     fn check_builtin_call(
@@ -1917,25 +2166,26 @@ impl TypeChecker {
         builtin: BuiltinFn,
         args: Vec<ResolvedExpr>,
         span: Span,
-    ) -> Result<TypedExpr, TypeError> {
+    ) -> TypedExpr {
         // Special case: role_to_string accepts any role type
         if builtin == BuiltinFn::RoleToString {
             if args.len() != 1 {
-                return Err(TypeError::WrongNumberOfArgs {
+                self.emit(TypeError::WrongNumberOfArgs {
                     expected: 1,
                     got: args.len(),
                     span,
                 });
+                return self.error_expr(span);
             }
-            let typed_arg = self.infer_expr(args.into_iter().next().unwrap())?;
-            if !matches!(typed_arg.ty, Type::Role(_, _)) {
-                return Err(TypeError::Mismatch {
+            let typed_arg = self.infer_expr(args.into_iter().next().unwrap());
+            if !matches!(typed_arg.ty, Type::Role(_, _) | Type::Error) {
+                self.emit(TypeError::Mismatch {
                     expected: Type::Role(NameId(0), "role".to_string()),
                     found: typed_arg.ty.clone(),
                     span,
                 });
             }
-            return Ok(TypedExpr {
+            return TypedExpr {
                 kind: TypedExprKind::FuncCall(TypedFuncCall::Builtin(
                     builtin,
                     vec![typed_arg],
@@ -1943,7 +2193,7 @@ impl TypeChecker {
                 )),
                 ty: Type::String,
                 span,
-            });
+            };
         }
 
         let sig = self.builtin_signatures.get(&builtin).unwrap_or_else(|| {
@@ -1958,9 +2208,9 @@ impl TypeChecker {
         let params = sig.params.clone();
         let return_type = sig.return_type.clone();
 
-        let typed_args = self.check_call_args(&params, args, span)?;
+        let typed_args = self.check_call_args(&params, args, span);
 
-        Ok(TypedExpr {
+        TypedExpr {
             kind: TypedExprKind::FuncCall(TypedFuncCall::Builtin(
                 builtin,
                 typed_args,
@@ -1968,23 +2218,23 @@ impl TypeChecker {
             )),
             ty: return_type,
             span,
-        })
+        }
     }
 
     fn check_user_func_call(
         &mut self,
         call: ResolvedUserFuncCall,
         sig: &FunctionSignature,
-    ) -> Result<TypedUserFuncCall, TypeError> {
-        let typed_args = self.check_call_args(&sig.params, call.args, call.span)?;
+    ) -> TypedUserFuncCall {
+        let typed_args = self.check_call_args(&sig.params, call.args, call.span);
 
-        Ok(TypedUserFuncCall {
+        TypedUserFuncCall {
             name: call.name,
             original_name: call.original_name,
             args: typed_args,
             return_type: sig.return_type.clone(),
             span: call.span,
-        })
+        }
     }
 
     fn infer_index(
@@ -1992,42 +2242,52 @@ impl TypeChecker {
         target: ResolvedExpr,
         index: ResolvedExpr,
         span: Span,
-    ) -> Result<TypedExpr, TypeError> {
-        let typed_target = self.infer_expr(target)?;
-        let typed_index = self.infer_expr(index)?;
+    ) -> TypedExpr {
+        let typed_target = self.infer_expr(target);
+        let typed_index = self.infer_expr(index);
 
         let target_ty = typed_target.ty.clone();
         let index_ty = typed_index.ty.clone();
 
         match target_ty {
             Type::List(elem_ty) => {
-                self.check_type_compatibility(&Type::Int, &index_ty, span)?;
-                Ok(TypedExpr {
+                if let Err(e) = self.check_type_compatibility(&Type::Int, &index_ty, span) {
+                    self.emit(e);
+                }
+                TypedExpr {
                     kind: TypedExprKind::Index(Box::new(typed_target), Box::new(typed_index)),
                     ty: *elem_ty,
                     span,
-                })
+                }
             }
             Type::Map(key_ty, val_ty) => {
-                self.check_type_compatibility(&key_ty, &index_ty, span)?;
-                Ok(TypedExpr {
+                if let Err(e) = self.check_type_compatibility(&key_ty, &index_ty, span) {
+                    self.emit(e);
+                }
+                TypedExpr {
                     kind: TypedExprKind::Index(Box::new(typed_target), Box::new(typed_index)),
                     ty: *val_ty,
                     span,
-                })
+                }
             }
             Type::String => {
-                self.check_type_compatibility(&Type::Int, &index_ty, span)?;
-                Ok(TypedExpr {
+                if let Err(e) = self.check_type_compatibility(&Type::Int, &index_ty, span) {
+                    self.emit(e);
+                }
+                TypedExpr {
                     kind: TypedExprKind::Index(Box::new(typed_target), Box::new(typed_index)),
                     ty: Type::String,
                     span,
-                })
+                }
             }
-            _ => Err(TypeError::NotIndexable {
-                ty: typed_target.ty,
-                span,
-            }),
+            Type::Error => self.error_expr(span),
+            _ => {
+                self.emit(TypeError::NotIndexable {
+                    ty: typed_target.ty,
+                    span,
+                });
+                self.error_expr(span)
+            }
         }
     }
 
@@ -2035,64 +2295,64 @@ impl TypeChecker {
         &mut self,
         mut items: Vec<ResolvedExpr>,
         span: Span,
-    ) -> Result<TypedExpr, TypeError> {
+    ) -> TypedExpr {
         if items.is_empty() {
-            return Ok(TypedExpr {
+            return TypedExpr {
                 kind: TypedExprKind::ListLit(vec![]),
                 ty: Type::EmptyList,
                 span,
-            });
+            };
         }
 
         let mut typed_items = Vec::new();
-        let first_typed = self.infer_expr(items.remove(0))?;
+        let first_typed = self.infer_expr(items.remove(0));
         let first_ty = first_typed.ty.clone();
         typed_items.push(first_typed);
 
         for item in items {
-            let typed_item = self.check_expr(item, &first_ty)?;
+            let typed_item = self.check_expr(item, &first_ty);
             typed_items.push(typed_item);
         }
 
-        Ok(TypedExpr {
+        TypedExpr {
             kind: TypedExprKind::ListLit(typed_items),
             ty: Type::List(Box::new(first_ty)),
             span,
-        })
+        }
     }
 
     fn infer_map_literal(
         &mut self,
         mut pairs: Vec<(ResolvedExpr, ResolvedExpr)>,
         span: Span,
-    ) -> Result<TypedExpr, TypeError> {
+    ) -> TypedExpr {
         if pairs.is_empty() {
-            return Ok(TypedExpr {
+            return TypedExpr {
                 kind: TypedExprKind::MapLit(vec![]),
                 ty: Type::EmptyMap,
                 span,
-            });
+            };
         }
 
         let (first_key, first_val) = pairs.remove(0);
-        let typed_first_key = self.infer_expr(first_key)?;
-        let typed_first_val = self.infer_expr(first_val)?;
+        let typed_first_key = self.infer_expr(first_key);
+        let typed_first_val = self.infer_expr(first_val);
         let key_ty = typed_first_key.ty.clone();
         let val_ty = typed_first_val.ty.clone();
 
         let mut typed_pairs = vec![(typed_first_key, typed_first_val)];
 
         for (key, val) in pairs {
-            let typed_key = self.check_expr(key, &key_ty)?;
-            let typed_val = self.check_expr(val, &val_ty)?;
+            let typed_key = self.check_expr(key, &key_ty);
+            let typed_val = self.check_expr(val, &val_ty);
             typed_pairs.push((typed_key, typed_val));
         }
 
-        Ok(TypedExpr {
+        TypedExpr {
             kind: TypedExprKind::MapLit(typed_pairs),
             ty: Type::Map(Box::new(key_ty), Box::new(val_ty)),
             span,
-        })
+        }
     }
 
     fn get_resolved_struct_fields(
@@ -2143,27 +2403,49 @@ impl TypeChecker {
         struct_id: NameId,
         fields: Vec<(String, ResolvedExpr)>,
         span: Span,
-    ) -> Result<TypedExpr, TypeError> {
-        let (resolved_id, field_defs) = self.get_resolved_struct_fields(struct_id, span, "")?;
+    ) -> TypedExpr {
+        let (resolved_id, field_defs) = match self.get_resolved_struct_fields(struct_id, span, "") {
+            Ok(v) => v,
+            Err(e) => {
+                self.emit(e);
+                // Still type-check field expressions for further errors
+                for (_, field_expr) in fields {
+                    let _ = self.infer_expr(field_expr);
+                }
+                return self.error_expr(span);
+            }
+        };
 
         let mut typed_fields = Vec::new();
         for (field_name, field_expr) in fields {
-            let field_def = field_defs
-                .iter()
-                .find(|f| f.name == field_name)
-                .ok_or_else(|| TypeError::UndefinedStructField {
-                    field_name: field_name.clone(),
-                    span,
-                })?;
+            let field_def = field_defs.iter().find(|f| f.name == field_name);
 
-            let expected_ty = self.resolve_type(&field_def.type_def)?;
-            let typed_field_expr = self.check_expr(field_expr, &expected_ty)?;
-            typed_fields.push((field_name, typed_field_expr));
+            match field_def {
+                Some(fd) => {
+                    match self.resolve_type(&fd.type_def) {
+                        Ok(expected_ty) => {
+                            let typed_field_expr = self.check_expr(field_expr, &expected_ty);
+                            typed_fields.push((field_name, typed_field_expr));
+                        }
+                        Err(e) => {
+                            self.emit(e);
+                            let _ = self.infer_expr(field_expr);
+                        }
+                    }
+                }
+                None => {
+                    self.emit(TypeError::UndefinedStructField {
+                        field_name: field_name.clone(),
+                        span,
+                    });
+                    let _ = self.infer_expr(field_expr);
+                }
+            }
         }
 
         for field_def in field_defs {
             if !typed_fields.iter().any(|(name, _)| name == &field_def.name) {
-                return Err(TypeError::MissingStructField {
+                self.emit(TypeError::MissingStructField {
                     field_name: field_def.name.clone(),
                     span,
                 });
@@ -2177,11 +2459,11 @@ impl TypeChecker {
             .unwrap_or_else(|| format!("struct_{}", resolved_id.0));
 
         let ty = Type::Struct(resolved_id, struct_name);
-        Ok(TypedExpr {
+        TypedExpr {
             kind: TypedExprKind::StructLit(resolved_id, typed_fields),
             ty,
             span,
-        })
+        }
     }
 
     fn get_field_type(
