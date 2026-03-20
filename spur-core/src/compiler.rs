@@ -68,10 +68,13 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     let parsed = parse_program(&lexed);
     if parsed.has_errors() {
         let _ = parser::format::report_errors(input, parsed.errors(), name);
-        result.parse_errors = parsed.errors().map(|e| ParseError {
-            message: e.to_string(),
-            span: *e.span(),
-        }).collect();
+        result.parse_errors = parsed
+            .errors()
+            .map(|e| ParseError {
+                message: e.to_string(),
+                span: *e.span(),
+            })
+            .collect();
     }
     let parsed = match parsed.into_output() {
         None => return result,
@@ -102,6 +105,47 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(typed, type_ids);
     result.program = Some(program);
+
+    result
+}
+
+/// A version of compile tailored for the language server.
+pub fn compile_lsp(input: &str) -> CompileResult {
+    let mut result = CompileResult {
+        program: None,
+        lex_errors: Vec::new(),
+        parse_errors: Vec::new(),
+        resolution_errors: Vec::new(),
+        type_errors: Vec::new(),
+    };
+
+    let mut lexer = Lexer::new(input);
+    let (lexed, lex_errors) = lexer.collect_all();
+    result.lex_errors = lex_errors;
+
+    let parsed = parse_program(&lexed);
+    if parsed.has_errors() {
+        result.parse_errors = parsed
+            .errors()
+            .map(|e| ParseError {
+                message: e.to_string(),
+                span: *e.span(),
+            })
+            .collect();
+    }
+    let parsed = match parsed.into_output() {
+        None => return result,
+        Some(v) => v,
+    };
+
+    let resolver = Resolver::new();
+    let prepopulated_types = resolver.get_pre_populated_types().clone();
+    let (resolved, resolution_errors) = resolver.resolve_program(parsed);
+    result.resolution_errors = resolution_errors;
+
+    let mut type_checker = TypeChecker::new(prepopulated_types);
+    let (_typed, type_errors) = type_checker.check_program(resolved);
+    result.type_errors = type_errors;
 
     result
 }

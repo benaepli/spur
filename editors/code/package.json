@@ -1,8 +1,8 @@
 {
   "name": "spur",
-  "displayName": "Spur VSCode",
+  "displayName": "Spur",
   "description": "VSCode support for Spur with Language Server Protocol integration.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "engines": {
     "vscode": "^1.75.0"
   },

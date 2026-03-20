@@ -43,11 +43,7 @@ impl Backend {
 }
 
 /// Long-lived task that debounces document changes and publishes diagnostics.
-async fn analysis_loop(
-    client: Client,
-    documents: Arc<DashMap<Url, String>>,
-    notify: Arc<Notify>,
-) {
+async fn analysis_loop(client: Client, documents: Arc<DashMap<Url, String>>, notify: Arc<Notify>) {
     const DEBOUNCE: Duration = Duration::from_millis(200);
 
     loop {
@@ -69,16 +65,9 @@ async fn analysis_loop(
             .collect();
 
         for (uri, source) in snapshot {
-            let name = uri
-                .path_segments()
-                .and_then(|s| s.last())
-                .unwrap_or("unknown")
-                .to_string();
-
             let src = source.clone();
             let result =
-                tokio::task::spawn_blocking(move || spur_core::compiler::compile(&src, &name))
-                    .await;
+                tokio::task::spawn_blocking(move || spur_core::compiler::compile_lsp(&src)).await;
 
             let diagnostics = match result {
                 Ok(compile_result) => {
@@ -97,9 +86,7 @@ async fn analysis_loop(
                 }
             };
 
-            client
-                .publish_diagnostics(uri, diagnostics, None)
-                .await;
+            client.publish_diagnostics(uri, diagnostics, None).await;
         }
     }
 }
@@ -125,17 +112,14 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.documents.insert(
-            params.text_document.uri,
-            params.text_document.text,
-        );
+        self.documents
+            .insert(params.text_document.uri, params.text_document.text);
         self.trigger_analysis();
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().last() {
-            self.documents
-                .insert(params.text_document.uri, change.text);
+            self.documents.insert(params.text_document.uri, change.text);
             self.trigger_analysis();
         }
     }
@@ -144,9 +128,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         self.documents.remove(&uri);
         // Clear diagnostics for the closed document.
-        self.client
-            .publish_diagnostics(uri, vec![], None)
-            .await;
+        self.client.publish_diagnostics(uri, vec![], None).await;
     }
 
     async fn shutdown(&self) -> Result<()> {
