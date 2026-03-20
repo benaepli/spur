@@ -57,6 +57,7 @@ pub struct ResolvedProgram {
 pub enum ResolvedTopLevelDef {
     Role(ResolvedRoleDef),
     Type(ResolvedTypeDefStmt),
+    FreeFunc(ResolvedFuncDef),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -314,6 +315,7 @@ pub struct Resolver {
 
     role_func_scopes: HashMap<NameId, Scope<NameId>>,
     client_func_scope: Scope<NameId>,
+    global_func_scope: Scope<NameId>,
 
     next_id: usize,
     current_role: Option<NameId>,
@@ -367,6 +369,7 @@ impl Resolver {
             role_scope: HashMap::new(),
             role_func_scopes: HashMap::new(),
             client_func_scope: HashMap::new(),
+            global_func_scope: HashMap::new(),
             next_id,
             current_role: None,
             pre_populated_types: PrepopulatedTypes {
@@ -472,6 +475,7 @@ impl Resolver {
     }
 
     fn lookup_func(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
+        // First check the role/client scope
         let scope_to_check = if let Some(role_id) = self.current_role {
             self.role_func_scopes.get(&role_id)
         } else {
@@ -479,14 +483,17 @@ impl Resolver {
         };
 
         if let Some(scope) = scope_to_check {
-            scope
-                .get(name)
-                .copied()
-                .ok_or_else(|| ResolutionError::NameNotFound(name.to_string(), span))
-        } else {
-            // This should not happen if resolve_program is correct
-            Err(ResolutionError::NameNotFound(name.to_string(), span))
+            if let Some(id) = scope.get(name) {
+                return Ok(*id);
+            }
         }
+
+        // Fall through to global free functions
+        if let Some(id) = self.global_func_scope.get(name) {
+            return Ok(*id);
+        }
+
+        Err(ResolutionError::NameNotFound(name.to_string(), span))
     }
 
     fn lookup_type(&self, name: &str, span: Span) -> Result<NameId, ResolutionError> {
@@ -541,6 +548,16 @@ impl Resolver {
             }
         }
 
+        // Register free function names in global scope
+        for def in &program.top_level_defs {
+            if let TopLevelDef::FreeFunc(func) = def {
+                let id = self.new_name_id(&func.name);
+                if let Some(err) = Self::declare_in_scope(&mut self.global_func_scope, &func.name, id, func.span) {
+                    self.emit(err);
+                }
+            }
+        }
+
         // Pass 2: resolve all bodies
         let mut resolved_top_levels = Vec::new();
         for def in program.top_level_defs {
@@ -568,6 +585,7 @@ impl Resolver {
             TopLevelDef::Type(stmt) => self
                 .resolve_type_def_stmt(stmt)
                 .map(ResolvedTopLevelDef::Type),
+            TopLevelDef::FreeFunc(func) => self.resolve_func_def(func).map(ResolvedTopLevelDef::FreeFunc),
         }
     }
 

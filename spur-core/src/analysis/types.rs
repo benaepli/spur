@@ -253,6 +253,7 @@ pub struct TypedProgram {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedTopLevelDef {
     Role(TypedRoleDef),
+    FreeFunc(TypedFuncDef),
 }
 
 #[derive(Debug, Clone, PartialEq)]

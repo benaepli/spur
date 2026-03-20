@@ -29,6 +29,7 @@ pub struct Program {
 pub enum TopLevelDef {
     Role(RoleDef),
     Type(TypeDefStmt),
+    FreeFunc(FuncDef),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1259,13 +1260,18 @@ where
             })
         });
 
-    let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type)))
+    let free_func = func_def.clone().map(TopLevelDef::FreeFunc);
+
+    let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type), free_func))
         .recover_with(skip_then_retry_until(
             any_ref().ignored(),
             choice((
                 just(TokenKind::Role).ignored(),
                 just(TokenKind::ClientInterface).ignored(),
                 just(TokenKind::Type).ignored(),
+                just(TokenKind::Func).ignored(),
+                just(TokenKind::At).ignored(),
+                just(TokenKind::Async).ignored(),
                 end(),
             )),
         ));

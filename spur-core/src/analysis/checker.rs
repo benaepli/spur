@@ -278,6 +278,10 @@ impl TypeChecker {
                     let typed_role = self.check_role_def(role);
                     typed_top_levels.push(TypedTopLevelDef::Role(typed_role));
                 }
+                ResolvedTopLevelDef::FreeFunc(func) => {
+                    let typed_func = self.check_func_def(func);
+                    typed_top_levels.push(TypedTopLevelDef::FreeFunc(typed_func));
+                }
                 ResolvedTopLevelDef::Type(_) => {}
             }
         }
@@ -353,12 +357,37 @@ impl TypeChecker {
                     self.role_defs.insert(role.name, role.original_name.clone());
                     self.role_func_signatures.insert(role.name, HashMap::new());
                 }
+                ResolvedTopLevelDef::FreeFunc(_) => {}
             }
         }
 
         for top_level_def in &program.top_level_defs {
-            if let ResolvedTopLevelDef::Role(role) = top_level_def {
-                for func in &role.func_defs {
+            match top_level_def {
+                ResolvedTopLevelDef::Role(role) => {
+                    for func in &role.func_defs {
+                        let sig = match self.build_function_signature(func) {
+                            Ok(sig) => sig,
+                            Err(e) => {
+                                self.emit(e);
+                                continue;
+                            }
+                        };
+                        let role_funcs = self
+                            .role_func_signatures
+                            .get_mut(&role.name)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Role '{}' not found in signature map. \
+                                     This should have been initialized in the first pass.",
+                                    role.original_name
+                                )
+                            });
+
+                        self.func_signatures.insert(func.name, sig.clone());
+                        role_funcs.insert(func.original_name.clone(), (func.name, sig));
+                    }
+                }
+                ResolvedTopLevelDef::FreeFunc(func) => {
                     let sig = match self.build_function_signature(func) {
                         Ok(sig) => sig,
                         Err(e) => {
@@ -366,20 +395,9 @@ impl TypeChecker {
                             continue;
                         }
                     };
-                    let role_funcs = self
-                        .role_func_signatures
-                        .get_mut(&role.name)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Role '{}' not found in signature map. \
-                                 This should have been initialized in the first pass.",
-                                role.original_name
-                            )
-                        });
-
-                    self.func_signatures.insert(func.name, sig.clone());
-                    role_funcs.insert(func.original_name.clone(), (func.name, sig));
+                    self.func_signatures.insert(func.name, sig);
                 }
+                ResolvedTopLevelDef::Type(_) => {}
             }
         }
     }
