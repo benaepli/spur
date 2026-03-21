@@ -846,6 +846,9 @@ impl Compiler {
                     self.scan_block_and_assign_slots(body);
                 }
             }
+            Block(block) => {
+                self.scan_block_and_assign_slots(block);
+            }
             VariantLit(_, _, payload) => {
                 if let Some(p) = payload {
                     self.scan_expr_and_assign_slots(p);
@@ -1544,6 +1547,10 @@ impl Compiler {
                 self.compile_conditional(cond, target, next_vertex, ctx)
             }
 
+            TypedExprKind::Block(block) => {
+                self.compile_typed_block(block, target, next_vertex, ctx)
+            }
+
             TypedExprKind::Store(a, b, c) => {
                 self.compile_ternary(a, b, c, target, next_vertex, ctx, Expr::Store)
             }
@@ -1929,6 +1936,7 @@ impl Compiler {
             | TypedExprKind::Recv(_)
             | TypedExprKind::Match(_, _)
             | TypedExprKind::Conditional(_)
+            | TypedExprKind::Block(_)
             | TypedExprKind::PersistData(_)
             | TypedExprKind::RetrieveData(_)
             | TypedExprKind::DiscardData

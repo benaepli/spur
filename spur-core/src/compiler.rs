@@ -1,4 +1,5 @@
 pub mod cfg;
+pub mod lowered;
 
 use crate::analysis::checker::{TypeChecker, TypeError};
 use crate::analysis::format::{report_resolution_errors, report_type_errors};
