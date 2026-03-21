@@ -147,6 +147,9 @@ pub enum TypeError {
 
     #[error("Safe navigation `?.` requires an optional type, found `{ty}`")]
     SafeNavOnNonOptional { ty: Type, span: Span },
+
+    #[error("Internal error: {message}")]
+    InternalError { message: String, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -374,16 +377,22 @@ impl TypeChecker {
                                 continue;
                             }
                         };
-                        let role_funcs = self
+                        let role_funcs = match self
                             .role_func_signatures
                             .get_mut(&role.name)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "Role '{}' not found in signature map. \
-                                     This should have been initialized in the first pass.",
-                                    role.original_name
-                                )
-                            });
+                        {
+                            Some(funcs) => funcs,
+                            None => {
+                                self.emit(TypeError::InternalError {
+                                    message: format!(
+                                        "Role '{}' not found in signature map",
+                                        role.original_name
+                                    ),
+                                    span: role.span,
+                                });
+                                continue;
+                            }
+                        };
 
                         self.func_signatures.insert(func.name, sig.clone());
                         role_funcs.insert(func.original_name.clone(), (func.name, sig));
@@ -454,17 +463,33 @@ impl TypeChecker {
     }
 
     fn check_func_def(&mut self, func: ResolvedFuncDef) -> TypedFuncDef {
-        let sig = self
-            .func_signatures
-            .get(&func.name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Function signature not found for '{}'. \
-                     This should have been collected in the signature collection pass.",
-                    func.original_name
-                )
-            })
-            .clone();
+        let sig = match self.func_signatures.get(&func.name) {
+            Some(sig) => sig.clone(),
+            None => {
+                self.emit(TypeError::InternalError {
+                    message: format!(
+                        "Function signature not found for '{}'",
+                        func.original_name
+                    ),
+                    span: func.span,
+                });
+                return TypedFuncDef {
+                    name: func.name,
+                    original_name: func.original_name,
+                    is_sync: false,
+                    is_traced: func.is_traced,
+                    params: vec![],
+                    return_type: Type::Error,
+                    body: TypedBlock {
+                        statements: vec![],
+                        tail_expr: None,
+                        ty: Type::Error,
+                        span: func.span,
+                    },
+                    span: func.span,
+                };
+            }
+        };
 
         self.enter_scope();
         self.current_return_type = Some(sig.return_type.clone());
@@ -481,27 +506,23 @@ impl TypeChecker {
             });
         }
 
-        let mut typed_body = self.check_block(func.body);
-        let body_type = typed_body.ty.clone();
-
-        // Convert tail expr to return statement
-        if let Some(tail) = typed_body.tail_expr.take() {
+        let mut body = func.body;
+        if let Some(tail) = body.tail_expr.take() {
             let span = tail.span;
-            typed_body.statements.push(TypedStatement {
-                kind: TypedStatementKind::Expr(TypedExpr {
-                    kind: TypedExprKind::Return(Box::new(*tail)),
-                    ty: Type::Never,
+            body.statements.push(ResolvedStatement{
+                kind: ResolvedStatementKind::Expr(ResolvedExpr{
+                    kind: ResolvedExprKind::Return(Box::new(*tail)),
                     span,
                 }),
                 span,
             });
         }
 
-        // Non-unit return type requires divergence (body_type == Never) or a tail expression
-        if sig.return_type != Type::Tuple(vec![])
-            && body_type != Type::Never
-            && body_type == Type::Tuple(vec![])
-        {
+        let typed_body = self.check_block(body);
+        let body_type = typed_body.ty.clone();
+
+        // Non-unit return type requires divergence (body_type == Never)
+        if sig.return_type != Type::Tuple(vec![]) && body_type != Type::Never {
             self.emit(TypeError::MissingReturn(func.span));
         }
 
@@ -2402,7 +2423,7 @@ impl TypeChecker {
                 });
                 return self.error_expr(span);
             }
-            let typed_arg = self.infer_expr(args.into_iter().next().unwrap());
+            let typed_arg = self.infer_expr(args.into_iter().next().expect("length already checked"));
             if !matches!(typed_arg.ty, Type::Role(_, _) | Type::Error) {
                 self.emit(TypeError::Mismatch {
                     expected: Type::Role(NameId(0), "role".to_string()),
@@ -2421,13 +2442,19 @@ impl TypeChecker {
             };
         }
 
-        let sig = self.builtin_signatures.get(&builtin).unwrap_or_else(|| {
-            panic!(
-                "Missing signature for builtin function '{:?}'. \
-                     This should have been initialized when the type checker was created.",
-                builtin
-            )
-        });
+        let sig = match self.builtin_signatures.get(&builtin) {
+            Some(sig) => sig,
+            None => {
+                self.emit(TypeError::InternalError {
+                    message: format!(
+                        "Missing signature for builtin function '{:?}'",
+                        builtin
+                    ),
+                    span,
+                });
+                return self.error_expr(span);
+            }
+        };
 
         // Clone data before mutable borrow
         let params = sig.params.clone();
