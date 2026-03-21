@@ -120,6 +120,12 @@ pub enum TypedExprKind {
     PersistData(Box<TypedExpr>),
     RetrieveData(Type),
     DiscardData,
+
+    // Control flow expressions
+    Return(Box<TypedExpr>),
+    Break,
+    Continue,
+
     Error,
 }
 
@@ -156,11 +162,8 @@ pub enum TypedStatementKind {
     VarInit(TypedVarInit),
     Assignment(TypedAssignment),
     Expr(TypedExpr),
-    Return(TypedExpr),
     ForLoop(TypedForLoop),
     ForInLoop(TypedForInLoop),
-    Break,
-    Continue,
     Error,
 }
 

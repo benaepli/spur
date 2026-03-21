@@ -704,9 +704,6 @@ impl Compiler {
             TypedStatementKind::Expr(expr) => {
                 self.scan_expr_and_assign_slots(expr);
             }
-            TypedStatementKind::Return(expr) => {
-                self.scan_expr_and_assign_slots(expr);
-            }
             TypedStatementKind::ForLoop(fl) => {
                 match &fl.init {
                     Some(TypedForLoopInit::VarInit(init)) => {
@@ -752,8 +749,6 @@ impl Compiler {
                 self.scan_expr_and_assign_slots(&loop_stmt.iterable);
                 self.scan_body_and_assign_slots(&loop_stmt.body);
             }
-            TypedStatementKind::Break => {}
-            TypedStatementKind::Continue => {}
             TypedStatementKind::Error => {}
         }
     }
@@ -861,6 +856,10 @@ impl Compiler {
                     self.scan_expr_and_assign_slots(e);
                 }
             }
+            Return(inner) => {
+                self.scan_expr_and_assign_slots(inner);
+            }
+            Break | Continue => {}
             Var(_, _) | IntLit(_) | StringLit(_) | BoolLit(_) | NilLit | SetTimer => {}
             Error => {}
         }
@@ -940,12 +939,21 @@ impl Compiler {
                 let lhs = self.convert_lhs(&assign.target);
                 self.compile_expr_to_value(&assign.value, lhs, next_vertex, ctx)
             }
-            TypedStatementKind::Expr(expr) => {
-                let dummy_slot = self.alloc_temp_slot();
-                self.compile_expr_to_value(expr, Lhs::Var(dummy_slot), next_vertex, ctx)
-            }
-            TypedStatementKind::Return(expr) => {
-                self.compile_expr_to_value(expr, Lhs::Var(ctx.return_slot), ctx.return_target, ctx)
+            TypedStatementKind::Expr(expr) => match &expr.kind {
+                TypedExprKind::Return(inner) => {
+                    self.compile_expr_to_value(
+                        inner,
+                        Lhs::Var(ctx.return_slot),
+                        ctx.return_target,
+                        ctx,
+                    )
+                }
+                TypedExprKind::Break => self.add_label(Label::Break(ctx.break_target)),
+                TypedExprKind::Continue => self.add_label(Label::Continue(ctx.continue_target)),
+                _ => {
+                    let dummy_slot = self.alloc_temp_slot();
+                    self.compile_expr_to_value(expr, Lhs::Var(dummy_slot), next_vertex, ctx)
+                }
             }
             TypedStatementKind::ForLoop(loop_stmt) => {
                 self.compile_for_loop(loop_stmt, next_vertex, ctx)
@@ -953,8 +961,6 @@ impl Compiler {
             TypedStatementKind::ForInLoop(loop_stmt) => {
                 self.compile_for_in_loop(loop_stmt, next_vertex, ctx)
             }
-            TypedStatementKind::Break => self.add_label(Label::Break(ctx.break_target)),
-            TypedStatementKind::Continue => self.add_label(Label::Continue(ctx.continue_target)),
             TypedStatementKind::Error => {
                 unreachable!("Error statements should not reach CFG generation")
             }
@@ -1566,6 +1572,19 @@ impl Compiler {
                 self.add_label(discard_label)
             }
 
+            // Control flow expressions — handled at statement level in compile_statement,
+            // but can appear nested in expression position.
+            TypedExprKind::Return(inner) => {
+                self.compile_expr_to_value(
+                    inner,
+                    Lhs::Var(ctx.return_slot),
+                    ctx.return_target,
+                    ctx,
+                )
+            }
+            TypedExprKind::Break => self.add_label(Label::Break(ctx.break_target)),
+            TypedExprKind::Continue => self.add_label(Label::Continue(ctx.continue_target)),
+
             _ => unreachable!(
                 "All simple expressions handled by fast path, all complex expressions \
                  handled above. Expression: {:?}",
@@ -1896,6 +1915,11 @@ impl Compiler {
                 EcoString::from(variant_name.as_str()),
                 None,
             ),
+
+            // Control flow expressions — cannot be inlined into pure expressions
+            TypedExprKind::Return(_)
+            | TypedExprKind::Break
+            | TypedExprKind::Continue => return None,
 
             // Complex expressions that need CFG control flow
             TypedExprKind::FuncCall(_)

@@ -133,11 +133,8 @@ pub enum StatementKind {
     VarInit(VarInit),
     Assignment(Assignment),
     Expr(Expr),
-    Return(Expr),
     ForLoop(ForLoop),
     ForInLoop(ForInLoop),
-    Break,
-    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -294,6 +291,11 @@ pub enum ExprKind {
     PersistData(Box<Expr>),
     RetrieveData(TypeDef),
     DiscardData,
+
+    // Control flow (expression-level)
+    Return(Option<Box<Expr>>),
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -511,6 +513,12 @@ where
             })
     });
 
+    #[derive(Clone)]
+    enum BlockItem {
+        Stmt(Statement),
+        Expr(Expr, bool), // (expression, has_semicolon)
+    }
+
     let primary = {
         let val = select! {
             TokenKind::Integer(i) => ExprKind::IntLit(i),
@@ -574,18 +582,47 @@ where
                 ExprKind::NamedDotAccess(first_name, second_name, payload)
             });
 
-        // block() parses { stmt; stmt; ... expr? } into a Block struct.
+        // block() parses { item* } where each item is a statement or expression.
+        // If the last item is an expression without a trailing semicolon, it becomes the tail expression.
         let block = || {
-            statement
-                .clone()
+            let block_item = choice((
+                statement.clone().map(BlockItem::Stmt),
+                expr.clone()
+                    .then(just(TokenKind::Semicolon).or_not())
+                    .map(|(e, semi)| BlockItem::Expr(e, semi.is_some())),
+            ));
+            block_item
                 .repeated()
-                .collect::<Vec<Statement>>()
-                .then(expr.clone().or_not())
+                .collect::<Vec<BlockItem>>()
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
-                .map_with(|(statements, tail_expr), e| Block {
-                    statements,
-                    tail_expr: tail_expr.map(Box::new),
-                    span: e.span(),
+                .map_with(|mut items, extra| {
+                    let block_span = extra.span();
+                    // If last item is an expression without semicolon → tail expression
+                    let tail = match items.last() {
+                        Some(BlockItem::Expr(_, false)) => {
+                            if let Some(BlockItem::Expr(e, _)) = items.pop() {
+                                Some(Box::new(e))
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        _ => None,
+                    };
+                    let statements = items
+                        .into_iter()
+                        .map(|item| match item {
+                            BlockItem::Stmt(s) => s,
+                            BlockItem::Expr(e, _) => {
+                                let span = e.span;
+                                Statement::new(StatementKind::Expr(e), span)
+                            }
+                        })
+                        .collect();
+                    Block {
+                        statements,
+                        tail_expr: tail,
+                        span: block_span,
+                    }
                 })
         };
 
@@ -623,12 +660,11 @@ where
             .then_ignore(just(TokenKind::FatArrow))
             .then(choice((
                 block(),
-                expr.clone()
-                    .map_with(|e, span| Block {
-                        statements: vec![],
-                        tail_expr: Some(Box::new(e)),
-                        span: span.span(),
-                    }),
+                expr.clone().map_with(|e, span| Block {
+                    statements: vec![],
+                    tail_expr: Some(Box::new(e)),
+                    span: span.span(),
+                }),
             )))
             .map_with(|(pattern, body), e| MatchArm {
                 pattern,
@@ -968,8 +1004,8 @@ where
             just(TokenKind::QuestionQuestion).to(BinOp::Coalesce),
         );
 
-        // val >- chan (infix send, lowest precedence)
-        coalesce_expr
+        // val >- chan (infix send)
+        let send_expr = coalesce_expr
             .clone()
             .then(
                 just(TokenKind::SendArrow)
@@ -983,7 +1019,21 @@ where
                 } else {
                     lhs
                 }
-            })
+            });
+
+        // Control flow expressions (lowest precedence)
+        choice((
+            just(TokenKind::Return)
+                .ignore_then(expr.clone().or_not())
+                .map_with(|opt, e| {
+                    Expr::new(ExprKind::Return(opt.map(Box::new)), e.span())
+                }),
+            just(TokenKind::Break)
+                .map_with(|_, e| Expr::new(ExprKind::Break, e.span())),
+            just(TokenKind::Continue)
+                .map_with(|_, e| Expr::new(ExprKind::Continue, e.span())),
+            send_expr,
+        ))
     });
 
     let var_target = choice((
@@ -1014,9 +1064,13 @@ where
 
     statement.define({
         let tailless_block = || {
-            statement
-                .clone()
-                .repeated()
+            let item = choice((
+                statement.clone(),
+                expr.clone()
+                    .then_ignore(just(TokenKind::Semicolon).or_not())
+                    .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span())),
+            ));
+            item.repeated()
                 .collect()
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
         };
@@ -1033,7 +1087,6 @@ where
 
         let var_init_stmt = var_init_core
             .clone()
-            .then_ignore(just(TokenKind::Semicolon))
             .map_with(|var_init, e| Statement::new(StatementKind::VarInit(var_init), e.span()));
 
         let for_loop_init = choice((
@@ -1092,48 +1145,26 @@ where
                 )
             });
 
-        let break_stmt =
-            just(TokenKind::Break).map_with(|_, e| Statement::new(StatementKind::Break, e.span()));
-
-        let continue_stmt = just(TokenKind::Continue)
-            .map_with(|_, e| Statement::new(StatementKind::Continue, e.span()));
-
-        let return_stmt = just(TokenKind::Return)
-            .ignore_then(expr.clone().or_not())
-            .map_with(|opt_expr, e| {
-                let expr =
-                    opt_expr.unwrap_or_else(|| Expr::new(ExprKind::TupleLit(vec![]), e.span()));
-                Statement::new(StatementKind::Return(expr), e.span())
-            });
-
-        let expr_stmt = expr
-            .clone()
-            .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span()));
-
         let simple_stmt = choice((
             var_init_stmt,
-            break_stmt,
-            continue_stmt,
-            return_stmt,
             assignment.map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
-            expr_stmt,
         ))
-        .then_ignore(just(TokenKind::Semicolon));
+        .then_ignore(just(TokenKind::Semicolon).or_not());
 
-        choice((for_loop, for_in_loop, simple_stmt)).recover_with(
-            skip_then_retry_until(
-                any_ref().ignored(),
-                choice((
-                    just(TokenKind::Semicolon).ignored(),
-                    just(TokenKind::RightBrace).ignored(),
-                    just(TokenKind::For).ignored(),
-                    just(TokenKind::Var).ignored(),
-                    just(TokenKind::Return).ignored(),
-                    just(TokenKind::Break).ignored(),
-                    just(TokenKind::Continue).ignored(),
-                )),
-            ),
-        )
+        choice((for_loop, for_in_loop, simple_stmt)).recover_with(skip_then_retry_until(
+            any_ref().ignored(),
+            choice((
+                just(TokenKind::Semicolon).ignored(),
+                just(TokenKind::RightBrace).ignored(),
+                just(TokenKind::For).ignored(),
+                just(TokenKind::Var).ignored(),
+                just(TokenKind::Return).ignored(),
+                just(TokenKind::Break).ignored(),
+                just(TokenKind::Continue).ignored(),
+                just(TokenKind::If).ignored(),
+                just(TokenKind::Match).ignored(),
+            )),
+        ))
     });
 
     let var_init = just(TokenKind::Var)
@@ -1178,19 +1209,46 @@ where
                 .ignore_then(type_def.clone())
                 .or_not(),
         )
-        .then(
-            statement
-                .clone()
+        .then({
+            let block_item = choice((
+                statement.clone().map(BlockItem::Stmt),
+                expr.clone()
+                    .then(just(TokenKind::Semicolon).or_not())
+                    .map(|(e, semi)| BlockItem::Expr(e, semi.is_some())),
+            ));
+            block_item
                 .repeated()
-                .collect::<Vec<Statement>>()
-                .then(expr.clone().or_not())
+                .collect::<Vec<BlockItem>>()
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
-                .map_with(|(statements, tail_expr), e| Block {
-                    statements,
-                    tail_expr: tail_expr.map(Box::new),
-                    span: e.span(),
-                }),
-        )
+                .map_with(|mut items, extra| {
+                    let block_span = extra.span();
+                    let tail = match items.last() {
+                        Some(BlockItem::Expr(_, false)) => {
+                            if let Some(BlockItem::Expr(e, _)) = items.pop() {
+                                Some(Box::new(e))
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        _ => None,
+                    };
+                    let statements = items
+                        .into_iter()
+                        .map(|item| match item {
+                            BlockItem::Stmt(s) => s,
+                            BlockItem::Expr(e, _) => {
+                                let span = e.span;
+                                Statement::new(StatementKind::Expr(e), span)
+                            }
+                        })
+                        .collect();
+                    Block {
+                        statements,
+                        tail_expr: tail,
+                        span: block_span,
+                    }
+                })
+        })
         .map_with(
             |(((((is_traced_opt, is_async_opt), name), params), return_type), body), e| FuncDef {
                 name,
@@ -1294,19 +1352,24 @@ where
         TopLevelDef::FreeFunc(func)
     });
 
-    let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type), free_func))
-        .recover_with(skip_then_retry_until(
-            any_ref().ignored(),
-            choice((
-                just(TokenKind::Role).ignored(),
-                just(TokenKind::ClientInterface).ignored(),
-                just(TokenKind::Type).ignored(),
-                just(TokenKind::Func).ignored(),
-                just(TokenKind::At).ignored(),
-                just(TokenKind::Async).ignored(),
-                end(),
-            )),
-        ));
+    let top_level_def = choice((
+        role_def,
+        client_def,
+        type_def_stmt.map(TopLevelDef::Type),
+        free_func,
+    ))
+    .recover_with(skip_then_retry_until(
+        any_ref().ignored(),
+        choice((
+            just(TokenKind::Role).ignored(),
+            just(TokenKind::ClientInterface).ignored(),
+            just(TokenKind::Type).ignored(),
+            just(TokenKind::Func).ignored(),
+            just(TokenKind::At).ignored(),
+            just(TokenKind::Async).ignored(),
+            end(),
+        )),
+    ));
 
     top_level_def
         .repeated()

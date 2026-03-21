@@ -161,11 +161,8 @@ pub enum ResolvedStatementKind {
     VarInit(ResolvedVarInit),
     Assignment(ResolvedAssignment),
     Expr(ResolvedExpr),
-    Return(ResolvedExpr),
     ForLoop(ResolvedForLoop),
     ForInLoop(ResolvedForInLoop),
-    Break,
-    Continue,
     Error,
 }
 
@@ -289,6 +286,12 @@ pub enum ResolvedExprKind {
     PersistData(Box<ResolvedExpr>),
     RetrieveData(ResolvedTypeDef),
     DiscardData,
+
+    // Control flow expressions
+    Return(Box<ResolvedExpr>),
+    Break,
+    Continue,
+
     Error,
 }
 
@@ -787,13 +790,10 @@ impl Resolver {
                 ResolvedStatementKind::Assignment(self.resolve_assignment(a))
             }
             StatementKind::Expr(e) => ResolvedStatementKind::Expr(self.resolve_expr(e)),
-            StatementKind::Return(e) => ResolvedStatementKind::Return(self.resolve_expr(e)),
             StatementKind::ForLoop(fl) => ResolvedStatementKind::ForLoop(self.resolve_for_loop(fl)),
             StatementKind::ForInLoop(fil) => {
                 ResolvedStatementKind::ForInLoop(self.resolve_for_in_loop(fil))
             }
-            StatementKind::Break => ResolvedStatementKind::Break,
-            StatementKind::Continue => ResolvedStatementKind::Continue,
         };
         ResolvedStatement { kind, span }
     }
@@ -1132,6 +1132,18 @@ impl Resolver {
                     ResolvedExprKind::Error
                 }
             },
+            ExprKind::Return(opt_inner) => {
+                let inner = match opt_inner {
+                    Some(e) => self.resolve_expr(*e),
+                    None => ResolvedExpr {
+                        kind: ResolvedExprKind::TupleLit(vec![]),
+                        span,
+                    },
+                };
+                ResolvedExprKind::Return(Box::new(inner))
+            }
+            ExprKind::Break => ResolvedExprKind::Break,
+            ExprKind::Continue => ResolvedExprKind::Continue,
         };
         ResolvedExpr { kind, span }
     }

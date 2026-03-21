@@ -349,7 +349,11 @@ fn test_compile_return_statement() {
     let return_target = 100;
 
     let stmt = TypedStatement {
-        kind: TypedStatementKind::Return(int_lit(42)),
+        kind: TypedStatementKind::Expr(TypedExpr {
+            kind: TypedExprKind::Return(Box::new(int_lit(42))),
+            ty: Type::Never,
+            span: dummy_span(),
+        }),
         span: dummy_span(),
     };
 
@@ -538,7 +542,11 @@ fn test_compile_break_in_loop() {
             condition: Some(bool_lit(true)),
             increment: None,
             body: vec![TypedStatement {
-                kind: TypedStatementKind::Break,
+                kind: TypedStatementKind::Expr(TypedExpr {
+                    kind: TypedExprKind::Break,
+                    ty: Type::Never,
+                    span: dummy_span(),
+                }),
                 span: dummy_span(),
             }],
             span: dummy_span(),
@@ -696,7 +704,11 @@ fn test_compile_continue_in_loop() {
             condition: Some(bool_lit(true)),
             increment: None,
             body: vec![TypedStatement {
-                kind: TypedStatementKind::Continue,
+                kind: TypedStatementKind::Expr(TypedExpr {
+                    kind: TypedExprKind::Continue,
+                    ty: Type::Never,
+                    span: dummy_span(),
+                }),
                 span: dummy_span(),
             }],
             span: dummy_span(),

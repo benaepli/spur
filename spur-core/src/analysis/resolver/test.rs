@@ -606,7 +606,7 @@ fn test_resolve_match_expression() {
                 span: dummy_span(),
             },
             body: Block {
-                statements: vec![stmt(StatementKind::Break)],
+                statements: vec![stmt(StatementKind::Expr(expr(ExprKind::Break)))],
                 tail_expr: None,
                 span: dummy_span(),
             },

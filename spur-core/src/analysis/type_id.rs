@@ -149,9 +149,6 @@ fn register_stmt(stmt: &TypedStatement, map: &mut TypeIdMap, next_id: &mut u32) 
         TypedStatementKind::Expr(expr) => {
             register_expr(expr, map, next_id);
         }
-        TypedStatementKind::Return(expr) => {
-            register_expr(expr, map, next_id);
-        }
         TypedStatementKind::ForLoop(fl) => {
             match &fl.init {
                 Some(crate::analysis::types::TypedForLoopInit::VarInit(init)) => {
@@ -177,7 +174,6 @@ fn register_stmt(stmt: &TypedStatement, map: &mut TypeIdMap, next_id: &mut u32) 
             register_expr(&fl.iterable, map, next_id);
             register_tailless_body(&fl.body, map, next_id);
         }
-        TypedStatementKind::Break | TypedStatementKind::Continue => {}
         TypedStatementKind::Error => {}
     }
 }
@@ -281,6 +277,10 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
         TypedExprKind::RetrieveData(ty) => {
             register_type(ty, map, next_id);
         }
+        TypedExprKind::Return(inner) => {
+            register_expr(inner, map, next_id);
+        }
+        TypedExprKind::Break | TypedExprKind::Continue => {}
         TypedExprKind::Var(_, _)
         | TypedExprKind::IntLit(_)
         | TypedExprKind::StringLit(_)
