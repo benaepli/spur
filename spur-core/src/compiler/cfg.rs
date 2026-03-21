@@ -1,5 +1,5 @@
-mod ast;
-pub use ast::*;
+mod ir;
+pub use ir::*;
 
 use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::analysis::type_id::{TypeId, TypeIdMap};
