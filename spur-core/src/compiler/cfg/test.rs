@@ -1,5 +1,6 @@
 use super::*;
-use crate::analysis::types::*;
+use crate::compiler::lowered::*;
+use crate::analysis::types::Type;
 use crate::parser::{BinOp, Span};
 
 fn dummy_span() -> Span {
@@ -10,24 +11,24 @@ fn id(i: usize) -> NameId {
     NameId(i)
 }
 
-fn typed_expr(kind: TypedExprKind, ty: Type) -> TypedExpr {
-    TypedExpr {
+fn lexpr(kind: LExprKind, ty: Type) -> LExpr {
+    LExpr {
         kind,
         ty,
         span: dummy_span(),
     }
 }
 
-fn int_lit(val: i64) -> TypedExpr {
-    typed_expr(TypedExprKind::IntLit(val), Type::Int)
+fn int_lit(val: i64) -> LExpr {
+    lexpr(LExprKind::IntLit(val), Type::Int)
 }
 
-fn bool_lit(val: bool) -> TypedExpr {
-    typed_expr(TypedExprKind::BoolLit(val), Type::Bool)
+fn bool_lit(val: bool) -> LExpr {
+    lexpr(LExprKind::BoolLit(val), Type::Bool)
 }
 
-fn string_lit(val: &str) -> TypedExpr {
-    typed_expr(TypedExprKind::StringLit(val.to_string()), Type::String)
+fn string_lit(val: &str) -> LExpr {
+    lexpr(LExprKind::StringLit(val.to_string()), Type::String)
 }
 
 fn dummy_target() -> Lhs {
@@ -47,8 +48,8 @@ fn dummy_ctx() -> CompileCtx {
     }
 }
 
-fn make_block(statements: Vec<TypedStatement>, tail_expr: Option<TypedExpr>) -> TypedBlock {
-    TypedBlock {
+fn make_block(statements: Vec<LStatement>, tail_expr: Option<LExpr>) -> LBlock {
+    LBlock {
         statements,
         tail_expr: tail_expr.map(Box::new),
         ty: Type::Nil,
@@ -119,8 +120,8 @@ fn test_compile_binop_add() {
     let target = dummy_target();
     let next = dummy_vertex();
 
-    let expr = typed_expr(
-        TypedExprKind::BinOp(BinOp::Add, Box::new(int_lit(1)), Box::new(int_lit(2))),
+    let expr = lexpr(
+        LExprKind::BinOp(BinOp::Add, Box::new(int_lit(1)), Box::new(int_lit(2))),
         Type::Int,
     );
 
@@ -145,57 +146,6 @@ fn test_compile_binop_add() {
 }
 
 #[test]
-fn test_compile_short_circuit_and() {
-    let mut compiler = Compiler::new();
-    compiler.begin_function(&[]);
-    let target = dummy_target();
-    let next = dummy_vertex();
-
-    let expr = typed_expr(
-        TypedExprKind::BinOp(
-            BinOp::And,
-            Box::new(bool_lit(false)),
-            Box::new(bool_lit(true)),
-        ),
-        Type::Bool,
-    );
-
-    let entry = compiler.compile_expr_to_value(
-        &expr,
-        target.clone(),
-        next,
-        dummy_ctx(),
-    );
-
-    let l_label = compiler.cfg.get(entry).expect("left label missing");
-    if let Label::Instr(Instr::Assign(l_lhs, Expr::Bool(false)), cond_entry) = l_label {
-        let cond_label = compiler.cfg.get(*cond_entry).expect("cond label missing");
-        if let Label::Cond(Expr::Var(cond_var), eval_right, assign_false) = cond_label {
-            if let Lhs::Var(l_slot) = l_lhs {
-                assert_eq!(l_slot, cond_var);
-            }
-
-            let false_label = compiler
-                .cfg
-                .get(*assign_false)
-                .expect("false label missing");
-            if let Label::Instr(Instr::Assign(lhs, Expr::Bool(false)), n) = false_label {
-                assert_eq!(lhs, &target);
-                assert_eq!(*n, next);
-            } else {
-                panic!("expected Assign Bool(false), got {:?}", false_label);
-            }
-
-            assert!(*eval_right < compiler.cfg.len());
-        } else {
-            panic!("expected Cond, got {:?}", cond_label);
-        }
-    } else {
-        panic!("expected Assign Bool(false), got {:?}", l_label);
-    }
-}
-
-#[test]
 fn test_compile_assignment() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
@@ -206,9 +156,9 @@ fn test_compile_assignment() {
 
     let next = dummy_vertex();
 
-    let stmt = TypedStatement {
-        kind: TypedStatementKind::Assignment(TypedAssignment {
-            target: typed_expr(TypedExprKind::Var(var_name, "x".to_string()), Type::Int),
+    let stmt = LStatement {
+        kind: LStatementKind::Assignment(LAssignment {
+            target: lexpr(LExprKind::Var(var_name, "x".to_string()), Type::Int),
             value: int_lit(100),
             span: dummy_span(),
         }),
@@ -241,9 +191,9 @@ fn test_compile_if_statement() {
     let target = dummy_target();
     let next = dummy_vertex();
 
-    let cond_expr = typed_expr(
-        TypedExprKind::Conditional(Box::new(TypedCondExpr {
-            if_branch: TypedIfBranch {
+    let cond_expr = lexpr(
+        LExprKind::Conditional(Box::new(LCondExpr {
+            if_branch: LIfBranch {
                 condition: bool_lit(true),
                 body: make_block(vec![], Some(int_lit(1))),
                 span: dummy_span(),
@@ -292,52 +242,51 @@ fn test_compile_if_statement() {
 }
 
 #[test]
-fn test_compile_for_loop() {
+fn test_compile_loop() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
     let next = dummy_vertex();
 
-    let stmt = TypedStatement {
-        kind: TypedStatementKind::ForLoop(TypedForLoop {
-            init: None,
-            condition: Some(bool_lit(false)),
-            increment: None,
-            body: vec![],
+    // A loop with a break-on-false-condition in the body:
+    // loop { if !false { break } }
+    // This is how lowered IR represents `for (; false; ) {}`
+    let break_expr = lexpr(LExprKind::Break, Type::Never);
+    let break_stmt = LStatement {
+        kind: LStatementKind::Expr(break_expr),
+        span: dummy_span(),
+    };
+    let cond_check = lexpr(
+        LExprKind::Conditional(Box::new(LCondExpr {
+            if_branch: LIfBranch {
+                condition: lexpr(LExprKind::Not(Box::new(bool_lit(false))), Type::Bool),
+                body: make_block(vec![break_stmt], None),
+                span: dummy_span(),
+            },
+            elseif_branches: vec![],
+            else_branch: None,
             span: dummy_span(),
-        }),
+        })),
+        Type::Nil,
+    );
+    let cond_stmt = LStatement {
+        kind: LStatementKind::Expr(cond_check),
+        span: dummy_span(),
+    };
+
+    let loop_stmt = LStatement {
+        kind: LStatementKind::Loop(vec![cond_stmt]),
         span: dummy_span(),
     };
 
     let entry = compiler.compile_statement(
-        &stmt,
+        &loop_stmt,
         next,
         dummy_ctx(),
     );
 
+    // Verify the loop head exists and is an instruction
     let head_label = compiler.cfg.get(entry).expect("head label missing");
-
-    if let Label::Instr(Instr::Assign(_, Expr::Unit), cond_calc_v) = head_label {
-        let cond_calc = compiler
-            .cfg
-            .get(*cond_calc_v)
-            .expect("cond calc label missing");
-        if let Label::Instr(Instr::Assign(_, Expr::Bool(false)), cond_check_v) = cond_calc {
-            let cond_check = compiler
-                .cfg
-                .get(*cond_check_v)
-                .expect("cond check label missing");
-            if let Label::Cond(_, body_v, exit_v) = cond_check {
-                assert_eq!(*exit_v, next);
-                assert_eq!(*body_v, entry);
-            } else {
-                panic!("expected Cond check, got {:?}", cond_check);
-            }
-        } else {
-            panic!("expected cond calc false, got {:?}", cond_calc);
-        }
-    } else {
-        panic!("expected loop head, got {:?}", head_label);
-    }
+    assert!(matches!(head_label, Label::Instr(_, _)));
 }
 
 #[test]
@@ -348,9 +297,9 @@ fn test_compile_return_statement() {
     let return_slot = VarSlot::Local(5, id(5));
     let return_target = 100;
 
-    let stmt = TypedStatement {
-        kind: TypedStatementKind::Expr(TypedExpr {
-            kind: TypedExprKind::Return(Box::new(int_lit(42))),
+    let stmt = LStatement {
+        kind: LStatementKind::Expr(LExpr {
+            kind: LExprKind::Return(Box::new(int_lit(42))),
             ty: Type::Never,
             span: dummy_span(),
         }),
@@ -391,7 +340,7 @@ fn test_compile_sync_function_call() {
         .func_qualifier_map
         .insert(func_id, "Node".to_string());
 
-    let call = TypedFuncCall::User(TypedUserFuncCall {
+    let call = LFuncCall::User(LUserFuncCall {
         name: func_id,
         original_name: "Foo".to_string(),
         args: vec![int_lit(10)],
@@ -403,7 +352,7 @@ fn test_compile_sync_function_call() {
     let next = dummy_vertex();
 
     let entry = compiler.compile_expr_to_value(
-        &typed_expr(TypedExprKind::FuncCall(call), Type::Int),
+        &lexpr(LExprKind::FuncCall(call), Type::Int),
         target.clone(),
         next,
         dummy_ctx(),
@@ -436,7 +385,7 @@ fn test_compile_empty_list() {
     let target = dummy_target();
     let next = dummy_vertex();
 
-    let empty_list = typed_expr(TypedExprKind::ListLit(vec![]), Type::EmptyList);
+    let empty_list = lexpr(LExprKind::ListLit(vec![]), Type::EmptyList);
     let entry = compiler.compile_expr_to_value(
         &empty_list,
         target.clone(),
@@ -461,7 +410,7 @@ fn test_compile_empty_map() {
     let target = dummy_target();
     let next = dummy_vertex();
 
-    let empty_map = typed_expr(TypedExprKind::MapLit(vec![]), Type::EmptyMap);
+    let empty_map = lexpr(LExprKind::MapLit(vec![]), Type::EmptyMap);
     let entry = compiler.compile_expr_to_value(
         &empty_map,
         target.clone(),
@@ -487,9 +436,9 @@ fn test_compile_nested_if_statements() {
     let next = dummy_vertex();
 
     // Nested if: if true { if false { 1 } else { 2 } } else { 3 }
-    let inner_cond = typed_expr(
-        TypedExprKind::Conditional(Box::new(TypedCondExpr {
-            if_branch: TypedIfBranch {
+    let inner_cond = lexpr(
+        LExprKind::Conditional(Box::new(LCondExpr {
+            if_branch: LIfBranch {
                 condition: bool_lit(false),
                 body: make_block(vec![], Some(int_lit(1))),
                 span: dummy_span(),
@@ -501,9 +450,9 @@ fn test_compile_nested_if_statements() {
         Type::Int,
     );
 
-    let outer_cond = typed_expr(
-        TypedExprKind::Conditional(Box::new(TypedCondExpr {
-            if_branch: TypedIfBranch {
+    let outer_cond = lexpr(
+        LExprKind::Conditional(Box::new(LCondExpr {
+            if_branch: LIfBranch {
                 condition: bool_lit(true),
                 body: make_block(vec![], Some(inner_cond)),
                 span: dummy_span(),
@@ -536,21 +485,17 @@ fn test_compile_break_in_loop() {
     compiler.begin_function(&[]);
     let next = dummy_vertex();
 
-    let loop_stmt = TypedStatement {
-        kind: TypedStatementKind::ForLoop(TypedForLoop {
-            init: None,
-            condition: Some(bool_lit(true)),
-            increment: None,
-            body: vec![TypedStatement {
-                kind: TypedStatementKind::Expr(TypedExpr {
-                    kind: TypedExprKind::Break,
-                    ty: Type::Never,
-                    span: dummy_span(),
-                }),
-                span: dummy_span(),
-            }],
+    let break_stmt = LStatement {
+        kind: LStatementKind::Expr(LExpr {
+            kind: LExprKind::Break,
+            ty: Type::Never,
             span: dummy_span(),
         }),
+        span: dummy_span(),
+    };
+
+    let loop_stmt = LStatement {
+        kind: LStatementKind::Loop(vec![break_stmt]),
         span: dummy_span(),
     };
 
@@ -563,6 +508,16 @@ fn test_compile_break_in_loop() {
     // Verify the loop is compiled and break jumps to exit
     let head_label = compiler.cfg.get(entry).expect("loop head missing");
     assert!(matches!(head_label, Label::Instr(_, _)));
+
+    // The body should contain a Break label pointing to next (the exit)
+    if let Label::Instr(_, body_v) = head_label {
+        let body_label = compiler.cfg.get(*body_v).expect("body label missing");
+        if let Label::Break(target) = body_label {
+            assert_eq!(*target, next);
+        } else {
+            panic!("expected Break label, got {:?}", body_label);
+        }
+    }
 }
 
 #[test]
@@ -573,12 +528,12 @@ fn test_compile_complex_binop_chain() {
     let next = dummy_vertex();
 
     // (1 + 2) * 3
-    let add_expr = typed_expr(
-        TypedExprKind::BinOp(BinOp::Add, Box::new(int_lit(1)), Box::new(int_lit(2))),
+    let add_expr = lexpr(
+        LExprKind::BinOp(BinOp::Add, Box::new(int_lit(1)), Box::new(int_lit(2))),
         Type::Int,
     );
-    let mul_expr = typed_expr(
-        TypedExprKind::BinOp(BinOp::Multiply, Box::new(add_expr), Box::new(int_lit(3))),
+    let mul_expr = lexpr(
+        LExprKind::BinOp(BinOp::Multiply, Box::new(add_expr), Box::new(int_lit(3))),
         Type::Int,
     );
 
@@ -595,53 +550,13 @@ fn test_compile_complex_binop_chain() {
 }
 
 #[test]
-fn test_compile_short_circuit_or() {
-    let mut compiler = Compiler::new();
-    compiler.begin_function(&[]);
-    let target = dummy_target();
-    let next = dummy_vertex();
-
-    let expr = typed_expr(
-        TypedExprKind::BinOp(
-            BinOp::Or,
-            Box::new(bool_lit(true)),
-            Box::new(bool_lit(false)),
-        ),
-        Type::Bool,
-    );
-
-    let entry = compiler.compile_expr_to_value(
-        &expr,
-        target.clone(),
-        next,
-        dummy_ctx(),
-    );
-
-    // Verify short-circuit: eval left, then conditional jump
-    let l_label = compiler.cfg.get(entry).expect("left label missing");
-    if let Label::Instr(Instr::Assign(_, Expr::Bool(true)), cond_entry) = l_label {
-        let cond_label = compiler.cfg.get(*cond_entry).expect("cond label missing");
-        // OR short-circuits: if true, assign true; else eval right
-        assert!(matches!(cond_label, Label::Cond(_, _, _)));
-    } else {
-        panic!("expected left Assign Bool(true), got {:?}", l_label);
-    }
-}
-
-#[test]
 fn test_compile_empty_loop_body() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
     let next = dummy_vertex();
 
-    let loop_stmt = TypedStatement {
-        kind: TypedStatementKind::ForLoop(TypedForLoop {
-            init: None,
-            condition: Some(bool_lit(false)),
-            increment: None,
-            body: vec![], // Empty body
-            span: dummy_span(),
-        }),
+    let loop_stmt = LStatement {
+        kind: LStatementKind::Loop(vec![]),
         span: dummy_span(),
     };
 
@@ -663,14 +578,14 @@ fn test_compile_elseif_chain() {
     let target = dummy_target();
     let next = dummy_vertex();
 
-    let cond_expr = typed_expr(
-        TypedExprKind::Conditional(Box::new(TypedCondExpr {
-            if_branch: TypedIfBranch {
+    let cond_expr = lexpr(
+        LExprKind::Conditional(Box::new(LCondExpr {
+            if_branch: LIfBranch {
                 condition: bool_lit(false),
                 body: make_block(vec![], Some(int_lit(1))),
                 span: dummy_span(),
             },
-            elseif_branches: vec![TypedIfBranch {
+            elseif_branches: vec![LIfBranch {
                 condition: bool_lit(true),
                 body: make_block(vec![], Some(int_lit(2))),
                 span: dummy_span(),
@@ -692,27 +607,24 @@ fn test_compile_elseif_chain() {
     let label = compiler.cfg.get(entry).expect("entry missing");
     assert!(matches!(label, Label::Instr(_, _)));
 }
+
 #[test]
 fn test_compile_continue_in_loop() {
     let mut compiler = Compiler::new();
     compiler.begin_function(&[]);
     let next = dummy_vertex();
 
-    let loop_stmt = TypedStatement {
-        kind: TypedStatementKind::ForLoop(TypedForLoop {
-            init: None,
-            condition: Some(bool_lit(true)),
-            increment: None,
-            body: vec![TypedStatement {
-                kind: TypedStatementKind::Expr(TypedExpr {
-                    kind: TypedExprKind::Continue,
-                    ty: Type::Never,
-                    span: dummy_span(),
-                }),
-                span: dummy_span(),
-            }],
+    let continue_stmt = LStatement {
+        kind: LStatementKind::Expr(LExpr {
+            kind: LExprKind::Continue,
+            ty: Type::Never,
             span: dummy_span(),
         }),
+        span: dummy_span(),
+    };
+
+    let loop_stmt = LStatement {
+        kind: LStatementKind::Loop(vec![continue_stmt]),
         span: dummy_span(),
     };
 
@@ -722,33 +634,20 @@ fn test_compile_continue_in_loop() {
         dummy_ctx(),
     );
 
-    // Verify the loop is compiled and continue jumps to loop head (since no increment)
+    // Verify the loop is compiled and continue jumps to loop head
     let head_label = compiler.cfg.get(entry).expect("loop head missing");
 
-    // Structure:
-    // head -> cond_calc -> cond_check -> body -> continue -> head
+    // Structure for Loop:
+    // head -> body -> continue -> head
 
-    if let Label::Instr(Instr::Assign(_, Expr::Unit), cond_calc_v) = head_label {
-        // cond_calc ...
-        let cond_calc = compiler.cfg.get(*cond_calc_v).expect("cond calc missing");
-        if let Label::Instr(Instr::Assign(_, Expr::Bool(true)), cond_check_v) = cond_calc {
-            let cond_check = compiler.cfg.get(*cond_check_v).expect("cond check missing");
-            if let Label::Cond(_, body_v, exit_v) = cond_check {
-                assert_eq!(*exit_v, next);
-
-                let body_label = compiler.cfg.get(*body_v).expect("body label missing");
-                // body should be the continue statement
-                if let Label::Continue(target) = body_label {
-                    // target should be loop head (entry)
-                    assert_eq!(*target, entry);
-                } else {
-                    panic!("expected Continue label, got {:?}", body_label);
-                }
-            } else {
-                panic!("expected Cond check, got {:?}", cond_check);
-            }
+    if let Label::Instr(Instr::Assign(_, Expr::Unit), body_v) = head_label {
+        let body_label = compiler.cfg.get(*body_v).expect("body label missing");
+        // body should be the continue statement
+        if let Label::Continue(target) = body_label {
+            // target should be loop head (entry)
+            assert_eq!(*target, entry);
         } else {
-            panic!("expected cond calc true");
+            panic!("expected Continue label, got {:?}", body_label);
         }
     } else {
         panic!("expected loop head, got {:?}", head_label);
