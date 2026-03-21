@@ -6,9 +6,9 @@ type Status enum {
 };
 
 role Test {
-    func assert(cond: bool) {}
+    fn assert(cond: bool) {}
 
-    func main() {
+    fn main() {
         var s1 = Status.Active;
         var s2 = Status.Inactive;
         var s3 = Status.Suspended("violation");
@@ -48,7 +48,7 @@ role Test {
         }
     }
 
-    func get_status(active: bool) -> Status {
+    fn get_status(active: bool): Status {
         if active {
             return Status.Active;
         } else {

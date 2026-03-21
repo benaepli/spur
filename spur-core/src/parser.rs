@@ -1201,11 +1201,11 @@ where
         .then(just(TokenKind::Identifier("trace".into())))
         .or_not()
         .then(just(TokenKind::Async).or_not())
-        .then_ignore(just(TokenKind::Func))
+        .then_ignore(just(TokenKind::Fn))
         .then(ident)
         .then(func_params.delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)))
         .then(
-            just(TokenKind::Arrow)
+            just(TokenKind::Colon)
                 .ignore_then(type_def.clone())
                 .or_not(),
         )
@@ -1364,7 +1364,7 @@ where
             just(TokenKind::Role).ignored(),
             just(TokenKind::ClientInterface).ignored(),
             just(TokenKind::Type).ignored(),
-            just(TokenKind::Func).ignored(),
+            just(TokenKind::Fn).ignored(),
             just(TokenKind::At).ignored(),
             just(TokenKind::Async).ignored(),
             end(),
@@ -1440,7 +1440,7 @@ mod tests {
 
     #[test]
     fn test_variant_literals() {
-        let source = "role R { func f() { x = E.V1; y = E.V2(42); } }";
+        let source = "role R { fn f() { x = E.V1; y = E.V2(42); } }";
         let program = parse(source);
         // Navigate to the assignments
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
@@ -1473,7 +1473,7 @@ mod tests {
 
     #[test]
     fn test_match_expression() {
-        let source = "role R { func f() { match x { E.V1 => { println(\"1\"); }, E.V2(val) => { println(\"2\"); } }; } }";
+        let source = "role R { fn f() { match x { E.V1 => { println(\"1\"); }, E.V2(val) => { println(\"2\"); } }; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1518,7 +1518,7 @@ mod tests {
 
     #[test]
     fn test_infix_send() {
-        let source = "role R { async func f() { val >- ch; } }";
+        let source = "role R { async fn f() { val >- ch; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1546,7 +1546,7 @@ mod tests {
 
     #[test]
     fn test_infix_send_precedence() {
-        let source = "role R { async func f() { x + 1 >- ch; } }";
+        let source = "role R { async fn f() { x + 1 >- ch; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];

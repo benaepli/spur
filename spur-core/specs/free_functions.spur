@@ -1,35 +1,35 @@
-func max(a: int, b: int) -> int {
+fn max(a: int, b: int): int {
     if (a > b) {
         return a;
     }
     return b;
 }
 
-func min2(a: int, b: int) -> int {
+fn min2(a: int, b: int): int {
     if (a < b) {
         return a;
     }
     return b;
 }
 
-func clamp(val: int, lo: int, hi: int) -> int {
+fn clamp(val: int, lo: int, hi: int): int {
     return max(lo, min2(val, hi));
 }
 
 role Node {
     var x: int = 0;
 
-    func get_clamped() -> int {
+    fn get_clamped(): int {
         return clamp(x, 0, 100);
     }
 
-    async func SetValue(v: int) -> () {
+    async fn SetValue(v: int): () {
         x = max(v, 0);
     }
 }
 
 ClientInterface {
-    async func set(dest: Node, v: int) -> () {
+    async fn set(dest: Node, v: int): () {
         dest->SetValue(v);
     }
 }

@@ -15,7 +15,7 @@ role_def ::= 'role' ID '{' var_inits func_defs '}'
 client_def ::= 'ClientInterface' '{' var_inits func_defs '}'
 
 func_defs ::= ( func_def )*
-func_def ::= ( '@trace' )? ( 'async' )? 'func' ID '(' func_params? ')' ( '->' type_def )? block
+func_def ::= ( '@trace' )? ( 'async' )? 'fn' ID '(' func_params? ')' ( ':' type_def )? block
 
 func_call ::= ID '(' args? ')'
 args ::= expr ( ',' expr )* ','?
@@ -235,19 +235,19 @@ Update expressions are syntactic sugar for the `store` built-in function:
 
 Spur supports two function types for concurrency: `sync` (default) and `async`.
 
-By default, all functions are synchronous. A sync func is a blocking, atomic call that:
+By default, all functions are synchronous. A sync function is a blocking, atomic call that:
 
 - Cannot use channel operations (`send` and `recv`)
 
 A function can be explicitly marked as asynchronous with the `async` keyword:
 
 ```
-async func my_async_call() -> int {
+async fn my_async_call(): int {
   return 10;
 }
 ```
 
-Calling an async func does not block execution and immediately returns a `chan<T>`.
+Calling an async function does not block execution and immediately returns a `chan<T>`.
 To get the actual return value, you must receive from the channel, which will pause the current task.
 
 This sync-first model, where most operations are blocking, can result in issues around concurrent processing.
