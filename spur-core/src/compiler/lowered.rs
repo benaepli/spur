@@ -924,3 +924,6 @@ fn lower_pattern_to_var_target(pattern: &TypedPattern) -> LVarTarget {
         _ => LVarTarget::Name(NameId(usize::MAX), "_".to_string()),
     }
 }
+
+#[cfg(test)]
+mod test;
