@@ -1,4 +1,4 @@
-use crate::compiler::cfg::{Instr, Label, Lhs, Program, VarSlot};
+use crate::compiler::cfg::{Instr, Label, Program, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{eval, make_local_env, store};
 use crate::simulator::core::state::{
@@ -6,6 +6,7 @@ use crate::simulator::core::state::{
     RunnableCategory, SchedulePolicy, State, Timer, TraceEntry, TraceKind,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
+use imbl::Vector;
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
 
@@ -289,14 +290,9 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                         let new_m = m.without(&k);
                         local_env.set(iter_slot_idx, Value::map(new_m));
 
-                        match lhs {
-                            Lhs::Tuple(vars) if vars.len() == 2 => {
-                                store(&Lhs::Var(vars[0]), k, local_env, node_env)?;
-                                store(&Lhs::Var(vars[1]), v, local_env, node_env)?;
-                                Ok(Some(StepOutcome::Continue(*body)))
-                            }
-                            _ => Err(RuntimeError::ForLoopMapExpectsTupleLhs),
-                        }
+                        let pair = Value::tuple(Vector::from(vec![k, v]));
+                        store(lhs, pair, local_env, node_env)?;
+                        Ok(Some(StepOutcome::Continue(*body)))
                     }
                 }
                 _ => Err(RuntimeError::ForLoopNotCollection {

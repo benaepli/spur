@@ -72,7 +72,6 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Hash)]
 pub enum Lhs {
     Var(VarSlot),
-    Tuple(Vec<VarSlot>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]

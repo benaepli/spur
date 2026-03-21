@@ -5,7 +5,7 @@ use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::analysis::type_id::{TypeId, TypeIdMap};
 use crate::compiler::lowered::{
     LBlock, LCondExpr, LExpr, LExprKind, LForInLoop, LFuncCall, LFuncDef,
-    LProgram, LStatement, LStatementKind, LTopLevelDef, LUserFuncCall, LVarInit, LVarTarget,
+    LProgram, LStatement, LStatementKind, LTopLevelDef, LUserFuncCall, LVarInit,
 };
 use crate::parser::Span;
 use ecow::EcoString;
@@ -106,18 +106,8 @@ impl Compiler {
         self.next_node_slot = 1; // Slot 0 reserved for 'self'
 
         for init in var_inits {
-            match &init.target {
-                LVarTarget::Name(name, _) => {
-                    self.node_slots.insert(*name, self.next_node_slot);
-                    self.next_node_slot += 1;
-                }
-                LVarTarget::Tuple(elements) => {
-                    for (name, _, _) in elements {
-                        self.node_slots.insert(*name, self.next_node_slot);
-                        self.next_node_slot += 1;
-                    }
-                }
-            }
+            self.node_slots.insert(init.name, self.next_node_slot);
+            self.next_node_slot += 1;
         }
 
         if self.next_node_slot > self.max_node_slots {
@@ -303,7 +293,7 @@ impl Compiler {
         // Build the init chain backwards
         // These assign to NODE slots, not local slots
         for init in inits.iter().rev() {
-            let lhs = self.convert_var_target(&init.target);
+            let lhs = Lhs::Var(self.resolve_slot(init.name));
             next_vertex = self.compile_expr_to_value(&init.value, lhs, next_vertex, ctx);
         }
 
@@ -441,7 +431,12 @@ impl Compiler {
     fn scan_stmt_slots(&mut self, stmt: &LStatement) {
         match &stmt.kind {
             LStatementKind::VarInit(init) => {
-                self.scan_var_init_target_slots(&init.target);
+                let name_str = self
+                    .id_to_name
+                    .get(&init.name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("var_{}", init.name.0));
+                self.alloc_local_slot(init.name, &name_str, Expr::Nil);
                 self.scan_expr_slots(&init.value);
             }
             LStatementKind::Assignment(assign) => {
@@ -452,7 +447,12 @@ impl Compiler {
                 self.scan_expr_slots(expr);
             }
             LStatementKind::ForInLoop(fil) => {
-                self.scan_var_target_slots(&fil.binding);
+                let name_str = self
+                    .id_to_name
+                    .get(&fil.binding_name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("var_{}", fil.binding_name.0));
+                self.alloc_local_slot(fil.binding_name, &name_str, Expr::Nil);
                 self.scan_expr_slots(&fil.iterable);
                 for stmt in &fil.body {
                     self.scan_stmt_slots(stmt);
@@ -465,34 +465,6 @@ impl Compiler {
             }
             LStatementKind::Error => {}
         }
-    }
-
-    fn scan_var_init_target_slots(&mut self, target: &LVarTarget) {
-        match target {
-            LVarTarget::Name(name, _) => {
-                let name_str = self
-                    .id_to_name
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| format!("var_{}", name.0));
-                self.alloc_local_slot(*name, &name_str, Expr::Nil);
-            }
-            LVarTarget::Tuple(elements) => {
-                for (name, _, _) in elements {
-                    let name_str = self
-                        .id_to_name
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_else(|| format!("var_{}", name.0));
-                    self.alloc_local_slot(*name, &name_str, Expr::Nil);
-                }
-            }
-        }
-    }
-
-    fn scan_var_target_slots(&mut self, target: &LVarTarget) {
-        // For for-in loop bindings: allocate slots for them
-        self.scan_var_init_target_slots(target);
     }
 
     fn scan_expr_slots(&mut self, expr: &LExpr) {
@@ -639,7 +611,7 @@ impl Compiler {
 
         let result = match &stmt.kind {
             LStatementKind::VarInit(init) => {
-                let lhs = self.convert_var_target(&init.target);
+                let lhs = Lhs::Var(self.resolve_slot(init.name));
                 self.compile_expr_to_value(&init.value, lhs, next_vertex, ctx)
             }
             LStatementKind::Assignment(assign) => {
@@ -768,7 +740,7 @@ impl Compiler {
 
         let body_vertex = self.compile_tailless_block(&loop_stmt.body, for_vertex, loop_ctx);
 
-        let lhs = self.convert_var_target(&loop_stmt.binding);
+        let lhs = Lhs::Var(self.resolve_slot(loop_stmt.binding_name));
         let iter_state_slot = self.alloc_temp_slot();
         let iterable_slot = self.alloc_temp_slot();
 
@@ -1507,18 +1479,6 @@ impl Compiler {
         }
     }
 
-    fn convert_var_target(&mut self, target: &LVarTarget) -> Lhs {
-        match target {
-            LVarTarget::Name(name, _) => Lhs::Var(self.resolve_slot(*name)),
-            LVarTarget::Tuple(elements) => {
-                let slots = elements
-                    .iter()
-                    .map(|(name, _, _)| self.resolve_slot(*name))
-                    .collect();
-                Lhs::Tuple(slots)
-            }
-        }
-    }
 }
 
 #[cfg(test)]

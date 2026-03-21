@@ -41,24 +41,6 @@ pub fn store<H: HashPolicy>(
             store_slot(*slot, val, local_env, node_env);
             Ok(())
         }
-        Lhs::Tuple(slots) => {
-            if let ValueKind::Tuple(vals) = val.kind {
-                if slots.len() != vals.len() {
-                    return Err(RuntimeError::TupleLengthMismatch {
-                        expected: slots.len(),
-                        got: vals.len(),
-                    });
-                }
-                for (slot, v) in slots.iter().zip(vals.into_iter()) {
-                    store_slot(*slot, v, local_env, node_env);
-                }
-                Ok(())
-            } else {
-                Err(RuntimeError::NonTupleAssignment {
-                    got: val.type_name(),
-                })
-            }
-        }
     }
 }
 
@@ -909,20 +891,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(local_env.get(0), &Value::<WithHashing>::int(42));
-
-        // Tuple store
-        let lhs = Lhs::Tuple(vec![dummy_slot(0), node_slot(0)]);
-        let val = Value::<WithHashing>::tuple(Vector::from(vec![
-            Value::<WithHashing>::int(1),
-            Value::<WithHashing>::int(2),
-        ]));
-        store(&lhs, val, &mut local_env, &mut node_env).unwrap();
-        assert_eq!(local_env.get(0), &Value::<WithHashing>::int(1));
-        assert_eq!(node_env.get(0), &Value::<WithHashing>::int(2));
-
-        // Mismatched tuple length
-        let val_bad = Value::<WithHashing>::tuple(Vector::from(vec![Value::<WithHashing>::int(1)]));
-        assert!(store(&lhs, val_bad, &mut local_env, &mut node_env).is_err());
     }
 
     #[test]

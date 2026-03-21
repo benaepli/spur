@@ -48,7 +48,14 @@ impl Lowerer {
         let var_inits = role
             .var_inits
             .into_iter()
-            .map(|vi| self.lower_var_init(vi))
+            .flat_map(|vi| self.lower_var_init_to_stmts(vi))
+            .filter_map(|stmt| {
+                if let LStatementKind::VarInit(init) = stmt.kind {
+                    Some(init)
+                } else {
+                    None
+                }
+            })
             .collect();
         let func_defs = role
             .func_defs
@@ -92,7 +99,7 @@ impl Lowerer {
         let statements = block
             .statements
             .into_iter()
-            .map(|s| self.lower_statement(s))
+            .flat_map(|s| self.lower_statement(s))
             .collect();
         let tail_expr = block.tail_expr.map(|e| Box::new(self.lower_expr(*e)));
         LBlock {
@@ -103,34 +110,44 @@ impl Lowerer {
         }
     }
 
-    fn lower_statement(&mut self, stmt: TypedStatement) -> LStatement {
+    fn lower_statement(&mut self, stmt: TypedStatement) -> Vec<LStatement> {
         let span = stmt.span;
-        let kind = match stmt.kind {
-            TypedStatementKind::VarInit(vi) => LStatementKind::VarInit(self.lower_var_init(vi)),
+        match stmt.kind {
+            TypedStatementKind::VarInit(vi) => self.lower_var_init_to_stmts(vi),
             TypedStatementKind::Assignment(a) => {
-                LStatementKind::Assignment(self.lower_assignment(a))
+                vec![LStatement {
+                    kind: LStatementKind::Assignment(self.lower_assignment(a)),
+                    span,
+                }]
             }
-            TypedStatementKind::Expr(e) => LStatementKind::Expr(self.lower_expr(e)),
-            TypedStatementKind::ForLoop(fl) => return self.lower_for_loop(fl, span),
+            TypedStatementKind::Expr(e) => {
+                vec![LStatement {
+                    kind: LStatementKind::Expr(self.lower_expr(e)),
+                    span,
+                }]
+            }
+            TypedStatementKind::ForLoop(fl) => vec![self.lower_for_loop(fl, span)],
             TypedStatementKind::ForInLoop(fil) => {
-                LStatementKind::ForInLoop(self.lower_for_in_loop(fil))
+                vec![LStatement {
+                    kind: LStatementKind::ForInLoop(self.lower_for_in_loop(fil)),
+                    span,
+                }]
             }
-            TypedStatementKind::Error => LStatementKind::Error,
-        };
-        LStatement { kind, span }
+            TypedStatementKind::Error => vec![LStatement {
+                kind: LStatementKind::Error,
+                span,
+            }],
+        }
     }
 
     fn lower_statements(&mut self, stmts: Vec<TypedStatement>) -> Vec<LStatement> {
-        stmts.into_iter().map(|s| self.lower_statement(s)).collect()
+        stmts.into_iter().flat_map(|s| self.lower_statement(s)).collect()
     }
 
-    fn lower_var_init(&mut self, vi: TypedVarInit) -> LVarInit {
-        LVarInit {
-            target: lower_var_target(vi.target),
-            type_def: vi.type_def,
-            value: self.lower_expr(vi.value),
-            span: vi.span,
-        }
+    fn lower_var_init_to_stmts(&mut self, vi: TypedVarInit) -> Vec<LStatement> {
+        let pattern = var_target_to_pattern(vi.target, vi.type_def.clone(), vi.span);
+        let value = self.lower_expr(vi.value);
+        self.bind_pattern(&pattern, value)
     }
 
     fn lower_assignment(&mut self, a: TypedAssignment) -> LAssignment {
@@ -201,24 +218,23 @@ impl Lowerer {
         }
 
         if let Some(init) = fl.init {
-            let init_stmt = match init {
-                TypedForLoopInit::VarInit(vi) => LStatement {
-                    kind: LStatementKind::VarInit(self.lower_var_init(vi)),
-                    span,
-                },
-                TypedForLoopInit::Assignment(a) => LStatement {
+            let init_stmts = match init {
+                TypedForLoopInit::VarInit(vi) => self.lower_var_init_to_stmts(vi),
+                TypedForLoopInit::Assignment(a) => vec![LStatement {
                     kind: LStatementKind::Assignment(self.lower_assignment(a)),
                     span,
-                },
+                }],
             };
             let loop_stmt = LStatement {
                 kind: LStatementKind::Loop(loop_body),
                 span,
             };
+            let mut block_stmts = init_stmts;
+            block_stmts.push(loop_stmt);
             LStatement {
                 kind: LStatementKind::Expr(LExpr {
                     kind: LExprKind::Block(Box::new(LBlock {
-                        statements: vec![init_stmt, loop_stmt],
+                        statements: block_stmts,
                         tail_expr: None,
                         ty: Type::Tuple(vec![]),
                         span,
@@ -237,12 +253,48 @@ impl Lowerer {
     }
 
     fn lower_for_in_loop(&mut self, fil: TypedForInLoop) -> LForInLoop {
-        let binding = lower_pattern_to_var_target(&fil.pattern);
-        LForInLoop {
-            binding,
-            iterable: self.lower_expr(fil.iterable),
-            body: self.lower_statements(fil.body),
-            span: fil.span,
+        let iterable = self.lower_expr(fil.iterable);
+        let mut body = self.lower_statements(fil.body);
+
+        match &fil.pattern.kind {
+            TypedPatternKind::Var(id, name) => {
+                LForInLoop {
+                    binding_name: *id,
+                    binding_original_name: name.clone(),
+                    iterable,
+                    body,
+                    span: fil.span,
+                }
+            }
+            TypedPatternKind::Wildcard => {
+                let tmp_id = self.fresh_name_id();
+                LForInLoop {
+                    binding_name: tmp_id,
+                    binding_original_name: "_".to_string(),
+                    iterable,
+                    body,
+                    span: fil.span,
+                }
+            }
+            _ => {
+                // Tuple or other complex pattern: bind to a temp, prepend destructuring
+                let tmp_id = self.fresh_name_id();
+                let tmp_name = "__for_binding".to_string();
+                let tmp_var = LExpr {
+                    kind: LExprKind::Var(tmp_id, tmp_name.clone()),
+                    ty: fil.pattern.ty.clone(),
+                    span: fil.pattern.span,
+                };
+                let mut destructure_stmts = self.bind_pattern(&fil.pattern, tmp_var);
+                destructure_stmts.append(&mut body);
+                LForInLoop {
+                    binding_name: tmp_id,
+                    binding_original_name: tmp_name,
+                    iterable,
+                    body: destructure_stmts,
+                    span: fil.span,
+                }
+            }
         }
     }
 
@@ -640,7 +692,8 @@ impl Lowerer {
         // Wrap in a block: { let __match_scrutinee = <scrutinee>; <cond_chain> }
         let init_stmt = LStatement {
             kind: LStatementKind::VarInit(LVarInit {
-                target: LVarTarget::Name(scrutinee_id, scrutinee_name),
+                name: scrutinee_id,
+                original_name: scrutinee_name,
                 type_def: scrutinee_ty,
                 value: lowered_scrutinee,
                 span: scrutinee_span,
@@ -744,7 +797,8 @@ impl Lowerer {
                 if let TypedPatternKind::Var(name_id, name) = &arm.pattern.kind {
                     let bind_stmt = LStatement {
                         kind: LStatementKind::VarInit(LVarInit {
-                            target: LVarTarget::Name(*name_id, name.clone()),
+                            name: *name_id,
+                            original_name: name.clone(),
                             type_def: arm.pattern.ty.clone(),
                             value: scrutinee_var.clone(),
                             span: arm.pattern.span,
@@ -788,7 +842,7 @@ impl Lowerer {
         scrutinee_var: &LExpr,
         payload_pat: Option<&TypedPattern>,
         body: &TypedBlock,
-        arm_span: Span,
+        _arm_span: Span,
     ) -> LBlock {
         let mut lowered_block = self.lower_block(body.clone());
 
@@ -812,7 +866,8 @@ impl Lowerer {
             TypedPatternKind::Var(name_id, name) => {
                 vec![LStatement {
                     kind: LStatementKind::VarInit(LVarInit {
-                        target: LVarTarget::Name(*name_id, name.clone()),
+                        name: *name_id,
+                        original_name: name.clone(),
                         type_def: pat.ty.clone(),
                         value,
                         span: pat.span,
@@ -897,31 +952,28 @@ impl Lowerer {
     }
 }
 
-fn lower_var_target(target: TypedVarTarget) -> LVarTarget {
+fn var_target_to_pattern(target: TypedVarTarget, type_def: Type, span: Span) -> TypedPattern {
     match target {
-        TypedVarTarget::Name(id, name) => LVarTarget::Name(id, name),
-        TypedVarTarget::Tuple(elements) => LVarTarget::Tuple(elements),
-    }
-}
-
-fn lower_pattern_to_var_target(pattern: &TypedPattern) -> LVarTarget {
-    match &pattern.kind {
-        TypedPatternKind::Var(id, name) => LVarTarget::Name(*id, name.clone()),
-        TypedPatternKind::Tuple(sub_pats) => {
-            let elements = sub_pats
-                .iter()
-                .filter_map(|p| {
-                    if let TypedPatternKind::Var(id, name) = &p.kind {
-                        Some((*id, name.clone(), p.ty.clone()))
-                    } else {
-                        None
-                    }
+        TypedVarTarget::Name(id, name) => TypedPattern {
+            kind: TypedPatternKind::Var(id, name),
+            ty: type_def,
+            span,
+        },
+        TypedVarTarget::Tuple(elements) => {
+            let sub_pats = elements
+                .into_iter()
+                .map(|(id, name, ty)| TypedPattern {
+                    kind: TypedPatternKind::Var(id, name),
+                    ty,
+                    span,
                 })
                 .collect();
-            LVarTarget::Tuple(elements)
+            TypedPattern {
+                kind: TypedPatternKind::Tuple(sub_pats),
+                ty: type_def,
+                span,
+            }
         }
-        TypedPatternKind::Wildcard => LVarTarget::Name(NameId(usize::MAX), "_".to_string()),
-        _ => LVarTarget::Name(NameId(usize::MAX), "_".to_string()),
     }
 }
 

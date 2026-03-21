@@ -434,10 +434,6 @@ fn resolve_slot(prog: &Program, slot: &VarSlot) -> String {
 fn pretty_lhs(prog: &Program, lhs: &Lhs) -> String {
     match lhs {
         Lhs::Var(slot) => resolve_slot(prog, slot),
-        Lhs::Tuple(ids) => {
-            let names: Vec<_> = ids.iter().map(|slot| resolve_slot(prog, slot)).collect();
-            format!("({})", names.join(", "))
-        }
     }
 }
 

@@ -136,14 +136,9 @@ pub struct LIfBranch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum LVarTarget {
-    Name(NameId, String),
-    Tuple(Vec<(NameId, String, Type)>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct LVarInit {
-    pub target: LVarTarget,
+    pub name: NameId,
+    pub original_name: String,
     pub type_def: Type,
     pub value: LExpr,
     pub span: Span,
@@ -158,7 +153,8 @@ pub struct LAssignment {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LForInLoop {
-    pub binding: LVarTarget,
+    pub binding_name: NameId,
+    pub binding_original_name: String,
     pub iterable: LExpr,
     pub body: Vec<LStatement>,
     pub span: Span,

@@ -256,11 +256,7 @@ fn test_lower_match_variant() {
         // First statement: scrutinee binding
         assert_eq!(block.statements.len(), 1);
         if let LStatementKind::VarInit(vi) = &block.statements[0].kind {
-            if let LVarTarget::Name(_, name) = &vi.target {
-                assert_eq!(name, "__match_scrutinee");
-            } else {
-                panic!("expected Name target for scrutinee");
-            }
+            assert_eq!(vi.original_name, "__match_scrutinee");
         } else {
             panic!("expected VarInit for scrutinee");
         }

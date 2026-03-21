@@ -174,10 +174,8 @@ fn test_compile_assignment() {
     let label = compiler.cfg.get(entry).expect("entry label missing");
     match label {
         Label::Instr(Instr::Assign(lhs, Expr::Int(100)), n) => {
-            match lhs {
-                Lhs::Var(slot) => assert_eq!(slot, &var_slot),
-                _ => panic!("expected Var LHS"),
-            }
+            let Lhs::Var(slot) = lhs;
+            assert_eq!(slot, &var_slot);
             assert_eq!(*n, next);
         }
         _ => panic!("expected Assign(Var, 100), got {:?}", label),
@@ -216,9 +214,8 @@ fn test_compile_if_statement() {
     if let Label::Instr(Instr::Assign(cond_lhs, Expr::Bool(true)), check_entry) = l_cond {
         let check_label = compiler.cfg.get(*check_entry).expect("check label missing");
         if let Label::Cond(Expr::Var(cond_var), then_vertex, else_vertex) = check_label {
-            if let Lhs::Var(slot) = cond_lhs {
-                assert_eq!(slot, cond_var);
-            }
+            let Lhs::Var(slot) = cond_lhs;
+            assert_eq!(slot, cond_var);
 
             let then_label = compiler.cfg.get(*then_vertex).expect("then label missing");
             if let Label::Instr(Instr::Assign(_, Expr::Int(1)), n) = then_label {
@@ -320,9 +317,8 @@ fn test_compile_return_statement() {
     let label = compiler.cfg.get(entry).expect("entry label missing");
     match label {
         Label::Instr(Instr::Assign(lhs, Expr::Int(42)), n) => {
-            if let Lhs::Var(slot) = lhs {
-                assert_eq!(slot, &return_slot);
-            }
+            let Lhs::Var(slot) = lhs;
+            assert_eq!(slot, &return_slot);
             assert_eq!(*n, return_target);
         }
         _ => panic!("expected Assign(return_slot, 42), got {:?}", label),
@@ -367,9 +363,8 @@ fn test_compile_sync_function_call() {
             assert_eq!(args.len(), 1);
             assert_eq!(*n, next);
 
-            if let Lhs::Var(arg_slot) = arg_lhs {
-                assert_eq!(args[0], Expr::Var(*arg_slot));
-            }
+            let Lhs::Var(arg_slot) = arg_lhs;
+            assert_eq!(args[0], Expr::Var(*arg_slot));
         } else {
             panic!("expected SyncCall, got {:?}", call_label);
         }
