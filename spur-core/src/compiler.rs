@@ -1,10 +1,12 @@
 pub mod cfg;
+pub mod lowered;
 
 use crate::analysis::checker::{TypeChecker, TypeError};
 use crate::analysis::format::{report_resolution_errors, report_type_errors};
 use crate::analysis::resolver::{ResolutionError, Resolver};
 use crate::analysis::{trivially_copyable, type_id};
 use crate::compiler::cfg::Compiler as CfgCompiler;
+use crate::compiler::lowered::lower_program;
 use crate::lexer::{LexError, Lexer};
 use crate::parser::{ParseError, parse_program};
 use crate::{lexer, parser};
@@ -102,8 +104,10 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
 
     let type_ids = type_id::assign_type_ids(&typed);
 
+    let lowered = lower_program(typed);
+
     let cfg_compiler = CfgCompiler::new();
-    let program = cfg_compiler.compile_program(typed, type_ids);
+    let program = cfg_compiler.compile_program(lowered, type_ids);
     result.program = Some(program);
 
     result

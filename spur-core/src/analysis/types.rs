@@ -95,6 +95,7 @@ pub enum TypedExprKind {
 
     Match(Box<TypedExpr>, Vec<TypedMatchArm>),
     Conditional(Box<TypedCondExpr>),
+    Block(Box<TypedBlock>),
     VariantLit(NameId, String, Option<Box<TypedExpr>>),
 
     UnwrapOptional(Box<TypedExpr>), // T? -> T

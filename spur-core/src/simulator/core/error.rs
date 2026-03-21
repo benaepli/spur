@@ -17,12 +17,6 @@ pub enum RuntimeError {
     #[error("map key not found")]
     KeyNotFound,
 
-    #[error("tuple length mismatch: expected {expected}, got {got}")]
-    TupleLengthMismatch { expected: usize, got: usize },
-
-    #[error("cannot assign non-tuple to tuple LHS, got {got}")]
-    NonTupleAssignment { got: &'static str },
-
     #[error("unwrap called on None")]
     UnwrapNone,
 
@@ -34,9 +28,6 @@ pub enum RuntimeError {
 
     #[error("instruction not allowed in sync function: {0}")]
     UnsupportedSyncInstruction(String),
-
-    #[error("for-loop over map expects tuple LHS")]
-    ForLoopMapExpectsTupleLhs,
 
     #[error("for-loop requires collection, got {got}")]
     ForLoopNotCollection { got: &'static str },

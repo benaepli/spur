@@ -476,7 +476,8 @@ fn test_for_loop_map_destructuring() {
     let ret = builder.add(Label::Return(Expr::Var(slot(3))));
     let loop_start = builder.add(Label::Return(Expr::Unit));
 
-    let body = builder.add(Label::Instr(
+    // Body: sum += k + v
+    let accumulate = builder.add(Label::Instr(
         Instr::Assign(
             Lhs::Var(slot(3)),
             Expr::Plus(
@@ -490,14 +491,32 @@ fn test_for_loop_map_destructuring() {
         loop_start,
     ));
 
+    // Extract value to slot(1) from pair in slot(4)
+    let extract_v = builder.add(Label::Instr(
+        Instr::Assign(
+            Lhs::Var(slot(1)),
+            Expr::TupleAccess(Box::new(Expr::Var(slot(4))), 1),
+        ),
+        accumulate,
+    ));
+
+    // Extract key to slot(0) from pair in slot(4)
+    let extract_k = builder.add(Label::Instr(
+        Instr::Assign(
+            Lhs::Var(slot(0)),
+            Expr::TupleAccess(Box::new(Expr::Var(slot(4))), 0),
+        ),
+        extract_v,
+    ));
+
     builder.labels[loop_start] = Label::ForLoopIn(
-        Lhs::Tuple(vec![slot(0), slot(1)]),
+        Lhs::Var(slot(4)),
         Expr::Map(vec![
             (Expr::Int(1), Expr::Int(10)),
             (Expr::Int(2), Expr::Int(20)),
         ]),
         slot(2),
-        body,
+        extract_k,
         ret,
     );
 
@@ -507,7 +526,7 @@ fn test_for_loop_map_destructuring() {
     ));
 
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 4);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 5);
     let mut logger = TestLogger::new();
     let record = make_record_with_cont(
         init,
@@ -542,20 +561,39 @@ fn test_tuple_assignment() {
         Box::new(Expr::Var(slot(1))),
     )));
 
-    let assign = builder.add(Label::Instr(
+    // Extract slot(1) = tmp.1
+    let extract_1 = builder.add(Label::Instr(
         Instr::Assign(
-            Lhs::Tuple(vec![slot(0), slot(1)]),
-            Expr::Tuple(vec![Expr::Int(10), Expr::Int(20)]),
+            Lhs::Var(slot(1)),
+            Expr::TupleAccess(Box::new(Expr::Var(slot(2))), 1),
         ),
         ret,
     ));
 
+    // Extract slot(0) = tmp.0
+    let extract_0 = builder.add(Label::Instr(
+        Instr::Assign(
+            Lhs::Var(slot(0)),
+            Expr::TupleAccess(Box::new(Expr::Var(slot(2))), 0),
+        ),
+        extract_1,
+    ));
+
+    // Assign tuple to tmp slot(2)
+    let assign = builder.add(Label::Instr(
+        Instr::Assign(
+            Lhs::Var(slot(2)),
+            Expr::Tuple(vec![Expr::Int(10), Expr::Int(20)]),
+        ),
+        extract_0,
+    ));
+
     let program = builder.build();
-    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 2);
+    let mut state = State::<WithHashing>::new(&[(NameId(0), 1)], 3);
     let mut logger = TestLogger::new();
     let record = make_record_with_cont(
         assign,
-        2,
+        3,
         Continuation::ClientOp {
             client_id: 0,
             op_name: "test".to_string(),

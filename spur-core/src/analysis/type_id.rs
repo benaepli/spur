@@ -264,6 +264,9 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
                 register_block(else_block, map, next_id);
             }
         }
+        TypedExprKind::Block(block) => {
+            register_block(block, map, next_id);
+        }
         TypedExprKind::VariantLit(_, _, payload) => {
             if let Some(p) = payload {
                 register_expr(p, map, next_id);
