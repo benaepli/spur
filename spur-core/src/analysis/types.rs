@@ -94,6 +94,7 @@ pub enum TypedExprKind {
     RpcCall(Box<TypedExpr>, TypedUserFuncCall),
 
     Match(Box<TypedExpr>, Vec<TypedMatchArm>),
+    Conditional(Box<TypedCondExpr>),
     VariantLit(NameId, String, Option<Box<TypedExpr>>),
 
     UnwrapOptional(Box<TypedExpr>), // T? -> T
@@ -119,6 +120,12 @@ pub enum TypedExprKind {
     PersistData(Box<TypedExpr>),
     RetrieveData(Type),
     DiscardData,
+
+    // Control flow expressions
+    Return(Box<TypedExpr>),
+    Break,
+    Continue,
+
     Error,
 }
 
@@ -140,7 +147,7 @@ pub struct TypedUserFuncCall {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedMatchArm {
     pub pattern: TypedPattern,
-    pub body: Vec<TypedStatement>,
+    pub body: TypedBlock,
     pub span: Span,
 }
 
@@ -152,30 +159,34 @@ pub struct TypedStatement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedStatementKind {
-    Conditional(TypedCondStmts),
     VarInit(TypedVarInit),
     Assignment(TypedAssignment),
     Expr(TypedExpr),
-    Return(TypedExpr),
     ForLoop(TypedForLoop),
     ForInLoop(TypedForInLoop),
-    Break,
-    Continue,
     Error,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypedCondStmts {
+pub struct TypedBlock {
+    pub statements: Vec<TypedStatement>,
+    pub tail_expr: Option<Box<TypedExpr>>,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedCondExpr {
     pub if_branch: TypedIfBranch,
     pub elseif_branches: Vec<TypedIfBranch>,
-    pub else_branch: Option<Vec<TypedStatement>>,
+    pub else_branch: Option<TypedBlock>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedIfBranch {
     pub condition: TypedExpr,
-    pub body: Vec<TypedStatement>,
+    pub body: TypedBlock,
     pub span: Span,
 }
 
@@ -273,7 +284,7 @@ pub struct TypedFuncDef {
     pub is_traced: bool,
     pub params: Vec<TypedFuncParam>,
     pub return_type: Type,
-    pub body: Vec<TypedStatement>,
+    pub body: TypedBlock,
     pub span: Span,
 }
 

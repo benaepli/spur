@@ -77,7 +77,14 @@ pub struct ResolvedFuncDef {
     pub is_traced: bool,
     pub params: Vec<ResolvedFuncParam>,
     pub return_type: Option<ResolvedTypeDef>,
-    pub body: Vec<ResolvedStatement>,
+    pub body: ResolvedBlock,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedBlock {
+    pub statements: Vec<ResolvedStatement>,
+    pub tail_expr: Option<Box<ResolvedExpr>>,
     pub span: Span,
 }
 
@@ -151,30 +158,26 @@ pub struct ResolvedStatement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedStatementKind {
-    Conditional(ResolvedCondStmts),
     VarInit(ResolvedVarInit),
     Assignment(ResolvedAssignment),
     Expr(ResolvedExpr),
-    Return(ResolvedExpr),
     ForLoop(ResolvedForLoop),
     ForInLoop(ResolvedForInLoop),
-    Break,
-    Continue,
     Error,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedCondStmts {
+pub struct ResolvedCondExpr {
     pub if_branch: ResolvedIfBranch,
     pub elseif_branches: Vec<ResolvedIfBranch>,
-    pub else_branch: Option<Vec<ResolvedStatement>>,
+    pub else_branch: Option<ResolvedBlock>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedIfBranch {
     pub condition: ResolvedExpr,
-    pub body: Vec<ResolvedStatement>,
+    pub body: ResolvedBlock,
     pub span: Span,
 }
 
@@ -211,7 +214,7 @@ pub struct ResolvedAssignment {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedMatchArm {
     pub pattern: ResolvedPattern,
-    pub body: Vec<ResolvedStatement>,
+    pub body: ResolvedBlock,
     pub span: Span,
 }
 
@@ -263,6 +266,7 @@ pub enum ResolvedExprKind {
     Len(Box<ResolvedExpr>),
     RpcCall(Box<ResolvedExpr>, ResolvedRpcCall),
     Match(Box<ResolvedExpr>, Vec<ResolvedMatchArm>),
+    Conditional(Box<ResolvedCondExpr>),
     VariantLit(NameId, String, Option<Box<ResolvedExpr>>),
 
     MakeChannel,
@@ -282,6 +286,12 @@ pub enum ResolvedExprKind {
     PersistData(Box<ResolvedExpr>),
     RetrieveData(ResolvedTypeDef),
     DiscardData,
+
+    // Control flow expressions
+    Return(Box<ResolvedExpr>),
+    Break,
+    Continue,
+
     Error,
 }
 
@@ -644,11 +654,7 @@ impl Resolver {
             None
         };
 
-        let body = func
-            .body
-            .into_iter()
-            .map(|s| self.resolve_statement(s))
-            .collect();
+        let body = self.resolve_block(func.body);
         self.exit_scope();
         Some(ResolvedFuncDef {
             name: name_id,
@@ -779,26 +785,20 @@ impl Resolver {
     fn resolve_statement(&mut self, stmt: Statement) -> ResolvedStatement {
         let span = stmt.span;
         let kind = match stmt.kind {
-            StatementKind::Conditional(c) => {
-                ResolvedStatementKind::Conditional(self.resolve_cond_stmts(c))
-            }
             StatementKind::VarInit(vi) => ResolvedStatementKind::VarInit(self.resolve_var_init(vi)),
             StatementKind::Assignment(a) => {
                 ResolvedStatementKind::Assignment(self.resolve_assignment(a))
             }
             StatementKind::Expr(e) => ResolvedStatementKind::Expr(self.resolve_expr(e)),
-            StatementKind::Return(e) => ResolvedStatementKind::Return(self.resolve_expr(e)),
             StatementKind::ForLoop(fl) => ResolvedStatementKind::ForLoop(self.resolve_for_loop(fl)),
             StatementKind::ForInLoop(fil) => {
                 ResolvedStatementKind::ForInLoop(self.resolve_for_in_loop(fil))
             }
-            StatementKind::Break => ResolvedStatementKind::Break,
-            StatementKind::Continue => ResolvedStatementKind::Continue,
         };
         ResolvedStatement { kind, span }
     }
 
-    fn resolve_block(&mut self, block: Vec<Statement>) -> Vec<ResolvedStatement> {
+    fn resolve_tailless_block(&mut self, block: Vec<Statement>) -> Vec<ResolvedStatement> {
         self.enter_scope();
         let resolved_block = block
             .into_iter()
@@ -808,8 +808,24 @@ impl Resolver {
         resolved_block
     }
 
-    fn resolve_cond_stmts(&mut self, cond: CondStmts) -> ResolvedCondStmts {
-        ResolvedCondStmts {
+    fn resolve_block(&mut self, block: Block) -> ResolvedBlock {
+        self.enter_scope();
+        let statements = block
+            .statements
+            .into_iter()
+            .map(|s| self.resolve_statement(s))
+            .collect();
+        let tail_expr = block.tail_expr.map(|e| Box::new(self.resolve_expr(*e)));
+        self.exit_scope();
+        ResolvedBlock {
+            statements,
+            tail_expr,
+            span: block.span,
+        }
+    }
+
+    fn resolve_cond_expr(&mut self, cond: CondExpr) -> ResolvedCondExpr {
+        ResolvedCondExpr {
             if_branch: self.resolve_if_branch(cond.if_branch),
             elseif_branches: cond
                 .elseif_branches
@@ -843,11 +859,7 @@ impl Resolver {
 
         let increment = loop_stmt.increment.map(|a| self.resolve_assignment(a));
 
-        let body = loop_stmt
-            .body
-            .into_iter()
-            .map(|s| self.resolve_statement(s))
-            .collect();
+        let body = self.resolve_tailless_block(loop_stmt.body);
 
         self.exit_scope();
 
@@ -864,11 +876,7 @@ impl Resolver {
         let iterable = self.resolve_expr(loop_stmt.iterable);
         self.enter_scope();
         let pattern = self.resolve_pattern(loop_stmt.pattern);
-        let body = loop_stmt
-            .body
-            .into_iter()
-            .map(|s| self.resolve_statement(s))
-            .collect();
+        let body = self.resolve_tailless_block(loop_stmt.body);
         self.exit_scope();
         ResolvedForInLoop {
             pattern,
@@ -1068,6 +1076,9 @@ impl Resolver {
                     .collect();
                 ResolvedExprKind::Match(resolved_expr, resolved_arms)
             }
+            ExprKind::Conditional(cond) => {
+                ResolvedExprKind::Conditional(Box::new(self.resolve_cond_expr(*cond)))
+            }
             ExprKind::VariantLit(enum_name, variant_name, payload) => {
                 match self.lookup_type(&enum_name, span) {
                     Ok(type_id) => {
@@ -1121,6 +1132,18 @@ impl Resolver {
                     ResolvedExprKind::Error
                 }
             },
+            ExprKind::Return(opt_inner) => {
+                let inner = match opt_inner {
+                    Some(e) => self.resolve_expr(*e),
+                    None => ResolvedExpr {
+                        kind: ResolvedExprKind::TupleLit(vec![]),
+                        span,
+                    },
+                };
+                ResolvedExprKind::Return(Box::new(inner))
+            }
+            ExprKind::Break => ResolvedExprKind::Break,
+            ExprKind::Continue => ResolvedExprKind::Continue,
         };
         ResolvedExpr { kind, span }
     }
@@ -1149,11 +1172,7 @@ impl Resolver {
     fn resolve_match_arm(&mut self, arm: MatchArm) -> ResolvedMatchArm {
         self.enter_scope();
         let pattern = self.resolve_pattern(arm.pattern);
-        let body = arm
-            .body
-            .into_iter()
-            .map(|s| self.resolve_statement(s))
-            .collect();
+        let body = self.resolve_block(arm.body);
         self.exit_scope();
         ResolvedMatchArm {
             pattern,

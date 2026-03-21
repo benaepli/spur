@@ -47,7 +47,7 @@ pub struct FuncDef {
     pub is_traced: bool,
     pub params: Vec<FuncParam>,
     pub return_type: Option<TypeDef>,
-    pub body: Vec<Statement>,
+    pub body: Block,
     pub span: Span,
 }
 
@@ -130,29 +130,32 @@ impl Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementKind {
-    Conditional(CondStmts),
     VarInit(VarInit),
     Assignment(Assignment),
     Expr(Expr),
-    Return(Expr),
     ForLoop(ForLoop),
     ForInLoop(ForInLoop),
-    Break,
-    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct CondStmts {
+pub struct Block {
+    pub statements: Vec<Statement>,
+    pub tail_expr: Option<Box<Expr>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CondExpr {
     pub if_branch: IfBranch,
     pub elseif_branches: Vec<IfBranch>,
-    pub else_branch: Option<Vec<Statement>>,
+    pub else_branch: Option<Block>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfBranch {
     pub condition: Expr,
-    pub body: Vec<Statement>,
+    pub body: Block,
     pub span: Span,
 }
 
@@ -189,7 +192,7 @@ pub struct Assignment {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: Pattern,
-    pub body: Vec<Statement>,
+    pub body: Block,
     pub span: Span,
 }
 
@@ -265,6 +268,7 @@ pub enum ExprKind {
 
     RpcCall(Box<Expr>, FuncCall),
     Match(Box<Expr>, Vec<MatchArm>),
+    Conditional(Box<CondExpr>),
     VariantLit(String, String, Option<Box<Expr>>),
     NamedDotAccess(String, String, Option<Box<Expr>>), // Ambiguous: could be VariantLit or FieldAccess
 
@@ -287,6 +291,11 @@ pub enum ExprKind {
     PersistData(Box<Expr>),
     RetrieveData(TypeDef),
     DiscardData,
+
+    // Control flow (expression-level)
+    Return(Option<Box<Expr>>),
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -504,6 +513,12 @@ where
             })
     });
 
+    #[derive(Clone)]
+    enum BlockItem {
+        Stmt(Statement),
+        Expr(Expr, bool), // (expression, has_semicolon)
+    }
+
     let primary = {
         let val = select! {
             TokenKind::Integer(i) => ExprKind::IntLit(i),
@@ -567,17 +582,89 @@ where
                 ExprKind::NamedDotAccess(first_name, second_name, payload)
             });
 
+        // block() parses { item* } where each item is a statement or expression.
+        // If the last item is an expression without a trailing semicolon, it becomes the tail expression.
+        let block = || {
+            let block_item = choice((
+                statement.clone().map(BlockItem::Stmt),
+                expr.clone()
+                    .then(just(TokenKind::Semicolon).or_not())
+                    .map(|(e, semi)| BlockItem::Expr(e, semi.is_some())),
+            ));
+            block_item
+                .repeated()
+                .collect::<Vec<BlockItem>>()
+                .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
+                .map_with(|mut items, extra| {
+                    let block_span = extra.span();
+                    // If last item is an expression without semicolon → tail expression
+                    let tail = match items.last() {
+                        Some(BlockItem::Expr(_, false)) => {
+                            if let Some(BlockItem::Expr(e, _)) = items.pop() {
+                                Some(Box::new(e))
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        _ => None,
+                    };
+                    let statements = items
+                        .into_iter()
+                        .map(|item| match item {
+                            BlockItem::Stmt(s) => s,
+                            BlockItem::Expr(e, _) => {
+                                let span = e.span;
+                                Statement::new(StatementKind::Expr(e), span)
+                            }
+                        })
+                        .collect();
+                    Block {
+                        statements,
+                        tail_expr: tail,
+                        span: block_span,
+                    }
+                })
+        };
+
+        let if_branch = just(TokenKind::If)
+            .ignore_then(expr.clone())
+            .then(block())
+            .map_with(|(condition, body), e| IfBranch {
+                condition,
+                body,
+                span: e.span(),
+            });
+        let else_if_branch = just(TokenKind::Else)
+            .ignore_then(just(TokenKind::If))
+            .ignore_then(expr.clone())
+            .then(block())
+            .map_with(|(condition, body), e| IfBranch {
+                condition,
+                body,
+                span: e.span(),
+            });
+        let cond_expr = if_branch
+            .then(else_if_branch.repeated().collect())
+            .then(just(TokenKind::Else).ignore_then(block()).or_not())
+            .map_with(|((if_branch, elseif_branches), else_branch), e| {
+                ExprKind::Conditional(Box::new(CondExpr {
+                    if_branch,
+                    elseif_branches,
+                    else_branch,
+                    span: e.span(),
+                }))
+            });
+
         let match_arm = pattern
             .clone()
             .then_ignore(just(TokenKind::FatArrow))
             .then(choice((
-                statement
-                    .clone()
-                    .repeated()
-                    .collect()
-                    .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
-                expr.clone()
-                    .map_with(|e, span| vec![Statement::new(StatementKind::Expr(e), span.span())]),
+                block(),
+                expr.clone().map_with(|e, span| Block {
+                    statements: vec![],
+                    tail_expr: Some(Box::new(e)),
+                    span: span.span(),
+                }),
             )))
             .map_with(|(pattern, body), e| MatchArm {
                 pattern,
@@ -689,11 +776,7 @@ where
                 .to(kind)
         };
 
-        let atom = choice((
-            val,
-            list_lit,
-            map_lit,
-            struct_lit,
+        let builtins = choice((
             two_arg_builtin(TokenKind::Append, ExprKind::Append),
             two_arg_builtin(TokenKind::Prepend, ExprKind::Prepend),
             two_arg_builtin(TokenKind::Min, ExprKind::Min),
@@ -722,8 +805,17 @@ where
             two_arg_builtin(TokenKind::Send, ExprKind::Send),
             one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
             zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
+        ));
+
+        let atom = choice((
+            val,
+            list_lit,
+            map_lit,
+            struct_lit,
+            builtins,
             func_call.clone().map(ExprKind::FuncCall),
             match_expr,
+            cond_expr,
             named_dot_access,
             ident.map(ExprKind::Var),
             fstring_parser,
@@ -912,8 +1004,8 @@ where
             just(TokenKind::QuestionQuestion).to(BinOp::Coalesce),
         );
 
-        // val >- chan (infix send, lowest precedence)
-        coalesce_expr
+        // val >- chan (infix send)
+        let send_expr = coalesce_expr
             .clone()
             .then(
                 just(TokenKind::SendArrow)
@@ -927,7 +1019,21 @@ where
                 } else {
                     lhs
                 }
-            })
+            });
+
+        // Control flow expressions (lowest precedence)
+        choice((
+            just(TokenKind::Return)
+                .ignore_then(expr.clone().or_not())
+                .map_with(|opt, e| {
+                    Expr::new(ExprKind::Return(opt.map(Box::new)), e.span())
+                }),
+            just(TokenKind::Break)
+                .map_with(|_, e| Expr::new(ExprKind::Break, e.span())),
+            just(TokenKind::Continue)
+                .map_with(|_, e| Expr::new(ExprKind::Continue, e.span())),
+            send_expr,
+        ))
     });
 
     let var_target = choice((
@@ -957,10 +1063,14 @@ where
         });
 
     statement.define({
-        let block = || {
-            statement
-                .clone()
-                .repeated()
+        let tailless_block = || {
+            let item = choice((
+                statement.clone(),
+                expr.clone()
+                    .then_ignore(just(TokenKind::Semicolon).or_not())
+                    .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span())),
+            ));
+            item.repeated()
                 .collect()
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
         };
@@ -977,42 +1087,7 @@ where
 
         let var_init_stmt = var_init_core
             .clone()
-            .then_ignore(just(TokenKind::Semicolon).or_not())
             .map_with(|var_init, e| Statement::new(StatementKind::VarInit(var_init), e.span()));
-
-        let if_branch = |kw| {
-            just(kw)
-                .ignore_then(expr.clone())
-                .then(block())
-                .map_with(|(condition, body), e| IfBranch {
-                    condition,
-                    body,
-                    span: e.span(),
-                })
-        };
-        let else_if_branch = just(TokenKind::Else)
-            .ignore_then(just(TokenKind::If))
-            .ignore_then(expr.clone())
-            .then(block())
-            .map_with(|(condition, body), e| IfBranch {
-                condition,
-                body,
-                span: e.span(),
-            });
-        let cond_stmts = if_branch(TokenKind::If)
-            .then(else_if_branch.repeated().collect())
-            .then(just(TokenKind::Else).ignore_then(block()).or_not())
-            .map_with(|((if_branch, elseif_branches), else_branch), e| {
-                Statement::new(
-                    StatementKind::Conditional(CondStmts {
-                        if_branch,
-                        elseif_branches,
-                        else_branch,
-                        span: e.span(),
-                    }),
-                    e.span(),
-                )
-            });
 
         let for_loop_init = choice((
             var_init_core.clone().map(ForLoopInit::VarInit),
@@ -1036,7 +1111,7 @@ where
 
         let for_loop = just(TokenKind::For)
             .ignore_then(for_header)
-            .then(block())
+            .then(tailless_block())
             .map_with(|((init, condition, increment), body), e| {
                 Statement::new(
                     StatementKind::ForLoop(ForLoop {
@@ -1057,7 +1132,7 @@ where
                     .then_ignore(just(TokenKind::In))
                     .then(expr.clone()),
             )
-            .then(block())
+            .then(tailless_block())
             .map_with(|((pattern, iterable), body), e| {
                 Statement::new(
                     StatementKind::ForInLoop(ForInLoop {
@@ -1070,49 +1145,26 @@ where
                 )
             });
 
-        let break_stmt =
-            just(TokenKind::Break).map_with(|_, e| Statement::new(StatementKind::Break, e.span()));
-
-        let continue_stmt = just(TokenKind::Continue)
-            .map_with(|_, e| Statement::new(StatementKind::Continue, e.span()));
-
-        let return_stmt = just(TokenKind::Return)
-            .ignore_then(expr.clone().or_not())
-            .map_with(|opt_expr, e| {
-                let expr =
-                    opt_expr.unwrap_or_else(|| Expr::new(ExprKind::TupleLit(vec![]), e.span()));
-                Statement::new(StatementKind::Return(expr), e.span())
-            });
-
-        let expr_stmt = expr
-            .clone()
-            .map_with(|e, s| Statement::new(StatementKind::Expr(e), s.span()));
-
         let simple_stmt = choice((
             var_init_stmt,
-            break_stmt,
-            continue_stmt,
-            return_stmt,
             assignment.map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
-            expr_stmt,
         ))
         .then_ignore(just(TokenKind::Semicolon).or_not());
 
-        choice((cond_stmts, for_loop, for_in_loop, simple_stmt)).recover_with(
-            skip_then_retry_until(
-                any_ref().ignored(),
-                choice((
-                    just(TokenKind::Semicolon).ignored(),
-                    just(TokenKind::RightBrace).ignored(),
-                    just(TokenKind::If).ignored(),
-                    just(TokenKind::For).ignored(),
-                    just(TokenKind::Var).ignored(),
-                    just(TokenKind::Return).ignored(),
-                    just(TokenKind::Break).ignored(),
-                    just(TokenKind::Continue).ignored(),
-                )),
-            ),
-        )
+        choice((for_loop, for_in_loop, simple_stmt)).recover_with(skip_then_retry_until(
+            any_ref().ignored(),
+            choice((
+                just(TokenKind::Semicolon).ignored(),
+                just(TokenKind::RightBrace).ignored(),
+                just(TokenKind::For).ignored(),
+                just(TokenKind::Var).ignored(),
+                just(TokenKind::Return).ignored(),
+                just(TokenKind::Break).ignored(),
+                just(TokenKind::Continue).ignored(),
+                just(TokenKind::If).ignored(),
+                just(TokenKind::Match).ignored(),
+            )),
+        ))
     });
 
     let var_init = just(TokenKind::Var)
@@ -1149,21 +1201,54 @@ where
         .then(just(TokenKind::Identifier("trace".into())))
         .or_not()
         .then(just(TokenKind::Async).or_not())
-        .then_ignore(just(TokenKind::Func))
+        .then_ignore(just(TokenKind::Fn))
         .then(ident)
         .then(func_params.delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)))
         .then(
-            just(TokenKind::Arrow)
+            just(TokenKind::Colon)
                 .ignore_then(type_def.clone())
                 .or_not(),
         )
-        .then(
-            statement
-                .clone()
+        .then({
+            let block_item = choice((
+                statement.clone().map(BlockItem::Stmt),
+                expr.clone()
+                    .then(just(TokenKind::Semicolon).or_not())
+                    .map(|(e, semi)| BlockItem::Expr(e, semi.is_some())),
+            ));
+            block_item
                 .repeated()
-                .collect()
-                .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace)),
-        )
+                .collect::<Vec<BlockItem>>()
+                .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
+                .map_with(|mut items, extra| {
+                    let block_span = extra.span();
+                    let tail = match items.last() {
+                        Some(BlockItem::Expr(_, false)) => {
+                            if let Some(BlockItem::Expr(e, _)) = items.pop() {
+                                Some(Box::new(e))
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        _ => None,
+                    };
+                    let statements = items
+                        .into_iter()
+                        .map(|item| match item {
+                            BlockItem::Stmt(s) => s,
+                            BlockItem::Expr(e, _) => {
+                                let span = e.span;
+                                Statement::new(StatementKind::Expr(e), span)
+                            }
+                        })
+                        .collect();
+                    Block {
+                        statements,
+                        tail_expr: tail,
+                        span: block_span,
+                    }
+                })
+        })
         .map_with(
             |(((((is_traced_opt, is_async_opt), name), params), return_type), body), e| FuncDef {
                 name,
@@ -1267,19 +1352,24 @@ where
         TopLevelDef::FreeFunc(func)
     });
 
-    let top_level_def = choice((role_def, client_def, type_def_stmt.map(TopLevelDef::Type), free_func))
-        .recover_with(skip_then_retry_until(
-            any_ref().ignored(),
-            choice((
-                just(TokenKind::Role).ignored(),
-                just(TokenKind::ClientInterface).ignored(),
-                just(TokenKind::Type).ignored(),
-                just(TokenKind::Func).ignored(),
-                just(TokenKind::At).ignored(),
-                just(TokenKind::Async).ignored(),
-                end(),
-            )),
-        ));
+    let top_level_def = choice((
+        role_def,
+        client_def,
+        type_def_stmt.map(TopLevelDef::Type),
+        free_func,
+    ))
+    .recover_with(skip_then_retry_until(
+        any_ref().ignored(),
+        choice((
+            just(TokenKind::Role).ignored(),
+            just(TokenKind::ClientInterface).ignored(),
+            just(TokenKind::Type).ignored(),
+            just(TokenKind::Fn).ignored(),
+            just(TokenKind::At).ignored(),
+            just(TokenKind::Async).ignored(),
+            end(),
+        )),
+    ));
 
     top_level_def
         .repeated()
@@ -1350,12 +1440,12 @@ mod tests {
 
     #[test]
     fn test_variant_literals() {
-        let source = "role R { func f() { x = E.V1; y = E.V2(42); } }";
+        let source = "role R { fn f() { x = E.V1; y = E.V2(42); } }";
         let program = parse(source);
         // Navigate to the assignments
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
-            if let StatementKind::Assignment(assign1) = &func.body[0].kind {
+            if let StatementKind::Assignment(assign1) = &func.body.statements[0].kind {
                 // E.V1 is initially parsed as NamedDotAccess(E, V1, None)
                 match &assign1.value.kind {
                     ExprKind::NamedDotAccess(first, second, payload) => {
@@ -1366,7 +1456,7 @@ mod tests {
                     _ => panic!("Expected NamedDotAccess for E.V1"),
                 }
             }
-            if let StatementKind::Assignment(assign2) = &func.body[1].kind {
+            if let StatementKind::Assignment(assign2) = &func.body.statements[1].kind {
                 match &assign2.value.kind {
                     ExprKind::NamedDotAccess(first, second, payload) => {
                         assert_eq!(first, "E");
@@ -1383,11 +1473,11 @@ mod tests {
 
     #[test]
     fn test_match_expression() {
-        let source = "role R { func f() { match x { E.V1 => { println(\"1\"); }, E.V2(val) => { println(\"2\"); } } } }";
+        let source = "role R { fn f() { match x { E.V1 => { println(\"1\"); }, E.V2(val) => { println(\"2\"); } }; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
-            if let StatementKind::Expr(expr) = &func.body[0].kind {
+            if let StatementKind::Expr(expr) = &func.body.statements[0].kind {
                 match &expr.kind {
                     ExprKind::Match(scrutinee, arms) => {
                         match &scrutinee.kind {
@@ -1428,11 +1518,11 @@ mod tests {
 
     #[test]
     fn test_infix_send() {
-        let source = "role R { async func f() { val >- ch; } }";
+        let source = "role R { async fn f() { val >- ch; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
-            if let StatementKind::Expr(expr) = &func.body[0].kind {
+            if let StatementKind::Expr(expr) = &func.body.statements[0].kind {
                 match &expr.kind {
                     ExprKind::Send(chan, val) => {
                         match &chan.kind {
@@ -1456,11 +1546,11 @@ mod tests {
 
     #[test]
     fn test_infix_send_precedence() {
-        let source = "role R { async func f() { x + 1 >- ch; } }";
+        let source = "role R { async fn f() { x + 1 >- ch; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
-            if let StatementKind::Expr(expr) = &func.body[0].kind {
+            if let StatementKind::Expr(expr) = &func.body.statements[0].kind {
                 match &expr.kind {
                     ExprKind::Send(chan, val) => {
                         match &chan.kind {

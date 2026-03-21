@@ -130,7 +130,7 @@
 				},
 				{
 					"name": "storage.type.spur",
-					"match": "\\b(func|async|map|list|chan|role|ClientInterface|type|options)\\b"
+					"match": "\\b(fn|async|map|list|chan|role|ClientInterface|type|options)\\b"
 				},
 				{
 					"name": "storage.type.primitive.spur",
@@ -162,7 +162,7 @@
 			"patterns": [
 				{
 					"name": "meta.function.declaration.spur",
-					"match": "(?:\\b(async)\\s+)?\\b(func)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+					"match": "(?:\\b(async)\\s+)?\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
 					"captures": {
 						"1": {
 							"name": "storage.modifier.spur"

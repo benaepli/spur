@@ -121,6 +121,7 @@ fn type_error_span(e: &TypeError) -> spur_core::parser::Span {
         | MatchScrutineeNotEnum { span, .. }
         | MatchArmTypeMismatch { span, .. }
         | NonTriviallyCopyable { span, .. }
-        | SafeNavOnNonOptional { span, .. } => *span,
+        | SafeNavOnNonOptional { span, .. }
+        | InternalError { span, .. } => *span,
     }
 }

@@ -15,7 +15,7 @@ role_def ::= 'role' ID '{' var_inits func_defs '}'
 client_def ::= 'ClientInterface' '{' var_inits func_defs '}'
 
 func_defs ::= ( func_def )*
-func_def ::= ( '@trace' )? ( 'async' )? 'func' ID '(' func_params? ')' ( '->' type_def )? '{' statements '}'
+func_def ::= ( '@trace' )? ( 'async' )? 'fn' ID '(' func_params? ')' ( ':' type_def )? block
 
 func_call ::= ID '(' args? ')'
 args ::= expr ( ',' expr )* ','?
@@ -48,25 +48,21 @@ base_type ::=
   | 'chan' '<' type_def '>'
   | '(' type_def_list? ')'
 
-statements ::= statement*
+(* If the last item is an expression without a
+   trailing semicolon, it becomes the block's tail expression / implicit
+   return value. *)
+block ::= '{' block_item* '}'
+block_item ::= statement | expr ';'?
+
+statements ::= ( statement | expr ';'? )*
 statement ::=
-  cond_stmts
-  | for_loop
+  for_loop
   | for_in_loop
   | simple_stmt ';'?
 
 simple_stmt ::=
   var_init
-  | 'break'
-  | 'continue'
-  | 'return' expr?
   | assignment
-  | expr
-
-cond_stmts ::= if_stmt ( else_if_stmt )* ( else_stmt )?
-if_stmt ::= 'if' expr '{' statements '}'
-else_if_stmt ::= 'else' 'if' expr '{' statements '}'
-else_stmt ::= 'else' '{' statements '}'
 
 for_loop ::= 'for' ( ( var_init | assignment )? ';' expr? ';' assignment? | expr | ) '{' statements '}'
 for_in_loop ::= 'for' pattern 'in' expr '{' statements '}'
@@ -82,7 +78,13 @@ pattern ::=
 
 pattern_list ::= pattern ( ',' pattern )* ','?
 
-expr ::= send_expr
+expr ::= control_flow_expr
+
+control_flow_expr ::=
+  'return' expr?
+  | 'break'
+  | 'continue'
+  | send_expr
 
 send_expr ::= coalescing_expr ( '>-' coalescing_expr )?
 
@@ -107,6 +109,7 @@ primary_base ::=
   | literals
   | func_call
   | match_expr
+  | cond_expr
   | named_dot_access
   | struct_literal
   | collection
@@ -139,9 +142,11 @@ postfix_op ::=
   | '->' func_call
   | ':=' expr
 
+cond_expr ::= 'if' expr block ( 'else' 'if' expr block )* ( 'else' block )?
+
 match_expr ::= 'match' expr '{' match_arms '}'
 match_arms ::= match_arm ( ',' match_arm )* ','?
-match_arm ::= pattern '=>' ( '{' statements '}' | expr )
+match_arm ::= pattern '=>' ( block | expr )
 
 named_dot_access ::= ID '.' ID ( '(' expr ')' )?
 
@@ -230,19 +235,19 @@ Update expressions are syntactic sugar for the `store` built-in function:
 
 Spur supports two function types for concurrency: `sync` (default) and `async`.
 
-By default, all functions are synchronous. A sync func is a blocking, atomic call that:
+By default, all functions are synchronous. A sync function is a blocking, atomic call that:
 
 - Cannot use channel operations (`send` and `recv`)
 
 A function can be explicitly marked as asynchronous with the `async` keyword:
 
 ```
-async func my_async_call() -> int {
+async fn my_async_call(): int {
   return 10;
 }
 ```
 
-Calling an async func does not block execution and immediately returns a `chan<T>`.
+Calling an async function does not block execution and immediately returns a `chan<T>`.
 To get the actual return value, you must receive from the channel, which will pause the current task.
 
 This sync-first model, where most operations are blocking, can result in issues around concurrent processing.

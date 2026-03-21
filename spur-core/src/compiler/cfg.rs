@@ -1,10 +1,10 @@
 use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::analysis::type_id::{TypeId, TypeIdMap};
 use crate::analysis::types::{
-    TypedCondStmts, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop, TypedForLoopInit,
-    TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram,
-    TypedStatement, TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit,
-    TypedVarTarget,
+    TypedBlock, TypedCondExpr, TypedExpr, TypedExprKind, TypedForInLoop, TypedForLoop,
+    TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedMatchArm, TypedPattern, TypedPatternKind,
+    TypedProgram, TypedStatement, TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall,
+    TypedVarInit, TypedVarTarget,
 };
 use crate::parser::{BinOp, Span};
 use ecow::EcoString;
@@ -618,7 +618,7 @@ impl Compiler {
             return_slot,
         };
 
-        let body_entry = self.compile_block(&func.body, effective_return_target, ctx);
+        let body_entry = self.compile_typed_block(&func.body, Lhs::Var(return_slot), effective_return_target, ctx);
 
         // If traced, insert TraceEnter after the return-slot init and before the body.
         let after_init = if is_traced {
@@ -659,9 +659,16 @@ impl Compiler {
     }
 
     /// Scan the function body for all local variable declarations and assign them slots.
-    fn scan_and_assign_slots(&mut self, body: &[TypedStatement]) {
-        for stmt in body {
+    fn scan_and_assign_slots(&mut self, body: &TypedBlock) {
+        self.scan_block_and_assign_slots(body);
+    }
+
+    fn scan_block_and_assign_slots(&mut self, block: &TypedBlock) {
+        for stmt in &block.statements {
             self.scan_stmt_and_assign_slots(stmt);
+        }
+        if let Some(tail) = &block.tail_expr {
+            self.scan_expr_and_assign_slots(tail);
         }
     }
 
@@ -696,20 +703,6 @@ impl Compiler {
             }
             TypedStatementKind::Expr(expr) => {
                 self.scan_expr_and_assign_slots(expr);
-            }
-            TypedStatementKind::Return(expr) => {
-                self.scan_expr_and_assign_slots(expr);
-            }
-            TypedStatementKind::Conditional(cond) => {
-                self.scan_expr_and_assign_slots(&cond.if_branch.condition);
-                self.scan_body_and_assign_slots(&cond.if_branch.body);
-                for branch in &cond.elseif_branches {
-                    self.scan_expr_and_assign_slots(&branch.condition);
-                    self.scan_body_and_assign_slots(&branch.body);
-                }
-                if let Some(body) = &cond.else_branch {
-                    self.scan_body_and_assign_slots(body);
-                }
             }
             TypedStatementKind::ForLoop(fl) => {
                 match &fl.init {
@@ -756,8 +749,6 @@ impl Compiler {
                 self.scan_expr_and_assign_slots(&loop_stmt.iterable);
                 self.scan_body_and_assign_slots(&loop_stmt.body);
             }
-            TypedStatementKind::Break => {}
-            TypedStatementKind::Continue => {}
             TypedStatementKind::Error => {}
         }
     }
@@ -841,7 +832,18 @@ impl Compiler {
                 self.scan_expr_and_assign_slots(scrutinee);
                 for arm in arms {
                     self.scan_pattern_and_assign_slots(&arm.pattern);
-                    self.scan_body_and_assign_slots(&arm.body);
+                    self.scan_block_and_assign_slots(&arm.body);
+                }
+            }
+            Conditional(cond) => {
+                self.scan_expr_and_assign_slots(&cond.if_branch.condition);
+                self.scan_block_and_assign_slots(&cond.if_branch.body);
+                for branch in &cond.elseif_branches {
+                    self.scan_expr_and_assign_slots(&branch.condition);
+                    self.scan_block_and_assign_slots(&branch.body);
+                }
+                if let Some(body) = &cond.else_branch {
+                    self.scan_block_and_assign_slots(body);
                 }
             }
             VariantLit(_, _, payload) => {
@@ -854,6 +856,10 @@ impl Compiler {
                     self.scan_expr_and_assign_slots(e);
                 }
             }
+            Return(inner) => {
+                self.scan_expr_and_assign_slots(inner);
+            }
+            Break | Continue => {}
             Var(_, _) | IntLit(_) | StringLit(_) | BoolLit(_) | NilLit | SetTimer => {}
             Error => {}
         }
@@ -878,7 +884,7 @@ impl Compiler {
         }
     }
 
-    fn compile_block(
+    fn compile_tailless_block(
         &mut self,
         body: &[TypedStatement],
         next_vertex: Vertex,
@@ -889,6 +895,21 @@ impl Compiler {
             next = self.compile_statement(stmt, next, ctx);
         }
         next
+    }
+
+    fn compile_typed_block(
+        &mut self,
+        block: &TypedBlock,
+        target: Lhs,
+        next_vertex: Vertex,
+        ctx: CompileCtx,
+    ) -> Vertex {
+        let tail_vertex = if let Some(tail) = &block.tail_expr {
+            self.compile_expr_to_value(tail, target, next_vertex, ctx)
+        } else {
+            self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex))
+        };
+        self.compile_tailless_block(&block.statements, tail_vertex, ctx)
     }
 
     fn compile_statement(
@@ -918,24 +939,28 @@ impl Compiler {
                 let lhs = self.convert_lhs(&assign.target);
                 self.compile_expr_to_value(&assign.value, lhs, next_vertex, ctx)
             }
-            TypedStatementKind::Expr(expr) => {
-                let dummy_slot = self.alloc_temp_slot();
-                self.compile_expr_to_value(expr, Lhs::Var(dummy_slot), next_vertex, ctx)
-            }
-            TypedStatementKind::Return(expr) => {
-                self.compile_expr_to_value(expr, Lhs::Var(ctx.return_slot), ctx.return_target, ctx)
+            TypedStatementKind::Expr(expr) => match &expr.kind {
+                TypedExprKind::Return(inner) => {
+                    self.compile_expr_to_value(
+                        inner,
+                        Lhs::Var(ctx.return_slot),
+                        ctx.return_target,
+                        ctx,
+                    )
+                }
+                TypedExprKind::Break => self.add_label(Label::Break(ctx.break_target)),
+                TypedExprKind::Continue => self.add_label(Label::Continue(ctx.continue_target)),
+                _ => {
+                    let dummy_slot = self.alloc_temp_slot();
+                    self.compile_expr_to_value(expr, Lhs::Var(dummy_slot), next_vertex, ctx)
+                }
             }
             TypedStatementKind::ForLoop(loop_stmt) => {
                 self.compile_for_loop(loop_stmt, next_vertex, ctx)
             }
-            TypedStatementKind::Conditional(cond) => {
-                self.compile_conditional(cond, next_vertex, ctx)
-            }
             TypedStatementKind::ForInLoop(loop_stmt) => {
                 self.compile_for_in_loop(loop_stmt, next_vertex, ctx)
             }
-            TypedStatementKind::Break => self.add_label(Label::Break(ctx.break_target)),
-            TypedStatementKind::Continue => self.add_label(Label::Continue(ctx.continue_target)),
             TypedStatementKind::Error => {
                 unreachable!("Error statements should not reach CFG generation")
             }
@@ -973,7 +998,7 @@ impl Compiler {
             ..loop_ctx_base
         };
 
-        let body_vertex = self.compile_block(&loop_stmt.body, increment_vertex, loop_ctx);
+        let body_vertex = self.compile_tailless_block(&loop_stmt.body, increment_vertex, loop_ctx);
 
         let cond_slot = self.alloc_temp_slot();
 
@@ -1025,17 +1050,20 @@ impl Compiler {
 
     fn compile_conditional(
         &mut self,
-        cond: &TypedCondStmts,
+        cond: &TypedCondExpr,
+        target: Lhs,
         next_vertex: Vertex,
         ctx: CompileCtx,
     ) -> Vertex {
-        let else_vertex = cond.else_branch.as_ref().map_or(next_vertex, |body| {
-            self.compile_block(body, next_vertex, ctx)
-        });
+        let else_vertex = if let Some(body) = &cond.else_branch {
+            self.compile_typed_block(body, target.clone(), next_vertex, ctx)
+        } else {
+            self.add_label(Label::Instr(Instr::Assign(target.clone(), Expr::Unit), next_vertex))
+        };
 
         let mut next_cond_vertex = else_vertex;
         for branch in cond.elseif_branches.iter().rev() {
-            let body_vertex = self.compile_block(&branch.body, next_vertex, ctx);
+            let body_vertex = self.compile_typed_block(&branch.body, target.clone(), next_vertex, ctx);
             let cond_slot = self.alloc_temp_slot();
             let check_vertex = self.add_label(Label::Cond(
                 Expr::Var(cond_slot),
@@ -1050,7 +1078,7 @@ impl Compiler {
             );
         }
 
-        let if_body_vertex = self.compile_block(&cond.if_branch.body, next_vertex, ctx);
+        let if_body_vertex = self.compile_typed_block(&cond.if_branch.body, target.clone(), next_vertex, ctx);
         let if_cond_slot = self.alloc_temp_slot();
 
         let if_check_vertex = self.add_label(Label::Cond(
@@ -1081,7 +1109,7 @@ impl Compiler {
             ..ctx
         };
 
-        let body_vertex = self.compile_block(&loop_stmt.body, for_vertex, loop_ctx);
+        let body_vertex = self.compile_tailless_block(&loop_stmt.body, for_vertex, loop_ctx);
 
         // Now we create the real [ForLoopIn] label.
         let lhs = self.convert_pattern(&loop_stmt.pattern);
@@ -1212,35 +1240,12 @@ impl Compiler {
 
     fn compile_match_arm_body(
         &mut self,
-        body: &[TypedStatement],
+        body: &TypedBlock,
         target: Lhs,
         next_vertex: Vertex,
         ctx: CompileCtx,
     ) -> Vertex {
-        if body.is_empty() {
-            return self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
-        }
-
-        let last_stmt = body.last().unwrap();
-        let (init_stmts, result_vertex) = if let TypedStatementKind::Expr(expr) = &last_stmt.kind {
-            let result_vertex = self.compile_expr_to_value(expr, target, next_vertex, ctx);
-            (&body[..body.len() - 1], result_vertex)
-        } else if let TypedStatementKind::Return(_) = &last_stmt.kind {
-            let unit_vertex =
-                self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
-            (body, unit_vertex)
-        } else {
-            let unit_vertex =
-                self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
-            (body, unit_vertex)
-        };
-
-        let mut current_vertex = result_vertex;
-        for stmt in init_stmts.iter().rev() {
-            current_vertex = self.compile_statement(stmt, current_vertex, ctx);
-        }
-
-        current_vertex
+        self.compile_typed_block(body, target, next_vertex, ctx)
     }
 
     /// Compile a single sub-expression, apply `make_expr`, assign to `target`.
@@ -1535,6 +1540,10 @@ impl Compiler {
                 self.compile_match(scrutinee, arms, target, next_vertex, ctx)
             }
 
+            TypedExprKind::Conditional(cond) => {
+                self.compile_conditional(cond, target, next_vertex, ctx)
+            }
+
             TypedExprKind::Store(a, b, c) => {
                 self.compile_ternary(a, b, c, target, next_vertex, ctx, Expr::Store)
             }
@@ -1562,6 +1571,19 @@ impl Compiler {
                 let discard_label = Label::DiscardData(assign_vertex);
                 self.add_label(discard_label)
             }
+
+            // Control flow expressions — handled at statement level in compile_statement,
+            // but can appear nested in expression position.
+            TypedExprKind::Return(inner) => {
+                self.compile_expr_to_value(
+                    inner,
+                    Lhs::Var(ctx.return_slot),
+                    ctx.return_target,
+                    ctx,
+                )
+            }
+            TypedExprKind::Break => self.add_label(Label::Break(ctx.break_target)),
+            TypedExprKind::Continue => self.add_label(Label::Continue(ctx.continue_target)),
 
             _ => unreachable!(
                 "All simple expressions handled by fast path, all complex expressions \
@@ -1894,6 +1916,11 @@ impl Compiler {
                 None,
             ),
 
+            // Control flow expressions — cannot be inlined into pure expressions
+            TypedExprKind::Return(_)
+            | TypedExprKind::Break
+            | TypedExprKind::Continue => return None,
+
             // Complex expressions that need CFG control flow
             TypedExprKind::FuncCall(_)
             | TypedExprKind::RpcCall(_, _)
@@ -1901,6 +1928,7 @@ impl Compiler {
             | TypedExprKind::Send(_, _)
             | TypedExprKind::Recv(_)
             | TypedExprKind::Match(_, _)
+            | TypedExprKind::Conditional(_)
             | TypedExprKind::PersistData(_)
             | TypedExprKind::RetrieveData(_)
             | TypedExprKind::DiscardData

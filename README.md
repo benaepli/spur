@@ -26,14 +26,14 @@ type Command = int;
 role Node {
   var db: map<string, Command> = {};
 
-  func Write(key: string, value: Command) -> bool {
+  fn Write(key: string, value: Command): bool {
       db = db[key] := value;
       return true;
   }
 }
 
 ClientInterface {
-  func Write(node: Node, key: string, value: Command) {
+  fn Write(node: Node, key: string, value: Command) {
       <-node->Write(key, value);
   }
 }

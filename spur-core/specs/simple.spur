@@ -3,22 +3,22 @@ type Value = int;
 role Head {
     var db: map<string, Value> = {"hi": 0};
 
-    async func Write(key: string, value: int) -> bool {
+    async fn Write(key: string, value: int): bool {
         db = db[key] := value;
         return true;
     }
 
-    async func Read(key: string) -> Value {
+    async fn Read(key: string): Value {
         return db[key];
     }
 }
 
 ClientInterface {
-    async func write(node: Head, key: string, value: Value) {
+    async fn write(node: Head, key: string, value: Value) {
         <-node->Write(key, value);
     }
 
-    async func read(node: Head, key: string) -> Value {
+    async fn read(node: Head, key: string): Value {
         return <-node->Read(key);
     }
 }

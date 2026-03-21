@@ -228,9 +228,12 @@ fn test_function_return_validation() {
     checker.enter_scope();
     checker.current_return_type = Some(Type::Int);
 
-    // Valid Return
+    // Valid Return (now wrapped as an expression)
     let ret_stmt = ResolvedStatement {
-        kind: ResolvedStatementKind::Return(int_lit(5)),
+        kind: ResolvedStatementKind::Expr(ResolvedExpr {
+            kind: ResolvedExprKind::Return(Box::new(int_lit(5))),
+            span: dummy_span(),
+        }),
         span: dummy_span(),
     };
 
@@ -240,7 +243,10 @@ fn test_function_return_validation() {
 
     // Invalid Return Type
     let bad_ret = ResolvedStatement {
-        kind: ResolvedStatementKind::Return(str_lit("bad")),
+        kind: ResolvedStatementKind::Expr(ResolvedExpr {
+            kind: ResolvedExprKind::Return(Box::new(str_lit("bad"))),
+            span: dummy_span(),
+        }),
         span: dummy_span(),
     };
 
@@ -388,10 +394,11 @@ fn test_check_match_expression_valid() {
             kind: ResolvedPatternKind::Variant(enum_id, "V1".to_string(), None),
             span: dummy_span(),
         },
-        body: vec![ResolvedStatement {
-            kind: ResolvedStatementKind::Expr(int_lit(1)),
+        body: ResolvedBlock {
+            statements: vec![],
+            tail_expr: Some(Box::new(int_lit(1))),
             span: dummy_span(),
-        }],
+        },
         span: dummy_span(),
     };
 
@@ -407,10 +414,11 @@ fn test_check_match_expression_valid() {
             ),
             span: dummy_span(),
         },
-        body: vec![ResolvedStatement {
-            kind: ResolvedStatementKind::Expr(expr(ResolvedExprKind::Var(id(20), "x".to_string()))),
+        body: ResolvedBlock {
+            statements: vec![],
+            tail_expr: Some(Box::new(expr(ResolvedExprKind::Var(id(20), "x".to_string())))),
             span: dummy_span(),
-        }],
+        },
         span: dummy_span(),
     };
 

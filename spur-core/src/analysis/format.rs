@@ -465,6 +465,12 @@ pub fn report_type_errors(
                     format!("help: the `?.` and `?[]` operators can only be used on optional types, but `{}` is not optional", ty),
                     "note: use `.` or `[]` for non-optional access".to_string(),
                 ]),
+            TypeError::InternalError { message, span } => Diagnostic::bug()
+                .with_message("Internal compiler error")
+                .with_labels(vec![
+                    Label::primary(file_id, span.start..span.end)
+                        .with_message(message),
+                ]),
         };
 
         term::emit_to_write_style(&mut writer_lock, &config, &files, &diagnostic)?;

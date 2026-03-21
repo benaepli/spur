@@ -83,7 +83,7 @@ pub enum TokenKind {
     Match,
     ClientInterface,
     Role,
-    Func,
+    Fn,
     Var,
     Type,
     Return,
@@ -168,7 +168,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Enum => write!(f, "enum"),
             TokenKind::Match => write!(f, "match"),
             TokenKind::Role => write!(f, "role"),
-            TokenKind::Func => write!(f, "func"),
+            TokenKind::Fn => write!(f, "fn"),
             TokenKind::Var => write!(f, "var"),
             TokenKind::Type => write!(f, "type"),
             TokenKind::Return => write!(f, "return"),
@@ -214,7 +214,7 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "match" => TokenKind::Match,
     "ClientInterface" => TokenKind::ClientInterface,
     "role" => TokenKind::Role,
-    "func" => TokenKind::Func,
+    "fn" => TokenKind::Fn,
     "var" => TokenKind::Var,
     "type" => TokenKind::Type,
     "return" => TokenKind::Return,
@@ -697,13 +697,13 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let input = "func var if else for return";
+        let input = "fn var if else for return";
         let mut lexer = Lexer::new(input);
         let (tokens, errors) = lexer.collect_all();
 
         assert!(errors.is_empty());
         assert_eq!(tokens.len(), 6);
-        assert_eq!(tokens[0].kind, TokenKind::Func);
+        assert_eq!(tokens[0].kind, TokenKind::Fn);
         assert_eq!(tokens[1].kind, TokenKind::Var);
         assert_eq!(tokens[2].kind, TokenKind::If);
         assert_eq!(tokens[3].kind, TokenKind::Else);
@@ -832,13 +832,13 @@ mod tests {
 
     #[test]
     fn test_comments() {
-        let input = "func // this is a comment\nvar";
+        let input = "fn // this is a comment\nvar";
         let mut lexer = Lexer::new(input);
         let (tokens, errors) = lexer.collect_all();
 
         assert!(errors.is_empty());
         assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].kind, TokenKind::Func);
+        assert_eq!(tokens[0].kind, TokenKind::Fn);
         assert_eq!(tokens[1].kind, TokenKind::Var);
     }
 }
