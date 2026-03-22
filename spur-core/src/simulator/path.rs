@@ -137,13 +137,6 @@ fn schedule_client_op<H: HashPolicy>(
                 Value::<H>::string(EcoString::from(key.as_str())),
             ],
         ),
-        ClientOpSpec::SimulateTimeout(target) => (
-            "ClientInterface.SimulateTimeout",
-            vec![Value::<H>::node(NodeId {
-                role: server_role,
-                index: *target as usize,
-            })],
-        ),
     };
 
     let op_func = prog
@@ -196,12 +189,15 @@ pub fn exec_plan<H: HashPolicy>(
     global_snapshot: Option<&VertexMap>,
     run_id: i64,
     policy: &SchedulePolicy,
+    strict_timers: bool,
 ) -> Result<(), RuntimeError> {
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
     // Map from node_id index to the plan engine NodeIndex for pending crash/recover events
     let mut pending_crash_recover: HashMap<usize, NodeIndex> = HashMap::new();
+    // Map from (node_index, label) to the plan engine NodeIndex for pending AllowTimer events
+    let mut pending_allow_timer: HashMap<(usize, String), NodeIndex> = HashMap::new();
 
     // Look up role NameIds from the program
     let server_role = program
@@ -293,7 +289,6 @@ pub fn exec_plan<H: HashPolicy>(
                     let target_idx = match op_spec {
                         ClientOpSpec::Write(t, _, _) => *t as usize,
                         ClientOpSpec::Read(t, _) => *t as usize,
-                        ClientOpSpec::SimulateTimeout(t) => *t as usize,
                     };
                     validate_node(&path_state.state, target_idx, server_role, "Node")?;
 
@@ -331,6 +326,11 @@ pub fn exec_plan<H: HashPolicy>(
                         });
                     pending_crash_recover.insert(nid.index, node_idx);
                 }
+                EventAction::AllowTimer(node_id, label) => {
+                    let key = (*node_id as usize, label.clone());
+                    path_state.state.allowed_timers.insert(key.clone());
+                    pending_allow_timer.insert(key, node_idx);
+                }
             }
         }
 
@@ -348,6 +348,7 @@ pub fn exec_plan<H: HashPolicy>(
                 &topology,
                 global_state,
                 policy,
+                strict_timers,
             )?;
 
             match result {
@@ -389,6 +390,12 @@ pub fn exec_plan<H: HashPolicy>(
                         step: path_state.state.crash_info.current_step,
                     });
                     if let Some(plan_node) = pending_crash_recover.remove(&node_id.index) {
+                        engine.mark_event_completed(plan_node);
+                    }
+                }
+                ScheduleResult::TimerFired { node_id, label } => {
+                    let key = (node_id.index, label);
+                    if let Some(plan_node) = pending_allow_timer.remove(&key) {
                         engine.mark_event_completed(plan_node);
                     }
                 }

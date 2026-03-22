@@ -273,7 +273,7 @@ pub enum ResolvedExprKind {
     Send(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Recv(Box<ResolvedExpr>),
 
-    SetTimer,
+    SetTimer(Option<String>),
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
@@ -1036,7 +1036,7 @@ impl Resolver {
                 Box::new(self.resolve_expr(*val)),
             ),
             ExprKind::Recv(ch) => ResolvedExprKind::Recv(Box::new(self.resolve_expr(*ch))),
-            ExprKind::SetTimer => ResolvedExprKind::SetTimer,
+            ExprKind::SetTimer(label) => ResolvedExprKind::SetTimer(label),
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)),
                 Box::new(self.resolve_expr(*i)),

@@ -290,7 +290,7 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
         | TypedExprKind::BoolLit(_)
         | TypedExprKind::NilLit
         | TypedExprKind::MakeChannel
-        | TypedExprKind::SetTimer
+        | TypedExprKind::SetTimer(_)
         | TypedExprKind::DiscardData
         | TypedExprKind::Error => {}
     }

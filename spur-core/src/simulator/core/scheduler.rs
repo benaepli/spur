@@ -24,6 +24,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
     topology: &TopologyInfo,
     global_state: &GlobalState,
     policy: &SchedulePolicy,
+    strict_timers: bool,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     let len = state.runnable_tasks.len();
     if len == 0 {
@@ -32,18 +33,40 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
 
     let mut rng = rand::rng();
 
+    // Check if a runnable is eligible (labeled timers need permission under strict_timers)
+    let is_eligible = |r: &Runnable<H>| -> bool {
+        if !strict_timers {
+            return true;
+        }
+        if let Runnable::Timer(t) = r {
+            if let Some(ref label) = t.label {
+                return state.allowed_timers.contains(&(t.node.index, label.clone()));
+            }
+        }
+        true
+    };
+
+    // Build list of eligible indices
+    let eligible: Vec<usize> = (0..len)
+        .filter(|&i| is_eligible(&state.runnable_tasks[i]))
+        .collect();
+
+    if eligible.is_empty() {
+        return Ok(ScheduleResult::None);
+    }
+
     // Combined score: novelty (exploration) + priority (urgency)
     let score = |r: &Runnable<H>| -> f64 {
         let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
         0.25 * novelty + 0.75 * r.priority()
     };
 
-    let idx = if len > 1 {
+    let idx = if eligible.len() > 1 {
         const K: usize = 10;
-        let mut best_idx = rng.random_range(0..len);
+        let mut best_idx = eligible[rng.random_range(0..eligible.len())];
         let mut best_score = score(&state.runnable_tasks[best_idx]);
-        for _ in 1..K.min(len) {
-            let i = rng.random_range(0..len);
+        for _ in 1..K.min(eligible.len()) {
+            let i = eligible[rng.random_range(0..eligible.len())];
             let s = score(&state.runnable_tasks[i]);
             if s > best_score {
                 best_idx = i;
@@ -52,7 +75,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
         }
         best_idx
     } else {
-        0
+        eligible[0]
     };
 
     let runnable = state.runnable_tasks.remove(idx);
@@ -103,7 +126,12 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                 }
                 state.channels.insert(timer.channel, chan);
             }
-            Ok(ScheduleResult::None)
+            if let Some(label) = timer.label {
+                state.allowed_timers.remove(&(timer.node.index, label.clone()));
+                Ok(ScheduleResult::TimerFired { node_id: timer.node, label })
+            } else {
+                Ok(ScheduleResult::None)
+            }
         }
         other => {
             let (src_node, dest_node) = match &other {

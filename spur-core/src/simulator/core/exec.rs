@@ -176,7 +176,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             store(lhs, Value::channel(cid), local_env, node_env)?;
             Ok(Some(StepOutcome::Continue(*next)))
         }
-        Label::SetTimer(lhs, next) => {
+        Label::SetTimer(lhs, next, label) => {
             let cid = ChannelId {
                 node: node_id,
                 id: state.alloc_channel_id(),
@@ -191,6 +191,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 node: node_id,
                 channel: cid,
                 priority: policy.sample(&mut rng, RunnableCategory::Timer),
+                label: label.clone(),
             };
             state.runnable_tasks.push_back(Runnable::Timer(timer));
             Ok(Some(StepOutcome::Continue(*next)))
@@ -564,7 +565,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
             }
             Label::Instr(_, _)
             | Label::MakeChannel(_, _, _)
-            | Label::SetTimer(_, _)
+            | Label::SetTimer(_, _, _)
             | Label::UniqueId(_, _)
             | Label::Cond(_, _, _)
             | Label::Return(_)

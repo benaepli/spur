@@ -16,7 +16,6 @@ pub enum PlanError {
 pub enum ClientOpSpec {
     Write(i32, EcoString, EcoString),
     Read(i32, EcoString),
-    SimulateTimeout(i32),
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
@@ -24,6 +23,7 @@ pub enum EventAction {
     ClientRequest(ClientOpSpec),
     CrashNode(i32),
     RecoverNode(i32),
+    AllowTimer(i32, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]

@@ -53,7 +53,7 @@ pub enum LExprKind {
     Send(Box<LExpr>, Box<LExpr>),
     Recv(Box<LExpr>),
 
-    SetTimer,
+    SetTimer(Option<String>),
 
     Index(Box<LExpr>, Box<LExpr>),
     Slice(Box<LExpr>, Box<LExpr>, Box<LExpr>),

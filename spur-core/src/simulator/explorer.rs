@@ -64,9 +64,6 @@ pub struct ExplorerConfig {
     #[serde(rename = "num_read_ops")]
     pub num_read_ops_range: Range,
 
-    #[serde(rename = "num_timeouts")]
-    pub num_timeouts_range: Range,
-
     #[serde(rename = "num_crashes")]
     pub num_crashes_range: Range,
 
@@ -98,9 +95,6 @@ impl ExplorerConfig {
         self.num_read_ops_range
             .validate()
             .map_err(|e| format!("num_read_ops range error: {}", e))?;
-        self.num_timeouts_range
-            .validate()
-            .map_err(|e| format!("num_timeouts range error: {}", e))?;
         self.num_crashes_range
             .validate()
             .map_err(|e| format!("num_crashes range error: {}", e))?;
@@ -125,7 +119,6 @@ pub struct SingleRunConfig {
     pub num_servers: i32,
     pub num_write_ops: i32,
     pub num_read_ops: i32,
-    pub num_timeouts: i32,
     pub num_crashes: i32,
     pub dependency_density: f64,
     pub use_coverage_scheduling: bool,
@@ -145,9 +138,6 @@ impl SingleRunConfig {
             ),
             num_read_ops: rng.random_range(
                 constraints.num_read_ops_range.min..=constraints.num_read_ops_range.max,
-            ),
-            num_timeouts: rng.random_range(
-                constraints.num_timeouts_range.min..=constraints.num_timeouts_range.max,
             ),
             num_crashes: rng.random_range(
                 constraints.num_crashes_range.min..=constraints.num_crashes_range.max,
@@ -179,7 +169,6 @@ impl SingleRunConfig {
         new_config.num_servers = mutate_int(self.num_servers, &constraints.num_servers_range);
         new_config.num_write_ops = mutate_int(self.num_write_ops, &constraints.num_write_ops_range);
         new_config.num_read_ops = mutate_int(self.num_read_ops, &constraints.num_read_ops_range);
-        new_config.num_timeouts = mutate_int(self.num_timeouts, &constraints.num_timeouts_range);
         new_config.num_crashes = mutate_int(self.num_crashes, &constraints.num_crashes_range);
 
         if rng.random_bool(0.3) && !constraints.dependency_density_values.is_empty() {
@@ -317,7 +306,6 @@ pub fn run_single_simulation(
         num_servers: config.num_servers,
         num_write_ops: config.num_write_ops,
         num_read_ops: config.num_read_ops,
-        num_timeouts: config.num_timeouts,
         num_crashes: config.num_crashes,
         dependency_density: config.dependency_density,
     };
@@ -388,6 +376,7 @@ pub fn run_single_simulation(
         Some(&global_snapshot),
         run_id,
         &config.schedule_policy,
+        false,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -437,7 +426,6 @@ pub fn run_explorer(
         let all_servers = config.num_servers_range.expand();
         let all_writes = config.num_write_ops_range.expand();
         let all_reads = config.num_read_ops_range.expand();
-        let all_timeouts = config.num_timeouts_range.expand();
         let all_crashes = config.num_crashes_range.expand();
         let all_densities = &config.dependency_density_values;
 
@@ -446,7 +434,6 @@ pub fn run_explorer(
         let total_configs = all_servers.len()
             * all_writes.len()
             * all_reads.len()
-            * all_timeouts.len()
             * all_crashes.len()
             * all_densities.len();
 
@@ -456,45 +443,41 @@ pub fn run_explorer(
         'outer: for &num_servers in &all_servers {
             for &num_writes in &all_writes {
                 for &num_reads in &all_reads {
-                    for &num_timeouts in &all_timeouts {
-                        for &num_crashes in &all_crashes {
-                            for &density in all_densities {
-                                if cancelled_producer.load(Ordering::Relaxed) {
-                                    break 'outer;
-                                }
-                                config_counter += 1;
+                    for &num_crashes in &all_crashes {
+                        for &density in all_densities {
+                            if cancelled_producer.load(Ordering::Relaxed) {
+                                break 'outer;
+                            }
+                            config_counter += 1;
 
-                                let run_config = SingleRunConfig {
-                                    num_servers,
-                                    num_write_ops: num_writes,
-                                    num_read_ops: num_reads,
-                                    num_timeouts,
-                                    num_crashes,
-                                    dependency_density: density,
-                                    use_coverage_scheduling: config.use_coverage_scheduling,
-                                    max_iterations: config.max_iterations,
-                                    schedule_policy: config.schedule_policy.clone(),
-                                };
+                            let run_config = SingleRunConfig {
+                                num_servers,
+                                num_write_ops: num_writes,
+                                num_read_ops: num_reads,
+                                num_crashes,
+                                dependency_density: density,
+                                use_coverage_scheduling: config.use_coverage_scheduling,
+                                max_iterations: config.max_iterations,
+                                schedule_policy: config.schedule_policy.clone(),
+                            };
 
-                                info!("{}", "=".repeat(70));
-                                info!(
-                                    "Queuing Config {}/{}: s{}_w{}_r{}_t{}_crash{}_d{:.2}",
-                                    config_counter,
-                                    total_configs,
-                                    num_servers,
-                                    num_writes,
-                                    num_reads,
-                                    num_timeouts,
-                                    num_crashes,
-                                    density
-                                );
-                                info!("{}", "=".repeat(70));
+                            info!("{}", "=".repeat(70));
+                            info!(
+                                "Queuing Config {}/{}: s{}_w{}_r{}_crash{}_d{:.2}",
+                                config_counter,
+                                total_configs,
+                                num_servers,
+                                num_writes,
+                                num_reads,
+                                num_crashes,
+                                density
+                            );
+                            info!("{}", "=".repeat(70));
 
-                                for _ in 1..=config.num_runs_per_config {
-                                    run_counter += 1;
-                                    if sender.send((run_counter, run_config.clone())).is_err() {
-                                        return;
-                                    }
+                            for _ in 1..=config.num_runs_per_config {
+                                run_counter += 1;
+                                if sender.send((run_counter, run_config.clone())).is_err() {
+                                    return;
                                 }
                             }
                         }
@@ -542,6 +525,7 @@ fn run_single_plan(
     num_servers: i32,
     max_iterations: i32,
     policy: &SchedulePolicy,
+    strict_timers: bool,
 ) -> Result<f64, Box<dyn Error>> {
     let global_snapshot = global_state.coverage.snapshot();
     let num_servers_usize = num_servers as usize;
@@ -598,6 +582,7 @@ fn run_single_plan(
         Some(&global_snapshot),
         run_id,
         policy,
+        strict_timers,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -639,7 +624,10 @@ pub fn run_plan(
         plan.node_count(),
         plan.edge_count()
     );
-    info!("Running {} times with {} servers", config.num_runs, config.num_servers);
+    info!(
+        "Running {} times with {} servers",
+        config.num_runs, config.num_servers
+    );
 
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
     let global_state = Arc::new(GlobalState::new(1_000_000));
@@ -660,6 +648,7 @@ pub fn run_plan(
             config.num_servers,
             config.max_iterations,
             &config.schedule_policy,
+            config.strict_timers,
         ) {
             Ok(_) => {
                 debug!(

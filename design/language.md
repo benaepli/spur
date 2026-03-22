@@ -126,7 +126,7 @@ primary_base ::=
   | 'make' '(' ')'
   | 'send' '(' expr ',' expr ')'
   | 'recv' '(' expr ')'
-  | 'set_timer' '(' ')'
+  | 'set_timer' '(' string_literal? ')'
   | ID
   | '(' expr ')'
 

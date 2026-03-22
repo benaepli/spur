@@ -8,6 +8,7 @@ use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use rand::Rng;
 use rand_distr::{Beta, Distribution};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 /// Defines the priority band for a category of runnable.
@@ -256,6 +257,7 @@ pub struct Timer {
     pub node: NodeId,
     pub channel: ChannelId,
     pub priority: f64,
+    pub label: Option<String>,
 }
 
 impl Hash for Timer {
@@ -370,6 +372,8 @@ pub enum ScheduleResult<H: HashPolicy> {
     Crash { node_id: NodeId },
     /// A recovery was executed on the given node.
     Recover { node_id: NodeId },
+    /// A labeled timer fired.
+    TimerFired { node_id: NodeId, label: String },
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +384,9 @@ pub struct State<H: HashPolicy> {
     pub crash_info: CrashInfo<H>,
     /// Per-node durable storage that survives crashes. Keyed by node index.
     pub persisted_data: ImHashMap<usize, (TypeId, Value<H>)>,
+    /// Set of (node_index, label) pairs for labeled timers that are allowed to fire.
+    /// Only used when strict_timers is enabled in a plan execution.
+    pub allowed_timers: HashSet<(usize, String)>,
     next_channel_id: usize,
     next_unique_id: usize,
 }
@@ -412,6 +419,7 @@ impl<H: HashPolicy> State<H> {
                 current_step: 0,
             },
             persisted_data: ImHashMap::new(),
+            allowed_timers: HashSet::new(),
             next_channel_id: 0,
             next_unique_id: 0,
         }

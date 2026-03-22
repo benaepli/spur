@@ -104,7 +104,7 @@ pub enum TypedExprKind {
     Send(Box<TypedExpr>, Box<TypedExpr>),
     Recv(Box<TypedExpr>),
 
-    SetTimer,
+    SetTimer(Option<String>),
 
     Index(Box<TypedExpr>, Box<TypedExpr>),
     Slice(Box<TypedExpr>, Box<TypedExpr>, Box<TypedExpr>),

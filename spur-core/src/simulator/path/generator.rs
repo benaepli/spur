@@ -24,7 +24,6 @@ pub struct GeneratorConfig {
     // Client operations
     pub num_write_ops: i32,
     pub num_read_ops: i32,
-    pub num_timeouts: i32,
     // Fault specs
     pub num_crashes: i32, // Number of crash/recover pairs
     // Dependency specs
@@ -50,11 +49,6 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
 
     for _ in 0..config.num_read_ops {
         let action = ClientOpSpec::Read(rand_server(), ecow::EcoString::from(rand_key()));
-        actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
-    }
-
-    for _ in 0..config.num_timeouts {
-        let action = ClientOpSpec::SimulateTimeout(rand_server());
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 

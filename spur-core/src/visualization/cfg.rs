@@ -105,7 +105,7 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             Label::Instr(_, next)
             | Label::Print(_, next)
             | Label::MakeChannel(_, _, next)
-            | Label::SetTimer(_, next)
+            | Label::SetTimer(_, next, _)
             | Label::UniqueId(_, next)
             | Label::Send(_, _, next)
             | Label::Recv(_, _, next)
@@ -213,10 +213,12 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
                 cap_str
             );
         }
-        Label::SetTimer(lhs, _) => {
+        Label::SetTimer(lhs, _, label) => {
             header_color = "#C8E6C9"; // Green
+            let label_str = label.as_ref().map_or(String::new(), |l| format!(" (\"{}\")", l));
             content = format!(
-                "<B>Set Timer</B><BR/>{}",
+                "<B>Set Timer{}</B><BR/>{}",
+                html_escape(&label_str),
                 html_escape(&pretty_lhs(prog, lhs))
             );
         }
@@ -567,7 +569,7 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         Label::Instr(_, n)
         | Label::Pause(n)
         | Label::MakeChannel(_, _, n)
-        | Label::SetTimer(_, n)
+        | Label::SetTimer(_, n, _)
         | Label::UniqueId(_, n)
         | Label::Send(_, _, n)
         | Label::Recv(_, _, n)

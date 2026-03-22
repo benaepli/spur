@@ -566,7 +566,7 @@ impl Compiler {
                 self.scan_expr_slots(inner);
             }
             Break | Continue => {}
-            Var(_, _) | IntLit(_) | StringLit(_) | BoolLit(_) | NilLit | SetTimer => {}
+            Var(_, _) | IntLit(_) | StringLit(_) | BoolLit(_) | NilLit | SetTimer(_) => {}
             Error => {}
         }
     }
@@ -1077,7 +1077,7 @@ impl Compiler {
                 self.compile_ternary(a, b, c, target, next_vertex, ctx, Expr::Store)
             }
 
-            LExprKind::SetTimer => self.add_label(Label::SetTimer(target, next_vertex)),
+            LExprKind::SetTimer(label) => self.add_label(Label::SetTimer(target, next_vertex, label.clone())),
 
             LExprKind::PersistData(e) => {
                 let assign_vertex =
@@ -1462,7 +1462,7 @@ impl Compiler {
             | LExprKind::PersistData(_)
             | LExprKind::RetrieveData(_)
             | LExprKind::DiscardData
-            | LExprKind::SetTimer
+            | LExprKind::SetTimer(_)
             | LExprKind::VariantLit(_, _, Some(_))
             | LExprKind::Error => return None,
         })

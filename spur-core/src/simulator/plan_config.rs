@@ -13,7 +13,9 @@ pub enum PlanConfigError {
     UnknownEventId(String),
     #[error("duplicate event id: {0}")]
     DuplicateEventId(String),
-    #[error("invalid target node {target} for event '{event_id}': must be < num_servers ({num_servers})")]
+    #[error(
+        "invalid target node {target} for event '{event_id}': must be < num_servers ({num_servers})"
+    )]
     TargetOutOfBounds {
         event_id: String,
         target: i32,
@@ -32,7 +34,7 @@ pub enum EventSpec {
     Read(i32, String),
     Crash(i32),
     Recover(i32),
-    Timeout(i32),
+    AllowTimer(i32, String),
 }
 
 impl EventSpec {
@@ -42,7 +44,7 @@ impl EventSpec {
             EventSpec::Read(t, _) => *t,
             EventSpec::Crash(t) => *t,
             EventSpec::Recover(t) => *t,
-            EventSpec::Timeout(t) => *t,
+            EventSpec::AllowTimer(t, _) => *t,
         }
     }
 
@@ -53,15 +55,12 @@ impl EventSpec {
                 EcoString::from(k.as_str()),
                 EcoString::from(v.as_str()),
             )),
-            EventSpec::Read(t, k) => EventAction::ClientRequest(ClientOpSpec::Read(
-                *t,
-                EcoString::from(k.as_str()),
-            )),
+            EventSpec::Read(t, k) => {
+                EventAction::ClientRequest(ClientOpSpec::Read(*t, EcoString::from(k.as_str())))
+            }
             EventSpec::Crash(t) => EventAction::CrashNode(*t),
             EventSpec::Recover(t) => EventAction::RecoverNode(*t),
-            EventSpec::Timeout(t) => {
-                EventAction::ClientRequest(ClientOpSpec::SimulateTimeout(*t))
-            }
+            EventSpec::AllowTimer(t, label) => EventAction::AllowTimer(*t, label.clone()),
         }
     }
 }
@@ -74,6 +73,10 @@ pub struct PlanFileConfig {
 
     #[serde(default)]
     pub schedule_policy: SchedulePolicy,
+
+    /// When true, labeled timers only fire when explicitly allowed by an AllowTimer event.
+    #[serde(default)]
+    pub strict_timers: bool,
 
     pub events: HashMap<String, EventSpec>,
     #[serde(default)]

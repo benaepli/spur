@@ -110,7 +110,7 @@ pub enum Label {
     Instr(Instr, Vertex /* next_vertex */),
     Pause(Vertex /* next_vertex */),
     MakeChannel(Lhs, Option<usize>, Vertex),
-    SetTimer(Lhs, Vertex),
+    SetTimer(Lhs, Vertex, Option<String>),
     UniqueId(Lhs, Vertex),
     Send(Expr, Expr, Vertex),
     Recv(Lhs, Expr, Vertex),

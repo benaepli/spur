@@ -1801,8 +1801,8 @@ impl TypeChecker {
                     self.error_expr(span)
                 }
             }
-            ResolvedExprKind::SetTimer => TypedExpr {
-                kind: TypedExprKind::SetTimer,
+            ResolvedExprKind::SetTimer(label) => TypedExpr {
+                kind: TypedExprKind::SetTimer(label),
                 ty: Type::Chan(Box::new(Type::Tuple(vec![]))),
                 span,
             },

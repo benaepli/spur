@@ -557,8 +557,8 @@ impl Lowerer {
                 ty,
                 span,
             },
-            TypedExprKind::SetTimer => LExpr {
-                kind: LExprKind::SetTimer,
+            TypedExprKind::SetTimer(label) => LExpr {
+                kind: LExprKind::SetTimer(label),
                 ty,
                 span,
             },

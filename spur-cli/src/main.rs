@@ -55,7 +55,7 @@ enum Commands {
         #[arg(short, long)]
         output_dir: PathBuf,
         /// Explorer type to use
-        #[arg(short, long, value_enum, default_value_t = ExplorerType::Genetic)]
+        #[arg(short, long, value_enum, default_value_t = ExplorerType::Standard)]
         explorer: ExplorerType,
         /// Logging backend for simulation history
         #[arg(long, value_enum, default_value_t = LogBackendArg::Parquet)]

@@ -275,7 +275,7 @@ pub enum ExprKind {
     MakeChannel,
     Send(Box<Expr>, Box<Expr>),
     Recv(Box<Expr>),
-    SetTimer,
+    SetTimer(Option<String>),
 
     // Postfix operations
     Index(Box<Expr>, Box<Expr>),
@@ -804,7 +804,14 @@ where
                 .map(|_| ExprKind::MakeChannel),
             two_arg_builtin(TokenKind::Send, ExprKind::Send),
             one_arg_builtin(TokenKind::Recv, ExprKind::Recv),
-            zero_arg_builtin(TokenKind::SetTimer, ExprKind::SetTimer),
+            just(TokenKind::SetTimer)
+                .ignore_then(just(TokenKind::LeftParen))
+                .ignore_then(
+                    select! { TokenKind::String(s) => s }
+                        .or_not()
+                )
+                .then_ignore(just(TokenKind::RightParen))
+                .map(ExprKind::SetTimer),
         ));
 
         let atom = choice((
