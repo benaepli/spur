@@ -14,4 +14,3 @@ output.json
 /editors/code/node_modules
 /editors/code/server
 /editors/code/*.vsix
-.cargo
