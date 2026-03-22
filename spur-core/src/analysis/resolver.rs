@@ -562,7 +562,9 @@ impl Resolver {
         for def in &program.top_level_defs {
             if let TopLevelDef::FreeFunc(func) = def {
                 let id = self.new_name_id(&func.name);
-                if let Some(err) = Self::declare_in_scope(&mut self.global_func_scope, &func.name, id, func.span) {
+                if let Some(err) =
+                    Self::declare_in_scope(&mut self.global_func_scope, &func.name, id, func.span)
+                {
                     self.emit(err);
                 }
             }
@@ -595,7 +597,9 @@ impl Resolver {
             TopLevelDef::Type(stmt) => self
                 .resolve_type_def_stmt(stmt)
                 .map(ResolvedTopLevelDef::Type),
-            TopLevelDef::FreeFunc(func) => self.resolve_func_def(func).map(ResolvedTopLevelDef::FreeFunc),
+            TopLevelDef::FreeFunc(func) => self
+                .resolve_func_def(func)
+                .map(ResolvedTopLevelDef::FreeFunc),
         }
     }
 

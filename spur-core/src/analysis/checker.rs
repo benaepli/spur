@@ -377,10 +377,7 @@ impl TypeChecker {
                                 continue;
                             }
                         };
-                        let role_funcs = match self
-                            .role_func_signatures
-                            .get_mut(&role.name)
-                        {
+                        let role_funcs = match self.role_func_signatures.get_mut(&role.name) {
                             Some(funcs) => funcs,
                             None => {
                                 self.emit(TypeError::InternalError {
@@ -467,10 +464,7 @@ impl TypeChecker {
             Some(sig) => sig.clone(),
             None => {
                 self.emit(TypeError::InternalError {
-                    message: format!(
-                        "Function signature not found for '{}'",
-                        func.original_name
-                    ),
+                    message: format!("Function signature not found for '{}'", func.original_name),
                     span: func.span,
                 });
                 return TypedFuncDef {
@@ -509,8 +503,8 @@ impl TypeChecker {
         let mut body = func.body;
         if let Some(tail) = body.tail_expr.take() {
             let span = tail.span;
-            body.statements.push(ResolvedStatement{
-                kind: ResolvedStatementKind::Expr(ResolvedExpr{
+            body.statements.push(ResolvedStatement {
+                kind: ResolvedStatementKind::Expr(ResolvedExpr {
                     kind: ResolvedExprKind::Return(Box::new(*tail)),
                     span,
                 }),
@@ -721,6 +715,45 @@ impl TypeChecker {
         }
     }
 
+    fn unify_branch_types(&self, branch_types: &[(Type, Span)], has_else: bool) -> Type {
+        if !has_else {
+            return Type::Tuple(vec![]);
+        }
+
+        let mut is_optional = false;
+        let mut concrete = None;
+
+        for (ty, _) in branch_types {
+            match ty {
+                Type::Never | Type::Error => continue,
+                Type::Nil => is_optional = true,
+                Type::Optional(inner) => {
+                    is_optional = true;
+                    if concrete.is_none() {
+                        concrete = Some((**inner).clone());
+                    }
+                }
+                _ => {
+                    if concrete.is_none() {
+                        concrete = Some(ty.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(c) = concrete {
+            if is_optional {
+                Type::Optional(Box::new(c))
+            } else {
+                c
+            }
+        } else if is_optional {
+            Type::Nil
+        } else {
+            Type::Never
+        }
+    }
+
     fn check_conditional(&mut self, cond: ResolvedCondExpr, span: Span) -> TypedExpr {
         let typed_if_cond = self.check_expr(cond.if_branch.condition, &Type::Bool);
         let typed_if_body = self.check_block(cond.if_branch.body);
@@ -754,18 +787,7 @@ impl TypeChecker {
             branch_types.push((else_b.ty.clone(), else_b.span));
         }
 
-        let concrete_ty = branch_types
-            .iter()
-            .find(|(ty, _)| *ty != Type::Never && *ty != Type::Error)
-            .map(|(ty, _)| ty.clone());
-
-        let target_ty = if typed_else_branch.is_none() {
-            Type::Tuple(vec![])
-        } else if let Some(ty) = concrete_ty {
-            ty
-        } else {
-            Type::Never
-        };
+        let target_ty = self.unify_branch_types(&branch_types, typed_else_branch.is_some());
 
         for (ty, branch_span) in &branch_types {
             if *ty != Type::Never && *ty != Type::Error {
@@ -2423,7 +2445,8 @@ impl TypeChecker {
                 });
                 return self.error_expr(span);
             }
-            let typed_arg = self.infer_expr(args.into_iter().next().expect("length already checked"));
+            let typed_arg =
+                self.infer_expr(args.into_iter().next().expect("length already checked"));
             if !matches!(typed_arg.ty, Type::Role(_, _) | Type::Error) {
                 self.emit(TypeError::Mismatch {
                     expected: Type::Role(NameId(0), "role".to_string()),
@@ -2446,10 +2469,7 @@ impl TypeChecker {
             Some(sig) => sig,
             None => {
                 self.emit(TypeError::InternalError {
-                    message: format!(
-                        "Missing signature for builtin function '{:?}'",
-                        builtin
-                    ),
+                    message: format!("Missing signature for builtin function '{:?}'", builtin),
                     span,
                 });
                 return self.error_expr(span);
