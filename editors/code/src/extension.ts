@@ -15,7 +15,8 @@ export function activate(context: ExtensionContext): void {
   const config = workspace.getConfiguration("spur");
   const serverPath =
     config.get<string>("serverPath") ||
-    path.join(context.extensionPath, "server", "spur-lsp");
+    path.join(context.extensionPath, "server",
+      process.platform === "win32" ? "spur-lsp.exe" : "spur-lsp");
 
   const serverOptions: ServerOptions = {
     command: serverPath,
