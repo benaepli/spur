@@ -67,6 +67,9 @@ pub struct ExplorerConfig {
     #[serde(rename = "num_crashes")]
     pub num_crashes_range: Range,
 
+    #[serde(rename = "num_partitions", default = "default_partitions_range")]
+    pub num_partitions_range: Range,
+
     #[serde(rename = "dependency_density")]
     pub dependency_density_values: Vec<f64>,
 
@@ -98,8 +101,15 @@ impl ExplorerConfig {
         self.num_crashes_range
             .validate()
             .map_err(|e| format!("num_crashes range error: {}", e))?;
+        self.num_partitions_range
+            .validate()
+            .map_err(|e| format!("num_partitions range error: {}", e))?;
         Ok(())
     }
+}
+
+fn default_partitions_range() -> Range {
+    Range { min: 0, max: 0, step: 1 }
 }
 
 fn default_population_size() -> usize {
@@ -120,6 +130,7 @@ pub struct SingleRunConfig {
     pub num_write_ops: i32,
     pub num_read_ops: i32,
     pub num_crashes: i32,
+    pub num_partitions: i32,
     pub dependency_density: f64,
     pub use_coverage_scheduling: bool,
     pub max_iterations: i32,
@@ -141,6 +152,9 @@ impl SingleRunConfig {
             ),
             num_crashes: rng.random_range(
                 constraints.num_crashes_range.min..=constraints.num_crashes_range.max,
+            ),
+            num_partitions: rng.random_range(
+                constraints.num_partitions_range.min..=constraints.num_partitions_range.max,
             ),
             dependency_density: *constraints
                 .dependency_density_values
@@ -170,6 +184,7 @@ impl SingleRunConfig {
         new_config.num_write_ops = mutate_int(self.num_write_ops, &constraints.num_write_ops_range);
         new_config.num_read_ops = mutate_int(self.num_read_ops, &constraints.num_read_ops_range);
         new_config.num_crashes = mutate_int(self.num_crashes, &constraints.num_crashes_range);
+        new_config.num_partitions = mutate_int(self.num_partitions, &constraints.num_partitions_range);
 
         if rng.random_bool(0.3) && !constraints.dependency_density_values.is_empty() {
             new_config.dependency_density = *constraints
@@ -307,6 +322,7 @@ pub fn run_single_simulation(
         num_write_ops: config.num_write_ops,
         num_read_ops: config.num_read_ops,
         num_crashes: config.num_crashes,
+        num_partitions: config.num_partitions,
         dependency_density: config.dependency_density,
     };
     let plan = generate_plan(gen_config);
@@ -427,6 +443,7 @@ pub fn run_explorer(
         let all_writes = config.num_write_ops_range.expand();
         let all_reads = config.num_read_ops_range.expand();
         let all_crashes = config.num_crashes_range.expand();
+        let all_partitions = config.num_partitions_range.expand();
         let all_densities = &config.dependency_density_values;
 
         let mut config_counter = 0;
@@ -435,6 +452,7 @@ pub fn run_explorer(
             * all_writes.len()
             * all_reads.len()
             * all_crashes.len()
+            * all_partitions.len()
             * all_densities.len();
 
         info!("Total unique configurations: {}", total_configs);
@@ -444,40 +462,44 @@ pub fn run_explorer(
             for &num_writes in &all_writes {
                 for &num_reads in &all_reads {
                     for &num_crashes in &all_crashes {
-                        for &density in all_densities {
-                            if cancelled_producer.load(Ordering::Relaxed) {
-                                break 'outer;
-                            }
-                            config_counter += 1;
+                        for &num_partitions in &all_partitions {
+                            for &density in all_densities {
+                                if cancelled_producer.load(Ordering::Relaxed) {
+                                    break 'outer;
+                                }
+                                config_counter += 1;
 
-                            let run_config = SingleRunConfig {
-                                num_servers,
-                                num_write_ops: num_writes,
-                                num_read_ops: num_reads,
-                                num_crashes,
-                                dependency_density: density,
-                                use_coverage_scheduling: config.use_coverage_scheduling,
-                                max_iterations: config.max_iterations,
-                                schedule_policy: config.schedule_policy.clone(),
-                            };
+                                let run_config = SingleRunConfig {
+                                    num_servers,
+                                    num_write_ops: num_writes,
+                                    num_read_ops: num_reads,
+                                    num_crashes,
+                                    num_partitions,
+                                    dependency_density: density,
+                                    use_coverage_scheduling: config.use_coverage_scheduling,
+                                    max_iterations: config.max_iterations,
+                                    schedule_policy: config.schedule_policy.clone(),
+                                };
 
-                            info!("{}", "=".repeat(70));
-                            info!(
-                                "Queuing Config {}/{}: s{}_w{}_r{}_crash{}_d{:.2}",
-                                config_counter,
-                                total_configs,
-                                num_servers,
-                                num_writes,
-                                num_reads,
-                                num_crashes,
-                                density
-                            );
-                            info!("{}", "=".repeat(70));
+                                info!("{}", "=".repeat(70));
+                                info!(
+                                    "Queuing Config {}/{}: s{}_w{}_r{}_crash{}_part{}_d{:.2}",
+                                    config_counter,
+                                    total_configs,
+                                    num_servers,
+                                    num_writes,
+                                    num_reads,
+                                    num_crashes,
+                                    num_partitions,
+                                    density
+                                );
+                                info!("{}", "=".repeat(70));
 
-                            for _ in 1..=config.num_runs_per_config {
-                                run_counter += 1;
-                                if sender.send((run_counter, run_config.clone())).is_err() {
-                                    return;
+                                for _ in 1..=config.num_runs_per_config {
+                                    run_counter += 1;
+                                    if sender.send((run_counter, run_config.clone())).is_err() {
+                                        return;
+                                    }
                                 }
                             }
                         }

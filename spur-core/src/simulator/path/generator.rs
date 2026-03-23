@@ -4,6 +4,7 @@ use rand::rng;
 use std::collections::HashMap;
 
 use crate::simulator::path::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlannedEvent};
+use crate::simulator::plan_config::PartitionSpec;
 
 #[derive(Debug, Clone)]
 enum ActionStub {
@@ -25,7 +26,8 @@ pub struct GeneratorConfig {
     pub num_write_ops: i32,
     pub num_read_ops: i32,
     // Fault specs
-    pub num_crashes: i32, // Number of crash/recover pairs
+    pub num_crashes: i32,     // Number of crash/recover pairs
+    pub num_partitions: i32,  // Number of partition/heal pairs
     // Dependency specs
     pub dependency_density: f64, // Probability (0.0 to 1.0)
 }
@@ -60,7 +62,41 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
         ));
     }
 
+    for _ in 0..config.num_partitions {
+        let spec = random_partition_spec(config.num_servers);
+        actions.push(ActionStub::Paired(
+            EventAction::Partition(spec),
+            EventAction::Heal,
+        ));
+    }
+
     actions
+}
+
+/// Generate a random PartitionSpec given the number of servers.
+fn random_partition_spec(num_servers: i32) -> PartitionSpec {
+    let mut rng = rng();
+    match rng.random_range(0..4) {
+        0 => PartitionSpec::IsolateOne {
+            node: rng.random_range(0..num_servers),
+        },
+        1 => {
+            // Random non-empty proper subset for side_a
+            let mut side_a: Vec<i32> = (0..num_servers)
+                .filter(|_| rng.random_bool(0.5))
+                .collect();
+            if side_a.is_empty() {
+                side_a.push(rng.random_range(0..num_servers));
+            } else if side_a.len() == num_servers as usize {
+                side_a.remove(rng.random_range(0..side_a.len()));
+            }
+            PartitionSpec::Halves { side_a }
+        }
+        2 => PartitionSpec::MajoritiesRing,
+        _ => PartitionSpec::Bridge {
+            bridge: rng.random_range(0..num_servers),
+        },
+    }
 }
 
 /// Main entry point: Generates a single, randomized execution plan as a DiGraph.
@@ -70,6 +106,8 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
 
     // Track crash/recover pairs and serialization
     let mut last_recovery: HashMap<i32, NodeIndex> = HashMap::new(); // server_id -> last recover node
+    // Track partition/heal serialization (only one partition active at a time)
+    let mut last_heal: Option<NodeIndex> = None;
 
     let stubs = generate_base_actions(&config);
 
@@ -105,6 +143,16 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
                 }
                 if let EventAction::RecoverNode(s) = action2 {
                     last_recovery.insert(*s, idx2);
+                }
+
+                // Serialization: partitions are globally serialized
+                if matches!(action1, EventAction::Partition(_)) {
+                    if let Some(prev_heal) = last_heal {
+                        graph.add_edge(prev_heal, idx1, ());
+                    }
+                }
+                if matches!(action2, EventAction::Heal) {
+                    last_heal = Some(idx2);
                 }
 
                 nodes.push((idx1, Some((pair_group_counter, PairPos::First))));
