@@ -198,6 +198,8 @@ pub fn exec_plan<H: HashPolicy>(
     let mut pending_crash_recover: HashMap<usize, NodeIndex> = HashMap::new();
     // Map from (node_index, label) to the plan engine NodeIndex for pending AllowTimer events
     let mut pending_allow_timer: HashMap<(usize, String), NodeIndex> = HashMap::new();
+    let mut pending_partition: Option<NodeIndex> = None;
+    let mut pending_heal: Option<NodeIndex> = None;
 
     // Look up role NameIds from the program
     let server_role = program
@@ -331,6 +333,25 @@ pub fn exec_plan<H: HashPolicy>(
                     path_state.state.allowed_timers.insert(key.clone());
                     pending_allow_timer.insert(key, node_idx);
                 }
+                EventAction::Partition(spec) => {
+                    let partition_type = spec.to_partition_type(
+                        server_role,
+                        topology.num_servers,
+                    );
+                    let mut rng = rand::rng();
+                    path_state.state.runnable_tasks.push_back(Runnable::Partition {
+                        partition_type,
+                        priority: policy.sample(&mut rng, RunnableCategory::Partition),
+                    });
+                    pending_partition = Some(node_idx);
+                }
+                EventAction::Heal => {
+                    let mut rng = rand::rng();
+                    path_state.state.runnable_tasks.push_back(Runnable::Heal {
+                        priority: policy.sample(&mut rng, RunnableCategory::Heal),
+                    });
+                    pending_heal = Some(node_idx);
+                }
             }
         }
 
@@ -396,6 +417,32 @@ pub fn exec_plan<H: HashPolicy>(
                 ScheduleResult::TimerFired { node_id, label } => {
                     let key = (node_id.index, label);
                     if let Some(plan_node) = pending_allow_timer.remove(&key) {
+                        engine.mark_event_completed(plan_node);
+                    }
+                }
+                ScheduleResult::Partition { partition_type: _ } => {
+                    path_state.history.push(Operation {
+                        client_id: -1,
+                        op_action: "System.Partition".to_string(),
+                        kind: OpKind::Partition,
+                        payload: vec![],
+                        unique_id: -1,
+                        step: path_state.state.crash_info.current_step,
+                    });
+                    if let Some(plan_node) = pending_partition.take() {
+                        engine.mark_event_completed(plan_node);
+                    }
+                }
+                ScheduleResult::Heal => {
+                    path_state.history.push(Operation {
+                        client_id: -1,
+                        op_action: "System.Heal".to_string(),
+                        kind: OpKind::Heal,
+                        payload: vec![],
+                        unique_id: -1,
+                        step: path_state.state.crash_info.current_step,
+                    });
+                    if let Some(plan_node) = pending_heal.take() {
                         engine.mark_event_completed(plan_node);
                     }
                 }

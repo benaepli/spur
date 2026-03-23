@@ -2,6 +2,7 @@ use crate::compiler::cfg::Program;
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::make_local_env;
 use crate::simulator::core::exec::{exec, exec_sync_on_node};
+use crate::simulator::core::partition::{activate_partition, heal_partition};
 use crate::simulator::core::state::{
     Continuation, Logger, NodeId, Record, Runnable, RunnableCategory, SchedulePolicy,
     ScheduleResult, State,
@@ -99,6 +100,14 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
             )?;
             Ok(ScheduleResult::Recover { node_id })
         }
+        Runnable::Partition { partition_type, .. } => {
+            activate_partition(state, partition_type.clone());
+            Ok(ScheduleResult::Partition { partition_type })
+        }
+        Runnable::Heal { .. } => {
+            heal_partition(state);
+            Ok(ScheduleResult::Heal)
+        }
         Runnable::Timer(timer) => {
             // Drop timer if node is crashed
             if state.crash_info.currently_crashed.contains(&timer.node) {
@@ -151,6 +160,35 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                         r.reset();
                         state.crash_info.queued_messages.push_back((dest_node, r));
                     }
+                }
+                return Ok(ScheduleResult::None);
+            }
+
+            if state.partition_info.is_blocked(src_node, dest_node) {
+                match other {
+                    Runnable::Record(r) => {
+                        let mut r = r;
+                        r.reset();
+                        state.partition_info.buffer_record(dest_node, r);
+                    }
+                    Runnable::ChannelSend {
+                        channel,
+                        message,
+                        origin_node,
+                        pc,
+                        priority,
+                        ..
+                    } => {
+                        state.partition_info.buffer_channel_send(
+                            dest_node,
+                            channel,
+                            message,
+                            origin_node,
+                            pc,
+                            priority,
+                        );
+                    }
+                    _ => unreachable!(),
                 }
                 return Ok(ScheduleResult::None);
             }
@@ -246,11 +284,14 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
                     state.runnable_tasks.push_back(task);
                 }
             }
-            // Keep other crash/recover runnables for different nodes
+            // Keep other crash/recover/partition/heal runnables for different nodes
             Runnable::Crash { node_id: nid, .. } | Runnable::Recover { node_id: nid, .. } => {
                 if nid != node_id {
                     state.runnable_tasks.push_back(task);
                 }
+            }
+            Runnable::Partition { .. } | Runnable::Heal { .. } => {
+                state.runnable_tasks.push_back(task);
             }
         }
     }

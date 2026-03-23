@@ -2,6 +2,7 @@ use crate::analysis::resolver::NameId;
 use crate::analysis::type_id::TypeId;
 use crate::compiler::cfg::{Lhs, Vertex};
 use crate::simulator::core::eval::store;
+use crate::simulator::core::partition::{PartitionInfo, PartitionType};
 use crate::simulator::core::values::{ChannelId, Env, Value};
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
@@ -35,6 +36,8 @@ pub enum RunnableCategory {
     ChannelSend,
     Crash,
     Recover,
+    Partition,
+    Heal,
 }
 
 /// Configures how base priorities are sampled for new runnables.
@@ -52,6 +55,10 @@ pub enum SchedulePolicy {
         channel_send: PriorityBand,
         crash: PriorityBand,
         recover: PriorityBand,
+        #[serde(default = "default_partition_band")]
+        partition: PriorityBand,
+        #[serde(default = "default_heal_band")]
+        heal: PriorityBand,
     },
 }
 
@@ -80,7 +87,29 @@ impl Default for SchedulePolicy {
                 center: 1.0,
                 width: 0.05,
             },
+            partition: PriorityBand {
+                center: 1.0,
+                width: 0.05,
+            },
+            heal: PriorityBand {
+                center: 1.0,
+                width: 0.05,
+            },
         }
+    }
+}
+
+fn default_partition_band() -> PriorityBand {
+    PriorityBand {
+        center: 1.0,
+        width: 0.05,
+    }
+}
+
+fn default_heal_band() -> PriorityBand {
+    PriorityBand {
+        center: 1.0,
+        width: 0.05,
     }
 }
 
@@ -93,6 +122,7 @@ impl SchedulePolicy {
                 RunnableCategory::Timer => 0.25,
                 RunnableCategory::ChannelSend => 0.5,
                 RunnableCategory::Crash | RunnableCategory::Recover => 1.0,
+                RunnableCategory::Partition | RunnableCategory::Heal => 1.0,
             },
             SchedulePolicy::Shaped {
                 alpha,
@@ -102,6 +132,8 @@ impl SchedulePolicy {
                 channel_send,
                 crash,
                 recover,
+                partition,
+                heal,
             } => {
                 let band = match cat {
                     RunnableCategory::Record => record,
@@ -109,6 +141,8 @@ impl SchedulePolicy {
                     RunnableCategory::ChannelSend => channel_send,
                     RunnableCategory::Crash => crash,
                     RunnableCategory::Recover => recover,
+                    RunnableCategory::Partition => partition,
+                    RunnableCategory::Heal => heal,
                 };
                 let dist = Beta::new(*alpha, *beta).unwrap();
                 let sample = dist.sample(rng);
@@ -239,6 +273,8 @@ pub enum OpKind {
     Response,
     Crash,
     Recover,
+    Partition,
+    Heal,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +324,13 @@ pub enum Runnable<H: HashPolicy> {
         node_id: NodeId,
         priority: f64,
     },
+    Partition {
+        partition_type: PartitionType,
+        priority: f64,
+    },
+    Heal {
+        priority: f64,
+    },
 }
 
 impl<H: HashPolicy> Hash for Runnable<H> {
@@ -324,18 +367,26 @@ impl<H: HashPolicy> Hash for Runnable<H> {
                 4u8.hash(state);
                 node_id.hash(state);
             }
+            Runnable::Partition { partition_type, .. } => {
+                5u8.hash(state);
+                partition_type.hash(state);
+            }
+            Runnable::Heal { .. } => {
+                6u8.hash(state);
+            }
         }
     }
 }
 
 impl<H: HashPolicy> Runnable<H> {
-    /// Get the node this runnable belongs to.
-    pub fn node(&self) -> NodeId {
+    /// Get the node this runnable belongs to, if applicable.
+    pub fn node(&self) -> Option<NodeId> {
         match self {
-            Runnable::Timer(t) => t.node,
-            Runnable::Record(r) => r.node,
-            Runnable::ChannelSend { target, .. } => *target,
-            Runnable::Crash { node_id, .. } | Runnable::Recover { node_id, .. } => *node_id,
+            Runnable::Timer(t) => Some(t.node),
+            Runnable::Record(r) => Some(r.node),
+            Runnable::ChannelSend { target, .. } => Some(*target),
+            Runnable::Crash { node_id, .. } | Runnable::Recover { node_id, .. } => Some(*node_id),
+            Runnable::Partition { .. } | Runnable::Heal { .. } => None,
         }
     }
 
@@ -346,6 +397,7 @@ impl<H: HashPolicy> Runnable<H> {
             Runnable::Record(r) => r.pc,
             Runnable::ChannelSend { pc, .. } => *pc,
             Runnable::Crash { .. } | Runnable::Recover { .. } => usize::MAX,
+            Runnable::Partition { .. } | Runnable::Heal { .. } => usize::MAX,
         }
     }
 
@@ -357,6 +409,8 @@ impl<H: HashPolicy> Runnable<H> {
             Runnable::ChannelSend { priority, .. } => *priority,
             Runnable::Crash { priority, .. } => *priority,
             Runnable::Recover { priority, .. } => *priority,
+            Runnable::Partition { priority, .. } => *priority,
+            Runnable::Heal { priority, .. } => *priority,
         }
     }
 }
@@ -374,6 +428,10 @@ pub enum ScheduleResult<H: HashPolicy> {
     Recover { node_id: NodeId },
     /// A labeled timer fired.
     TimerFired { node_id: NodeId, label: String },
+    /// A network partition was activated.
+    Partition { partition_type: PartitionType },
+    /// A network partition was healed.
+    Heal,
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +440,7 @@ pub struct State<H: HashPolicy> {
     pub runnable_tasks: Vector<Runnable<H>>,
     pub channels: ImHashMap<ChannelId, ChannelState<H>>,
     pub crash_info: CrashInfo<H>,
+    pub partition_info: PartitionInfo<H>,
     /// Per-node durable storage that survives crashes. Keyed by node index.
     pub persisted_data: ImHashMap<usize, (TypeId, Value<H>)>,
     /// Set of (node_index, label) pairs for labeled timers that are allowed to fire.
@@ -418,6 +477,7 @@ impl<H: HashPolicy> State<H> {
                 queued_messages: Vector::new(),
                 current_step: 0,
             },
+            partition_info: PartitionInfo::new(),
             persisted_data: ImHashMap::new(),
             allowed_timers: HashSet::new(),
             next_channel_id: 0,
@@ -470,6 +530,9 @@ impl<H: HashPolicy> State<H> {
 
         // crash_info
         h ^= compute_hash(&self.crash_info);
+
+        // partition_info
+        h ^= compute_hash(&self.partition_info);
 
         // Persisted data: Order-independent XOR
         for (&node_idx, (tid, val)) in self.persisted_data.iter() {

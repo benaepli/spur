@@ -161,6 +161,10 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                         .crash_info
                         .queued_messages
                         .push_back((target_node, new_record));
+                } else if state.partition_info.is_blocked(node_id, target_node) {
+                    state
+                        .partition_info
+                        .buffer_record(target_node, new_record);
                 } else {
                     state.runnable_tasks.push_back(Runnable::Record(new_record));
                 }

@@ -4,6 +4,7 @@ pub mod state;
 pub mod eval;
 pub mod exec;
 pub mod scheduler;
+pub mod partition;
 
 pub use error::*;
 pub use values::*;
@@ -11,3 +12,4 @@ pub use state::*;
 pub use eval::*;
 pub use exec::*;
 pub use scheduler::*;
+pub use partition::*;

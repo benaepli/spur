@@ -1,3 +1,4 @@
+use crate::simulator::plan_config::PartitionSpec;
 use ecow::EcoString;
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -24,6 +25,8 @@ pub enum EventAction {
     CrashNode(i32),
     RecoverNode(i32),
     AllowTimer(i32, String),
+    Partition(PartitionSpec),
+    Heal,
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]

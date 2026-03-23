@@ -1,9 +1,13 @@
+use crate::simulator::core::partition::PartitionType;
+use crate::simulator::core::state::NodeId;
 use ecow::EcoString;
+use imbl::OrdSet;
 use petgraph::graph::DiGraph;
 use serde::Deserialize;
 use std::collections::HashMap;
 use thiserror::Error;
 
+use crate::analysis::resolver::NameId;
 use crate::simulator::core::SchedulePolicy;
 use crate::simulator::path::plan::{ClientOpSpec, EventAction, PlannedEvent};
 
@@ -27,6 +31,55 @@ pub enum PlanConfigError {
     InvalidNumRuns(i32),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartitionSpec {
+    IsolateOne { node: i32 },
+    Halves { side_a: Vec<i32> },
+    MajoritiesRing,
+    Bridge { bridge: i32 },
+}
+
+impl PartitionSpec {
+    /// Convert a plan config PartitionSpec into a runtime PartitionType.
+    pub fn to_partition_type(&self, server_role: NameId, num_servers: i32) -> PartitionType {
+        let make_node = |idx: i32| NodeId {
+            role: server_role,
+            index: idx as usize,
+        };
+        let n = num_servers as usize;
+        match self {
+            PartitionSpec::IsolateOne { node } => PartitionType::IsolateOne(make_node(*node)),
+            PartitionSpec::Halves { side_a } => {
+                let a: OrdSet<NodeId> = side_a.iter().map(|&i| make_node(i)).collect();
+                let b: OrdSet<NodeId> = (0..num_servers)
+                    .filter(|i| !side_a.contains(i))
+                    .map(|i| make_node(i))
+                    .collect();
+                PartitionType::Halves { side_a: a, side_b: b }
+            }
+            PartitionSpec::MajoritiesRing => PartitionType::MajoritiesRing { num_nodes: n },
+            PartitionSpec::Bridge { bridge } => {
+                let bridge_node = make_node(*bridge);
+                let mid = n / 2;
+                let side_a: OrdSet<NodeId> = (0..mid)
+                    .filter(|&i| i != *bridge as usize)
+                    .map(|i| make_node(i as i32))
+                    .collect();
+                let side_b: OrdSet<NodeId> = (mid..n)
+                    .filter(|&i| i != *bridge as usize)
+                    .map(|i| make_node(i as i32))
+                    .collect();
+                PartitionType::Bridge {
+                    bridge: bridge_node,
+                    side_a,
+                    side_b,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSpec {
@@ -35,16 +88,42 @@ pub enum EventSpec {
     Crash(i32),
     Recover(i32),
     AllowTimer(i32, String),
+    Partition(PartitionSpec),
+    Heal,
 }
 
 impl EventSpec {
-    fn target(&self) -> i32 {
+    fn validate_nodes(&self, num_servers: i32, event_id: &str) -> Result<(), PlanConfigError> {
+        let check = |node: i32| -> Result<(), PlanConfigError> {
+            if node < 0 || node >= num_servers {
+                Err(PlanConfigError::TargetOutOfBounds {
+                    event_id: event_id.to_string(),
+                    target: node,
+                    num_servers,
+                })
+            } else {
+                Ok(())
+            }
+        };
+
         match self {
-            EventSpec::Write(t, _, _) => *t,
-            EventSpec::Read(t, _) => *t,
-            EventSpec::Crash(t) => *t,
-            EventSpec::Recover(t) => *t,
-            EventSpec::AllowTimer(t, _) => *t,
+            EventSpec::Write(t, _, _)
+            | EventSpec::Read(t, _)
+            | EventSpec::Crash(t)
+            | EventSpec::Recover(t)
+            | EventSpec::AllowTimer(t, _) => check(*t),
+            EventSpec::Partition(spec) => match spec {
+                PartitionSpec::IsolateOne { node } => check(*node),
+                PartitionSpec::Halves { side_a } => {
+                    for n in side_a {
+                        check(*n)?;
+                    }
+                    Ok(())
+                }
+                PartitionSpec::Bridge { bridge } => check(*bridge),
+                PartitionSpec::MajoritiesRing => Ok(()),
+            },
+            EventSpec::Heal => Ok(()),
         }
     }
 
@@ -61,6 +140,8 @@ impl EventSpec {
             EventSpec::Crash(t) => EventAction::CrashNode(*t),
             EventSpec::Recover(t) => EventAction::RecoverNode(*t),
             EventSpec::AllowTimer(t, label) => EventAction::AllowTimer(*t, label.clone()),
+            EventSpec::Partition(spec) => EventAction::Partition(spec.clone()),
+            EventSpec::Heal => EventAction::Heal,
         }
     }
 }
@@ -92,16 +173,9 @@ impl PlanFileConfig {
             return Err(PlanConfigError::InvalidNumRuns(self.num_runs));
         }
 
-        // Validate target indices
+        // Validate node indices
         for (id, spec) in &self.events {
-            let target = spec.target();
-            if target < 0 || target >= self.num_servers {
-                return Err(PlanConfigError::TargetOutOfBounds {
-                    event_id: id.clone(),
-                    target,
-                    num_servers: self.num_servers,
-                });
-            }
+            spec.validate_nodes(self.num_servers, id)?;
         }
 
         // Validate dependency references

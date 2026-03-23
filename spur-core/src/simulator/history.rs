@@ -187,6 +187,8 @@ pub fn serialize_history<H: crate::simulator::hash_utils::HashPolicy>(
                 OpKind::Invocation => "Invocation",
                 OpKind::Crash => "Crash",
                 OpKind::Recover => "Recover",
+                OpKind::Partition => "Partition",
+                OpKind::Heal => "Heal",
             },
             action: op.op_action.clone(),
             payload_json: payload_to_json_string::<H>(&op.payload),
@@ -210,6 +212,8 @@ pub fn save_history_to_csv<H: crate::simulator::hash_utils::HashPolicy, P: AsRef
             OpKind::Invocation => "Invocation",
             OpKind::Crash => "Crash",
             OpKind::Recover => "Recover",
+            OpKind::Partition => "Partition",
+            OpKind::Heal => "Heal",
         };
 
         let payload_str = payload_to_json_string::<H>(&op.payload);
