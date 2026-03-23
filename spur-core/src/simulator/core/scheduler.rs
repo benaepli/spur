@@ -227,11 +227,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
             Runnable::Record(record) => {
                 if record.node == node_id {
                     let is_external = record.origin_node != record.node;
-                    let origin_alive = !state
-                        .crash_info
-                        .currently_crashed
-                        .contains(&record.origin_node);
-                    if is_external && origin_alive {
+                    if is_external {
                         let mut record = record;
                         record.reset();
                         state
