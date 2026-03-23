@@ -754,11 +754,25 @@ impl TypeChecker {
         }
     }
 
+    fn wrap_block_tail(&mut self, block: &mut TypedBlock, target_ty: &Type) {
+        if let Some(tail) = block.tail_expr.take() {
+            match self.check_types_match(*tail, target_ty) {
+                Ok(wrapped) => {
+                    block.tail_expr = Some(Box::new(wrapped));
+                    block.ty = target_ty.clone();
+                }
+                Err(e) => {
+                    self.emit(e);
+                }
+            }
+        }
+    }
+
     fn check_conditional(&mut self, cond: ResolvedCondExpr, span: Span) -> TypedExpr {
         let typed_if_cond = self.check_expr(cond.if_branch.condition, &Type::Bool);
         let typed_if_body = self.check_block(cond.if_branch.body);
         let if_ty = typed_if_body.ty.clone();
-        let typed_if_branch = TypedIfBranch {
+        let mut typed_if_branch = TypedIfBranch {
             condition: typed_if_cond,
             body: typed_if_body,
             span: cond.if_branch.span,
@@ -775,7 +789,7 @@ impl TypeChecker {
             });
         }
 
-        let typed_else_branch = cond.else_branch.map(|b| self.check_block(b));
+        let mut typed_else_branch = cond.else_branch.map(|b| self.check_block(b));
 
         // Collect all branch types
         let mut branch_types: Vec<(Type, Span)> = vec![];
@@ -789,12 +803,12 @@ impl TypeChecker {
 
         let target_ty = self.unify_branch_types(&branch_types, typed_else_branch.is_some());
 
-        for (ty, branch_span) in &branch_types {
-            if *ty != Type::Never && *ty != Type::Error {
-                if let Err(e) = self.check_type_compatibility(&target_ty, ty, *branch_span) {
-                    self.emit(e);
-                }
-            }
+        self.wrap_block_tail(&mut typed_if_branch.body, &target_ty);
+        for elseif in &mut typed_elseif_branches {
+            self.wrap_block_tail(&mut elseif.body, &target_ty);
+        }
+        if let Some(else_b) = &mut typed_else_branch {
+            self.wrap_block_tail(else_b, &target_ty);
         }
 
         TypedExpr {

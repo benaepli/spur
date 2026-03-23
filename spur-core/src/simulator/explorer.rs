@@ -109,7 +109,11 @@ impl ExplorerConfig {
 }
 
 fn default_partitions_range() -> Range {
-    Range { min: 0, max: 0, step: 1 }
+    Range {
+        min: 0,
+        max: 0,
+        step: 1,
+    }
 }
 
 fn default_population_size() -> usize {
@@ -184,7 +188,8 @@ impl SingleRunConfig {
         new_config.num_write_ops = mutate_int(self.num_write_ops, &constraints.num_write_ops_range);
         new_config.num_read_ops = mutate_int(self.num_read_ops, &constraints.num_read_ops_range);
         new_config.num_crashes = mutate_int(self.num_crashes, &constraints.num_crashes_range);
-        new_config.num_partitions = mutate_int(self.num_partitions, &constraints.num_partitions_range);
+        new_config.num_partitions =
+            mutate_int(self.num_partitions, &constraints.num_partitions_range);
 
         if rng.random_bool(0.3) && !constraints.dependency_density_values.is_empty() {
             new_config.dependency_density = *constraints
