@@ -648,3 +648,74 @@ fn test_compile_continue_in_loop() {
         panic!("expected loop head, got {:?}", head_label);
     }
 }
+
+#[test]
+fn test_compile_for_loop_continue_targets_increment() {
+    // for (let i = 0; i < 10; i = i + 1) { continue }
+    // Verify that `continue` jumps to the increment vertex, not the loop head.
+    let mut compiler = Compiler::new();
+    compiler.begin_function(&[]);
+
+    let var_i = id(10);
+    compiler.id_to_name.insert(var_i, "i".to_string());
+
+    let next = dummy_vertex();
+
+    let for_loop_stmt = LStatement {
+        kind: LStatementKind::ForLoop(LForLoop {
+            init: Some(LForLoopInit::VarInit(LVarInit {
+                name: var_i,
+                original_name: "i".to_string(),
+                type_def: Type::Int,
+                value: int_lit(0),
+                span: dummy_span(),
+            })),
+            condition: Some(bool_lit(true)),
+            increment: Some(LAssignment {
+                target: lexpr(LExprKind::Var(var_i, "i".to_string()), Type::Int),
+                value: int_lit(1),
+                span: dummy_span(),
+            }),
+            body: vec![LStatement {
+                kind: LStatementKind::Expr(LExpr {
+                    kind: LExprKind::Continue,
+                    ty: Type::Never,
+                    span: dummy_span(),
+                }),
+                span: dummy_span(),
+            }],
+            span: dummy_span(),
+        }),
+        span: dummy_span(),
+    };
+
+    // Need to scan slots first (like compile_func_def does)
+    compiler.scan_stmt_slots(&for_loop_stmt);
+
+    let _entry = compiler.compile_statement(
+        &for_loop_stmt,
+        next,
+        dummy_ctx(),
+    );
+
+    // Walk the CFG to find the Continue label and verify its target.
+    // The Continue target should be the increment vertex, which should
+    // eventually lead to an assignment (the increment i = 1).
+    let mut found_continue = false;
+    for (_v, label) in compiler.cfg.iter().enumerate() {
+        if let Label::Continue(target) = label {
+            found_continue = true;
+            // The continue target should NOT be entry (the init/loop head).
+            // It should be the increment vertex.
+            let inc_label = compiler.cfg.get(*target).expect("continue target missing");
+            // The increment compiles to an assignment of the value 1
+            assert!(
+                matches!(inc_label, Label::Instr(Instr::Assign(_, Expr::Int(1)), _)),
+                "expected increment assignment at continue target (vertex {}), got {:?}",
+                target,
+                inc_label
+            );
+        }
+    }
+    assert!(found_continue, "no Continue label found in compiled CFG");
+}

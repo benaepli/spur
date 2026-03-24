@@ -2,8 +2,21 @@ use crate::analysis::resolver::NameId;
 use crate::analysis::type_id::{TypeId, TypeIdMap};
 use crate::parser::{BinOp, Span};
 use ecow::EcoString;
-use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use std::collections::HashMap;
+
+/// Serialize a HashMap<NameId, V> with NameId keys as string representations of their inner usize.
+fn serialize_nameid_map<V: Serialize, S: Serializer>(
+    map: &HashMap<NameId, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut m = serializer.serialize_map(Some(map.len()))?;
+    for (k, v) in map {
+        m.serialize_entry(&k.0.to_string(), v)?;
+    }
+    m.end()
+}
 
 pub const SELF_NAME: NameId = NameId(usize::MAX);
 
@@ -172,12 +185,14 @@ pub struct Program {
     pub cfg: Cfg,
 
     // Map of function NameId -> FunctionInfo
+    #[serde(serialize_with = "serialize_nameid_map")]
     pub rpc: HashMap<NameId, FunctionInfo>,
 
     // Mapping from qualified function name strings to NameId
     pub func_name_to_id: HashMap<String, NameId>,
 
     // Mapping from NameId to original name (for debugging/display)
+    #[serde(serialize_with = "serialize_nameid_map")]
     pub id_to_name: HashMap<NameId, String>,
 
     // The next available NameId for generating new names
@@ -197,6 +212,7 @@ pub struct Program {
     pub roles: Vec<(NameId, String)>,
 
     /// Maps each structurally distinct Type to a unique TypeId.
+    #[serde(skip)]
     pub type_ids: TypeIdMap,
 }
 

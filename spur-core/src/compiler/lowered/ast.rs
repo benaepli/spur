@@ -106,6 +106,7 @@ pub enum LStatementKind {
     VarInit(LVarInit),
     Assignment(LAssignment),
     Expr(LExpr),
+    ForLoop(LForLoop),
     ForInLoop(LForInLoop),
     Loop(Vec<LStatement>),
     Error,
@@ -148,6 +149,21 @@ pub struct LVarInit {
 pub struct LAssignment {
     pub target: LExpr,
     pub value: LExpr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LForLoopInit {
+    VarInit(LVarInit),
+    Assignment(LAssignment),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LForLoop {
+    pub init: Option<LForLoopInit>,
+    pub condition: Option<LExpr>,
+    pub increment: Option<LAssignment>,
+    pub body: Vec<LStatement>,
     pub span: Span,
 }
 

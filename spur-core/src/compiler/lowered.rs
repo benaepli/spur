@@ -159,96 +159,41 @@ impl Lowerer {
     }
 
     fn lower_for_loop(&mut self, fl: TypedForLoop, span: Span) -> LStatement {
-        // Build the inner loop body:
-        //   loop {
-        //       if !cond { break }   (if cond present)
-        //       ...body...
-        //       inc;                  (if inc present)
-        //   }
-
-        let mut loop_body: Vec<LStatement> = Vec::new();
-
-        if let Some(cond) = fl.condition {
-            let cond_span = cond.span;
-            let lowered_cond = self.lower_expr(cond);
-            let negated = LExpr {
-                kind: LExprKind::Not(Box::new(lowered_cond)),
-                ty: Type::Bool,
-                span: cond_span,
-            };
-            let break_expr = LExpr {
-                kind: LExprKind::Break,
-                ty: Type::Never,
-                span: cond_span,
-            };
-            let break_block = LBlock {
-                statements: vec![],
-                tail_expr: Some(Box::new(break_expr)),
-                ty: Type::Never,
-                span: cond_span,
-            };
-            let cond_expr = LExpr {
-                kind: LExprKind::Conditional(Box::new(LCondExpr {
-                    if_branch: LIfBranch {
-                        condition: negated,
-                        body: break_block,
-                        span: cond_span,
-                    },
-                    elseif_branches: vec![],
-                    else_branch: None,
-                    span: cond_span,
-                })),
-                ty: Type::Tuple(vec![]),
-                span: cond_span,
-            };
-            loop_body.push(LStatement {
-                kind: LStatementKind::Expr(cond_expr),
-                span: cond_span,
-            });
-        }
-
-        loop_body.extend(self.lower_statements(fl.body));
-
-        if let Some(inc) = fl.increment {
-            let inc_span = inc.span;
-            loop_body.push(LStatement {
-                kind: LStatementKind::Assignment(self.lower_assignment(inc)),
-                span: inc_span,
-            });
-        }
-
-        if let Some(init) = fl.init {
-            let init_stmts = match init {
-                TypedForLoopInit::VarInit(vi) => self.lower_var_init_to_stmts(vi),
-                TypedForLoopInit::Assignment(a) => vec![LStatement {
-                    kind: LStatementKind::Assignment(self.lower_assignment(a)),
-                    span,
-                }],
-            };
-            let loop_stmt = LStatement {
-                kind: LStatementKind::Loop(loop_body),
-                span,
-            };
-            let mut block_stmts = init_stmts;
-            block_stmts.push(loop_stmt);
-            LStatement {
-                kind: LStatementKind::Expr(LExpr {
-                    kind: LExprKind::Block(Box::new(LBlock {
-                        statements: block_stmts,
-                        tail_expr: None,
-                        ty: Type::Tuple(vec![]),
-                        span,
-                    })),
-                    ty: Type::Tuple(vec![]),
-                    span,
-                }),
-                span,
+        let init = fl.init.map(|i| match i {
+            TypedForLoopInit::VarInit(vi) => {
+                let value = self.lower_expr(vi.value);
+                match vi.target {
+                    TypedVarTarget::Name(id, name) => {
+                        LForLoopInit::VarInit(LVarInit {
+                            name: id,
+                            original_name: name,
+                            type_def: vi.type_def,
+                            value,
+                            span: vi.span,
+                        })
+                    }
+                    TypedVarTarget::Tuple(_) => {
+                        panic!("Tuple destructuring in for-loop init is not supported")
+                    }
+                }
             }
-        } else {
-            LStatement {
-                kind: LStatementKind::Loop(loop_body),
-                span,
+            TypedForLoopInit::Assignment(a) => {
+                LForLoopInit::Assignment(self.lower_assignment(a))
             }
+        });
+        let condition = fl.condition.map(|c| self.lower_expr(c));
+        let increment = fl.increment.map(|i| self.lower_assignment(i));
+        let body = self.lower_statements(fl.body);
+
+        LStatement {
+            kind: LStatementKind::ForLoop(LForLoop {
+                init,
+                condition,
+                increment,
+                body,
+                span,
+            }),
+            span,
         }
     }
 

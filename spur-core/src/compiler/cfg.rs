@@ -4,8 +4,9 @@ pub use ir::*;
 use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::analysis::type_id::{TypeId, TypeIdMap};
 use crate::compiler::lowered::{
-    LBlock, LCondExpr, LExpr, LExprKind, LForInLoop, LFuncCall, LFuncDef,
-    LProgram, LStatement, LStatementKind, LTopLevelDef, LUserFuncCall, LVarInit,
+    LBlock, LCondExpr, LExpr, LExprKind, LForInLoop, LForLoop, LForLoopInit,
+    LFuncCall, LFuncDef, LProgram, LStatement, LStatementKind, LTopLevelDef,
+    LUserFuncCall, LVarInit,
 };
 use crate::parser::Span;
 use ecow::EcoString;
@@ -446,6 +447,35 @@ impl Compiler {
             LStatementKind::Expr(expr) => {
                 self.scan_expr_slots(expr);
             }
+            LStatementKind::ForLoop(fl) => {
+                if let Some(init) = &fl.init {
+                    match init {
+                        LForLoopInit::VarInit(vi) => {
+                            let name_str = self
+                                .id_to_name
+                                .get(&vi.name)
+                                .cloned()
+                                .unwrap_or_else(|| format!("var_{}", vi.name.0));
+                            self.alloc_local_slot(vi.name, &name_str, Expr::Nil);
+                            self.scan_expr_slots(&vi.value);
+                        }
+                        LForLoopInit::Assignment(a) => {
+                            self.scan_expr_slots(&a.target);
+                            self.scan_expr_slots(&a.value);
+                        }
+                    }
+                }
+                if let Some(cond) = &fl.condition {
+                    self.scan_expr_slots(cond);
+                }
+                if let Some(inc) = &fl.increment {
+                    self.scan_expr_slots(&inc.target);
+                    self.scan_expr_slots(&inc.value);
+                }
+                for stmt in &fl.body {
+                    self.scan_stmt_slots(stmt);
+                }
+            }
             LStatementKind::ForInLoop(fil) => {
                 let name_str = self
                     .id_to_name
@@ -634,6 +664,9 @@ impl Compiler {
                     self.compile_expr_to_value(expr, Lhs::Var(dummy_slot), next_vertex, ctx)
                 }
             }
+            LStatementKind::ForLoop(for_loop) => {
+                self.compile_for_loop(for_loop, next_vertex, ctx)
+            }
             LStatementKind::Loop(body) => {
                 self.compile_loop(body, next_vertex, ctx)
             }
@@ -722,6 +755,79 @@ impl Compiler {
             if_check_vertex,
             ctx,
         )
+    }
+
+    fn compile_for_loop(
+        &mut self,
+        fl: &LForLoop,
+        next_vertex: Vertex,
+        ctx: CompileCtx,
+    ) -> Vertex {
+        // Placeholder: the stable back-edge target for the loop
+        let cond_entry = self.add_label(Label::Return(Expr::Unit));
+
+        // 1. Increment → cond_entry
+        let inc_vertex = if let Some(inc) = &fl.increment {
+            let inc_stmt = LStatement {
+                kind: LStatementKind::Assignment(inc.clone()),
+                span: inc.span,
+            };
+            self.compile_statement(&inc_stmt, cond_entry, ctx)
+        } else {
+            cond_entry
+        };
+
+        // 2. Body: continue → inc_vertex, break → next_vertex
+        let loop_ctx = CompileCtx {
+            break_target: next_vertex,
+            continue_target: inc_vertex,
+            ..ctx
+        };
+        let body_vertex = self.compile_tailless_block(&fl.body, inc_vertex, loop_ctx);
+
+        // 3. Condition → branch(body, exit), or unconditional → body
+        if let Some(cond) = &fl.condition {
+            let cond_slot = self.alloc_temp_slot();
+            let branch = self.add_label(Label::Cond(
+                Expr::Var(cond_slot),
+                body_vertex,
+                next_vertex,
+            ));
+            let eval_entry =
+                self.compile_expr_to_value(cond, Lhs::Var(cond_slot), branch, ctx);
+            // Trampoline → condition evaluation
+            let dummy = self.alloc_temp_slot();
+            self.cfg[cond_entry] = Label::Instr(
+                Instr::Assign(Lhs::Var(dummy), Expr::Unit),
+                eval_entry,
+            );
+        } else {
+            // No condition: infinite loop, jump straight to body
+            let dummy = self.alloc_temp_slot();
+            self.cfg[cond_entry] = Label::Instr(
+                Instr::Assign(Lhs::Var(dummy), Expr::Unit),
+                body_vertex,
+            );
+        }
+
+        // 4. Init → cond_entry (runs once before the loop)
+        if let Some(init) = &fl.init {
+            match init {
+                LForLoopInit::VarInit(vi) => {
+                    let lhs = Lhs::Var(self.resolve_slot(vi.name));
+                    self.compile_expr_to_value(&vi.value, lhs, cond_entry, ctx)
+                }
+                LForLoopInit::Assignment(a) => {
+                    let init_stmt = LStatement {
+                        kind: LStatementKind::Assignment(a.clone()),
+                        span: a.span,
+                    };
+                    self.compile_statement(&init_stmt, cond_entry, ctx)
+                }
+            }
+        } else {
+            cond_entry
+        }
     }
 
     fn compile_for_in_loop(

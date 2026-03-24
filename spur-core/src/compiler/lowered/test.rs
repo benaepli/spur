@@ -117,7 +117,7 @@ fn test_lower_regular_binop() {
 
 #[test]
 fn test_lower_for_loop_no_init() {
-    // for (; cond; ) { body }  →  loop { if !cond { break }; body }
+    // for (; cond; ) { body }  →  ForLoop { init: None, cond, inc: None, body }
     let mut l = lowerer();
     let for_loop = TypedForLoop {
         init: None,
@@ -131,30 +131,28 @@ fn test_lower_for_loop_no_init() {
     };
     let result = l.lower_for_loop(for_loop, dummy_span());
 
-    // Without init, should be a Loop directly (not wrapped in a Block)
-    if let LStatementKind::Loop(body) = &result.kind {
-        // First statement: if !cond { break }
-        assert!(body.len() >= 2);
-        if let LStatementKind::Expr(cond_expr) = &body[0].kind {
-            assert!(matches!(&cond_expr.kind, LExprKind::Conditional(_)));
-        } else {
-            panic!("expected condition check as first statement");
-        }
-        // Second statement: the body expression
-        if let LStatementKind::Expr(body_expr) = &body[1].kind {
+    if let LStatementKind::ForLoop(fl) = &result.kind {
+        assert!(fl.init.is_none());
+        assert!(fl.increment.is_none());
+        // Condition should be the lowered bool
+        let cond = fl.condition.as_ref().expect("expected condition");
+        assert_eq!(cond.kind, LExprKind::BoolLit(true));
+        // Body should have one statement
+        assert_eq!(fl.body.len(), 1);
+        if let LStatementKind::Expr(body_expr) = &fl.body[0].kind {
             assert_eq!(body_expr.kind, LExprKind::IntLit(1));
         } else {
-            panic!("expected body expr as second statement");
+            panic!("expected body expr as first statement");
         }
     } else {
-        panic!("expected Loop, got {:?}", result.kind);
+        panic!("expected ForLoop, got {:?}", result.kind);
     }
 }
 
 #[test]
 fn test_lower_for_loop_with_init() {
     // for (let x = 0; cond; x = x + 1) { body }
-    //   →  { let x = 0; loop { if !cond { break }; body; x = x + 1 } }
+    //   →  ForLoop { init: VarInit(x=0), cond: true, inc: x=1, body: [] }
     let mut l = lowerer();
     let for_loop = TypedForLoop {
         init: Some(TypedForLoopInit::VarInit(TypedVarInit {
@@ -174,26 +172,24 @@ fn test_lower_for_loop_with_init() {
     };
     let result = l.lower_for_loop(for_loop, dummy_span());
 
-    // With init, should be wrapped: Expr(Block { [init, Loop], None })
-    if let LStatementKind::Expr(block_expr) = &result.kind {
-        if let LExprKind::Block(block) = &block_expr.kind {
-            assert_eq!(block.statements.len(), 2);
-            assert!(matches!(&block.statements[0].kind, LStatementKind::VarInit(_)));
-            if let LStatementKind::Loop(loop_body) = &block.statements[1].kind {
-                // loop body: [cond-break, increment]
-                // (no user body statements in this test)
-                assert!(loop_body.len() >= 1);
-                // Last statement should be the increment assignment
-                let last = loop_body.last().unwrap();
-                assert!(matches!(&last.kind, LStatementKind::Assignment(_)));
-            } else {
-                panic!("expected Loop as second statement in block");
-            }
+    if let LStatementKind::ForLoop(fl) = &result.kind {
+        // Init should be VarInit
+        if let Some(LForLoopInit::VarInit(vi)) = &fl.init {
+            assert_eq!(vi.original_name, "x");
+            assert_eq!(vi.value.kind, LExprKind::IntLit(0));
         } else {
-            panic!("expected Block, got {:?}", block_expr.kind);
+            panic!("expected VarInit init, got {:?}", fl.init);
         }
+        // Condition
+        let cond = fl.condition.as_ref().expect("expected condition");
+        assert_eq!(cond.kind, LExprKind::BoolLit(true));
+        // Increment
+        let inc = fl.increment.as_ref().expect("expected increment");
+        assert_eq!(inc.value.kind, LExprKind::IntLit(1));
+        // Body should be empty
+        assert!(fl.body.is_empty());
     } else {
-        panic!("expected Expr(Block), got {:?}", result.kind);
+        panic!("expected ForLoop, got {:?}", result.kind);
     }
 }
 
