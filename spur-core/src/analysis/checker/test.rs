@@ -200,7 +200,8 @@ fn test_assignment_type_check() {
 
     // Valid Assignment
     let assign_ok = ResolvedAssignment {
-        target: expr(ResolvedExprKind::Var(var_id, "x".into())),
+        targets: vec![ResolvedAssignItem::Existing(var_id, "x".into())],
+        type_def: None,
         value: int_lit(10),
         span: dummy_span(),
     };
@@ -209,7 +210,8 @@ fn test_assignment_type_check() {
 
     // Invalid Assignment
     let assign_bad = ResolvedAssignment {
-        target: expr(ResolvedExprKind::Var(var_id, "x".into())),
+        targets: vec![ResolvedAssignItem::Existing(var_id, "x".into())],
+        type_def: None,
         value: str_lit("no"),
         span: dummy_span(),
     };
@@ -217,6 +219,75 @@ fn test_assignment_type_check() {
     checker.check_assignment(assign_bad);
     assert_eq!(checker.errors.len(), 1);
     assert!(matches!(&checker.errors[0], TypeError::Mismatch { .. }));
+
+    checker.exit_scope();
+}
+
+#[test]
+fn test_assignment_nil_coercion_to_optional() {
+    let mut checker = setup_checker();
+    let var_id = id(60);
+
+    checker.enter_scope();
+    checker.add_var(var_id, Type::Optional(Box::new(Type::Int)));
+
+    let assign = ResolvedAssignment {
+        targets: vec![ResolvedAssignItem::Existing(var_id, "x".into())],
+        type_def: None,
+        value: expr(ResolvedExprKind::NilLit),
+        span: dummy_span(),
+    };
+    let result = checker.check_assignment(assign);
+    assert!(checker.errors.is_empty());
+    assert_eq!(result.value.ty, Type::Optional(Box::new(Type::Int)));
+
+    checker.exit_scope();
+}
+
+#[test]
+fn test_assignment_empty_list_coercion() {
+    let mut checker = setup_checker();
+    let var_id = id(61);
+
+    checker.enter_scope();
+    checker.add_var(var_id, Type::List(Box::new(Type::Int)));
+
+    let assign = ResolvedAssignment {
+        targets: vec![ResolvedAssignItem::Existing(var_id, "x".into())],
+        type_def: None,
+        value: expr(ResolvedExprKind::ListLit(vec![])),
+        span: dummy_span(),
+    };
+    let result = checker.check_assignment(assign);
+    assert!(checker.errors.is_empty());
+    assert_eq!(result.value.ty, Type::List(Box::new(Type::Int)));
+
+    checker.exit_scope();
+}
+
+#[test]
+fn test_assignment_empty_map_coercion() {
+    let mut checker = setup_checker();
+    let var_id = id(62);
+
+    checker.enter_scope();
+    checker.add_var(
+        var_id,
+        Type::Map(Box::new(Type::String), Box::new(Type::Int)),
+    );
+
+    let assign = ResolvedAssignment {
+        targets: vec![ResolvedAssignItem::Existing(var_id, "x".into())],
+        type_def: None,
+        value: expr(ResolvedExprKind::MapLit(vec![])),
+        span: dummy_span(),
+    };
+    let result = checker.check_assignment(assign);
+    assert!(checker.errors.is_empty());
+    assert_eq!(
+        result.value.ty,
+        Type::Map(Box::new(Type::String), Box::new(Type::Int))
+    );
 
     checker.exit_scope();
 }

@@ -113,13 +113,7 @@ impl Lowerer {
     fn lower_statement(&mut self, stmt: TypedStatement) -> Vec<LStatement> {
         let span = stmt.span;
         match stmt.kind {
-            TypedStatementKind::VarInit(vi) => self.lower_var_init_to_stmts(vi),
-            TypedStatementKind::Assignment(a) => {
-                vec![LStatement {
-                    kind: LStatementKind::Assignment(self.lower_assignment(a)),
-                    span,
-                }]
-            }
+            TypedStatementKind::Assignment(a) => self.lower_assignment_to_stmts(a),
             TypedStatementKind::Expr(e) => {
                 vec![LStatement {
                     kind: LStatementKind::Expr(self.lower_expr(e)),
@@ -150,40 +144,123 @@ impl Lowerer {
         self.bind_pattern(&pattern, value)
     }
 
-    fn lower_assignment(&mut self, a: TypedAssignment) -> LAssignment {
-        LAssignment {
-            target: self.lower_expr(a.target),
-            value: self.lower_expr(a.value),
-            span: a.span,
+    fn lower_assignment_to_stmts(&mut self, a: TypedAssignment) -> Vec<LStatement> {
+        let span = a.span;
+        let value = self.lower_expr(a.value);
+
+        if a.targets.len() == 1 {
+            self.lower_assign_item(a.targets.into_iter().next().unwrap(), value, span)
+        } else {
+            self.destructure_items(a.targets, value, "__assign_tmp", span)
+        }
+    }
+
+    /// Bind `value` to a temp variable, then tuple-access each element into `items`.
+    fn destructure_items(
+        &mut self,
+        items: Vec<TypedAssignItem>,
+        value: LExpr,
+        tmp_name: &str,
+        span: Span,
+    ) -> Vec<LStatement> {
+        let tmp_id = self.fresh_name_id();
+        let tmp_ty = value.ty.clone();
+        let tmp_var = LExpr {
+            kind: LExprKind::Var(tmp_id, tmp_name.to_string()),
+            ty: tmp_ty.clone(),
+            span,
+        };
+        let mut stmts = vec![LStatement {
+            kind: LStatementKind::VarInit(LVarInit {
+                name: tmp_id,
+                original_name: tmp_name.to_string(),
+                type_def: tmp_ty,
+                value,
+                span,
+            }),
+            span,
+        }];
+        for (i, item) in items.into_iter().enumerate() {
+            let elem_ty = item.ty().clone();
+            let access = LExpr {
+                kind: LExprKind::TupleAccess(Box::new(tmp_var.clone()), i),
+                ty: elem_ty,
+                span,
+            };
+            stmts.extend(self.lower_assign_item(item, access, span));
+        }
+        stmts
+    }
+
+    fn lower_assign_item(
+        &mut self,
+        item: TypedAssignItem,
+        value: LExpr,
+        span: Span,
+    ) -> Vec<LStatement> {
+        match item {
+            TypedAssignItem::Declare(id, name, ty) => {
+                vec![LStatement {
+                    kind: LStatementKind::VarInit(LVarInit {
+                        name: id,
+                        original_name: name,
+                        type_def: ty,
+                        value,
+                        span,
+                    }),
+                    span,
+                }]
+            }
+            TypedAssignItem::Existing(id, name, ty) => {
+                let target = LExpr {
+                    kind: LExprKind::Var(id, name),
+                    ty,
+                    span,
+                };
+                vec![LStatement {
+                    kind: LStatementKind::Assignment(LAssignment {
+                        target,
+                        value,
+                        span,
+                    }),
+                    span,
+                }]
+            }
+            TypedAssignItem::Wildcard(_) => vec![],
+            TypedAssignItem::Nested(items, _) => {
+                self.destructure_items(items, value, "__nested_tmp", span)
+            }
         }
     }
 
     fn lower_for_loop(&mut self, fl: TypedForLoop, span: Span) -> LStatement {
-        let init = fl.init.map(|i| match i {
-            TypedForLoopInit::VarInit(vi) => {
-                let value = self.lower_expr(vi.value);
-                match vi.target {
-                    TypedVarTarget::Name(id, name) => {
-                        LForLoopInit::VarInit(LVarInit {
-                            name: id,
-                            original_name: name,
-                            type_def: vi.type_def,
-                            value,
-                            span: vi.span,
-                        })
-                    }
-                    TypedVarTarget::Tuple(_) => {
-                        panic!("Tuple destructuring in for-loop init is not supported")
-                    }
-                }
+        let mut body = self.lower_statements(fl.body);
+
+        let init = if let Some(a) = fl.init {
+            if a.targets.len() == 1
+                && matches!(
+                    &a.targets[0],
+                    TypedAssignItem::Declare(..) | TypedAssignItem::Existing(..)
+                )
+            {
+                Some(self.lower_assignment_to_for_init(a))
+            } else {
+                let mut init_stmts = self.lower_assignment_to_stmts(a);
+                init_stmts.append(&mut body);
+                body = init_stmts;
+                None
             }
-            TypedForLoopInit::Assignment(a) => {
-                LForLoopInit::Assignment(self.lower_assignment(a))
-            }
-        });
+        } else {
+            None
+        };
+
+        let increment = if let Some(a) = fl.increment {
+            self.lower_assignment_to_stmts(a)
+        } else {
+            vec![]
+        };
+
         let condition = fl.condition.map(|c| self.lower_expr(c));
-        let increment = fl.increment.map(|i| self.lower_assignment(i));
-        let body = self.lower_statements(fl.body);
 
         LStatement {
             kind: LStatementKind::ForLoop(LForLoop {
@@ -194,6 +271,40 @@ impl Lowerer {
                 span,
             }),
             span,
+        }
+    }
+
+    fn lower_assignment_to_for_init(&mut self, a: TypedAssignment) -> LForLoopInit {
+        let span = a.span;
+        if a.targets.len() == 1 {
+            let item = a.targets.into_iter().next().unwrap();
+            let value = self.lower_expr(a.value);
+            match item {
+                TypedAssignItem::Declare(id, name, ty) => {
+                    LForLoopInit::VarInit(LVarInit {
+                        name: id,
+                        original_name: name,
+                        type_def: ty,
+                        value,
+                        span,
+                    })
+                }
+                TypedAssignItem::Existing(id, name, ty) => {
+                    let target = LExpr {
+                        kind: LExprKind::Var(id, name),
+                        ty,
+                        span,
+                    };
+                    LForLoopInit::Assignment(LAssignment {
+                        target,
+                        value,
+                        span,
+                    })
+                }
+                _ => panic!("Wildcard or nested destructuring in for-loop init is not supported"),
+            }
+        } else {
+            panic!("Multi-target destructuring in for-loop init is not supported")
         }
     }
 

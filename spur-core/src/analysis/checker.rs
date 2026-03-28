@@ -1,16 +1,17 @@
 use crate::analysis::resolver::{
-    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignment, ResolvedBlock, ResolvedCondExpr,
-    ResolvedExpr, ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop, ResolvedFuncCall,
-    ResolvedFuncDef, ResolvedMatchArm, ResolvedPattern, ResolvedPatternKind, ResolvedProgram,
-    ResolvedRoleDef, ResolvedStatement, ResolvedStatementKind, ResolvedTopLevelDef,
-    ResolvedTypeDef, ResolvedTypeDefStmtKind, ResolvedUserFuncCall, ResolvedVarInit,
+    BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignItem, ResolvedAssignment, ResolvedBlock,
+    ResolvedCondExpr, ResolvedExpr, ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop,
+    ResolvedFuncCall, ResolvedFuncDef, ResolvedMatchArm, ResolvedPattern, ResolvedPatternKind,
+    ResolvedProgram, ResolvedRoleDef, ResolvedStatement, ResolvedStatementKind,
+    ResolvedTopLevelDef, ResolvedTypeDef, ResolvedTypeDefStmtKind, ResolvedUserFuncCall,
+    ResolvedVarInit,
 };
 use crate::analysis::trivially_copyable::{
     TriviallyCopyableMap, compute_trivially_copyable, is_trivially_copyable,
 };
 use crate::analysis::types::{
-    Type, TypedAssignment, TypedBlock, TypedCondExpr, TypedExpr, TypedExprKind, TypedForInLoop,
-    TypedForLoop, TypedForLoopInit, TypedFuncCall, TypedFuncDef, TypedFuncParam, TypedIfBranch,
+    Type, TypedAssignItem, TypedAssignment, TypedBlock, TypedCondExpr, TypedExpr, TypedExprKind,
+    TypedForInLoop, TypedForLoop, TypedFuncCall, TypedFuncDef, TypedFuncParam, TypedIfBranch,
     TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram, TypedRoleDef, TypedStatement,
     TypedStatementKind, TypedTopLevelDef, TypedUserFuncCall, TypedVarInit, TypedVarTarget,
 };
@@ -612,14 +613,6 @@ impl TypeChecker {
     fn check_statement(&mut self, stmt: ResolvedStatement) -> (TypedStatement, bool) {
         let span = stmt.span;
         match stmt.kind {
-            ResolvedStatementKind::VarInit(var_init) => {
-                let typed_var_init = self.check_var_init(var_init);
-                let typed_stmt = TypedStatement {
-                    kind: TypedStatementKind::VarInit(typed_var_init),
-                    span,
-                };
-                (typed_stmt, false)
-            }
             ResolvedStatementKind::Assignment(assign) => {
                 let typed_assign = self.check_assignment(assign);
                 let typed_stmt = TypedStatement {
@@ -827,30 +820,9 @@ impl TypeChecker {
         self.enter_scope();
         self.loop_depth += 1;
 
-        let typed_init = if let Some(init) = for_loop.init {
-            match init {
-                crate::analysis::resolver::ResolvedForLoopInit::VarInit(vi) => {
-                    Some(TypedForLoopInit::VarInit(self.check_var_init(vi)))
-                }
-                crate::analysis::resolver::ResolvedForLoopInit::Assignment(a) => {
-                    Some(TypedForLoopInit::Assignment(self.check_assignment(a)))
-                }
-            }
-        } else {
-            None
-        };
-
-        let typed_condition = if let Some(condition) = for_loop.condition {
-            Some(self.check_expr(condition, &Type::Bool))
-        } else {
-            None
-        };
-
-        let typed_increment = if let Some(increment) = for_loop.increment {
-            Some(self.check_assignment(increment))
-        } else {
-            None
-        };
+        let typed_init = for_loop.init.map(|a| self.check_assignment(a));
+        let typed_condition = for_loop.condition.map(|c| self.check_expr(c, &Type::Bool));
+        let typed_increment = for_loop.increment.map(|a| self.check_assignment(a));
 
         let mut typed_body = Vec::new();
         for stmt in for_loop.body {
@@ -1030,31 +1002,172 @@ impl TypeChecker {
 
     fn check_assignment(&mut self, assign: ResolvedAssignment) -> TypedAssignment {
         let span = assign.span;
-        if !self.is_valid_lvalue(&assign.target.kind) {
-            self.emit(TypeError::InvalidAssignmentTarget(span));
-            let typed_target = self.infer_expr(assign.target);
-            let typed_value = self.infer_expr(assign.value);
-            return TypedAssignment {
-                target: typed_target,
-                value: typed_value,
-                span,
-            };
-        }
 
-        let typed_target = self.infer_expr(assign.target);
-        let typed_value = self.check_expr(assign.value, &typed_target.ty);
+        // Resolve the overall type: annotation or infer from RHS
+        let (typed_value, overall_ty) = if let Some(def) = assign.type_def {
+            match self.resolve_type(&def) {
+                Ok(expected_ty) => {
+                    let typed_val = self.check_expr(assign.value, &expected_ty);
+                    (typed_val, expected_ty)
+                }
+                Err(e) => {
+                    self.emit(e);
+                    let typed_val = self.infer_expr(assign.value);
+                    let ty = typed_val.ty.clone();
+                    (typed_val, ty)
+                }
+            }
+        } else if let Some(expected_ty) = self.target_expected_type(&assign.targets, span) {
+            let typed_val = self.check_expr(assign.value, &expected_ty);
+            (typed_val, expected_ty)
+        } else {
+            let typed_val = self.infer_expr(assign.value);
+            let ty = typed_val.ty.clone();
+            (typed_val, ty)
+        };
+
+        // Single target: match against overall type directly
+        // Multi target: expect a tuple type and match element-wise
+        let targets = if assign.targets.len() == 1 {
+            vec![self.check_assign_item(assign.targets.into_iter().next().unwrap(), &overall_ty, span)]
+        } else {
+            match &overall_ty {
+                Type::Tuple(types) => {
+                    if assign.targets.len() != types.len() {
+                        self.emit(TypeError::PatternMismatch {
+                            pattern_ty: format!("tuple of {} elements", assign.targets.len()),
+                            iterable_ty: overall_ty.clone(),
+                            span,
+                        });
+                        assign.targets
+                            .into_iter()
+                            .map(|item| self.check_assign_item(item, &Type::Error, span))
+                            .collect()
+                    } else {
+                        assign.targets
+                            .into_iter()
+                            .zip(types.iter())
+                            .map(|(item, ty)| self.check_assign_item(item, ty, span))
+                            .collect()
+                    }
+                }
+                Type::Error => {
+                    assign.targets
+                        .into_iter()
+                        .map(|item| self.check_assign_item(item, &Type::Error, span))
+                        .collect()
+                }
+                _ => {
+                    self.emit(TypeError::NotATuple {
+                        ty: overall_ty.clone(),
+                        span,
+                    });
+                    assign.targets
+                        .into_iter()
+                        .map(|item| self.check_assign_item(item, &Type::Error, span))
+                        .collect()
+                }
+            }
+        };
 
         TypedAssignment {
-            target: typed_target,
+            targets,
             value: typed_value,
             span,
         }
     }
 
-    fn is_valid_lvalue(&self, expr_kind: &ResolvedExprKind) -> bool {
-        match expr_kind {
-            ResolvedExprKind::Var(_, _) => true,
-            _ => false,
+    fn target_expected_type(&self, targets: &[ResolvedAssignItem], span: Span) -> Option<Type> {
+        if targets.len() == 1 {
+            match &targets[0] {
+                ResolvedAssignItem::Existing(id, _) => {
+                    self.get_var_type(*id, span).ok()
+                }
+                _ => None,
+            }
+        } else {
+            let mut types = Vec::new();
+            for target in targets {
+                match target {
+                    ResolvedAssignItem::Existing(id, _) => {
+                        match self.get_var_type(*id, span) {
+                            Ok(ty) => types.push(ty),
+                            Err(_) => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Some(Type::Tuple(types))
+        }
+    }
+
+    fn check_assign_item(
+        &mut self,
+        item: ResolvedAssignItem,
+        expected_ty: &Type,
+        span: Span,
+    ) -> TypedAssignItem {
+        match item {
+            ResolvedAssignItem::Existing(id, name) => {
+                // Look up the existing variable's type and check it matches
+                let var_ty = self.get_var_type(id, span).unwrap_or(Type::Error);
+                if var_ty != Type::Error && *expected_ty != Type::Error && var_ty != *expected_ty {
+                    self.emit(TypeError::Mismatch {
+                        expected: var_ty.clone(),
+                        found: expected_ty.clone(),
+                        span,
+                    });
+                }
+                TypedAssignItem::Existing(id, name, var_ty)
+            }
+            ResolvedAssignItem::Declare(id, name) => {
+                self.add_var(id, expected_ty.clone());
+                TypedAssignItem::Declare(id, name, expected_ty.clone())
+            }
+            ResolvedAssignItem::Wildcard => {
+                TypedAssignItem::Wildcard(expected_ty.clone())
+            }
+            ResolvedAssignItem::Nested(items) => {
+                let typed_items = match expected_ty {
+                    Type::Tuple(types) => {
+                        if items.len() != types.len() {
+                            self.emit(TypeError::PatternMismatch {
+                                pattern_ty: format!("tuple of {} elements", items.len()),
+                                iterable_ty: expected_ty.clone(),
+                                span,
+                            });
+                            items
+                                .into_iter()
+                                .map(|i| self.check_assign_item(i, &Type::Error, span))
+                                .collect()
+                        } else {
+                            items
+                                .into_iter()
+                                .zip(types.iter())
+                                .map(|(i, ty)| self.check_assign_item(i, ty, span))
+                                .collect()
+                        }
+                    }
+                    Type::Error => {
+                        items
+                            .into_iter()
+                            .map(|i| self.check_assign_item(i, &Type::Error, span))
+                            .collect()
+                    }
+                    _ => {
+                        self.emit(TypeError::NotATuple {
+                            ty: expected_ty.clone(),
+                            span,
+                        });
+                        items
+                            .into_iter()
+                            .map(|i| self.check_assign_item(i, &Type::Error, span))
+                            .collect()
+                    }
+                };
+                TypedAssignItem::Nested(typed_items, expected_ty.clone())
+            }
         }
     }
 

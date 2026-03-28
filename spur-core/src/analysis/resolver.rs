@@ -158,7 +158,6 @@ pub struct ResolvedStatement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedStatementKind {
-    VarInit(ResolvedVarInit),
     Assignment(ResolvedAssignment),
     Expr(ResolvedExpr),
     ForLoop(ResolvedForLoop),
@@ -182,14 +181,8 @@ pub struct ResolvedIfBranch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ResolvedForLoopInit {
-    VarInit(ResolvedVarInit),
-    Assignment(ResolvedAssignment),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedForLoop {
-    pub init: Option<ResolvedForLoopInit>,
+    pub init: Option<ResolvedAssignment>,
     pub condition: Option<ResolvedExpr>,
     pub increment: Option<ResolvedAssignment>,
     pub body: Vec<ResolvedStatement>,
@@ -205,8 +198,17 @@ pub struct ResolvedForInLoop {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedAssignItem {
+    Existing(NameId, String),
+    Declare(NameId, String),
+    Wildcard,
+    Nested(Vec<ResolvedAssignItem>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedAssignment {
-    pub target: ResolvedExpr,
+    pub targets: Vec<ResolvedAssignItem>,
+    pub type_def: Option<ResolvedTypeDef>,
     pub value: ResolvedExpr,
     pub span: Span,
 }
@@ -789,7 +791,6 @@ impl Resolver {
     fn resolve_statement(&mut self, stmt: Statement) -> ResolvedStatement {
         let span = stmt.span;
         let kind = match stmt.kind {
-            StatementKind::VarInit(vi) => ResolvedStatementKind::VarInit(self.resolve_var_init(vi)),
             StatementKind::Assignment(a) => {
                 ResolvedStatementKind::Assignment(self.resolve_assignment(a))
             }
@@ -852,17 +853,9 @@ impl Resolver {
     fn resolve_for_loop(&mut self, loop_stmt: ForLoop) -> ResolvedForLoop {
         self.enter_scope();
 
-        let init = loop_stmt.init.map(|init_kind| match init_kind {
-            ForLoopInit::VarInit(vi) => ResolvedForLoopInit::VarInit(self.resolve_var_init(vi)),
-            ForLoopInit::Assignment(a) => {
-                ResolvedForLoopInit::Assignment(self.resolve_assignment(a))
-            }
-        });
-
+        let init = loop_stmt.init.map(|a| self.resolve_assignment(a));
         let condition = loop_stmt.condition.map(|e| self.resolve_expr(e));
-
         let increment = loop_stmt.increment.map(|a| self.resolve_assignment(a));
-
         let body = self.resolve_tailless_block(loop_stmt.body);
 
         self.exit_scope();
@@ -890,10 +883,45 @@ impl Resolver {
         }
     }
 
+    fn resolve_assign_item(&mut self, item: AssignItem, span: Span) -> ResolvedAssignItem {
+        match item {
+            AssignItem::Existing(name) => {
+                match self.lookup_var(&name, span) {
+                    Ok(id) => ResolvedAssignItem::Existing(id, name),
+                    Err(e) => {
+                        self.errors.push(e);
+                        let id = self.new_name_id(&name);
+                        ResolvedAssignItem::Existing(id, name)
+                    }
+                }
+            }
+            AssignItem::Declare(name) => {
+                let id = self.declare_var(&name, span);
+                ResolvedAssignItem::Declare(id, name)
+            }
+            AssignItem::Wildcard => ResolvedAssignItem::Wildcard,
+            AssignItem::Nested(items) => {
+                let resolved = items
+                    .into_iter()
+                    .map(|i| self.resolve_assign_item(i, span))
+                    .collect();
+                ResolvedAssignItem::Nested(resolved)
+            }
+        }
+    }
+
     fn resolve_assignment(&mut self, assign: Assignment) -> ResolvedAssignment {
+        let type_def = assign.type_def.map(|t| self.resolve_type_def(t));
+        let value = self.resolve_expr(assign.value);
+        let targets = assign
+            .targets
+            .into_iter()
+            .map(|item| self.resolve_assign_item(item, assign.span))
+            .collect();
         ResolvedAssignment {
-            target: self.resolve_expr(assign.target),
-            value: self.resolve_expr(assign.value),
+            targets,
+            type_def,
+            value,
             span: assign.span,
         }
     }

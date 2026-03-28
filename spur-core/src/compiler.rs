@@ -8,7 +8,7 @@ use crate::analysis::{trivially_copyable, type_id};
 use crate::compiler::cfg::Compiler as CfgCompiler;
 use crate::compiler::lowered::lower_program;
 use crate::lexer::{LexError, Lexer};
-use crate::parser::{ParseError, parse_program};
+use crate::parser::{ParseError, ValidationError, parse_program};
 use crate::{lexer, parser};
 
 /// Result of compilation that always carries diagnostics and optionally a program.
@@ -16,6 +16,7 @@ pub struct CompileResult {
     pub program: Option<cfg::Program>,
     pub lex_errors: Vec<LexError>,
     pub parse_errors: Vec<ParseError>,
+    pub validation_errors: Vec<ValidationError>,
     pub resolution_errors: Vec<ResolutionError>,
     pub type_errors: Vec<TypeError>,
 }
@@ -25,6 +26,7 @@ impl CompileResult {
     pub fn has_errors(&self) -> bool {
         !self.lex_errors.is_empty()
             || !self.parse_errors.is_empty()
+            || !self.validation_errors.is_empty()
             || !self.resolution_errors.is_empty()
             || !self.type_errors.is_empty()
     }
@@ -36,6 +38,12 @@ impl CompileResult {
         }
         if !self.parse_errors.is_empty() {
             return Err(anyhow::anyhow!("{}", self.parse_errors[0].message));
+        }
+        if !self.validation_errors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "validation error: {}",
+                self.validation_errors[0]
+            ));
         }
         if !self.resolution_errors.is_empty() {
             return Err(anyhow::anyhow!(
@@ -56,6 +64,7 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
         program: None,
         lex_errors: Vec::new(),
         parse_errors: Vec::new(),
+        validation_errors: Vec::new(),
         resolution_errors: Vec::new(),
         type_errors: Vec::new(),
     };
@@ -82,6 +91,13 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
         None => return result,
         Some(v) => v,
     };
+
+    let validation_errors = parser::validate_parsed(&parsed);
+    if !validation_errors.is_empty() {
+        let _ = parser::format::report_validation_errors(input, &validation_errors, name);
+        result.validation_errors = validation_errors;
+        return result;
+    }
 
     let resolver = Resolver::new();
     let prepopulated_types = resolver.get_pre_populated_types().clone();
@@ -119,6 +135,7 @@ pub fn compile_lsp(input: &str) -> CompileResult {
         program: None,
         lex_errors: Vec::new(),
         parse_errors: Vec::new(),
+        validation_errors: Vec::new(),
         resolution_errors: Vec::new(),
         type_errors: Vec::new(),
     };
@@ -141,6 +158,12 @@ pub fn compile_lsp(input: &str) -> CompileResult {
         None => return result,
         Some(v) => v,
     };
+
+    let validation_errors = parser::validate_parsed(&parsed);
+    if !validation_errors.is_empty() {
+        result.validation_errors = validation_errors;
+        return result;
+    }
 
     let resolver = Resolver::new();
     let prepopulated_types = resolver.get_pre_populated_types().clone();

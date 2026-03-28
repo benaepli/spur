@@ -4,6 +4,7 @@ use crate::lexer::{Token, TokenKind};
 use chumsky::input::BorrowInput;
 use chumsky::prelude::*;
 use chumsky::span::SimpleSpan;
+use thiserror::Error;
 
 pub type Span = SimpleSpan<usize>;
 
@@ -17,6 +18,12 @@ impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
     }
+}
+
+#[derive(Error, Debug, PartialEq, Clone)]
+pub enum ValidationError {
+    #[error("Variable initialization is not allowed in a for-loop increment")]
+    VarDeclInForIncrement(Span),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,12 +71,21 @@ pub enum VarTarget {
     Tuple(Vec<String>),
 }
 
+// Used only for role-level field declarations
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarInit {
     pub target: VarTarget,
     pub type_def: Option<TypeDef>,
     pub value: Expr,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignItem {
+    Existing(String),
+    Declare(String),
+    Wildcard,
+    Nested(Vec<AssignItem>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +146,6 @@ impl Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementKind {
-    VarInit(VarInit),
     Assignment(Assignment),
     Expr(Expr),
     ForLoop(ForLoop),
@@ -160,14 +175,8 @@ pub struct IfBranch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ForLoopInit {
-    VarInit(VarInit),
-    Assignment(Assignment),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct ForLoop {
-    pub init: Option<ForLoopInit>,
+    pub init: Option<Assignment>,
     pub condition: Option<Expr>,
     pub increment: Option<Assignment>,
     pub body: Vec<Statement>,
@@ -184,7 +193,8 @@ pub struct ForInLoop {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
-    pub target: Expr,
+    pub targets: Vec<AssignItem>,
+    pub type_def: Option<TypeDef>,
     pub value: Expr,
     pub span: Span,
 }
@@ -1086,7 +1096,7 @@ where
         ident.map(VarTarget::Name),
     ));
 
-    let var_init_core = just(TokenKind::Var)
+    let var_init_role = just(TokenKind::Var)
         .ignore_then(var_target.clone())
         .then(
             just(TokenKind::Colon)
@@ -1095,8 +1105,42 @@ where
         )
         .then_ignore(just(TokenKind::Equal))
         .then(expr.clone())
+        .then_ignore(just(TokenKind::Semicolon).or_not())
         .map_with(|((target, type_def), value), e| VarInit {
             target,
+            type_def,
+            value,
+            span: e.span(),
+        });
+
+    let assign_target = recursive(|assign_target| {
+        let assign_item = choice((
+            just(TokenKind::Var)
+                .ignore_then(ident)
+                .map(AssignItem::Declare),
+            just(TokenKind::Underscore).to(AssignItem::Wildcard),
+            assign_target
+                .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen))
+                .map(AssignItem::Nested),
+            ident.map(AssignItem::Existing),
+        ));
+        assign_item
+            .separated_by(just(TokenKind::Comma))
+            .allow_trailing()
+            .at_least(1)
+            .collect::<Vec<_>>()
+    });
+
+    let assignment = assign_target
+        .then(
+            just(TokenKind::Colon)
+                .ignore_then(type_def.clone())
+                .or_not(),
+        )
+        .then_ignore(just(TokenKind::Equal))
+        .then(expr.clone())
+        .map_with(|((targets, type_def), value), e| Assignment {
+            targets,
             type_def,
             value,
             span: e.span(),
@@ -1115,26 +1159,7 @@ where
                 .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
         };
 
-        let assignment = ident
-            .map_with(|name, e| Expr::new(ExprKind::Var(name), e.span()))
-            .then_ignore(just(TokenKind::Equal))
-            .then(expr.clone())
-            .map_with(|(target, value), e| Assignment {
-                target,
-                value,
-                span: e.span(),
-            });
-
-        let var_init_stmt = var_init_core
-            .clone()
-            .map_with(|var_init, e| Statement::new(StatementKind::VarInit(var_init), e.span()));
-
-        let for_loop_init = choice((
-            var_init_core.clone().map(ForLoopInit::VarInit),
-            assignment.clone().map(ForLoopInit::Assignment),
-        ));
-
-        let three_part_header = for_loop_init
+        let three_part_header = assignment
             .clone()
             .or_not()
             .then_ignore(just(TokenKind::Semicolon))
@@ -1185,11 +1210,10 @@ where
                 )
             });
 
-        let simple_stmt = choice((
-            var_init_stmt,
-            assignment.map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span())),
-        ))
-        .then_ignore(just(TokenKind::Semicolon).or_not());
+        let simple_stmt = assignment
+            .clone()
+            .map_with(|a, e| Statement::new(StatementKind::Assignment(a), e.span()))
+            .then_ignore(just(TokenKind::Semicolon).or_not());
 
         choice((for_loop, for_in_loop, simple_stmt)).recover_with(skip_then_retry_until(
             any_ref().ignored(),
@@ -1206,23 +1230,6 @@ where
             )),
         ))
     });
-
-    let var_init = just(TokenKind::Var)
-        .ignore_then(var_target.clone())
-        .then(
-            just(TokenKind::Colon)
-                .ignore_then(type_def.clone())
-                .or_not(),
-        )
-        .then_ignore(just(TokenKind::Equal))
-        .then(expr.clone())
-        .then_ignore(just(TokenKind::Semicolon).or_not())
-        .map_with(|((target, type_def), value), e| VarInit {
-            target,
-            type_def,
-            value,
-            span: e.span(),
-        });
 
     let func_param = ident
         .then_ignore(just(TokenKind::Colon))
@@ -1354,7 +1361,7 @@ where
         });
 
     let role_contents = || {
-        var_init
+        var_init_role
             .clone()
             .repeated()
             .collect::<Vec<_>>()
@@ -1433,6 +1440,158 @@ pub fn parse_program(tokens: &'_ [Token]) -> ParseResult<Program, Rich<'_, Token
     let input = make_input((0..len).into(), tokens);
 
     program().parse(input)
+}
+
+pub fn validate_parsed(program: &Program) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    errors.extend(validate_for_loop_increments(program));
+    errors
+}
+
+pub fn validate_for_loop_increments(program: &Program) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for def in &program.top_level_defs {
+        match def {
+            TopLevelDef::Role(role) => {
+                for func in &role.func_defs {
+                    validate_block(&func.body, &mut errors);
+                }
+            }
+            TopLevelDef::FreeFunc(func) => {
+                validate_block(&func.body, &mut errors);
+            }
+            TopLevelDef::Type(_) => {}
+        }
+    }
+    errors
+}
+
+fn validate_block(block: &Block, errors: &mut Vec<ValidationError>) {
+    for stmt in &block.statements {
+        validate_stmt(stmt, errors);
+    }
+    if let Some(expr) = &block.tail_expr {
+        validate_expr(expr, errors);
+    }
+}
+
+fn validate_stmt(stmt: &Statement, errors: &mut Vec<ValidationError>) {
+    match &stmt.kind {
+        StatementKind::Assignment(assign) => validate_expr(&assign.value, errors),
+        StatementKind::Expr(expr) => validate_expr(expr, errors),
+        StatementKind::ForLoop(fl) => {
+            if let Some(init) = &fl.init {
+                validate_expr(&init.value, errors);
+            }
+            if let Some(cond) = &fl.condition {
+                validate_expr(cond, errors);
+            }
+            if let Some(inc) = &fl.increment {
+                if contains_declare(&inc.targets) {
+                    errors.push(ValidationError::VarDeclInForIncrement(inc.span));
+                }
+                validate_expr(&inc.value, errors);
+            }
+            for b_stmt in &fl.body {
+                validate_stmt(b_stmt, errors);
+            }
+        }
+        StatementKind::ForInLoop(fil) => {
+            validate_expr(&fil.iterable, errors);
+            for b_stmt in &fil.body {
+                validate_stmt(b_stmt, errors);
+            }
+        }
+    }
+}
+
+fn contains_declare(targets: &[AssignItem]) -> bool {
+    for target in targets {
+        match target {
+            AssignItem::Declare(_) => return true,
+            AssignItem::Nested(inner_targets) => {
+                if contains_declare(inner_targets) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn validate_expr(expr: &Expr, errors: &mut Vec<ValidationError>) {
+    match &expr.kind {
+        ExprKind::FString(parts) | ExprKind::ListLit(parts) | ExprKind::TupleLit(parts) => {
+            for p in parts {
+                validate_expr(p, errors);
+            }
+        }
+        ExprKind::BinOp(_, a, b) | ExprKind::Append(a, b) | ExprKind::Prepend(a, b) |
+        ExprKind::Min(a, b) | ExprKind::Exists(a, b) | ExprKind::Erase(a, b) |
+        ExprKind::Send(a, b) | ExprKind::Index(a, b) | ExprKind::SafeIndex(a, b) => {
+            validate_expr(a, errors);
+            validate_expr(b, errors);
+        }
+        ExprKind::Not(a) | ExprKind::Negate(a) | ExprKind::Head(a) | ExprKind::Tail(a) |
+        ExprKind::Len(a) | ExprKind::TupleAccess(a, _) | ExprKind::SafeTupleAccess(a, _) | ExprKind::FieldAccess(a, _) |
+        ExprKind::Unwrap(a) | ExprKind::SafeFieldAccess(a, _) | ExprKind::PersistData(a) |
+        ExprKind::Recv(a) | ExprKind::Return(Some(a)) => {
+            validate_expr(a, errors);
+        }
+        ExprKind::FuncCall(fc) => {
+            for a in &fc.args {
+                validate_expr(a, errors);
+            }
+        }
+        ExprKind::MapLit(pairs) => {
+            for (k, v) in pairs {
+                validate_expr(k, errors);
+                validate_expr(v, errors);
+            }
+        }
+        ExprKind::StructLit(_, fields) => {
+            for (_, v) in fields {
+                validate_expr(v, errors);
+            }
+        }
+        ExprKind::Store(a, b, c) | ExprKind::Slice(a, b, c) => {
+            validate_expr(a, errors);
+            validate_expr(b, errors);
+            validate_expr(c, errors);
+        }
+        ExprKind::RpcCall(target, call) => {
+            validate_expr(target, errors);
+            for a in &call.args {
+                validate_expr(a, errors);
+            }
+        }
+        ExprKind::Match(scrutinee, arms) => {
+            validate_expr(scrutinee, errors);
+            for arm in arms {
+                validate_block(&arm.body, errors);
+            }
+        }
+        ExprKind::Conditional(cond) => {
+            validate_expr(&cond.if_branch.condition, errors);
+            validate_block(&cond.if_branch.body, errors);
+            for elseif in &cond.elseif_branches {
+                validate_expr(&elseif.condition, errors);
+                validate_block(&elseif.body, errors);
+            }
+            if let Some(else_branch) = &cond.else_branch {
+                validate_block(else_branch, errors);
+            }
+        }
+        ExprKind::VariantLit(_, _, Some(p)) | ExprKind::NamedDotAccess(_, _, Some(p)) => {
+            validate_expr(p, errors);
+        }
+        ExprKind::Return(None) | ExprKind::Break | ExprKind::Continue | ExprKind::Var(_) |
+        ExprKind::IntLit(_) | ExprKind::StringLit(_) | ExprKind::BoolLit(_) | ExprKind::NilLit |
+        ExprKind::VariantLit(_, _, None) | ExprKind::NamedDotAccess(_, _, None) |
+        ExprKind::SetTimer(_) | ExprKind::MakeChannel | ExprKind::RetrieveData(_) |
+        ExprKind::DiscardData => {}
+    }
 }
 
 #[cfg(test)]
@@ -1618,18 +1777,18 @@ mod tests {
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
-            if let StatementKind::VarInit(init) = &func.body.statements[0].kind {
+            if let StatementKind::Assignment(assign) = &func.body.statements[0].kind {
                 // Should desugar to Store(record, "age", 31)
-                match &init.value.kind {
+                match &assign.value.kind {
                     ExprKind::Store(base, key, val) => {
                         assert!(matches!(&base.kind, ExprKind::Var(name) if name == "record"));
                         assert!(matches!(&key.kind, ExprKind::StringLit(s) if s == "age"));
                         assert!(matches!(&val.kind, ExprKind::IntLit(31)));
                     }
-                    _ => panic!("Expected Store, got {:?}", init.value.kind),
+                    _ => panic!("Expected Store, got {:?}", assign.value.kind),
                 }
             } else {
-                panic!("Expected VarInit");
+                panic!("Expected Assignment");
             }
         }
     }
@@ -1640,9 +1799,9 @@ mod tests {
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
-            if let StatementKind::VarInit(init) = &func.body.statements[0].kind {
+            if let StatementKind::Assignment(assign) = &func.body.statements[0].kind {
                 // Should desugar to Store(Store(record, "age", 31), "active", true)
-                match &init.value.kind {
+                match &assign.value.kind {
                     ExprKind::Store(inner, key2, val2) => {
                         assert!(matches!(&key2.kind, ExprKind::StringLit(s) if s == "active"));
                         assert!(matches!(&val2.kind, ExprKind::BoolLit(true)));
@@ -1655,10 +1814,10 @@ mod tests {
                             _ => panic!("Expected inner Store"),
                         }
                     }
-                    _ => panic!("Expected outer Store, got {:?}", init.value.kind),
+                    _ => panic!("Expected outer Store, got {:?}", assign.value.kind),
                 }
             } else {
-                panic!("Expected VarInit");
+                panic!("Expected Assignment");
             }
         }
     }
@@ -1669,17 +1828,17 @@ mod tests {
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
-            if let StatementKind::VarInit(init) = &func.body.statements[0].kind {
-                match &init.value.kind {
+            if let StatementKind::Assignment(assign) = &func.body.statements[0].kind {
+                match &assign.value.kind {
                     ExprKind::Store(base, key, val) => {
                         assert!(matches!(&base.kind, ExprKind::Var(name) if name == "m"));
                         assert!(matches!(&key.kind, ExprKind::StringLit(s) if s == "k1"));
                         assert!(matches!(&val.kind, ExprKind::StringLit(s) if s == "v1"));
                     }
-                    _ => panic!("Expected Store, got {:?}", init.value.kind),
+                    _ => panic!("Expected Store, got {:?}", assign.value.kind),
                 }
             } else {
-                panic!("Expected VarInit");
+                panic!("Expected Assignment");
             }
         }
     }
@@ -1690,11 +1849,20 @@ mod tests {
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
-            if let StatementKind::VarInit(init) = &func.body.statements[0].kind {
-                assert!(matches!(&init.value.kind, ExprKind::Store(..)));
+            if let StatementKind::Assignment(assign) = &func.body.statements[0].kind {
+                assert!(matches!(&assign.value.kind, ExprKind::Store(..)));
             } else {
-                panic!("Expected VarInit");
+                panic!("Expected Assignment");
             }
         }
+    }
+
+    #[test]
+    fn test_for_loop_increment_validation() {
+        let source = "role R { fn f() { for var i = 0; i < 10; var i = i + 1 {} } }";
+        let program = parse(source);
+        let errors = super::validate_parsed(&program);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0], super::ValidationError::VarDeclInForIncrement(_)));
     }
 }

@@ -40,8 +40,8 @@ fn stmt(kind: StatementKind) -> Statement {
 }
 
 fn var_init(name: &str, value: Expr) -> Statement {
-    stmt(StatementKind::VarInit(VarInit {
-        target: VarTarget::Name(name.to_string()),
+    stmt(StatementKind::Assignment(Assignment {
+        targets: vec![AssignItem::Declare(name.to_string())],
         type_def: None,
         value,
         span: dummy_span(),
@@ -216,11 +216,14 @@ fn test_resolve_block_scope() {
     assert_eq!(resolved_block.statements.len(), 2);
 
     match &resolved_block.statements[0].kind {
-        ResolvedStatementKind::VarInit(vi) => match &vi.target {
-            ResolvedVarTarget::Name(_, name) => assert_eq!(name, "x"),
-            _ => panic!("expected Name target"),
-        },
-        _ => panic!("expected VarInit"),
+        ResolvedStatementKind::Assignment(a) => {
+            assert_eq!(a.targets.len(), 1);
+            match &a.targets[0] {
+                ResolvedAssignItem::Declare(_, name) => assert_eq!(name, "x"),
+                _ => panic!("expected Declare target"),
+            }
+        }
+        _ => panic!("expected Assignment"),
     }
 
     // "x" should not be available outside the block if resolve_block handles scoping correctly
@@ -236,9 +239,9 @@ fn test_resolve_block_scope() {
 fn test_resolve_tuple_destructuring() {
     let mut resolver = Resolver::new();
 
-    // var (x, y) = (1, 2)
-    let stmt = stmt(StatementKind::VarInit(VarInit {
-        target: VarTarget::Tuple(vec!["x".to_string(), "y".to_string()]),
+    // var x, var y = (1, 2)
+    let stmt = stmt(StatementKind::Assignment(Assignment {
+        targets: vec![AssignItem::Declare("x".to_string()), AssignItem::Declare("y".to_string())],
         type_def: None,
         value: expr(ExprKind::TupleLit(vec![int_lit(1), int_lit(2)])),
         span: dummy_span(),
@@ -247,30 +250,41 @@ fn test_resolve_tuple_destructuring() {
     let resolved = resolver.resolve_statement(stmt);
 
     match resolved.kind {
-        ResolvedStatementKind::VarInit(vi) => {
-            match vi.target {
-                ResolvedVarTarget::Tuple(names) => {
-                    assert_eq!(names.len(), 2);
-                    assert_eq!(names[0].1, "x");
-                    assert_eq!(names[1].1, "y");
-
-                    // Ensure variables are declared in scope
+        ResolvedStatementKind::Assignment(a) => {
+            assert_eq!(a.targets.len(), 2);
+            match &a.targets[0] {
+                ResolvedAssignItem::Declare(_, name) => {
+                    assert_eq!(name, "x");
+                    // Ensure variable is declared in scope
                     let x_res = resolver.resolve_expr(var_expr("x"));
                     match x_res.kind {
-                        ResolvedExprKind::Var(id, _) => assert_eq!(id, names[0].0),
+                        ResolvedExprKind::Var(id, _) => {
+                            if let ResolvedAssignItem::Declare(x_id, _) = &a.targets[0] {
+                                assert_eq!(id, *x_id);
+                            }
+                        }
                         _ => panic!("expected Var x"),
                     }
-
+                }
+                _ => panic!("expected Declare for x"),
+            }
+            match &a.targets[1] {
+                ResolvedAssignItem::Declare(_, name) => {
+                    assert_eq!(name, "y");
                     let y_res = resolver.resolve_expr(var_expr("y"));
                     match y_res.kind {
-                        ResolvedExprKind::Var(id, _) => assert_eq!(id, names[1].0),
+                        ResolvedExprKind::Var(id, _) => {
+                            if let ResolvedAssignItem::Declare(y_id, _) = &a.targets[1] {
+                                assert_eq!(id, *y_id);
+                            }
+                        }
                         _ => panic!("expected Var y"),
                     }
                 }
-                _ => panic!("expected Tuple target"),
+                _ => panic!("expected Declare for y"),
             }
         }
-        _ => panic!("expected VarInit"),
+        _ => panic!("expected Assignment"),
     }
 }
 
@@ -385,8 +399,8 @@ fn test_variable_used_before_declaration_in_same_expression() {
     resolver.enter_scope();
 
     // Try to use variable in its own initializer
-    let var_init_stmt = stmt(StatementKind::VarInit(VarInit {
-        target: VarTarget::Name("x".to_string()),
+    let var_init_stmt = stmt(StatementKind::Assignment(Assignment {
+        targets: vec![AssignItem::Declare("x".to_string())],
         type_def: None,
         value: bin_op(BinOp::Add, var_expr("x"), int_lit(1)),
         span: dummy_span(),
@@ -394,7 +408,7 @@ fn test_variable_used_before_declaration_in_same_expression() {
 
     let res = resolver.resolve_statement(var_init_stmt);
     match res.kind {
-        ResolvedStatementKind::VarInit(vi) => match vi.value.kind {
+        ResolvedStatementKind::Assignment(a) => match a.value.kind {
             ResolvedExprKind::BinOp(op, l, r) => {
                 assert_eq!(op, BinOp::Add);
                 assert!(matches!(l.kind, ResolvedExprKind::Error));
@@ -402,7 +416,7 @@ fn test_variable_used_before_declaration_in_same_expression() {
             }
             _ => panic!("Expected BinOp"),
         },
-        _ => panic!("Expected VarInit statement"),
+        _ => panic!("Expected Assignment statement"),
     }
     assert_eq!(resolver.errors.len(), 1);
     assert!(

@@ -671,11 +671,14 @@ fn test_compile_for_loop_continue_targets_increment() {
                 span: dummy_span(),
             })),
             condition: Some(bool_lit(true)),
-            increment: Some(LAssignment {
-                target: lexpr(LExprKind::Var(var_i, "i".to_string()), Type::Int),
-                value: int_lit(1),
+            increment: vec![LStatement {
+                kind: LStatementKind::Assignment(LAssignment {
+                    target: lexpr(LExprKind::Var(var_i, "i".to_string()), Type::Int),
+                    value: int_lit(1),
+                    span: dummy_span(),
+                }),
                 span: dummy_span(),
-            }),
+            }],
             body: vec![LStatement {
                 kind: LStatementKind::Expr(LExpr {
                     kind: LExprKind::Continue,

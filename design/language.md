@@ -60,14 +60,20 @@ statement ::=
   | for_in_loop
   | simple_stmt ';'?
 
-simple_stmt ::=
-  var_init
-  | assignment
+simple_stmt ::= assignment
 
-for_loop ::= 'for' ( ( var_init | assignment )? ';' expr? ';' assignment? | expr | ) '{' statements '}'
+for_loop ::= 'for' ( assignment? ';' expr? ';' assignment? | expr | ) '{' statements '}'
 for_in_loop ::= 'for' pattern 'in' expr '{' statements '}'
 
-assignment ::= ID '=' expr
+assignment ::= assign_target ( ':' type_def )? '=' expr
+
+assign_target ::= assign_item ( ',' assign_item )* ','?
+
+assign_item ::=
+  'var' ID
+  | '_'
+  | ID
+  | '(' assign_target ')'
 
 pattern ::=
   ID '.' ID ( '(' pattern ')' )?
@@ -404,3 +410,7 @@ Right now, this includes:
 
 - `println: string -> ()`
 - `int_to_string: int -> string`
+
+## Syntactic Notes
+
+- Variable declarations are illegal in for loop increments.

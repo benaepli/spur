@@ -2,7 +2,7 @@ use spur_core::analysis::checker::TypeError;
 use spur_core::analysis::resolver::ResolutionError;
 use spur_core::compiler::CompileResult;
 use spur_core::lexer::LexError;
-use spur_core::parser::ParseError;
+use spur_core::parser::{ParseError, ValidationError};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::convert::LineIndex;
@@ -19,6 +19,9 @@ pub fn compile_result_to_diagnostics(
     }
     for e in &result.parse_errors {
         out.push(parse_error_to_diagnostic(e, line_index));
+    }
+    for e in &result.validation_errors {
+        out.push(validation_error_to_diagnostic(e, line_index));
     }
     for e in &result.resolution_errors {
         out.push(resolution_error_to_diagnostic(e, line_index));
@@ -50,6 +53,19 @@ fn parse_error_to_diagnostic(e: &ParseError, line_index: &LineIndex) -> Diagnost
         severity: Some(DiagnosticSeverity::ERROR),
         source: Some("spur".into()),
         message: e.message.clone(),
+        ..Default::default()
+    }
+}
+
+fn validation_error_to_diagnostic(e: &ValidationError, line_index: &LineIndex) -> Diagnostic {
+    let span = match e {
+        ValidationError::VarDeclInForIncrement(s) => s,
+    };
+    Diagnostic {
+        range: line_index.span_to_range(span.start, span.end),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("spur".into()),
+        message: e.to_string(),
         ..Default::default()
     }
 }

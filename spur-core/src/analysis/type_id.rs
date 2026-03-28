@@ -2,9 +2,9 @@
 mod test;
 
 use crate::analysis::types::{
-    Type, TypedBlock, TypedExpr, TypedExprKind, TypedFuncCall, TypedFuncDef, TypedMatchArm,
-    TypedPattern, TypedPatternKind, TypedProgram, TypedStatement, TypedStatementKind,
-    TypedTopLevelDef, TypedVarInit, TypedVarTarget,
+    Type, TypedAssignItem, TypedAssignment, TypedBlock, TypedExpr, TypedExprKind, TypedFuncCall,
+    TypedFuncDef, TypedMatchArm, TypedPattern, TypedPatternKind, TypedProgram, TypedStatement,
+    TypedStatementKind, TypedTopLevelDef, TypedVarInit, TypedVarTarget,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -137,35 +137,46 @@ fn register_tailless_body(body: &[TypedStatement], map: &mut TypeIdMap, next_id:
     }
 }
 
+fn register_assignment(assign: &TypedAssignment, map: &mut TypeIdMap, next_id: &mut u32) {
+    for item in &assign.targets {
+        register_assign_item(item, map, next_id);
+    }
+    register_expr(&assign.value, map, next_id);
+}
+
+fn register_assign_item(item: &TypedAssignItem, map: &mut TypeIdMap, next_id: &mut u32) {
+    match item {
+        TypedAssignItem::Existing(_, _, ty)
+        | TypedAssignItem::Declare(_, _, ty)
+        | TypedAssignItem::Wildcard(ty) => {
+            register_type(ty, map, next_id);
+        }
+        TypedAssignItem::Nested(items, ty) => {
+            register_type(ty, map, next_id);
+            for i in items {
+                register_assign_item(i, map, next_id);
+            }
+        }
+    }
+}
+
 fn register_stmt(stmt: &TypedStatement, map: &mut TypeIdMap, next_id: &mut u32) {
     match &stmt.kind {
-        TypedStatementKind::VarInit(init) => {
-            register_var_init(init, map, next_id);
-        }
         TypedStatementKind::Assignment(assign) => {
-            register_expr(&assign.target, map, next_id);
-            register_expr(&assign.value, map, next_id);
+            register_assignment(assign, map, next_id);
         }
         TypedStatementKind::Expr(expr) => {
             register_expr(expr, map, next_id);
         }
         TypedStatementKind::ForLoop(fl) => {
-            match &fl.init {
-                Some(crate::analysis::types::TypedForLoopInit::VarInit(init)) => {
-                    register_var_init(init, map, next_id);
-                }
-                Some(crate::analysis::types::TypedForLoopInit::Assignment(assign)) => {
-                    register_expr(&assign.target, map, next_id);
-                    register_expr(&assign.value, map, next_id);
-                }
-                None => {}
+            if let Some(init) = &fl.init {
+                register_assignment(init, map, next_id);
             }
             if let Some(cond) = &fl.condition {
                 register_expr(cond, map, next_id);
             }
             if let Some(inc) = &fl.increment {
-                register_expr(&inc.target, map, next_id);
-                register_expr(&inc.value, map, next_id);
+                register_assignment(inc, map, next_id);
             }
             register_tailless_body(&fl.body, map, next_id);
         }

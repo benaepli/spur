@@ -468,9 +468,8 @@ impl Compiler {
                 if let Some(cond) = &fl.condition {
                     self.scan_expr_slots(cond);
                 }
-                if let Some(inc) = &fl.increment {
-                    self.scan_expr_slots(&inc.target);
-                    self.scan_expr_slots(&inc.value);
+                for inc_stmt in &fl.increment {
+                    self.scan_stmt_slots(inc_stmt);
                 }
                 for stmt in &fl.body {
                     self.scan_stmt_slots(stmt);
@@ -767,14 +766,10 @@ impl Compiler {
         let cond_entry = self.add_label(Label::Return(Expr::Unit));
 
         // 1. Increment → cond_entry
-        let inc_vertex = if let Some(inc) = &fl.increment {
-            let inc_stmt = LStatement {
-                kind: LStatementKind::Assignment(inc.clone()),
-                span: inc.span,
-            };
-            self.compile_statement(&inc_stmt, cond_entry, ctx)
-        } else {
+        let inc_vertex = if fl.increment.is_empty() {
             cond_entry
+        } else {
+            self.compile_tailless_block(&fl.increment, cond_entry, ctx)
         };
 
         // 2. Body: continue → inc_vertex, break → next_vertex

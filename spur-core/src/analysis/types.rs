@@ -160,7 +160,6 @@ pub struct TypedStatement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedStatementKind {
-    VarInit(TypedVarInit),
     Assignment(TypedAssignment),
     Expr(TypedExpr),
     ForLoop(TypedForLoop),
@@ -206,21 +205,34 @@ pub struct TypedVarInit {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum TypedAssignItem {
+    Existing(NameId, String, Type),
+    Declare(NameId, String, Type),
+    Wildcard(Type),
+    Nested(Vec<TypedAssignItem>, Type),
+}
+
+impl TypedAssignItem {
+    pub fn ty(&self) -> &Type {
+        match self {
+            TypedAssignItem::Existing(_, _, ty)
+            | TypedAssignItem::Declare(_, _, ty)
+            | TypedAssignItem::Wildcard(ty)
+            | TypedAssignItem::Nested(_, ty) => ty,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypedAssignment {
-    pub target: TypedExpr,
+    pub targets: Vec<TypedAssignItem>,
     pub value: TypedExpr,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum TypedForLoopInit {
-    VarInit(TypedVarInit),
-    Assignment(TypedAssignment),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct TypedForLoop {
-    pub init: Option<TypedForLoopInit>,
+    pub init: Option<TypedAssignment>,
     pub condition: Option<TypedExpr>,
     pub increment: Option<TypedAssignment>,
     pub body: Vec<TypedStatement>,

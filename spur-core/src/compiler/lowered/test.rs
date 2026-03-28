@@ -133,7 +133,7 @@ fn test_lower_for_loop_no_init() {
 
     if let LStatementKind::ForLoop(fl) = &result.kind {
         assert!(fl.init.is_none());
-        assert!(fl.increment.is_none());
+        assert!(fl.increment.is_empty());
         // Condition should be the lowered bool
         let cond = fl.condition.as_ref().expect("expected condition");
         assert_eq!(cond.kind, LExprKind::BoolLit(true));
@@ -155,15 +155,14 @@ fn test_lower_for_loop_with_init() {
     //   →  ForLoop { init: VarInit(x=0), cond: true, inc: x=1, body: [] }
     let mut l = lowerer();
     let for_loop = TypedForLoop {
-        init: Some(TypedForLoopInit::VarInit(TypedVarInit {
-            target: TypedVarTarget::Name(id(0), "x".to_string()),
-            type_def: Type::Int,
+        init: Some(TypedAssignment {
+            targets: vec![TypedAssignItem::Declare(id(0), "x".to_string(), Type::Int)],
             value: typed_int(0),
             span: dummy_span(),
-        })),
+        }),
         condition: Some(typed_bool(true)),
         increment: Some(TypedAssignment {
-            target: typed_expr(TypedExprKind::Var(id(0), "x".to_string()), Type::Int),
+            targets: vec![TypedAssignItem::Existing(id(0), "x".to_string(), Type::Int)],
             value: typed_int(1),
             span: dummy_span(),
         }),
@@ -184,8 +183,12 @@ fn test_lower_for_loop_with_init() {
         let cond = fl.condition.as_ref().expect("expected condition");
         assert_eq!(cond.kind, LExprKind::BoolLit(true));
         // Increment
-        let inc = fl.increment.as_ref().expect("expected increment");
-        assert_eq!(inc.value.kind, LExprKind::IntLit(1));
+        assert_eq!(fl.increment.len(), 1);
+        if let LStatementKind::Assignment(inc) = &fl.increment[0].kind {
+            assert_eq!(inc.value.kind, LExprKind::IntLit(1));
+        } else {
+            panic!("expected Assignment in increment, got {:?}", fl.increment[0].kind);
+        }
         // Body should be empty
         assert!(fl.body.is_empty());
     } else {

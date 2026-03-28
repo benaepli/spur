@@ -162,7 +162,7 @@ pub enum LForLoopInit {
 pub struct LForLoop {
     pub init: Option<LForLoopInit>,
     pub condition: Option<LExpr>,
-    pub increment: Option<LAssignment>,
+    pub increment: Vec<LStatement>,
     pub body: Vec<LStatement>,
     pub span: Span,
 }
