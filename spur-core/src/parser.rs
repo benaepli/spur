@@ -844,6 +844,7 @@ where
             SafeFieldAccess(String, Span),
             SafeIndex(Expr),
             SafeTupleAccess(usize, Span),
+            With(Vec<(Expr, Expr)>, Span),
         }
 
         let postfix_op = choice((
@@ -889,6 +890,29 @@ where
             just(TokenKind::Arrow)
                 .ignore_then(func_call.clone())
                 .map(PostfixOp::RpcCall),
+            // With: with { field: expr, [key]: expr, ... }
+            just(TokenKind::With)
+                .ignore_then({
+                    let field_entry = ident.map(|name| {
+                        Expr::new(ExprKind::StringLit(name), Span::default())
+                    })
+                    .then_ignore(just(TokenKind::Colon))
+                    .then(expr.clone());
+
+                    let index_entry = expr.clone()
+                        .delimited_by(just(TokenKind::LeftBracket), just(TokenKind::RightBracket))
+                        .then_ignore(just(TokenKind::Colon))
+                        .then(expr.clone());
+
+                    let entry = choice((field_entry, index_entry));
+
+                    entry
+                        .separated_by(just(TokenKind::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
+                })
+                .map_with(|entries, e| PostfixOp::With(entries, e.span())),
         ));
 
         primary_base.foldl(postfix_op.repeated(), |lhs, op| match op {
@@ -947,6 +971,15 @@ where
             PostfixOp::SafeTupleAccess(idx, op_span) => {
                 let span = lhs.span.union(op_span);
                 Expr::new(ExprKind::SafeTupleAccess(Box::new(lhs), idx), span)
+            }
+            PostfixOp::With(entries, op_span) => {
+                let span = lhs.span.union(op_span);
+                entries.into_iter().fold(lhs, |acc, (key, val)| {
+                    Expr::new(
+                        ExprKind::Store(Box::new(acc), Box::new(key), Box::new(val)),
+                        span,
+                    )
+                })
             }
         })
     };
@@ -1576,6 +1609,92 @@ mod tests {
             }
         } else {
             panic!("Expected role definition");
+        }
+    }
+
+    #[test]
+    fn test_with_struct_field() {
+        let source = "role R { fn f() { var x = record with { age: 31 }; } }";
+        let program = parse(source);
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::VarInit(init) = &func.body.statements[0].kind {
+                // Should desugar to Store(record, "age", 31)
+                match &init.value.kind {
+                    ExprKind::Store(base, key, val) => {
+                        assert!(matches!(&base.kind, ExprKind::Var(name) if name == "record"));
+                        assert!(matches!(&key.kind, ExprKind::StringLit(s) if s == "age"));
+                        assert!(matches!(&val.kind, ExprKind::IntLit(31)));
+                    }
+                    _ => panic!("Expected Store, got {:?}", init.value.kind),
+                }
+            } else {
+                panic!("Expected VarInit");
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_multiple_fields() {
+        let source = "role R { fn f() { var x = record with { age: 31, active: true }; } }";
+        let program = parse(source);
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::VarInit(init) = &func.body.statements[0].kind {
+                // Should desugar to Store(Store(record, "age", 31), "active", true)
+                match &init.value.kind {
+                    ExprKind::Store(inner, key2, val2) => {
+                        assert!(matches!(&key2.kind, ExprKind::StringLit(s) if s == "active"));
+                        assert!(matches!(&val2.kind, ExprKind::BoolLit(true)));
+                        match &inner.kind {
+                            ExprKind::Store(base, key1, val1) => {
+                                assert!(matches!(&base.kind, ExprKind::Var(name) if name == "record"));
+                                assert!(matches!(&key1.kind, ExprKind::StringLit(s) if s == "age"));
+                                assert!(matches!(&val1.kind, ExprKind::IntLit(31)));
+                            }
+                            _ => panic!("Expected inner Store"),
+                        }
+                    }
+                    _ => panic!("Expected outer Store, got {:?}", init.value.kind),
+                }
+            } else {
+                panic!("Expected VarInit");
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_index_key() {
+        let source = r#"role R { fn f() { var x = m with { ["k1"]: "v1" }; } }"#;
+        let program = parse(source);
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::VarInit(init) = &func.body.statements[0].kind {
+                match &init.value.kind {
+                    ExprKind::Store(base, key, val) => {
+                        assert!(matches!(&base.kind, ExprKind::Var(name) if name == "m"));
+                        assert!(matches!(&key.kind, ExprKind::StringLit(s) if s == "k1"));
+                        assert!(matches!(&val.kind, ExprKind::StringLit(s) if s == "v1"));
+                    }
+                    _ => panic!("Expected Store, got {:?}", init.value.kind),
+                }
+            } else {
+                panic!("Expected VarInit");
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_trailing_comma() {
+        let source = "role R { fn f() { var x = record with { age: 31, }; } }";
+        let program = parse(source);
+        if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
+            let func = &role.func_defs[0];
+            if let StatementKind::VarInit(init) = &func.body.statements[0].kind {
+                assert!(matches!(&init.value.kind, ExprKind::Store(..)));
+            } else {
+                panic!("Expected VarInit");
+            }
         }
     }
 }

@@ -126,7 +126,7 @@
 			"patterns": [
 				{
 					"name": "keyword.control.spur",
-					"match": "\\b(if|else|for|in|return|break|continue|var|match|enum)\\b"
+					"match": "\\b(if|else|for|in|return|break|continue|var|match|enum|with)\\b"
 				},
 				{
 					"name": "storage.type.spur",

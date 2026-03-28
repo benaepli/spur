@@ -141,6 +141,10 @@ postfix_op ::=
   | '!'
   | '->' func_call
   | ':=' expr
+  | 'with' '{' with_entries '}'
+
+with_entries ::= with_entry ( ',' with_entry )* ','?
+with_entry ::= ID ':' expr | '[' expr ']' ':' expr
 
 cond_expr ::= 'if' expr block ( 'else' 'if' expr block )* ( 'else' block )?
 
@@ -230,6 +234,37 @@ Update expressions are syntactic sugar for the `store` built-in function:
 - `x.field := value` desugars to `store(x, "field", value)`
 - `x[key] := value` desugars to `store(x, key, value)`
 - Nested updates like `x.a.b := v` desugar to `store(x, "a", store(x.a, "b", v))`
+
+### Bulk Updates with `with`
+
+The `with` keyword provides a postfix syntax for applying multiple updates at once.
+It desugars to nested `store()` calls, applied left-to-right.
+
+#### Struct Fields
+
+```
+var updated = record with { age: 31, active: true };
+// desugars to: store(store(record, "age", 31), "active", true)
+```
+
+#### Collection Keys
+
+```
+var updated_map = my_map with { ["key1"]: "val1", ["key2"]: "val2" };
+var updated_list = my_list with { [0]: first_item };
+```
+
+#### Nested Updates
+
+For deep updates, compose `with` expressions manually:
+
+```
+var updated = record with { address: record.address with { zip: 12345 } };
+```
+
+#### Restrictions
+
+`with` inherits the same restrictions as `:=`.
 
 ## Concurrency
 
