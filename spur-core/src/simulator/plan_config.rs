@@ -146,6 +146,10 @@ impl EventSpec {
     }
 }
 
+fn default_quick_fire_multiplier() -> f64 {
+    5.0
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlanFileConfig {
     pub num_servers: i32,
@@ -157,6 +161,9 @@ pub struct PlanFileConfig {
 
     #[serde(default)]
     pub queue_policy: QueuePolicyConfig,
+
+    #[serde(default = "default_quick_fire_multiplier")]
+    pub quick_fire_multiplier: f64,
 
     /// When true, labeled timers only fire when explicitly allowed by an AllowTimer event.
     #[serde(default)]

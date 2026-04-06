@@ -191,6 +191,7 @@ pub fn exec_plan<H: HashPolicy>(
     policy: &SchedulePolicy,
     strict_timers: bool,
     queue_policy: &QueuePolicyConfig,
+    quick_fire_multiplier: f64,
 ) -> Result<(), RuntimeError> {
     let mut selector = queue_policy.into_selector();
     let mut engine = PlanEngine::new(plan);
@@ -369,6 +370,7 @@ pub fn exec_plan<H: HashPolicy>(
                 policy,
                 strict_timers,
                 &mut selector,
+                quick_fire_multiplier,
             )?;
 
             match result {

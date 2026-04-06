@@ -88,6 +88,9 @@ pub struct ExplorerConfig {
 
     #[serde(default)]
     pub queue_policy: QueuePolicyConfig,
+
+    #[serde(default = "default_quick_fire_multiplier")]
+    pub quick_fire_multiplier: f64,
 }
 
 impl ExplorerConfig {
@@ -131,6 +134,10 @@ fn default_use_coverage_scheduling() -> bool {
     true
 }
 
+fn default_quick_fire_multiplier() -> f64 {
+    5.0
+}
+
 #[derive(Debug, Clone)]
 pub struct SingleRunConfig {
     pub num_servers: i32,
@@ -143,6 +150,7 @@ pub struct SingleRunConfig {
     pub max_iterations: i32,
     pub schedule_policy: SchedulePolicy,
     pub queue_policy: QueuePolicyConfig,
+    pub quick_fire_multiplier: f64,
 }
 
 impl SingleRunConfig {
@@ -174,6 +182,7 @@ impl SingleRunConfig {
             max_iterations: constraints.max_iterations,
             schedule_policy: constraints.schedule_policy.clone(),
             queue_policy: QueuePolicyConfig::Probabilistic { p_local, p_timer },
+            quick_fire_multiplier: constraints.quick_fire_multiplier,
         }
     }
 
@@ -419,6 +428,7 @@ pub fn run_single_simulation(
         &config.schedule_policy,
         false,
         &config.queue_policy,
+        config.quick_fire_multiplier,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -506,6 +516,7 @@ pub fn run_explorer(
                                     max_iterations: config.max_iterations,
                                     schedule_policy: config.schedule_policy.clone(),
                                     queue_policy: config.queue_policy.clone(),
+                                    quick_fire_multiplier: config.quick_fire_multiplier,
                                 };
 
                                 info!("{}", "=".repeat(70));
@@ -576,6 +587,7 @@ fn run_single_plan(
     policy: &SchedulePolicy,
     strict_timers: bool,
     queue_policy: &QueuePolicyConfig,
+    quick_fire_multiplier: f64,
 ) -> Result<f64, Box<dyn Error>> {
     let global_snapshot = global_state.coverage.snapshot();
     let num_servers_usize = num_servers as usize;
@@ -634,6 +646,7 @@ fn run_single_plan(
         policy,
         strict_timers,
         queue_policy,
+        quick_fire_multiplier,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -701,6 +714,7 @@ pub fn run_plan(
             &config.schedule_policy,
             config.strict_timers,
             &config.queue_policy,
+            config.quick_fire_multiplier,
         ) {
             Ok(_) => {
                 debug!(

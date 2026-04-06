@@ -13,20 +13,31 @@ use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
-use imbl::Vector;
+use imbl::{OrdSet, Vector};
 use log::warn;
 use rand::Rng;
 
 /// Stochastic beam selection: K-tournament over a queue, scored by novelty + priority.
+/// For Recover events targeting a currently-crashed node, `quick_fire_multiplier`
+/// increases the weight of priority relative to novelty while keeping scores in [0, 1].
 fn beam_select<H: HashPolicy>(
     queue: &Vector<Runnable<H>>,
     eligible: &[usize],
     global_snapshot: Option<&VertexMap>,
+    currently_crashed: &OrdSet<NodeId>,
+    quick_fire_multiplier: f64,
     rng: &mut impl Rng,
 ) -> usize {
     let score = |r: &Runnable<H>| -> f64 {
         let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
-        0.25 * novelty + 0.75 * r.priority()
+        let priority = r.priority();
+        let is_quick_fire = matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
+        if is_quick_fire {
+            let w = 0.75 * quick_fire_multiplier;
+            (0.25 * novelty + w * priority) / (0.25 + w)
+        } else {
+            0.25 * novelty + 0.75 * priority
+        }
     };
 
     if eligible.len() <= 1 {
@@ -59,6 +70,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
     policy: &SchedulePolicy,
     strict_timers: bool,
     selector: &mut Q,
+    quick_fire_multiplier: f64,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     if state.all_queues_empty() {
         return Ok(ScheduleResult::None);
@@ -104,7 +116,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(queue, &eligible, global_snapshot, &mut rng);
+            let idx = beam_select(queue, &eligible, global_snapshot, &state.crash_info.currently_crashed, quick_fire_multiplier, &mut rng);
             state.local_queues[node_idx].remove(idx)
         }
         QueueSelection::Network => {
@@ -113,7 +125,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(queue, &eligible, global_snapshot, &mut rng);
+            let idx = beam_select(queue, &eligible, global_snapshot, &state.crash_info.currently_crashed, quick_fire_multiplier, &mut rng);
             state.network_queue.remove(idx)
         }
         QueueSelection::Timer => {
@@ -136,7 +148,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(queue, &eligible, global_snapshot, &mut rng);
+            let idx = beam_select(queue, &eligible, global_snapshot, &state.crash_info.currently_crashed, quick_fire_multiplier, &mut rng);
             state.timer_queue.remove(idx)
         }
     };
