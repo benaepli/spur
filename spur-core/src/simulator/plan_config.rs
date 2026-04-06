@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::analysis::resolver::NameId;
-use crate::simulator::core::{QueuePolicyConfig, SchedulePolicy};
+use crate::simulator::core::{PurgatoryConfig, QueuePolicyConfig, SchedulePolicy};
 use crate::simulator::path::plan::{ClientOpSpec, EventAction, PlannedEvent};
 
 #[derive(Debug, Error)]
@@ -172,6 +172,9 @@ pub struct PlanFileConfig {
     pub events: HashMap<String, EventSpec>,
     #[serde(default)]
     pub dependencies: Vec<(String, String)>,
+
+    #[serde(default)]
+    pub purgatory: PurgatoryConfig,
 }
 
 impl PlanFileConfig {

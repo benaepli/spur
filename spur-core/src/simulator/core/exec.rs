@@ -2,11 +2,12 @@ use crate::compiler::cfg::{Instr, Label, Program, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{eval, make_local_env, store};
 use crate::simulator::core::state::{
-    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, Record, Runnable,
-    RunnableCategory, SchedulePolicy, State, Timer, TraceEntry, TraceKind,
+    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, PurgatoryConfig, Record,
+    Runnable, RunnableCategory, SchedulePolicy, State, Timer, TraceEntry, TraceKind,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
 use imbl::Vector;
+use rand::Rng;
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
 
@@ -435,6 +436,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let causal_operation_id = record.causal_operation_id;
     let mut pending_trace_id = record.trace_id;
@@ -488,14 +490,30 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 let val = eval(&local_env, &node_env, val_expr, &program.id_to_name)?;
                 if cid.node != record.node {
                     let mut rng = rand::rng();
-                    state.push_runnable(Runnable::ChannelSend {
+                    let cs = Runnable::ChannelSend {
                         target: cid.node,
                         channel: cid,
                         message: val,
                         origin_node: record.node,
                         pc: *next,
                         priority: policy.sample(&mut rng, RunnableCategory::ChannelSend),
-                    });
+                    };
+                    if purgatory_config.delay_probability > 0.0
+                        && rng.random::<f64>() < purgatory_config.delay_probability
+                    {
+                        let (min, max) = purgatory_config.delay_duration_range;
+                        let duration = if min >= max {
+                            min
+                        } else {
+                            let ln_min = (min as f64).ln();
+                            let ln_max = (max as f64).ln();
+                            rng.random_range(ln_min..=ln_max).exp().round() as i32
+                        };
+                        let release_step = state.crash_info.current_step + duration;
+                        state.delay_runnable(release_step, cs);
+                    } else {
+                        state.push_runnable(cs);
+                    }
                     // Non-blocking, proceed
                     record.pc = *next;
                 } else {

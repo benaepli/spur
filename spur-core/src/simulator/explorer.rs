@@ -1,7 +1,7 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Env, Logger, NodeId, QueuePolicyConfig, RuntimeError, SchedulePolicy, State, Value,
-    exec_sync_on_node, make_local_env,
+    Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
+    Value, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::history::{
@@ -91,6 +91,9 @@ pub struct ExplorerConfig {
 
     #[serde(default = "default_quick_fire_multiplier")]
     pub quick_fire_multiplier: f64,
+
+    #[serde(default)]
+    pub purgatory: PurgatoryConfig,
 }
 
 impl ExplorerConfig {
@@ -151,6 +154,7 @@ pub struct SingleRunConfig {
     pub schedule_policy: SchedulePolicy,
     pub queue_policy: QueuePolicyConfig,
     pub quick_fire_multiplier: f64,
+    pub purgatory: PurgatoryConfig,
 }
 
 impl SingleRunConfig {
@@ -183,6 +187,7 @@ impl SingleRunConfig {
             schedule_policy: constraints.schedule_policy.clone(),
             queue_policy: QueuePolicyConfig::Probabilistic { p_local, p_timer },
             quick_fire_multiplier: constraints.quick_fire_multiplier,
+            purgatory: constraints.purgatory.clone(),
         }
     }
 
@@ -429,6 +434,7 @@ pub fn run_single_simulation(
         false,
         &config.queue_policy,
         config.quick_fire_multiplier,
+        &config.purgatory,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -517,6 +523,7 @@ pub fn run_explorer(
                                     schedule_policy: config.schedule_policy.clone(),
                                     queue_policy: config.queue_policy.clone(),
                                     quick_fire_multiplier: config.quick_fire_multiplier,
+                                    purgatory: config.purgatory.clone(),
                                 };
 
                                 info!("{}", "=".repeat(70));
@@ -588,6 +595,7 @@ fn run_single_plan(
     strict_timers: bool,
     queue_policy: &QueuePolicyConfig,
     quick_fire_multiplier: f64,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<f64, Box<dyn Error>> {
     let global_snapshot = global_state.coverage.snapshot();
     let num_servers_usize = num_servers as usize;
@@ -647,6 +655,7 @@ fn run_single_plan(
         strict_timers,
         queue_policy,
         quick_fire_multiplier,
+        purgatory_config,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -715,6 +724,7 @@ pub fn run_plan(
             config.strict_timers,
             &config.queue_policy,
             config.quick_fire_multiplier,
+            &config.purgatory,
         ) {
             Ok(_) => {
                 debug!(

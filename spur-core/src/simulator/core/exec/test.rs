@@ -118,6 +118,7 @@ fn test_assign_then_cond_true() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
 }
@@ -147,6 +148,7 @@ fn test_assign_then_cond_false() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
 }
@@ -177,6 +179,7 @@ fn test_arithmetic_assignment() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
 }
@@ -211,6 +214,7 @@ fn test_multiple_assigns() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
 }
@@ -238,6 +242,7 @@ fn test_node_slot_assignment() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
     assert_eq!(state.nodes[0].get(1), &Value::<WithHashing>::int(42));
@@ -270,6 +275,7 @@ fn test_copy_instruction() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
 }
@@ -294,6 +300,7 @@ fn test_print_instruction() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
     assert_eq!(logger.entries.len(), 1);
@@ -338,6 +345,7 @@ fn test_for_loop_in_list() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
 }
@@ -362,6 +370,7 @@ fn test_pause_yields() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
@@ -399,6 +408,7 @@ fn test_coverage_records_transitions() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
     assert!(coverage.unique_edges() >= 2);
 }
@@ -433,6 +443,7 @@ fn test_channel_send_recv() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -460,6 +471,7 @@ fn test_recv_blocks_on_empty() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
 
     assert!(result.is_ok());
@@ -547,6 +559,7 @@ fn test_for_loop_map_destructuring() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -610,6 +623,7 @@ fn test_tuple_assignment() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -643,6 +657,7 @@ fn test_runtime_type_error() {
         None,
         &mut coverage,
         &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
     );
 
     assert!(result.is_err());

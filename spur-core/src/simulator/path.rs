@@ -1,9 +1,9 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, QueuePolicyConfig,
-    QueueSelector, Record, Runnable, RunnableCategory, RuntimeError, SchedulePolicy,
-    ScheduleResult, State, TraceEntry, Value, make_local_env, schedule_runnable,
+    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, PurgatoryConfig,
+    QueuePolicyConfig, QueueSelector, Record, Runnable, RunnableCategory, RuntimeError,
+    SchedulePolicy, ScheduleResult, State, TraceEntry, Value, make_local_env, schedule_runnable,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
@@ -192,6 +192,7 @@ pub fn exec_plan<H: HashPolicy>(
     strict_timers: bool,
     queue_policy: &QueuePolicyConfig,
     quick_fire_multiplier: f64,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
     let mut selector = queue_policy.into_selector();
     let mut engine = PlanEngine::new(plan);
@@ -241,6 +242,9 @@ pub fn exec_plan<H: HashPolicy>(
         }
 
         path_state.state.crash_info.current_step = step;
+
+        // Release delayed messages whose time has come
+        path_state.state.release_from_purgatory(step);
 
         // Dispatch ready events
         let ready_events: Vec<(NodeIndex, PlannedEvent)> = engine
@@ -371,6 +375,7 @@ pub fn exec_plan<H: HashPolicy>(
                 strict_timers,
                 &mut selector,
                 quick_fire_multiplier,
+                purgatory_config,
             )?;
 
             match result {

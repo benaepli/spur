@@ -5,8 +5,8 @@ use crate::simulator::core::exec::{exec, exec_sync_on_node};
 use crate::simulator::core::partition::{activate_partition, heal_partition};
 use crate::simulator::core::queue_selector::{QueueInfo, QueueSelection, QueueSelector};
 use crate::simulator::core::state::{
-    Continuation, Logger, NodeId, Record, Runnable, RunnableCategory, SchedulePolicy,
-    ScheduleResult, State,
+    Continuation, Logger, NodeId, PurgatoryConfig, Record, Runnable, RunnableCategory,
+    SchedulePolicy, ScheduleResult, State,
 };
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
@@ -71,6 +71,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
     strict_timers: bool,
     selector: &mut Q,
     quick_fire_multiplier: f64,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     if state.all_queues_empty() {
         return Ok(ScheduleResult::None);
@@ -271,6 +272,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                 Runnable::Record(r) => {
                     let result = exec(
                         state, logger, program, r, global_snapshot, local_coverage, policy,
+                        purgatory_config,
                     )?;
                     match result {
                         Some(client_op) => Ok(ScheduleResult::ClientOp(client_op)),
@@ -360,6 +362,11 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
         }
         state.timer_queue.push_back(task);
     }
+
+    // 4. Filter purgatory: remove items targeting the crashed node
+    state.purgatory.retain(|(_, task)| {
+        !matches!(task, Runnable::ChannelSend { target, .. } if *target == node_id)
+    });
 }
 
 fn recover_crashed_node<H: HashPolicy, L: Logger>(
@@ -520,6 +527,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
         policy,
+        &PurgatoryConfig::default(),
     )?;
     Ok(())
 }

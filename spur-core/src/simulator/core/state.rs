@@ -113,6 +113,30 @@ fn default_heal_band() -> PriorityBand {
     }
 }
 
+/// Configures probabilistic message delays ("purgatory").
+#[derive(Debug, Clone, Deserialize)]
+pub struct PurgatoryConfig {
+    /// Probability that a remote ChannelSend is delayed. 0.0 = disabled.
+    #[serde(default)]
+    pub delay_probability: f64,
+    /// (min_steps, max_steps) for log-uniform delay sampling.
+    #[serde(default = "default_delay_range")]
+    pub delay_duration_range: (i32, i32),
+}
+
+impl Default for PurgatoryConfig {
+    fn default() -> Self {
+        Self {
+            delay_probability: 0.0,
+            delay_duration_range: (5, 50),
+        }
+    }
+}
+
+fn default_delay_range() -> (i32, i32) {
+    (5, 50)
+}
+
 impl SchedulePolicy {
     /// Sample a priority value for the given runnable category.
     pub fn sample(&self, rng: &mut impl Rng, cat: RunnableCategory) -> f64 {
@@ -440,6 +464,8 @@ pub struct State<H: HashPolicy> {
     pub local_queues: Vec<Vector<Runnable<H>>>,
     pub network_queue: Vector<Runnable<H>>,
     pub timer_queue: Vector<Runnable<H>>,
+    /// Delayed runnables not yet schedulable. (release_step, runnable)
+    pub purgatory: Vec<(i32, Runnable<H>)>,
     pub channels: ImHashMap<ChannelId, ChannelState<H>>,
     pub crash_info: CrashInfo<H>,
     pub partition_info: PartitionInfo<H>,
@@ -476,6 +502,7 @@ impl<H: HashPolicy> State<H> {
             local_queues: (0..num_nodes).map(|_| Vector::new()).collect(),
             network_queue: Vector::new(),
             timer_queue: Vector::new(),
+            purgatory: Vec::new(),
             channels: ImHashMap::new(),
             crash_info: CrashInfo {
                 currently_crashed: OrdSet::new(),
@@ -544,11 +571,31 @@ impl<H: HashPolicy> State<H> {
         self.local_queues[node_index].push_back(runnable);
     }
 
-    /// True when all three queue groups are empty.
+    /// True when all queue groups and purgatory are empty.
     pub fn all_queues_empty(&self) -> bool {
         self.network_queue.is_empty()
             && self.timer_queue.is_empty()
             && self.local_queues.iter().all(|q| q.is_empty())
+            && self.purgatory.is_empty()
+    }
+
+    /// Move a runnable into purgatory, delaying it until `release_step`.
+    pub fn delay_runnable(&mut self, release_step: i32, runnable: Runnable<H>) {
+        self.purgatory.push((release_step, runnable));
+    }
+
+    /// Release purgatory items whose release_step <= current_step into their normal queues.
+    pub fn release_from_purgatory(&mut self, current_step: i32) {
+        let mut i = 0;
+        while i < self.purgatory.len() {
+            if self.purgatory[i].0 <= current_step {
+                let (_, runnable) = self.purgatory.swap_remove(i);
+                self.push_runnable(runnable);
+                // Don't increment i — swap_remove moved the last element here
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Total number of runnables across all queues.
@@ -603,6 +650,13 @@ impl<H: HashPolicy> State<H> {
         // Persisted data: Order-independent XOR
         for (&node_idx, (tid, val)) in self.persisted_data.iter() {
             h ^= H::mix(compute_hash(&(node_idx, tid.0)), 2000) ^ H::mix(val.sig, 2001);
+        }
+
+        // Purgatory
+        let mut purg_idx = 3000usize;
+        for (release_step, task) in &self.purgatory {
+            h ^= H::mix(compute_hash(&(release_step, task)), purg_idx as u32);
+            purg_idx += 1;
         }
 
         h
