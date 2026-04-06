@@ -30,6 +30,22 @@ pub trait QueueSelector {
     fn select(&mut self, info: &QueueInfo, rng: &mut impl Rng) -> Option<QueueSelection>;
 }
 
+/// Pick a non-empty local queue index, weighted by queue size.
+fn pick_local(info: &QueueInfo, rng: &mut impl Rng) -> Option<QueueSelection> {
+    let total: usize = info.local_queue_sizes.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let mut target = rng.random_range(0..total);
+    for (i, &size) in info.local_queue_sizes.iter().enumerate() {
+        if target < size {
+            return Some(QueueSelection::Local(i));
+        }
+        target -= size;
+    }
+    unreachable!()
+}
+
 #[derive(Debug, Clone)]
 pub struct ProbabilisticSelector {
     pub p_local: f64,
@@ -37,22 +53,6 @@ pub struct ProbabilisticSelector {
 }
 
 impl ProbabilisticSelector {
-    /// Pick a non-empty local queue index, weighted by queue size.
-    fn pick_local(&self, info: &QueueInfo, rng: &mut impl Rng) -> Option<QueueSelection> {
-        let total: usize = info.local_queue_sizes.iter().sum();
-        if total == 0 {
-            return None;
-        }
-        let mut target = rng.random_range(0..total);
-        for (i, &size) in info.local_queue_sizes.iter().enumerate() {
-            if target < size {
-                return Some(QueueSelection::Local(i));
-            }
-            target -= size;
-        }
-        unreachable!()
-    }
-
     /// Try to select from a specific queue category, falling back to others.
     fn try_select(
         &self,
@@ -60,7 +60,7 @@ impl ProbabilisticSelector {
         info: &QueueInfo,
         rng: &mut impl Rng,
     ) -> Option<QueueSelection> {
-        let order = match primary {
+        let order: [usize; 3] = match primary {
             0 => [0, 1, 2],
             1 => [1, 0, 2],
             _ => [2, 0, 1],
@@ -68,7 +68,7 @@ impl ProbabilisticSelector {
         for &cat in &order {
             match cat {
                 0 => {
-                    if let Some(sel) = self.pick_local(info, rng) {
+                    if let Some(sel) = pick_local(info, rng) {
                         return Some(sel);
                     }
                 }
@@ -107,14 +107,68 @@ impl QueueSelector for ProbabilisticSelector {
 }
 
 #[derive(Debug, Clone)]
+pub struct PreemptiveSelector {
+    pub p_timer: f64,
+    pub preempt_interval: i32,
+    active_node: Option<usize>,
+    steps_since_network_pull: i32,
+}
+
+impl QueueSelector for PreemptiveSelector {
+    fn select(&mut self, info: &QueueInfo, rng: &mut impl Rng) -> Option<QueueSelection> {
+        if info.total() == 0 {
+            return None;
+        }
+
+        if info.timer_queue_size > 0 && rng.random::<f64>() < self.p_timer {
+            return Some(QueueSelection::Timer);
+        }
+
+        if self.steps_since_network_pull >= self.preempt_interval && info.network_queue_size > 0 {
+            self.steps_since_network_pull = 0;
+            self.active_node = None;
+            return Some(QueueSelection::Network);
+        }
+
+        if let Some(node) = self.active_node {
+            if info.local_queue_sizes.get(node).copied().unwrap_or(0) > 0 {
+                self.steps_since_network_pull += 1;
+                return Some(QueueSelection::Local(node));
+            }
+            // Active node drained, clear it
+            self.active_node = None;
+        }
+
+        if let Some(sel) = pick_local(info, rng) {
+            if let QueueSelection::Local(node) = sel {
+                self.active_node = Some(node);
+            }
+            self.steps_since_network_pull += 1;
+            return Some(sel);
+        }
+
+        if info.network_queue_size > 0 {
+            self.steps_since_network_pull = 0;
+            return Some(QueueSelection::Network);
+        }
+        if info.timer_queue_size > 0 {
+            return Some(QueueSelection::Timer);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum AnySelector {
     Probabilistic(ProbabilisticSelector),
+    Preemptive(PreemptiveSelector),
 }
 
 impl QueueSelector for AnySelector {
     fn select(&mut self, info: &QueueInfo, rng: &mut impl Rng) -> Option<QueueSelection> {
         match self {
             AnySelector::Probabilistic(s) => s.select(info, rng),
+            AnySelector::Preemptive(s) => s.select(info, rng),
         }
     }
 }
@@ -123,6 +177,7 @@ impl QueueSelector for AnySelector {
 #[serde(tag = "type")]
 pub enum QueuePolicyConfig {
     Probabilistic { p_local: f64, p_timer: f64 },
+    Preemptive { p_timer: f64, preempt_interval: i32 },
 }
 
 impl Default for QueuePolicyConfig {
@@ -143,6 +198,15 @@ impl QueuePolicyConfig {
                     p_timer: *p_timer,
                 })
             }
+            QueuePolicyConfig::Preemptive {
+                p_timer,
+                preempt_interval,
+            } => AnySelector::Preemptive(PreemptiveSelector {
+                p_timer: *p_timer,
+                preempt_interval: *preempt_interval,
+                active_node: None,
+                steps_since_network_pull: 0,
+            }),
         }
     }
 }

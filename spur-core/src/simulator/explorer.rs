@@ -160,8 +160,18 @@ pub struct SingleRunConfig {
 impl SingleRunConfig {
     pub fn random(constraints: &ExplorerConfig) -> Self {
         let mut rng = rand::rng();
-        let p_local: f64 = rng.random_range(0.1..=0.6);
-        let p_timer: f64 = rng.random_range(0.1..=(0.9 - p_local));
+        let queue_policy = if rng.random::<f64>() < 0.2 {
+            let p_timer: f64 = rng.random_range(0.05..=0.3);
+            let preempt_interval: i32 = rng.random_range(10..=200);
+            QueuePolicyConfig::Preemptive {
+                p_timer,
+                preempt_interval,
+            }
+        } else {
+            let p_local: f64 = rng.random_range(0.1..=0.6);
+            let p_timer: f64 = rng.random_range(0.1..=(0.9 - p_local));
+            QueuePolicyConfig::Probabilistic { p_local, p_timer }
+        };
         SingleRunConfig {
             num_servers: rng.random_range(
                 constraints.num_servers_range.min..=constraints.num_servers_range.max,
@@ -185,7 +195,7 @@ impl SingleRunConfig {
             use_coverage_scheduling: constraints.use_coverage_scheduling,
             max_iterations: constraints.max_iterations,
             schedule_policy: constraints.schedule_policy.clone(),
-            queue_policy: QueuePolicyConfig::Probabilistic { p_local, p_timer },
+            queue_policy,
             quick_fire_multiplier: constraints.quick_fire_multiplier,
             purgatory: constraints.purgatory.clone(),
         }
@@ -220,15 +230,25 @@ impl SingleRunConfig {
         }
 
         if rng.random_bool(0.3) {
-            if let QueuePolicyConfig::Probabilistic {
-                ref mut p_local,
-                ref mut p_timer,
-            } = new_config.queue_policy
-            {
-                let delta: f64 = rng.random_range(-0.1..=0.1);
-                *p_local = (*p_local + delta).clamp(0.05, 0.8);
-                let delta: f64 = rng.random_range(-0.1..=0.1);
-                *p_timer = (*p_timer + delta).clamp(0.05, 0.9 - *p_local);
+            match new_config.queue_policy {
+                QueuePolicyConfig::Probabilistic {
+                    ref mut p_local,
+                    ref mut p_timer,
+                } => {
+                    let delta: f64 = rng.random_range(-0.1..=0.1);
+                    *p_local = (*p_local + delta).clamp(0.05, 0.8);
+                    let delta: f64 = rng.random_range(-0.1..=0.1);
+                    *p_timer = (*p_timer + delta).clamp(0.05, 0.9 - *p_local);
+                }
+                QueuePolicyConfig::Preemptive {
+                    ref mut p_timer,
+                    ref mut preempt_interval,
+                } => {
+                    let delta: f64 = rng.random_range(-0.05..=0.05);
+                    *p_timer = (*p_timer + delta).clamp(0.05, 0.3);
+                    let delta: i32 = rng.random_range(-20..=20);
+                    *preempt_interval = (*preempt_interval + delta).clamp(5, 300);
+                }
             }
         }
 
