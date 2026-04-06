@@ -1,7 +1,7 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Env, Logger, NodeId, RuntimeError, SchedulePolicy, State, Value, exec_sync_on_node,
-    make_local_env,
+    Env, Logger, NodeId, QueuePolicyConfig, RuntimeError, SchedulePolicy, State, Value,
+    exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::history::{
@@ -85,6 +85,9 @@ pub struct ExplorerConfig {
 
     #[serde(default)]
     pub schedule_policy: SchedulePolicy,
+
+    #[serde(default)]
+    pub queue_policy: QueuePolicyConfig,
 }
 
 impl ExplorerConfig {
@@ -139,11 +142,14 @@ pub struct SingleRunConfig {
     pub use_coverage_scheduling: bool,
     pub max_iterations: i32,
     pub schedule_policy: SchedulePolicy,
+    pub queue_policy: QueuePolicyConfig,
 }
 
 impl SingleRunConfig {
     pub fn random(constraints: &ExplorerConfig) -> Self {
         let mut rng = rand::rng();
+        let p_local: f64 = rng.random_range(0.1..=0.6);
+        let p_timer: f64 = rng.random_range(0.1..=(0.9 - p_local));
         SingleRunConfig {
             num_servers: rng.random_range(
                 constraints.num_servers_range.min..=constraints.num_servers_range.max,
@@ -167,6 +173,7 @@ impl SingleRunConfig {
             use_coverage_scheduling: constraints.use_coverage_scheduling,
             max_iterations: constraints.max_iterations,
             schedule_policy: constraints.schedule_policy.clone(),
+            queue_policy: QueuePolicyConfig::Probabilistic { p_local, p_timer },
         }
     }
 
@@ -196,6 +203,19 @@ impl SingleRunConfig {
                 .dependency_density_values
                 .choose(&mut rng)
                 .unwrap();
+        }
+
+        if rng.random_bool(0.3) {
+            if let QueuePolicyConfig::Probabilistic {
+                ref mut p_local,
+                ref mut p_timer,
+            } = new_config.queue_policy
+            {
+                let delta: f64 = rng.random_range(-0.1..=0.1);
+                *p_local = (*p_local + delta).clamp(0.05, 0.8);
+                let delta: f64 = rng.random_range(-0.1..=0.1);
+                *p_timer = (*p_timer + delta).clamp(0.05, 0.9 - *p_local);
+            }
         }
 
         new_config
@@ -398,6 +418,7 @@ pub fn run_single_simulation(
         run_id,
         &config.schedule_policy,
         false,
+        &config.queue_policy,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -484,6 +505,7 @@ pub fn run_explorer(
                                     use_coverage_scheduling: config.use_coverage_scheduling,
                                     max_iterations: config.max_iterations,
                                     schedule_policy: config.schedule_policy.clone(),
+                                    queue_policy: config.queue_policy.clone(),
                                 };
 
                                 info!("{}", "=".repeat(70));
@@ -553,6 +575,7 @@ fn run_single_plan(
     max_iterations: i32,
     policy: &SchedulePolicy,
     strict_timers: bool,
+    queue_policy: &QueuePolicyConfig,
 ) -> Result<f64, Box<dyn Error>> {
     let global_snapshot = global_state.coverage.snapshot();
     let num_servers_usize = num_servers as usize;
@@ -610,6 +633,7 @@ fn run_single_plan(
         run_id,
         policy,
         strict_timers,
+        queue_policy,
     )?;
 
     let plan_score = path_state.coverage.plan_score();
@@ -676,6 +700,7 @@ pub fn run_plan(
             config.max_iterations,
             &config.schedule_policy,
             config.strict_timers,
+            &config.queue_policy,
         ) {
             Ok(_) => {
                 debug!(

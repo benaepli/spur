@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::analysis::resolver::NameId;
-use crate::simulator::core::SchedulePolicy;
+use crate::simulator::core::{QueuePolicyConfig, SchedulePolicy};
 use crate::simulator::path::plan::{ClientOpSpec, EventAction, PlannedEvent};
 
 #[derive(Debug, Error)]
@@ -154,6 +154,9 @@ pub struct PlanFileConfig {
 
     #[serde(default)]
     pub schedule_policy: SchedulePolicy,
+
+    #[serde(default)]
+    pub queue_policy: QueuePolicyConfig,
 
     /// When true, labeled timers only fire when explicitly allowed by an AllowTimer event.
     #[serde(default)]

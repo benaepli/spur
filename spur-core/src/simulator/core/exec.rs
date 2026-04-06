@@ -166,7 +166,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                         .partition_info
                         .buffer_record(target_node, new_record);
                 } else {
-                    state.runnable_tasks.push_back(Runnable::Record(new_record));
+                    state.push_runnable(Runnable::Record(new_record));
                 }
                 Ok(Some(StepOutcome::Continue(*next)))
             }
@@ -197,7 +197,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 priority: policy.sample(&mut rng, RunnableCategory::Timer),
                 label: label.clone(),
             };
-            state.runnable_tasks.push_back(Runnable::Timer(timer));
+            state.push_runnable(Runnable::Timer(timer));
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::UniqueId(lhs, next) => {
@@ -323,7 +323,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 function_name: func_name.clone(),
                 kind: TraceKind::Enter,
                 payload,
-                schedulable_count: state.runnable_tasks.len(),
+                schedulable_count: state.total_runnable_count(),
                 step: state.crash_info.current_step,
                 trace_id: id,
                 causal_operation_id: causal_operation_id.map(|id| id as i64),
@@ -339,7 +339,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 function_name: func_name.clone(),
                 kind: TraceKind::Exit,
                 payload: vec![return_val.to_string()],
-                schedulable_count: state.runnable_tasks.len(),
+                schedulable_count: state.total_runnable_count(),
                 step: state.crash_info.current_step,
                 trace_id,
                 causal_operation_id: causal_operation_id.map(|id| id as i64),
@@ -362,7 +362,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 function_name: func_name.clone(),
                 kind: TraceKind::Dispatch,
                 payload,
-                schedulable_count: state.runnable_tasks.len(),
+                schedulable_count: state.total_runnable_count(),
                 step: state.crash_info.current_step,
                 trace_id: id,
                 causal_operation_id: causal_operation_id.map(|id| id as i64),
@@ -487,9 +487,8 @@ pub fn exec<H: HashPolicy, L: Logger>(
                     eval(&local_env, &node_env, chan_expr, &program.id_to_name)?.as_channel()?;
                 let val = eval(&local_env, &node_env, val_expr, &program.id_to_name)?;
                 if cid.node != record.node {
-                    // Remote Send
                     let mut rng = rand::rng();
-                    state.runnable_tasks.push_back(Runnable::ChannelSend {
+                    state.push_runnable(Runnable::ChannelSend {
                         target: cid.node,
                         channel: cid,
                         message: val,
@@ -508,11 +507,11 @@ pub fn exec<H: HashPolicy, L: Logger>(
                         .clone();
 
                     if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                        // Wakeup reader
                         let mut r_node_env = state.nodes[reader.node.index].clone();
                         store(&lhs, val, &mut reader.env, &mut r_node_env)?;
-                        state.nodes[reader.node.index] = r_node_env;
-                        state.runnable_tasks.push_back(Runnable::Record(reader));
+                        let node_index = reader.node.index;
+                        state.nodes[node_index] = r_node_env;
+                        state.push_to_local(node_index, Runnable::Record(reader));
                     } else {
                         chan.buffer.push_back(val);
                     }
@@ -552,7 +551,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 let node_id = record.node;
                 record.env = local_env;
                 record.pc = *next;
-                state.runnable_tasks.push_back(Runnable::Record(record));
+                state.push_to_local(node_id.index, Runnable::Record(record));
                 state.nodes[node_id.index] = node_env;
                 return Ok(None); // Yield
             }
@@ -562,7 +561,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
                 } else {
                     let node_id = record.node;
                     record.env = local_env;
-                    state.runnable_tasks.push_back(Runnable::Record(record));
+                    state.push_to_local(node_id.index, Runnable::Record(record));
                     state.nodes[node_id.index] = node_env;
                     return Ok(None); // Yield
                 }

@@ -221,7 +221,7 @@ impl<H: HashPolicy> PartitionInfo<H> {
 }
 
 /// Activate a partition. No-op with warning if one is already active.
-/// Scans runnable_tasks and moves cross-partition messages to partition queue.
+/// Only scans network_queue since local and timer items cannot be cross-node.
 pub fn activate_partition<H: HashPolicy>(
     state: &mut crate::simulator::core::state::State<H>,
     partition: PartitionType,
@@ -231,7 +231,7 @@ pub fn activate_partition<H: HashPolicy>(
         return;
     }
     state.partition_info.active = Some(partition);
-    let tasks = std::mem::take(&mut state.runnable_tasks);
+    let tasks = std::mem::take(&mut state.network_queue);
     for task in tasks {
         match &task {
             Runnable::Record(r)
@@ -259,14 +259,14 @@ pub fn activate_partition<H: HashPolicy>(
                     *priority,
                 );
             }
-            _ => state.runnable_tasks.push_back(task),
+            _ => state.network_queue.push_back(task),
         }
     }
 }
 
 /// Heal the active partition. Drains the partition queue with crash-awareness:
 /// - Messages to crashed nodes: Records move to crash queue, ChannelSends are dropped.
-/// - Messages to alive nodes: converted back to runnables.
+/// - Messages to alive nodes: converted back to runnables via push_runnable.
 pub fn heal_partition<H: HashPolicy>(state: &mut crate::simulator::core::state::State<H>) {
     if state.partition_info.active.is_none() {
         warn!("No active partition to heal");
@@ -280,7 +280,7 @@ pub fn heal_partition<H: HashPolicy>(state: &mut crate::simulator::core::state::
                 if state.crash_info.currently_crashed.contains(&dest) {
                     state.crash_info.queued_messages.push_back((dest, record));
                 } else {
-                    state.runnable_tasks.push_back(Runnable::Record(record));
+                    state.push_runnable(Runnable::Record(record));
                 }
             }
             QueuedMessage::ChannelSend {
@@ -291,10 +291,8 @@ pub fn heal_partition<H: HashPolicy>(state: &mut crate::simulator::core::state::
                 pc,
                 priority,
             } => {
-                if state.crash_info.currently_crashed.contains(&dest) {
-                    // Drop ChannelSend for crashed nodes (matching crash semantics)
-                } else {
-                    state.runnable_tasks.push_back(Runnable::ChannelSend {
+                if !state.crash_info.currently_crashed.contains(&dest) {
+                    state.push_runnable(Runnable::ChannelSend {
                         target: dest,
                         channel,
                         message,

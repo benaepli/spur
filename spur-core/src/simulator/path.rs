@@ -1,9 +1,9 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, Record, Runnable,
-    RunnableCategory, RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value,
-    make_local_env, schedule_runnable,
+    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, QueuePolicyConfig,
+    QueueSelector, Record, Runnable, RunnableCategory, RuntimeError, SchedulePolicy,
+    ScheduleResult, State, TraceEntry, Value, make_local_env, schedule_runnable,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
@@ -160,7 +160,7 @@ fn schedule_client_op<H: HashPolicy>(
     });
 
     let mut rng = rand::rng();
-    state.runnable_tasks.push_back(Runnable::Record(Record {
+    state.push_runnable(Runnable::Record(Record {
         pc: op_func.entry,
         node: client_node_id,
         origin_node: client_node_id,
@@ -190,7 +190,9 @@ pub fn exec_plan<H: HashPolicy>(
     run_id: i64,
     policy: &SchedulePolicy,
     strict_timers: bool,
+    queue_policy: &QueuePolicyConfig,
 ) -> Result<(), RuntimeError> {
+    let mut selector = queue_policy.into_selector();
     let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
@@ -309,7 +311,7 @@ pub fn exec_plan<H: HashPolicy>(
                     let nid =
                         validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
                     let mut rng = rand::rng();
-                    path_state.state.runnable_tasks.push_back(Runnable::Crash {
+                    path_state.state.push_runnable(Runnable::Crash {
                         node_id: nid,
                         priority: policy.sample(&mut rng, RunnableCategory::Crash),
                     });
@@ -319,13 +321,10 @@ pub fn exec_plan<H: HashPolicy>(
                     let nid =
                         validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
                     let mut rng = rand::rng();
-                    path_state
-                        .state
-                        .runnable_tasks
-                        .push_back(Runnable::Recover {
-                            node_id: nid,
-                            priority: policy.sample(&mut rng, RunnableCategory::Recover),
-                        });
+                    path_state.state.push_runnable(Runnable::Recover {
+                        node_id: nid,
+                        priority: policy.sample(&mut rng, RunnableCategory::Recover),
+                    });
                     pending_crash_recover.insert(nid.index, node_idx);
                 }
                 EventAction::AllowTimer(node_id, label) => {
@@ -339,7 +338,7 @@ pub fn exec_plan<H: HashPolicy>(
                         topology.num_servers,
                     );
                     let mut rng = rand::rng();
-                    path_state.state.runnable_tasks.push_back(Runnable::Partition {
+                    path_state.state.push_runnable(Runnable::Partition {
                         partition_type,
                         priority: policy.sample(&mut rng, RunnableCategory::Partition),
                     });
@@ -347,7 +346,7 @@ pub fn exec_plan<H: HashPolicy>(
                 }
                 EventAction::Heal => {
                     let mut rng = rand::rng();
-                    path_state.state.runnable_tasks.push_back(Runnable::Heal {
+                    path_state.state.push_runnable(Runnable::Heal {
                         priority: policy.sample(&mut rng, RunnableCategory::Heal),
                     });
                     pending_heal = Some(node_idx);
@@ -357,8 +356,7 @@ pub fn exec_plan<H: HashPolicy>(
 
         let history_start_len = path_state.history.len();
 
-        // Execute one simulation step
-        if !path_state.state.runnable_tasks.is_empty() {
+        if !path_state.state.all_queues_empty() {
             let result = schedule_runnable(
                 &mut path_state.state,
                 &mut path_state.logs,
@@ -370,6 +368,7 @@ pub fn exec_plan<H: HashPolicy>(
                 global_state,
                 policy,
                 strict_timers,
+                &mut selector,
             )?;
 
             match result {

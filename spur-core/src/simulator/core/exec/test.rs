@@ -365,8 +365,8 @@ fn test_pause_yields() {
     );
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
-    assert_eq!(state.runnable_tasks.len(), 1);
-    match &state.runnable_tasks[0] {
+    assert_eq!(state.local_queues[0].len(), 1);
+    match &state.local_queues[0][0] {
         crate::simulator::core::state::Runnable::Record(r) => assert_eq!(r.pc, ret),
         _ => panic!("Expected Record"),
     }

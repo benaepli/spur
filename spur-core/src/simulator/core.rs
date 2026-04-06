@@ -5,6 +5,7 @@ pub mod eval;
 pub mod exec;
 pub mod scheduler;
 pub mod partition;
+pub mod queue_selector;
 
 pub use error::*;
 pub use values::*;
@@ -13,3 +14,4 @@ pub use eval::*;
 pub use exec::*;
 pub use scheduler::*;
 pub use partition::*;
+pub use queue_selector::*;

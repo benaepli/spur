@@ -3,6 +3,7 @@ use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::make_local_env;
 use crate::simulator::core::exec::{exec, exec_sync_on_node};
 use crate::simulator::core::partition::{activate_partition, heal_partition};
+use crate::simulator::core::queue_selector::{QueueInfo, QueueSelection, QueueSelector};
 use crate::simulator::core::state::{
     Continuation, Logger, NodeId, Record, Runnable, RunnableCategory, SchedulePolicy,
     ScheduleResult, State,
@@ -12,10 +13,41 @@ use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
+use imbl::Vector;
 use log::warn;
 use rand::Rng;
 
-pub fn schedule_runnable<H: HashPolicy, L: Logger>(
+/// Stochastic beam selection: K-tournament over a queue, scored by novelty + priority.
+fn beam_select<H: HashPolicy>(
+    queue: &Vector<Runnable<H>>,
+    eligible: &[usize],
+    global_snapshot: Option<&VertexMap>,
+    rng: &mut impl Rng,
+) -> usize {
+    let score = |r: &Runnable<H>| -> f64 {
+        let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
+        0.25 * novelty + 0.75 * r.priority()
+    };
+
+    if eligible.len() <= 1 {
+        return eligible[0];
+    }
+
+    const K: usize = 10;
+    let mut best_idx = eligible[rng.random_range(0..eligible.len())];
+    let mut best_score = score(&queue[best_idx]);
+    for _ in 1..K.min(eligible.len()) {
+        let i = eligible[rng.random_range(0..eligible.len())];
+        let s = score(&queue[i]);
+        if s > best_score {
+            best_idx = i;
+            best_score = s;
+        }
+    }
+    best_idx
+}
+
+pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
@@ -26,60 +58,88 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
     global_state: &GlobalState,
     policy: &SchedulePolicy,
     strict_timers: bool,
+    selector: &mut Q,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
-    let len = state.runnable_tasks.len();
-    if len == 0 {
-        return Ok(ScheduleResult::None); // Halt equivalent
+    if state.all_queues_empty() {
+        return Ok(ScheduleResult::None);
     }
 
     let mut rng = rand::rng();
 
-    // Check if a runnable is eligible (labeled timers need permission under strict_timers)
-    let is_eligible = |r: &Runnable<H>| -> bool {
-        if !strict_timers {
-            return true;
-        }
-        if let Runnable::Timer(t) = r {
-            if let Some(ref label) = t.label {
-                return state.allowed_timers.contains(&(t.node.index, label.clone()));
-            }
-        }
-        true
-    };
-
-    // Build list of eligible indices
-    let eligible: Vec<usize> = (0..len)
-        .filter(|&i| is_eligible(&state.runnable_tasks[i]))
-        .collect();
-
-    if eligible.is_empty() {
-        return Ok(ScheduleResult::None);
-    }
-
-    // Combined score: novelty (exploration) + priority (urgency)
-    let score = |r: &Runnable<H>| -> f64 {
-        let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
-        0.25 * novelty + 0.75 * r.priority()
-    };
-
-    let idx = if eligible.len() > 1 {
-        const K: usize = 10;
-        let mut best_idx = eligible[rng.random_range(0..eligible.len())];
-        let mut best_score = score(&state.runnable_tasks[best_idx]);
-        for _ in 1..K.min(eligible.len()) {
-            let i = eligible[rng.random_range(0..eligible.len())];
-            let s = score(&state.runnable_tasks[i]);
-            if s > best_score {
-                best_idx = i;
-                best_score = s;
-            }
-        }
-        best_idx
+    // Build QueueInfo, accounting for strict_timers eligibility
+    let timer_queue_size = if strict_timers {
+        state
+            .timer_queue
+            .iter()
+            .filter(|r| {
+                if let Runnable::Timer(t) = r {
+                    t.label
+                        .as_ref()
+                        .map_or(true, |l| state.allowed_timers.contains(&(t.node.index, l.clone())))
+                } else {
+                    true
+                }
+            })
+            .count()
     } else {
-        eligible[0]
+        state.timer_queue.len()
     };
 
-    let runnable = state.runnable_tasks.remove(idx);
+    let info = QueueInfo {
+        local_queue_sizes: state.local_queues.iter().map(|q| q.len()).collect(),
+        network_queue_size: state.network_queue.len(),
+        timer_queue_size,
+        step: state.crash_info.current_step,
+    };
+
+    let selection = match selector.select(&info, &mut rng) {
+        Some(s) => s,
+        None => return Ok(ScheduleResult::None),
+    };
+
+    let runnable = match selection {
+        QueueSelection::Local(node_idx) => {
+            let queue = &state.local_queues[node_idx];
+            let eligible: Vec<usize> = (0..queue.len()).collect();
+            if eligible.is_empty() {
+                return Ok(ScheduleResult::None);
+            }
+            let idx = beam_select(queue, &eligible, global_snapshot, &mut rng);
+            state.local_queues[node_idx].remove(idx)
+        }
+        QueueSelection::Network => {
+            let queue = &state.network_queue;
+            let eligible: Vec<usize> = (0..queue.len()).collect();
+            if eligible.is_empty() {
+                return Ok(ScheduleResult::None);
+            }
+            let idx = beam_select(queue, &eligible, global_snapshot, &mut rng);
+            state.network_queue.remove(idx)
+        }
+        QueueSelection::Timer => {
+            let queue = &state.timer_queue;
+            let eligible: Vec<usize> = if strict_timers {
+                (0..queue.len())
+                    .filter(|&i| {
+                        if let Runnable::Timer(t) = &queue[i] {
+                            t.label.as_ref().map_or(true, |l| {
+                                state.allowed_timers.contains(&(t.node.index, l.clone()))
+                            })
+                        } else {
+                            true
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..queue.len()).collect()
+            };
+            if eligible.is_empty() {
+                return Ok(ScheduleResult::None);
+            }
+            let idx = beam_select(queue, &eligible, global_snapshot, &mut rng);
+            state.timer_queue.remove(idx)
+        }
+    };
 
     match runnable {
         Runnable::Crash { node_id, .. } => {
@@ -109,15 +169,12 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
             Ok(ScheduleResult::Heal)
         }
         Runnable::Timer(timer) => {
-            // Drop timer if node is crashed
             if state.crash_info.currently_crashed.contains(&timer.node) {
                 return Ok(ScheduleResult::None);
             }
 
-            // Send a unit value to the timer's channel to signal completion
             if let Some(mut chan) = state.channels.get(&timer.channel).cloned() {
                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                    // There's a reader waiting - directly wake it
                     let mut r_node_env = state.nodes[reader.node.index].clone();
                     if let Err(e) = crate::simulator::core::eval::store(
                         &lhs,
@@ -127,17 +184,22 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                     ) {
                         log::warn!("Store failed in timer completion: {}", e);
                     }
-                    state.nodes[reader.node.index] = r_node_env;
-                    state.runnable_tasks.push_back(Runnable::Record(reader));
+                    let node_index = reader.node.index;
+                    state.nodes[node_index] = r_node_env;
+                    state.push_to_local(node_index, Runnable::Record(reader));
                 } else {
-                    // No reader waiting - buffer the value
                     chan.buffer.push_back(Value::<H>::unit());
                 }
                 state.channels.insert(timer.channel, chan);
             }
             if let Some(label) = timer.label {
-                state.allowed_timers.remove(&(timer.node.index, label.clone()));
-                Ok(ScheduleResult::TimerFired { node_id: timer.node, label })
+                state
+                    .allowed_timers
+                    .remove(&(timer.node.index, label.clone()));
+                Ok(ScheduleResult::TimerFired {
+                    node_id: timer.node,
+                    label,
+                })
             } else {
                 Ok(ScheduleResult::None)
             }
@@ -180,12 +242,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                         ..
                     } => {
                         state.partition_info.buffer_channel_send(
-                            dest_node,
-                            channel,
-                            message,
-                            origin_node,
-                            pc,
-                            priority,
+                            dest_node, channel, message, origin_node, pc, priority,
                         );
                     }
                     _ => unreachable!(),
@@ -193,7 +250,6 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                 return Ok(ScheduleResult::None);
             }
 
-            // Network faults (random drops)
             let is_remote = src_node != dest_node;
             if is_remote && randomly_drop_msgs && rng.random::<f64>() < 0.3 {
                 return Ok(ScheduleResult::None);
@@ -202,13 +258,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
             match other {
                 Runnable::Record(r) => {
                     let result = exec(
-                        state,
-                        logger,
-                        program,
-                        r,
-                        global_snapshot,
-                        local_coverage,
-                        policy,
+                        state, logger, program, r, global_snapshot, local_coverage, policy,
                     )?;
                     match result {
                         Some(client_op) => Ok(ScheduleResult::ClientOp(client_op)),
@@ -220,7 +270,6 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                 } => {
                     if let Some(mut chan) = state.channels.get(&channel).cloned() {
                         if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
-                            // Wakeup reader
                             let mut r_node_env = state.nodes[reader.node.index].clone();
                             if let Err(e) = crate::simulator::core::eval::store(
                                 &lhs,
@@ -230,10 +279,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger>(
                             ) {
                                 log::warn!("Store failed in remote channel delivery: {}", e);
                             }
-                            state.nodes[reader.node.index] = r_node_env;
-                            state.runnable_tasks.push_back(Runnable::Record(reader));
+                            let node_index = reader.node.index;
+                            state.nodes[node_index] = r_node_env;
+                            state.push_to_local(node_index, Runnable::Record(reader));
                         } else {
-                            // Unbounded buffer
                             chan.buffer.push_back(message);
                         }
                         state.channels.insert(channel, chan);
@@ -253,47 +302,51 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     }
     state.crash_info.currently_crashed.insert(node_id);
 
-    let tasks = std::mem::take(&mut state.runnable_tasks);
-    for task in tasks {
-        match task {
-            Runnable::Timer(timer) => {
-                // Drop timers for crashed nodes
-                if timer.node != node_id {
-                    state.runnable_tasks.push_back(Runnable::Timer(timer));
-                }
-            }
-            Runnable::Record(record) => {
-                if record.node == node_id {
-                    let is_external = record.origin_node != record.node;
-                    if is_external {
-                        let mut record = record;
-                        record.reset();
-                        state
-                            .crash_info
-                            .queued_messages
-                            .push_back((node_id, record));
-                    }
-                } else {
-                    state.runnable_tasks.push_back(Runnable::Record(record));
-                }
-            }
-            Runnable::ChannelSend { target, .. } => {
-                // If target is the crashed node, drop it.
-                // If target is another node, keep it.
-                if target != node_id {
-                    state.runnable_tasks.push_back(task);
-                }
-            }
-            // Keep other crash/recover/partition/heal runnables for different nodes
-            Runnable::Crash { node_id: nid, .. } | Runnable::Recover { node_id: nid, .. } => {
-                if nid != node_id {
-                    state.runnable_tasks.push_back(task);
-                }
-            }
-            Runnable::Partition { .. } | Runnable::Heal { .. } => {
-                state.runnable_tasks.push_back(task);
+    // 1. Process local queue for crashed node: save external records, drop the rest
+    let local = std::mem::take(&mut state.local_queues[node_id.index]);
+    for task in local {
+        if let Runnable::Record(record) = task {
+            if record.origin_node != record.node {
+                let mut record = record;
+                record.reset();
+                state
+                    .crash_info
+                    .queued_messages
+                    .push_back((node_id, record));
             }
         }
+    }
+
+    // 2. Filter network queue: remove items targeting the crashed node
+    let net = std::mem::take(&mut state.network_queue);
+    for task in net {
+        match &task {
+            Runnable::Record(r) if r.node == node_id => {
+                if r.origin_node != r.node {
+                    let mut r = r.clone();
+                    r.reset();
+                    state
+                        .crash_info
+                        .queued_messages
+                        .push_back((node_id, r));
+                }
+            }
+            Runnable::ChannelSend { target, .. } if *target == node_id => {}
+            Runnable::Crash { node_id: nid, .. } | Runnable::Recover { node_id: nid, .. }
+                if *nid == node_id => {}
+            _ => state.network_queue.push_back(task),
+        }
+    }
+
+    // 3. Filter timer queue: remove timers for the crashed node
+    let timers = std::mem::take(&mut state.timer_queue);
+    for task in timers {
+        if let Runnable::Timer(ref t) = task {
+            if t.node == node_id {
+                continue;
+            }
+        }
+        state.timer_queue.push_back(task);
     }
 }
 
@@ -330,7 +383,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
     let queued = std::mem::take(&mut state.crash_info.queued_messages);
     for (dest, record) in queued {
         if dest == node_id {
-            state.runnable_tasks.push_back(Runnable::Record(record));
+            state.push_runnable(Runnable::Record(record));
         } else {
             state.crash_info.queued_messages.push_back((dest, record));
         }

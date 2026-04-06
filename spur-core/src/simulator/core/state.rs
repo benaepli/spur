@@ -437,7 +437,9 @@ pub enum ScheduleResult<H: HashPolicy> {
 #[derive(Debug, Clone)]
 pub struct State<H: HashPolicy> {
     pub nodes: Vector<Env<H>>, // Index is node_id.index
-    pub runnable_tasks: Vector<Runnable<H>>,
+    pub local_queues: Vec<Vector<Runnable<H>>>,
+    pub network_queue: Vector<Runnable<H>>,
+    pub timer_queue: Vector<Runnable<H>>,
     pub channels: ImHashMap<ChannelId, ChannelState<H>>,
     pub crash_info: CrashInfo<H>,
     pub partition_info: PartitionInfo<H>,
@@ -468,9 +470,12 @@ impl<H: HashPolicy> State<H> {
                 global_index += 1;
             }
         }
+        let num_nodes = nodes.len();
         Self {
             nodes,
-            runnable_tasks: Vector::new(),
+            local_queues: (0..num_nodes).map(|_| Vector::new()).collect(),
+            network_queue: Vector::new(),
+            timer_queue: Vector::new(),
             channels: ImHashMap::new(),
             crash_info: CrashInfo {
                 currently_crashed: OrdSet::new(),
@@ -493,6 +498,7 @@ impl<H: HashPolicy> State<H> {
         let mut env = Env::<H>::with_slots(node_slot_count);
         env.set(0, Value::<H>::node(node_id)); // Slot 0 = self
         self.nodes.push_back(env);
+        self.local_queues.push(Vector::new());
         node_id
     }
 
@@ -508,6 +514,50 @@ impl<H: HashPolicy> State<H> {
         id
     }
 
+    /// Auto-route a runnable to the correct queue.
+    /// Records use origin_node == node to decide local vs network.
+    /// Use `push_to_local()` for continuations/wakeups where the record
+    /// is already delivered and being re-enqueued.
+    pub fn push_runnable(&mut self, runnable: Runnable<H>) {
+        match &runnable {
+            Runnable::Timer(_) => self.timer_queue.push_back(runnable),
+            Runnable::ChannelSend { .. } => self.network_queue.push_back(runnable),
+            Runnable::Partition { .. } | Runnable::Heal { .. } => {
+                self.network_queue.push_back(runnable)
+            }
+            Runnable::Crash { node_id, .. } | Runnable::Recover { node_id, .. } => {
+                let idx = node_id.index;
+                self.local_queues[idx].push_back(runnable);
+            }
+            Runnable::Record(r) => {
+                if r.origin_node == r.node {
+                    self.local_queues[r.node.index].push_back(runnable);
+                } else {
+                    self.network_queue.push_back(runnable);
+                }
+            }
+        }
+    }
+
+    /// Force a runnable into a specific node's local queue.
+    pub fn push_to_local(&mut self, node_index: usize, runnable: Runnable<H>) {
+        self.local_queues[node_index].push_back(runnable);
+    }
+
+    /// True when all three queue groups are empty.
+    pub fn all_queues_empty(&self) -> bool {
+        self.network_queue.is_empty()
+            && self.timer_queue.is_empty()
+            && self.local_queues.iter().all(|q| q.is_empty())
+    }
+
+    /// Total number of runnables across all queues.
+    pub fn total_runnable_count(&self) -> usize {
+        self.local_queues.iter().map(|q| q.len()).sum::<usize>()
+            + self.network_queue.len()
+            + self.timer_queue.len()
+    }
+
     /// Compute state signature by aggregating component signatures.
     pub fn signature(&self) -> u64 {
         let mut h: u64 = 0;
@@ -517,9 +567,25 @@ impl<H: HashPolicy> State<H> {
             h ^= H::mix(env.sig, i as u32);
         }
 
-        // Runnable tasks: Hash each task and mix
-        for (i, task) in self.runnable_tasks.iter().enumerate() {
-            h ^= H::mix(compute_hash(task), (1000 + i) as u32);
+        // Local queues
+        let mut idx = 1000usize;
+        for queue in &self.local_queues {
+            for task in queue.iter() {
+                h ^= H::mix(compute_hash(task), idx as u32);
+                idx += 1;
+            }
+        }
+
+        // Network queue
+        for task in self.network_queue.iter() {
+            h ^= H::mix(compute_hash(task), idx as u32);
+            idx += 1;
+        }
+
+        // Timer queue
+        for task in self.timer_queue.iter() {
+            h ^= H::mix(compute_hash(task), idx as u32);
+            idx += 1;
         }
 
         // Channels: Order-independent XOR
@@ -615,12 +681,12 @@ impl<H: HashPolicy> Continuation<H> {
                 };
                 if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
                     let mut node_env = state.nodes[reader.node.index].clone();
-                    // Note: store errors in continuations are logged but ignored (fire-and-forget)
                     if let Err(e) = store(&lhs, val, &mut reader.env, &mut node_env) {
                         log::warn!("Store failed in async continuation: {}", e);
                     }
-                    state.nodes[reader.node.index] = node_env;
-                    state.runnable_tasks.push_back(Runnable::Record(reader));
+                    let node_index = reader.node.index;
+                    state.nodes[node_index] = node_env;
+                    state.push_to_local(node_index, Runnable::Record(reader));
                 } else {
                     chan.buffer.push_back(val);
                 }
