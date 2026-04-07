@@ -262,6 +262,7 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
     num_servers: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<State<H>, RuntimeError> {
     // Look up role NameIds from the program
     let server_role = program
@@ -298,6 +299,7 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
                 global_snapshot,
                 local_coverage,
                 &SchedulePolicy::Fixed,
+                purgatory_config,
             )?;
         }
     }
@@ -312,6 +314,7 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
     num_servers: usize,
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
     let init_fn_name = "Node.Init";
     let Some(init_fn) = program.get_func_by_name(init_fn_name) else {
@@ -362,6 +365,7 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
             global_snapshot,
             local_coverage,
             &SchedulePolicy::Fixed,
+            purgatory_config,
         )?;
     }
     Ok(())
@@ -425,6 +429,7 @@ pub fn run_single_simulation(
         num_servers,
         Some(&global_snapshot),
         &mut path_state.coverage,
+        &config.purgatory,
     )?;
 
     let topology_info = TopologyInfo {
@@ -439,6 +444,7 @@ pub fn run_single_simulation(
         num_servers,
         Some(&global_snapshot),
         &mut path_state.coverage,
+        &config.purgatory,
     )?;
 
     exec_plan(
@@ -646,6 +652,7 @@ fn run_single_plan(
         num_servers_usize,
         Some(&global_snapshot),
         &mut path_state.coverage,
+        purgatory_config,
     )?;
 
     let topology_info = TopologyInfo {
@@ -660,6 +667,7 @@ fn run_single_plan(
         num_servers_usize,
         Some(&global_snapshot),
         &mut path_state.coverage,
+        purgatory_config,
     )?;
 
     exec_plan(

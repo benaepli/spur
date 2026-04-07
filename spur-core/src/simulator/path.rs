@@ -284,6 +284,7 @@ pub fn exec_plan<H: HashPolicy>(
                                 global_snapshot,
                                 &mut path_state.coverage,
                                 policy,
+                                purgatory_config,
                             ) {
                                 log::warn!(
                                     "Failed to initialize dynamic client node {}: {}",

@@ -21,6 +21,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<Value<H>, RuntimeError> {
     let mut node_env = state.nodes[node_id.index].clone();
     let result = exec_sync_inner(
@@ -34,6 +35,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
         policy,
+        purgatory_config,
         None, // top-level sync calls have no causal client op
     );
     state.nodes[node_id.index] = node_env;
@@ -56,6 +58,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
     pending_trace_id: &mut Option<i64>,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
@@ -104,6 +107,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     global_snapshot,
                     local_coverage,
                     policy,
+                    purgatory_config,
                     causal_operation_id,
                 )?;
 
@@ -157,15 +161,19 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     trace_id: pending_trace_id.take(),
                 };
 
-                if state.crash_info.currently_crashed.contains(&target_node) {
-                    state
-                        .crash_info
-                        .queued_messages
-                        .push_back((target_node, new_record));
-                } else if state.partition_info.is_blocked(node_id, target_node) {
-                    state
-                        .partition_info
-                        .buffer_record(target_node, new_record);
+                if purgatory_config.delay_probability > 0.0
+                    && rng.random::<f64>() < purgatory_config.delay_probability
+                {
+                    let (min, max) = purgatory_config.delay_duration_range;
+                    let duration = if min >= max {
+                        min
+                    } else {
+                        let ln_min = (min as f64).ln();
+                        let ln_max = (max as f64).ln();
+                        rng.random_range(ln_min..=ln_max).exp().round() as i32
+                    };
+                    let release_step = state.crash_info.current_step + duration;
+                    state.delay_runnable(release_step, Runnable::Record(new_record));
                 } else {
                     state.push_runnable(Runnable::Record(new_record));
                 }
@@ -385,6 +393,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
 ) -> Result<Value<H>, RuntimeError> {
     let mut pc = start_pc;
@@ -409,6 +418,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
             global_snapshot,
             local_coverage,
             policy,
+            purgatory_config,
             causal_operation_id,
             &mut pending_trace_id,
         )? {
@@ -466,6 +476,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
             global_snapshot,
             local_coverage,
             policy,
+            purgatory_config,
             causal_operation_id,
             &mut pending_trace_id,
         )? {

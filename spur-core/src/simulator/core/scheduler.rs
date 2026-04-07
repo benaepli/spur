@@ -31,7 +31,8 @@ fn beam_select<H: HashPolicy>(
     let score = |r: &Runnable<H>| -> f64 {
         let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
         let priority = r.priority();
-        let is_quick_fire = matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
+        let is_quick_fire =
+            matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
         if is_quick_fire {
             let w = 0.75 * quick_fire_multiplier;
             (0.25 * novelty + w * priority) / (0.25 + w)
@@ -86,9 +87,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             .iter()
             .filter(|r| {
                 if let Runnable::Timer(t) = r {
-                    t.label
-                        .as_ref()
-                        .map_or(true, |l| state.allowed_timers.contains(&(t.node.index, l.clone())))
+                    t.label.as_ref().map_or(true, |l| {
+                        state.allowed_timers.contains(&(t.node.index, l.clone()))
+                    })
                 } else {
                     true
                 }
@@ -117,7 +118,14 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(queue, &eligible, global_snapshot, &state.crash_info.currently_crashed, quick_fire_multiplier, &mut rng);
+            let idx = beam_select(
+                queue,
+                &eligible,
+                global_snapshot,
+                &state.crash_info.currently_crashed,
+                quick_fire_multiplier,
+                &mut rng,
+            );
             state.local_queues[node_idx].remove(idx)
         }
         QueueSelection::Network => {
@@ -126,7 +134,14 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(queue, &eligible, global_snapshot, &state.crash_info.currently_crashed, quick_fire_multiplier, &mut rng);
+            let idx = beam_select(
+                queue,
+                &eligible,
+                global_snapshot,
+                &state.crash_info.currently_crashed,
+                quick_fire_multiplier,
+                &mut rng,
+            );
             state.network_queue.remove(idx)
         }
         QueueSelection::Timer => {
@@ -149,7 +164,14 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(queue, &eligible, global_snapshot, &state.crash_info.currently_crashed, quick_fire_multiplier, &mut rng);
+            let idx = beam_select(
+                queue,
+                &eligible,
+                global_snapshot,
+                &state.crash_info.currently_crashed,
+                quick_fire_multiplier,
+                &mut rng,
+            );
             state.timer_queue.remove(idx)
         }
     };
@@ -170,6 +192,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                 global_snapshot,
                 local_coverage,
                 policy,
+                purgatory_config,
             )?;
             Ok(ScheduleResult::Recover { node_id })
         }
@@ -255,7 +278,12 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                         ..
                     } => {
                         state.partition_info.buffer_channel_send(
-                            dest_node, channel, message, origin_node, pc, priority,
+                            dest_node,
+                            channel,
+                            message,
+                            origin_node,
+                            pc,
+                            priority,
                         );
                     }
                     _ => unreachable!(),
@@ -271,7 +299,13 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             match other {
                 Runnable::Record(r) => {
                     let result = exec(
-                        state, logger, program, r, global_snapshot, local_coverage, policy,
+                        state,
+                        logger,
+                        program,
+                        r,
+                        global_snapshot,
+                        local_coverage,
+                        policy,
                         purgatory_config,
                     )?;
                     match result {
@@ -339,10 +373,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
                 if r.origin_node != r.node {
                     let mut r = r.clone();
                     r.reset();
-                    state
-                        .crash_info
-                        .queued_messages
-                        .push_back((node_id, r));
+                    state.crash_info.queued_messages.push_back((node_id, r));
                 }
             }
             Runnable::ChannelSend { target, .. } if *target == node_id => {}
@@ -362,11 +393,6 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
         }
         state.timer_queue.push_back(task);
     }
-
-    // 4. Filter purgatory: remove items targeting the crashed node
-    state.purgatory.retain(|(_, task)| {
-        !matches!(task, Runnable::ChannelSend { target, .. } if *target == node_id)
-    });
 }
 
 fn recover_crashed_node<H: HashPolicy, L: Logger>(
@@ -379,6 +405,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
     if !state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is not crashed", node_id);
@@ -397,6 +424,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
         policy,
+        purgatory_config,
     )?;
 
     let queued = std::mem::take(&mut state.crash_info.queued_messages);
@@ -420,6 +448,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
     use crate::compiler::cfg::{SELF_SLOT, VarSlot};
 
@@ -450,6 +479,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
         policy,
+        purgatory_config,
     )?;
 
     recover_node(
@@ -462,6 +492,7 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
         policy,
+        purgatory_config,
     )
 }
 
@@ -475,6 +506,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
     global_snapshot: Option<&VertexMap>,
     local_coverage: &mut LocalCoverage,
     policy: &SchedulePolicy,
+    purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
     let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
         return Ok(());
@@ -527,7 +559,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
         global_snapshot,
         local_coverage,
         policy,
-        &PurgatoryConfig::default(),
+        purgatory_config,
     )?;
     Ok(())
 }
