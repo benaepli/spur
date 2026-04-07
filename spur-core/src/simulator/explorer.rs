@@ -161,15 +161,23 @@ impl SingleRunConfig {
     pub fn random(constraints: &ExplorerConfig) -> Self {
         let mut rng = rand::rng();
         let queue_policy = if rng.random::<f64>() < 0.2 {
-            let p_timer: f64 = rng.random_range(0.05..=0.3);
+            let p_timer = if rng.random::<f64>() < 0.8 {
+                rng.random_range(0.005..=0.03)
+            } else {
+                rng.random_range(0.05..=0.3)
+            };
             let preempt_interval: i32 = rng.random_range(10..=200);
             QueuePolicyConfig::Preemptive {
                 p_timer,
                 preempt_interval,
             }
         } else {
-            let p_local: f64 = rng.random_range(0.1..=0.6);
-            let p_timer: f64 = rng.random_range(0.1..=(0.9 - p_local));
+            let p_local: f64 = rng.random_range(0.6..=0.95);
+            let p_timer = if rng.random::<f64>() < 0.8 {
+                rng.random_range(0.005..=0.03)
+            } else {
+                rng.random_range(0.05..=0.2)
+            };
             QueuePolicyConfig::Probabilistic { p_local, p_timer }
         };
         SingleRunConfig {
@@ -236,16 +244,16 @@ impl SingleRunConfig {
                     ref mut p_timer,
                 } => {
                     let delta: f64 = rng.random_range(-0.1..=0.1);
-                    *p_local = (*p_local + delta).clamp(0.05, 0.8);
+                    *p_local = (*p_local + delta).clamp(0.6, 0.95);
                     let delta: f64 = rng.random_range(-0.1..=0.1);
-                    *p_timer = (*p_timer + delta).clamp(0.05, 0.9 - *p_local);
+                    *p_timer = (*p_timer + delta).clamp(0.005, 0.3);
                 }
                 QueuePolicyConfig::Preemptive {
                     ref mut p_timer,
                     ref mut preempt_interval,
                 } => {
                     let delta: f64 = rng.random_range(-0.05..=0.05);
-                    *p_timer = (*p_timer + delta).clamp(0.05, 0.3);
+                    *p_timer = (*p_timer + delta).clamp(0.005, 0.3);
                     let delta: i32 = rng.random_range(-20..=20);
                     *preempt_interval = (*preempt_interval + delta).clamp(5, 300);
                 }

@@ -183,8 +183,8 @@ pub enum QueuePolicyConfig {
 impl Default for QueuePolicyConfig {
     fn default() -> Self {
         QueuePolicyConfig::Probabilistic {
-            p_local: 0.34,
-            p_timer: 0.33,
+            p_local: 0.80,
+            p_timer: 0.03,
         }
     }
 }
