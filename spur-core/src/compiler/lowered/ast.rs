@@ -49,6 +49,10 @@ pub enum LExprKind {
 
     UnwrapOptional(Box<LExpr>),
 
+    MakeIter(Box<LExpr>),
+    IterIsDone(Box<LExpr>),
+    IterNext(Box<LExpr>),
+
     MakeChannel,
     Send(Box<LExpr>, Box<LExpr>),
     Recv(Box<LExpr>),

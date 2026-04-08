@@ -522,6 +522,9 @@ impl Compiler {
             | Tail(e)
             | Len(e)
             | UnwrapOptional(e)
+            | MakeIter(e)
+            | IterIsDone(e)
+            | IterNext(e)
             | Recv(e)
             | TupleAccess(e, _)
             | FieldAccess(e, _)
@@ -1115,6 +1118,7 @@ impl Compiler {
                 self.compile_unary(e, target, next_vertex, ctx,
                     |v| Expr::Find(v, Box::new(Expr::String(field))))
             }
+            LExprKind::MakeIter(_) | LExprKind::IterIsDone(_) | LExprKind::IterNext(_) => todo!("Iterator primitives to CFG"),
             LExprKind::UnwrapOptional(e) => {
                 self.compile_unary(e, target, next_vertex, ctx, Expr::Unwrap)
             }
@@ -1513,6 +1517,7 @@ impl Compiler {
                 Box::new(self.try_to_expr(target)?),
                 Box::new(Expr::String(EcoString::from(field.as_str()))),
             ),
+            LExprKind::MakeIter(_) | LExprKind::IterIsDone(_) | LExprKind::IterNext(_) => return None,
             LExprKind::UnwrapOptional(e) => Expr::Unwrap(Box::new(self.try_to_expr(e)?)),
             LExprKind::WrapInOptional(e) => Expr::Some(Box::new(self.try_to_expr(e)?)),
             LExprKind::SafeFieldAccess(target, field) => Expr::SafeFind(

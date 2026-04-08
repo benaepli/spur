@@ -16,6 +16,7 @@ pub enum Type {
     Role(NameId, String),
     Optional(Box<Type>),
     Chan(Box<Type>),
+    Iter(Box<Type>),
 
     // Placeholder types.
     EmptyList,
@@ -47,6 +48,7 @@ impl std::fmt::Display for Type {
             Type::Role(_, name) => write!(f, "{}", name),
             Type::Optional(t) => write!(f, "{}?", t),
             Type::Chan(t) => write!(f, "chan<{}>", t),
+            Type::Iter(t) => write!(f, "iter<{}>", t),
             Type::EmptyList => write!(f, "empty list"),
             Type::EmptyMap => write!(f, "empty map"),
             Type::UnknownChannel => write!(f, "unknown channel"),
