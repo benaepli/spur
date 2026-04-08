@@ -120,8 +120,8 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
 
     let type_ids = type_id::assign_type_ids(&typed);
 
-    let mut lowered = lower_program(typed);
-    crate::compiler::lowered::remove_for_loops(&mut lowered);
+    let lowered = lower_program(typed);
+    // lowered::remove_for_loops(&mut lowered);
 
     let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(lowered, type_ids);

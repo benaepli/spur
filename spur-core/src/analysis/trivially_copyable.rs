@@ -80,27 +80,22 @@ pub fn compute_trivially_copyable(
 pub fn is_trivially_copyable(ty: &Type, map: &TriviallyCopyableMap) -> bool {
     match ty {
         Type::Int | Type::String | Type::Bool => true,
-
         Type::Chan(_) => false,
-
         Type::List(elem) => is_trivially_copyable(elem, map),
         Type::Map(key, val) => is_trivially_copyable(key, map) && is_trivially_copyable(val, map),
         Type::Tuple(elems) => elems.iter().all(|e| is_trivially_copyable(e, map)),
         Type::Optional(inner) => is_trivially_copyable(inner, map),
-
         Type::Struct(id, _) | Type::Enum(id, _) => {
             map.get(id)
                 .map(|c| *c == TriviallyCopyable::Trivial)
                 .unwrap_or(true) // Unknown types default to trivial.
         }
-
-        // Roles are just identifiers.
         Type::Role(_, _) => true,
-
         Type::UnknownChannel => false,
         Type::EmptyList | Type::EmptyMap => true,
         Type::Nil => true,
         Type::Never => true,
         Type::Error => true,
+        Type::Iter(t) => is_trivially_copyable(t, map),
     }
 }

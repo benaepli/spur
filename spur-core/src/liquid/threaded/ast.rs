@@ -48,6 +48,10 @@ pub enum TExprKind {
 
     UnwrapOptional(Box<TExpr>),
 
+    MakeIter(Box<TExpr>),
+    IterIsDone(Box<TExpr>),
+    IterNext(Box<TExpr>),
+
     MakeChannel,
     Send(Box<TExpr>, Box<TExpr>, Box<TExpr>),
     Recv(Box<TExpr>, Box<TExpr>),
@@ -103,8 +107,6 @@ pub enum TStatementKind {
     VarInit(TVarInit),
     Assignment(TAssignment),
     Expr(TExpr),
-    ForLoop(TForLoop),
-    ForInLoop(TForInLoop),
     Loop(Vec<TStatement>),
     Error,
 }
@@ -145,30 +147,6 @@ pub struct TVarInit {
 pub struct TAssignment {
     pub target: TExpr,
     pub value: TExpr,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum TForLoopInit {
-    VarInit(TVarInit),
-    Assignment(TAssignment),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TForLoop {
-    pub init: Option<TForLoopInit>,
-    pub condition: Option<TExpr>,
-    pub increment: Vec<TStatement>,
-    pub body: Vec<TStatement>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TForInLoop {
-    pub binding_name: NameId,
-    pub binding_original_name: String,
-    pub iterable: TExpr,
-    pub body: Vec<TStatement>,
     pub span: Span,
 }
 

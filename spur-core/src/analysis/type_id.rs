@@ -94,6 +94,7 @@ fn register_type(ty: &Type, map: &mut TypeIdMap, next_id: &mut u32) {
         | Type::EmptyList
         | Type::EmptyMap
         | Type::UnknownChannel
+        | Type::Iter(_)
         | Type::Nil
         | Type::Never
         | Type::Error => {}
