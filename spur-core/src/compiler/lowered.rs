@@ -3,8 +3,10 @@ use crate::analysis::types::*;
 use crate::parser::{BinOp, Span};
 
 mod ast;
+mod remove_loops;
 
 pub use ast::*;
+pub use remove_loops::*;
 
 pub fn lower_program(typed: TypedProgram) -> LProgram {
     let mut lowerer = Lowerer {
