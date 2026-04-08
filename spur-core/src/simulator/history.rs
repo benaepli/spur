@@ -4,7 +4,6 @@ use crate::simulator::core::{
 use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use duckdb::{Connection, params};
 use log::error;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -257,221 +256,6 @@ pub trait HistoryWriter: Send + Sync {
 
     /// Shuts down the background writer, waiting for all pending writes to complete.
     fn shutdown(&self);
-}
-
-// ─── DuckDB backend ───────────────────────────────────────────────────────────
-
-/// Initialize the DuckDB database with the required tables.
-pub fn init_db(conn: &Connection) -> Result<(), duckdb::Error> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS runs (
-            run_id INTEGER PRIMARY KEY,
-            start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            meta_info TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS executions (
-            run_id INTEGER REFERENCES runs(run_id),
-            seq_num INTEGER,
-            unique_id INTEGER,
-            client_id INTEGER,
-            kind TEXT,
-            action TEXT,
-            payload TEXT,
-            step INTEGER,
-            PRIMARY KEY (run_id, seq_num)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_run_execution ON executions(run_id, seq_num);
-
-        CREATE TABLE IF NOT EXISTS logs (
-            run_id INTEGER REFERENCES runs(run_id),
-            seq_num INTEGER,
-            node_id INTEGER,
-            step INTEGER,
-            content TEXT,
-            PRIMARY KEY (run_id, seq_num)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_run_logs ON logs(run_id);
-
-        CREATE TABLE IF NOT EXISTS traces (
-            run_id INTEGER REFERENCES runs(run_id),
-            seq_num INTEGER,
-            node_id INTEGER,
-            step INTEGER,
-            function_name TEXT,
-            trace_kind TEXT,
-            payload TEXT,
-            schedulable_count INTEGER,
-            trace_id INTEGER,
-            causal_operation_id INTEGER,
-            PRIMARY KEY (run_id, seq_num)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_run_traces ON traces(run_id);",
-    )?;
-
-    Ok(())
-}
-
-fn save_history_db(
-    conn: &Connection,
-    run_id: i64,
-    history: &[PersistableOp],
-) -> Result<(), Box<dyn Error>> {
-    conn.execute("INSERT INTO runs (run_id) VALUES (?1)", params![run_id])?;
-
-    // Use DuckDB's Appender for fast bulk inserts
-    let mut appender = conn.appender("executions")?;
-
-    for (seq_num, op) in history.iter().enumerate() {
-        appender.append_row(params![
-            run_id,
-            seq_num as i64,
-            op.unique_id,
-            op.client_id,
-            op.kind,
-            &op.action,
-            &op.payload_json,
-            op.step
-        ])?;
-    }
-
-    appender.flush()?;
-    Ok(())
-}
-
-fn save_logs_db(
-    conn: &Connection,
-    run_id: i64,
-    logs: &[PersistableLog],
-) -> Result<(), Box<dyn Error>> {
-    // Use DuckDB's Appender for fast bulk inserts
-    let mut appender = conn.appender("logs")?;
-
-    for (seq_num, log) in logs.iter().enumerate() {
-        appender.append_row(params![
-            run_id,
-            seq_num as i64,
-            log.node_id,
-            log.step,
-            &log.content
-        ])?;
-    }
-
-    appender.flush()?;
-    Ok(())
-}
-
-fn save_traces_db(
-    conn: &Connection,
-    run_id: i64,
-    traces: &[PersistableTrace],
-) -> Result<(), Box<dyn Error>> {
-    let mut appender = conn.appender("traces")?;
-
-    for (seq_num, t) in traces.iter().enumerate() {
-        appender.append_row(params![
-            run_id,
-            seq_num as i64,
-            t.node_id,
-            t.step,
-            &t.function_name,
-            t.trace_kind,
-            &t.payload,
-            t.schedulable_count,
-            t.trace_id,
-            t.causal_operation_id
-        ])?;
-    }
-
-    appender.flush()?;
-    Ok(())
-}
-
-/// A background writer that serializes all DuckDB writes to a single thread.
-pub struct DuckDBWriter {
-    sender: Sender<HistoryCommand>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl DuckDBWriter {
-    /// Creates a new DuckDBWriter, opening and initializing the DuckDB database.
-    /// The connection is then moved to a background thread that processes write requests.
-    pub fn new(db_path: &str) -> Result<Self, Box<dyn Error>> {
-        let conn = Connection::open(db_path)?;
-        init_db(&conn)?;
-
-        let (sender, receiver) = mpsc::channel::<HistoryCommand>();
-
-        let handle = thread::spawn(move || {
-            while let Ok(cmd) = receiver.recv() {
-                match cmd {
-                    HistoryCommand::Write {
-                        run_id,
-                        history,
-                        logs,
-                        traces,
-                    } => {
-                        if let Err(e) = save_history_db(&conn, run_id, &history) {
-                            error!("failed to save history for run {}: {}", run_id, e);
-                        }
-                        if let Err(e) = save_logs_db(&conn, run_id, &logs) {
-                            error!("failed to save logs for run {}: {}", run_id, e);
-                        }
-                        if !traces.is_empty() {
-                            if let Err(e) = save_traces_db(&conn, run_id, &traces) {
-                                error!("failed to save traces for run {}: {}", run_id, e);
-                            }
-                        }
-                    }
-                    HistoryCommand::Shutdown => break,
-                }
-            }
-        });
-
-        Ok(Self {
-            sender,
-            handle: Mutex::new(Some(handle)),
-        })
-    }
-}
-
-impl HistoryWriter for DuckDBWriter {
-    fn write(
-        &self,
-        run_id: i64,
-        history: Vec<PersistableOp>,
-        logs: Vec<PersistableLog>,
-        traces: Vec<PersistableTrace>,
-    ) {
-        if let Err(e) = self.sender.send(HistoryCommand::Write {
-            run_id,
-            history,
-            logs,
-            traces,
-        }) {
-            log::error!(
-                "Failed to send history write command for run {}: {}",
-                run_id,
-                e
-            );
-        }
-    }
-
-    fn shutdown(&self) {
-        if let Err(e) = self.sender.send(HistoryCommand::Shutdown) {
-            log::error!("Failed to send shutdown command to DuckDB writer: {}", e);
-        }
-        if let Ok(mut guard) = self.handle.lock() {
-            if let Some(h) = guard.take() {
-                if let Err(e) = h.join() {
-                    log::error!("DuckDB writer thread panicked: {:?}", e);
-                }
-            }
-        }
-    }
 }
 
 // ─── Parquet backend ──────────────────────────────────────────────────────────
@@ -848,7 +632,6 @@ impl HistoryWriter for ParquetWriter {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogBackend {
     Parquet,
-    DuckDB,
 }
 
 impl Default for LogBackend {
@@ -868,6 +651,5 @@ pub fn create_writer(
             std::fs::create_dir_all(&dir)?;
             Ok(Box::new(ParquetWriter::new(&dir)?))
         }
-        LogBackend::DuckDB => Ok(Box::new(DuckDBWriter::new(output_path)?)),
     }
 }

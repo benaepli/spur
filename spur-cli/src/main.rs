@@ -97,15 +97,12 @@ pub enum ExplorerType {
 pub enum LogBackendArg {
     /// Parquet files (default, fast write performance)
     Parquet,
-    /// DuckDB database file
-    Duckdb,
 }
 
 impl From<LogBackendArg> for LogBackend {
     fn from(arg: LogBackendArg) -> Self {
         match arg {
             LogBackendArg::Parquet => LogBackend::Parquet,
-            LogBackendArg::Duckdb => LogBackend::DuckDB,
         }
     }
 }
@@ -283,19 +280,12 @@ fn run_explore(
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("Failed to create directory '{}'", output_dir.display()))?;
 
-    // Determine output path: Parquet uses the directory, DuckDB uses a file inside it
+    // Determine output path: Parquet uses the directory
     let output_path_str: String = match &backend {
         LogBackend::Parquet => output_dir
             .to_str()
             .context("Output dir contains invalid UTF-8")?
             .to_string(),
-        LogBackend::DuckDB => {
-            let db_path = output_dir.join("results.duckdb");
-            db_path
-                .to_str()
-                .context("Database path contains invalid UTF-8")?
-                .to_string()
-        }
     };
     let start = Instant::now();
 
@@ -411,13 +401,6 @@ fn run_run_plan(
             .to_str()
             .context("Output dir contains invalid UTF-8")?
             .to_string(),
-        LogBackend::DuckDB => {
-            let db_path = output_dir.join("results.duckdb");
-            db_path
-                .to_str()
-                .context("Database path contains invalid UTF-8")?
-                .to_string()
-        }
     };
     let start = Instant::now();
 

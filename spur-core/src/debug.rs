@@ -1,119 +1,119 @@
-use duckdb::{Connection, Result, params};
-use std::path::Path;
-
-/// Opens a DuckDB connection for the given path.
-///
-/// - If `path` is a `.duckdb` file, opens it directly.
-/// - If `path` is a directory (Parquet backend), opens an in-memory DuckDB
-///   and uses DuckDB's native `read_parquet()` to query the `.parquet` files
-///   inside the directory. This is transparent to all query methods.
-fn open_connection(path: &Path) -> Result<Connection> {
-    if path.extension().and_then(|e| e.to_str()) == Some("duckdb") {
-        Connection::open(path)
-    } else {
-        // Parquet directory: open in-memory DuckDB
-        Connection::open_in_memory()
-    }
-}
+use anyhow::{Result, anyhow};
+use arrow::array::{Array, AsArray};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub struct SimulatorDebugger {
-    conn: Connection,
-    /// None for DuckDB mode; Some(dir) for Parquet mode.
-    parquet_dir: Option<std::path::PathBuf>,
+    /// Only Parquet mode is supported now.
+    parquet_dir: PathBuf,
 }
 
 impl SimulatorDebugger {
-    /// Connects to an existing simulation database or Parquet directory.
+    /// Connects to a Parquet directory setup.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let conn = open_connection(path)?;
-        let parquet_dir = if path.is_dir() {
-            Some(path.to_path_buf())
-        } else {
-            None
-        };
-        Ok(Self { conn, parquet_dir })
-    }
-
-    /// Returns the SQL table expression to use for `logs`.
-    fn logs_source(&self) -> String {
-        match &self.parquet_dir {
-            None => "logs".to_string(),
-            Some(dir) => {
-                let p = dir.join("logs").join("*.parquet");
-                format!("read_parquet('{}', union_by_name=true)", p.display())
-            }
+        if !path.is_dir() {
+            return Err(anyhow!(
+                "Debug path must be a directory containing parquet files"
+            ));
         }
-    }
-
-    /// Returns the SQL table expression to use for `executions`.
-    fn executions_source(&self) -> String {
-        match &self.parquet_dir {
-            None => "executions".to_string(),
-            Some(dir) => {
-                let p = dir.join("executions").join("*.parquet");
-                format!("read_parquet('{}', union_by_name=true)", p.display())
-            }
-        }
-    }
-
-    /// Returns the SQL table expression to use for `traces`.
-    fn traces_source(&self) -> String {
-        match &self.parquet_dir {
-            None => "traces".to_string(),
-            Some(dir) => {
-                let p = dir.join("traces").join("*.parquet");
-                format!("read_parquet('{}', union_by_name=true)", p.display())
-            }
-        }
+        Ok(Self {
+            parquet_dir: path.to_path_buf(),
+        })
     }
 
     /// Fetches all logs for a specific node, ordered by simulation step.
     pub fn get_node_timeline(&self, run_id: i64, node_id: i64) -> Result<Vec<(i32, String)>> {
-        let src = self.logs_source();
-        let query = format!(
-            "SELECT step, content FROM {src}
-             WHERE run_id = ?1 AND node_id = ?2
-             ORDER BY step ASC"
-        );
-        let mut stmt = self.conn.prepare(&query)?;
+        let dir = self.parquet_dir.join("logs");
+        let batches = read_all_batches(&dir)?;
 
-        let rows = stmt.query_map(params![run_id, node_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
-        rows.collect()
+        let mut results = Vec::new();
+        for batch in batches {
+            let run_id_arr = batch
+                .column_by_name("run_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let node_id_arr = batch
+                .column_by_name("node_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let step_arr = batch
+                .column_by_name("step")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            let content_arr = batch.column_by_name("content").unwrap().as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                if run_id_arr.value(i) == run_id && node_id_arr.value(i) == node_id {
+                    results.push((step_arr.value(i), content_arr.value(i).to_string()));
+                }
+            }
+        }
+        results.sort_by_key(|(step, _)| *step);
+        Ok(results)
     }
 
     /// Fetches all logs for a specific run, ordered by simulation step.
     pub fn get_all_logs(&self, run_id: i64) -> Result<Vec<(i32, Option<i64>, String)>> {
-        let src = self.logs_source();
-        let query = format!(
-            "SELECT step, node_id, content FROM {src}
-             WHERE run_id = ?1
-             ORDER BY step ASC"
-        );
-        let mut stmt = self.conn.prepare(&query)?;
+        let dir = self.parquet_dir.join("logs");
+        let batches = read_all_batches(&dir)?;
 
-        let rows = stmt.query_map(params![run_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
-        rows.collect()
+        let mut results = Vec::new();
+        for batch in batches {
+            let run_id_arr = batch
+                .column_by_name("run_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let node_id_arr = batch
+                .column_by_name("node_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let step_arr = batch
+                .column_by_name("step")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            let content_arr = batch.column_by_name("content").unwrap().as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                if run_id_arr.value(i) == run_id {
+                    let node_id_val = if node_id_arr.is_valid(i) {
+                        Some(node_id_arr.value(i))
+                    } else {
+                        None
+                    };
+                    results.push((
+                        step_arr.value(i),
+                        node_id_val,
+                        content_arr.value(i).to_string(),
+                    ));
+                }
+            }
+        }
+        results.sort_by_key(|(step, _, _)| *step);
+        Ok(results)
     }
 
     /// Returns a summary of a run (count of invocations, crashes, etc.)
     pub fn get_run_summary(&self, run_id: i64) -> Result<std::collections::HashMap<String, i64>> {
-        let src = self.executions_source();
-        let query = format!("SELECT kind, COUNT(*) FROM {src} WHERE run_id = ?1 GROUP BY kind");
-        let mut stmt = self.conn.prepare(&query)?;
-
-        let rows = stmt.query_map(params![run_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
+        let dir = self.parquet_dir.join("executions");
+        let batches = read_all_batches(&dir)?;
 
         let mut summary = std::collections::HashMap::new();
-        for row in rows {
-            let (kind, count) = row?;
-            summary.insert(kind, count);
+        for batch in batches {
+            let run_id_arr = batch
+                .column_by_name("run_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let kind_arr = batch.column_by_name("kind").unwrap().as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                if run_id_arr.value(i) == run_id {
+                    let kind = kind_arr.value(i).to_string();
+                    *summary.entry(kind).or_insert(0) += 1;
+                }
+            }
         }
         Ok(summary)
     }
@@ -121,40 +121,255 @@ impl SimulatorDebugger {
     /// Fetches a combined, interleaved timeline of executions, logs, and traces
     /// for a given run, ordered by simulation step.
     pub fn get_combined_timeline(&self, run_id: i64) -> Result<Vec<CombinedEvent>> {
-        let exec_src = self.executions_source();
-        let logs_src = self.logs_source();
-        let traces_src = self.traces_source();
+        let mut temp = Vec::new();
 
-        let query = format!(
-            "SELECT step, source, node_id, description FROM (
-                SELECT step, 'Execution' AS source, client_id AS node_id, seq_num,
-                       kind || ': ' || action AS description
-                FROM {exec_src} WHERE run_id = ?1
-              UNION ALL
-                SELECT step, 'Log' AS source, node_id, seq_num,
-                       content AS description
-                FROM {logs_src} WHERE run_id = ?1
-              UNION ALL
-                SELECT step, 'Trace' AS source, node_id, seq_num,
-                       trace_kind || ' ' || function_name 
-                         || ' [tid=' || trace_id || ']'
-                         || ' [sched=' || schedulable_count || ']'
-                         || CASE WHEN causal_operation_id IS NOT NULL THEN ' [cop=' || causal_operation_id || ']' ELSE '' END
-                       AS description
-                FROM {traces_src} WHERE run_id = ?1
-            ) ORDER BY step ASC, source ASC, seq_num ASC"
-        );
+        // executions
+        let batches = read_all_batches(&self.parquet_dir.join("executions"))?;
+        for batch in batches {
+            let run_id_arr = batch
+                .column_by_name("run_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let step_arr = batch
+                .column_by_name("step")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            let client_id_arr = batch
+                .column_by_name("client_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let seq_num_arr = batch
+                .column_by_name("seq_num")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let kind_arr = batch.column_by_name("kind").unwrap().as_string::<i32>();
+            let action_arr = batch.column_by_name("action").unwrap().as_string::<i32>();
 
-        let mut stmt = self.conn.prepare(&query)?;
-        let rows = stmt.query_map(params![run_id], |row| {
-            Ok(CombinedEvent {
-                step: row.get(0)?,
-                source: row.get(1)?,
-                node_id: row.get(2)?,
-                description: row.get(3)?,
+            for i in 0..batch.num_rows() {
+                if run_id_arr.value(i) == run_id {
+                    temp.push(TempEvent {
+                        step: step_arr.value(i),
+                        source: "Execution".to_string(),
+                        node_id: Some(client_id_arr.value(i)),
+                        description: format!("{}: {}", kind_arr.value(i), action_arr.value(i)),
+                        seq_num: seq_num_arr.value(i),
+                    });
+                }
+            }
+        }
+
+        // logs
+        let batches = read_all_batches(&self.parquet_dir.join("logs"))?;
+        for batch in batches {
+            let run_id_arr = batch
+                .column_by_name("run_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let step_arr = batch
+                .column_by_name("step")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            let node_id_arr = batch
+                .column_by_name("node_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let seq_num_arr = batch
+                .column_by_name("seq_num")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let content_arr = batch.column_by_name("content").unwrap().as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                if run_id_arr.value(i) == run_id {
+                    temp.push(TempEvent {
+                        step: step_arr.value(i),
+                        source: "Log".to_string(),
+                        node_id: Some(node_id_arr.value(i)),
+                        description: content_arr.value(i).to_string(),
+                        seq_num: seq_num_arr.value(i),
+                    });
+                }
+            }
+        }
+
+        // traces
+        let batches = read_all_batches(&self.parquet_dir.join("traces"))?;
+        for batch in batches {
+            let run_id_arr = batch
+                .column_by_name("run_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let step_arr = batch
+                .column_by_name("step")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            let node_id_arr = batch
+                .column_by_name("node_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let seq_num_arr = batch
+                .column_by_name("seq_num")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+
+            let function_name_arr = batch
+                .column_by_name("function_name")
+                .unwrap()
+                .as_string::<i32>();
+            let trace_kind_arr = batch
+                .column_by_name("trace_kind")
+                .unwrap()
+                .as_string::<i32>();
+            let trace_id_arr = batch
+                .column_by_name("trace_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let schedulable_count_arr = batch
+                .column_by_name("schedulable_count")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let causal_operation_id_arr = batch
+                .column_by_name("causal_operation_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+
+            for i in 0..batch.num_rows() {
+                if run_id_arr.value(i) == run_id {
+                    let cop = if causal_operation_id_arr.is_valid(i) {
+                        format!(" [cop={}]", causal_operation_id_arr.value(i))
+                    } else {
+                        "".to_string()
+                    };
+
+                    let desc = format!(
+                        "{} {} [tid={}] [sched={}]{}",
+                        trace_kind_arr.value(i),
+                        function_name_arr.value(i),
+                        trace_id_arr.value(i),
+                        schedulable_count_arr.value(i),
+                        cop
+                    );
+
+                    temp.push(TempEvent {
+                        step: step_arr.value(i),
+                        source: "Trace".to_string(),
+                        node_id: Some(node_id_arr.value(i)),
+                        description: desc,
+                        seq_num: seq_num_arr.value(i),
+                    });
+                }
+            }
+        }
+
+        temp.sort_unstable_by(|a, b| {
+            a.step
+                .cmp(&b.step)
+                .then(a.source.cmp(&b.source))
+                .then(a.seq_num.cmp(&b.seq_num))
+        });
+
+        Ok(temp
+            .into_iter()
+            .map(|e| CombinedEvent {
+                step: e.step,
+                source: e.source,
+                node_id: e.node_id,
+                description: e.description,
             })
-        })?;
-        rows.collect()
+            .collect())
+    }
+
+    /// Fetches all traces for a specific run, and optionally a specific node.
+    pub fn get_traces(&self, run_id: i64, node_id: Option<i64>) -> Result<Vec<TraceEvent>> {
+        let dir = self.parquet_dir.join("traces");
+        let batches = read_all_batches(&dir)?;
+
+        struct TempTrace {
+            event: TraceEvent,
+            seq_num: i64,
+        }
+
+        let mut results = Vec::new();
+        for batch in batches {
+            let run_id_arr = batch
+                .column_by_name("run_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let node_id_arr = batch
+                .column_by_name("node_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let seq_num_arr = batch
+                .column_by_name("seq_num")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+
+            let step_arr = batch
+                .column_by_name("step")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            let function_name_arr = batch
+                .column_by_name("function_name")
+                .unwrap()
+                .as_string::<i32>();
+            let trace_kind_arr = batch
+                .column_by_name("trace_kind")
+                .unwrap()
+                .as_string::<i32>();
+            let trace_id_arr = batch
+                .column_by_name("trace_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let payload_arr = batch.column_by_name("payload").unwrap().as_string::<i32>();
+            let schedulable_count_arr = batch
+                .column_by_name("schedulable_count")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let causal_operation_id_arr = batch
+                .column_by_name("causal_operation_id")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int64Type>();
+
+            for i in 0..batch.num_rows() {
+                if run_id_arr.value(i) == run_id {
+                    let n_id = node_id_arr.value(i);
+                    if let Some(target_node) = node_id {
+                        if n_id != target_node {
+                            continue;
+                        }
+                    }
+
+                    let cop = if causal_operation_id_arr.is_valid(i) {
+                        Some(causal_operation_id_arr.value(i))
+                    } else {
+                        None
+                    };
+
+                    results.push(TempTrace {
+                        event: TraceEvent {
+                            step: step_arr.value(i),
+                            node_id: n_id,
+                            trace_id: trace_id_arr.value(i),
+                            function_name: function_name_arr.value(i).to_string(),
+                            trace_kind: trace_kind_arr.value(i).to_string(),
+                            payload: payload_arr.value(i).to_string(),
+                            schedulable_count: schedulable_count_arr.value(i),
+                            causal_operation_id: cop,
+                        },
+                        seq_num: seq_num_arr.value(i),
+                    });
+                }
+            }
+        }
+
+        results.sort_unstable_by(|a, b| {
+            a.event
+                .step
+                .cmp(&b.event.step)
+                .then(a.seq_num.cmp(&b.seq_num))
+        });
+
+        Ok(results.into_iter().map(|t| t.event).collect())
     }
 }
 
@@ -176,53 +391,30 @@ pub struct TraceEvent {
     pub causal_operation_id: Option<i64>,
 }
 
-impl SimulatorDebugger {
-    /// Fetches all traces for a specific run, and optionally a specific node.
-    pub fn get_traces(&self, run_id: i64, node_id: Option<i64>) -> Result<Vec<TraceEvent>> {
-        let src = self.traces_source();
+struct TempEvent {
+    step: i32,
+    source: String,
+    node_id: Option<i64>,
+    description: String,
+    seq_num: i64,
+}
 
-        if let Some(n_id) = node_id {
-            let q = format!(
-                "SELECT step, node_id, trace_id, function_name, trace_kind, payload, schedulable_count, causal_operation_id
-                 FROM {src}
-                 WHERE run_id = ?1 AND node_id = ?2
-                 ORDER BY step ASC, seq_num ASC"
-            );
-            let mut stmt = self.conn.prepare(&q)?;
-            let rows = stmt.query_map(params![run_id, n_id], |row| {
-                Ok(TraceEvent {
-                    step: row.get(0)?,
-                    node_id: row.get(1)?,
-                    trace_id: row.get(2)?,
-                    function_name: row.get(3)?,
-                    trace_kind: row.get(4)?,
-                    payload: row.get(5)?,
-                    schedulable_count: row.get(6)?,
-                    causal_operation_id: row.get(7)?,
-                })
-            })?;
-            rows.collect()
-        } else {
-            let q = format!(
-                "SELECT step, node_id, trace_id, function_name, trace_kind, payload, schedulable_count, causal_operation_id
-                 FROM {src}
-                 WHERE run_id = ?1
-                 ORDER BY step ASC, seq_num ASC"
-            );
-            let mut stmt = self.conn.prepare(&q)?;
-            let rows = stmt.query_map(params![run_id], |row| {
-                Ok(TraceEvent {
-                    step: row.get(0)?,
-                    node_id: row.get(1)?,
-                    trace_id: row.get(2)?,
-                    function_name: row.get(3)?,
-                    trace_kind: row.get(4)?,
-                    payload: row.get(5)?,
-                    schedulable_count: row.get(6)?,
-                    causal_operation_id: row.get(7)?,
-                })
-            })?;
-            rows.collect()
+fn read_all_batches(dir: &Path) -> Result<Vec<RecordBatch>> {
+    let mut batches = Vec::new();
+    if !dir.exists() {
+        return Ok(batches);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+            let file = fs::File::open(&path)?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let reader = builder.build()?;
+            for batch_result in reader {
+                batches.push(batch_result?);
+            }
         }
     }
+    Ok(batches)
 }
