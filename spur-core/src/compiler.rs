@@ -1,3 +1,4 @@
+pub mod anf;
 pub mod cfg;
 pub mod lowered;
 
@@ -122,6 +123,10 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
 
     let lowered = lower_program(typed);
     // lowered::remove_for_loops(&mut lowered);
+
+    // ANF flattening (Phase 1) — runs but CFG backend still
+    // consumes the original lowered output until Phase 2.
+    let _anf = anf::lower_program(lowered.clone());
 
     let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(lowered, type_ids);
