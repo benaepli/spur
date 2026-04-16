@@ -17,7 +17,7 @@ use crate::analysis::types::{
 };
 use crate::parser::{BinOp, Span};
 use chumsky::span::Span as ChumskySpan;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Clone)]
@@ -173,6 +173,7 @@ pub struct TypeChecker {
     builtin_signatures: HashMap<BuiltinFn, FunctionSignature>,
     role_defs: HashMap<NameId, String>,
     role_func_signatures: HashMap<NameId, HashMap<String, (NameId, FunctionSignature)>>,
+    role_func_name_ids: HashSet<NameId>,
     struct_names: HashMap<NameId, String>,
     enum_names: HashMap<NameId, String>,
     current_return_type: Option<Type>,
@@ -238,6 +239,7 @@ impl TypeChecker {
             builtin_signatures,
             role_defs: HashMap::new(),
             role_func_signatures: HashMap::new(),
+            role_func_name_ids: HashSet::new(),
             struct_names: HashMap::new(),
             enum_names: HashMap::new(),
             current_return_type: None,
@@ -393,6 +395,7 @@ impl TypeChecker {
                         };
 
                         self.func_signatures.insert(func.name, sig.clone());
+                        self.role_func_name_ids.insert(func.name);
                         role_funcs.insert(func.original_name.clone(), (func.name, sig));
                     }
                 }
@@ -1592,7 +1595,8 @@ impl TypeChecker {
                         }
                     };
 
-                    let typed_call = self.check_user_func_call(user_call, &sig);
+                    let is_free = !self.role_func_name_ids.contains(&user_call.name);
+                    let typed_call = self.check_user_func_call(user_call, &sig, is_free);
                     let return_ty = if sig.is_sync {
                         sig.return_type
                     } else {
@@ -2280,6 +2284,7 @@ impl TypeChecker {
                     original_name: call.original_name,
                     args: typed_args,
                     return_type: return_type.clone(),
+                    is_free: false,
                     span: call.span,
                 };
 
@@ -2624,6 +2629,7 @@ impl TypeChecker {
         &mut self,
         call: ResolvedUserFuncCall,
         sig: &FunctionSignature,
+        is_free: bool,
     ) -> TypedUserFuncCall {
         let typed_args = self.check_call_args(&sig.params, call.args, call.span);
 
@@ -2632,6 +2638,7 @@ impl TypeChecker {
             original_name: call.original_name,
             args: typed_args,
             return_type: sig.return_type.clone(),
+            is_free,
             span: call.span,
         }
     }

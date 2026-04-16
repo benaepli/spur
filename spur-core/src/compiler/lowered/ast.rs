@@ -95,6 +95,7 @@ pub struct LUserFuncCall {
     pub original_name: String,
     pub args: Vec<LExpr>,
     pub return_type: Type,
+    pub is_free: bool,
     pub span: Span,
 }
 

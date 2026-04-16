@@ -341,6 +341,7 @@ fn test_compile_sync_function_call() {
         original_name: "Foo".to_string(),
         args: vec![int_lit(10)],
         return_type: Type::Int,
+        is_free: false,
         span: dummy_span(),
     });
 

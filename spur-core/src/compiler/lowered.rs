@@ -1005,6 +1005,7 @@ impl Lowerer {
             original_name: call.original_name,
             args: call.args.into_iter().map(|a| self.lower_expr(a)).collect(),
             return_type: call.return_type,
+            is_free: call.is_free,
             span: call.span,
         }
     }

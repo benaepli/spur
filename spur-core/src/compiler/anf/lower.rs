@@ -554,6 +554,7 @@ impl AnfLowerer {
             original_name: call.original_name,
             args: aargs,
             return_type: call.return_type,
+            is_free: call.is_free,
             span: call.span,
         }
     }

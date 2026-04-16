@@ -96,6 +96,7 @@ pub struct AUserFuncCall {
     pub original_name: String,
     pub args: Vec<AAtomic>,
     pub return_type: Type,
+    pub is_free: bool,
     pub span: Span,
 }
 

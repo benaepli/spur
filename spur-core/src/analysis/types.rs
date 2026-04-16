@@ -144,6 +144,7 @@ pub struct TypedUserFuncCall {
     pub original_name: String,
     pub args: Vec<TypedExpr>,
     pub return_type: Type,
+    pub is_free: bool,
     pub span: Span,
 }
 
