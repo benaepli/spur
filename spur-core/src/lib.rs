@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod compiler;
 pub mod lexer;
+pub mod liquid;
 pub mod parser;
 pub mod visualization;
 

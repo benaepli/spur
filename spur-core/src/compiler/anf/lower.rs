@@ -794,17 +794,11 @@ impl AnfLowerer {
             .map(|vi| {
                 let mut stmts = Vec::new();
                 let aexpr = self.lower_expr_to_aexpr(vi.value, &mut stmts);
-                // TODO(benaepli): I need to handle complex role variable initializations
-                // or restrict the set of allowed ones to being literal.
-                assert!(
-                    stmts.is_empty(),
-                    "role var init produced hoisted stmts: {:?}",
-                    stmts
-                );
                 AVarInit {
                     name: vi.name,
                     original_name: vi.original_name,
                     type_def: vi.type_def,
+                    stmts,
                     value: aexpr,
                     span: vi.span,
                 }

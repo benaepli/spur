@@ -178,6 +178,7 @@ pub struct AVarInit {
     pub name: NameId,
     pub original_name: String,
     pub type_def: Type,
+    pub stmts: Vec<AStatement>,
     pub value: AExpr,
     pub span: Span,
 }

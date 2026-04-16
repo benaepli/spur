@@ -1,6 +1,7 @@
 pub mod anf;
 pub mod cfg;
 pub mod lowered;
+pub mod threaded;
 
 use crate::analysis::checker::{TypeChecker, TypeError};
 use crate::analysis::format::{report_resolution_errors, report_type_errors};
@@ -124,9 +125,12 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     let lowered = lower_program(typed);
     // lowered::remove_for_loops(&mut lowered);
 
-    // ANF flattening (Phase 1) — runs but CFG backend still
-    // consumes the original lowered output until Phase 2.
-    let _anf = anf::lower_program(lowered.clone());
+    // ANF flattening (Phase 1)
+    let anf = anf::lower_program(lowered.clone());
+
+    // State threading (Phase 2) — runs but CFG backend still
+    // consumes the original lowered output until full migration.
+    let _threaded = threaded::lower_program(anf);
 
     let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(lowered, type_ids);
