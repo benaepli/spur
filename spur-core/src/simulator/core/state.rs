@@ -456,6 +456,12 @@ pub enum ScheduleResult<H: HashPolicy> {
     Partition { partition_type: PartitionType },
     /// A network partition was healed.
     Heal,
+    /// A non-client Record runnable was executed (internal RPC delivery).
+    RecordExecuted {
+        entry_pc: Vertex,
+        origin_node: NodeId,
+        dest_node: NodeId,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -1,19 +1,20 @@
 use crate::analysis::resolver::NameId;
-use crate::compiler::cfg::Program;
+use crate::compiler::cfg::{Program, Vertex};
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, PurgatoryConfig,
-    QueuePolicyConfig, QueueSelector, Record, Runnable, RunnableCategory, RuntimeError,
-    SchedulePolicy, ScheduleResult, State, TraceEntry, Value, make_local_env, schedule_runnable,
+    QueuePolicyConfig, QueueSelector, Record, Reservation, Runnable, RunnableCategory,
+    RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, make_local_env,
+    schedule_runnable,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
-    ClientOpSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
+    ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod generator;
 pub mod plan;
@@ -195,7 +196,6 @@ pub fn exec_plan<H: HashPolicy>(
     purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
     let mut selector = queue_policy.into_selector();
-    let mut engine = PlanEngine::new(plan);
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
     // Map from node_id index to the plan engine NodeIndex for pending crash/recover events
@@ -204,6 +204,41 @@ pub fn exec_plan<H: HashPolicy>(
     let mut pending_allow_timer: HashMap<(usize, String), NodeIndex> = HashMap::new();
     let mut pending_partition: Option<NodeIndex> = None;
     let mut pending_heal: Option<NodeIndex> = None;
+
+    // Build name-to-entry-pc map for resolving deliver specs.
+    // Resolution happens once upfront, not per scheduler call.
+    let name_to_entry: HashMap<&str, Vertex> = program
+        .func_name_to_id
+        .iter()
+        .filter_map(|(name, name_id)| {
+            program.rpc.get(name_id).map(|fi| (name.as_str(), fi.entry))
+        })
+        .collect();
+
+    // Reverse map for matching RecordExecuted results back to function names
+    let entry_to_name: HashMap<Vertex, &str> = name_to_entry
+        .iter()
+        .map(|(&name, &entry)| (entry, name))
+        .collect();
+
+    // Collect all deliver events from the plan DAG before PlanEngine::new consumes it.
+    let all_delivers: HashMap<NodeIndex, DeliverSpec> = plan
+        .node_indices()
+        .filter_map(|idx| match &plan[idx].action {
+            EventAction::Deliver(spec) => Some((idx, spec.clone())),
+            _ => None,
+        })
+        .collect();
+
+    // Track deliver states: ready (unlocked) vs completed
+    let mut ready_delivers: HashSet<NodeIndex> = HashSet::new();
+    let mut completed_delivers: HashSet<NodeIndex> = HashSet::new();
+
+    let mut engine = PlanEngine::new(plan);
+
+    // Starvation detection: track consecutive no-progress iterations
+    let mut no_progress_count: i32 = 0;
+    const STARVATION_WARN_THRESHOLD: i32 = 500;
 
     // Look up role NameIds from the program
     let server_role = program
@@ -357,8 +392,27 @@ pub fn exec_plan<H: HashPolicy>(
                     });
                     pending_heal = Some(node_idx);
                 }
+                EventAction::Deliver(_) => {
+                    // Deliver events are constraints, not actions.
+                    // When ready, lift the reservation so the scheduler can pick the match.
+                    ready_delivers.insert(node_idx);
+                }
             }
         }
+
+        // Build reservations from delivers that are NOT yet ready and NOT completed.
+        // These constrain the scheduler from picking their matching runnables early.
+        let reservations: Vec<Reservation> = all_delivers
+            .iter()
+            .filter(|(idx, _)| !ready_delivers.contains(idx) && !completed_delivers.contains(idx))
+            .filter_map(|(_, spec)| {
+                name_to_entry.get(spec.function.as_str()).map(|&entry_pc| Reservation {
+                    entry_pc,
+                    from: spec.from.map(|f| f as usize),
+                    to: spec.to.map(|t| t as usize),
+                })
+            })
+            .collect();
 
         let history_start_len = path_state.history.len();
 
@@ -377,6 +431,7 @@ pub fn exec_plan<H: HashPolicy>(
                 &mut selector,
                 quick_fire_multiplier,
                 purgatory_config,
+                &reservations,
             )?;
 
             match result {
@@ -453,6 +508,37 @@ pub fn exec_plan<H: HashPolicy>(
                         engine.mark_event_completed(plan_node);
                     }
                 }
+                ScheduleResult::RecordExecuted {
+                    entry_pc,
+                    origin_node,
+                    dest_node,
+                } => {
+                    // Check if this record delivery matches any ready deliver event.
+                    if let Some(&func_name) = entry_to_name.get(&entry_pc) {
+                        let matched = ready_delivers
+                            .iter()
+                            .find(|idx| {
+                                if let Some(spec) = all_delivers.get(idx) {
+                                    spec.function == func_name
+                                        && spec
+                                            .to
+                                            .map_or(true, |t| dest_node.index == t as usize)
+                                        && spec
+                                            .from
+                                            .map_or(true, |f| origin_node.index == f as usize)
+                                } else {
+                                    false
+                                }
+                            })
+                            .copied();
+
+                        if let Some(idx) = matched {
+                            ready_delivers.remove(&idx);
+                            completed_delivers.insert(idx);
+                            engine.mark_event_completed(idx);
+                        }
+                    }
+                }
             }
         }
 
@@ -470,6 +556,31 @@ pub fn exec_plan<H: HashPolicy>(
 
         for id in completed {
             in_progress.remove(&id);
+        }
+
+        // Starvation detection: if nothing happened this iteration, increment counter.
+        // Helps catch typos in deliver function names.
+        if path_state.history.len() == history_start_len {
+            no_progress_count += 1;
+            if no_progress_count == STARVATION_WARN_THRESHOLD {
+                let pending_deliver_names: Vec<&str> = ready_delivers
+                    .iter()
+                    .filter_map(|idx| all_delivers.get(idx).map(|s| s.function.as_str()))
+                    .collect();
+                let blocked_deliver_names: Vec<&str> = all_delivers
+                    .iter()
+                    .filter(|(idx, _)| {
+                        !ready_delivers.contains(idx) && !completed_delivers.contains(idx)
+                    })
+                    .map(|(_, s)| s.function.as_str())
+                    .collect();
+                warn!(
+                    "Plan {} stalled for {} iterations. Ready delivers waiting: {:?}. Blocked delivers: {:?}",
+                    run_id, no_progress_count, pending_deliver_names, blocked_deliver_names
+                );
+            }
+        } else {
+            no_progress_count = 0;
         }
     }
 

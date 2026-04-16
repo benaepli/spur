@@ -1,4 +1,4 @@
-use crate::compiler::cfg::Program;
+use crate::compiler::cfg::{Program, Vertex};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::make_local_env;
 use crate::simulator::core::exec::{exec, exec_sync_on_node};
@@ -16,6 +16,30 @@ use crate::simulator::path::TopologyInfo;
 use imbl::{OrdSet, Vector};
 use log::warn;
 use rand::Rng;
+
+/// A resolved deliver reservation. Runnables matching this are excluded from scheduling
+/// until the deliver's DAG dependencies are met.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    pub entry_pc: Vertex,
+    pub from: Option<usize>,
+    pub to: Option<usize>,
+}
+
+impl Reservation {
+    pub fn matches<H: HashPolicy>(&self, runnable: &Runnable<H>) -> bool {
+        match runnable {
+            Runnable::Record(r) => {
+                r.entry_pc == self.entry_pc
+                    && self.to.map_or(true, |t| r.node.index == t)
+                    && self.from.map_or(true, |f| r.origin_node.index == f)
+            }
+            // ChannelSend runnables are not matchable by delivers.
+            // All VR inter-node messages are RPCs (Record runnables).
+            _ => false,
+        }
+    }
+}
 
 /// Stochastic beam selection: K-tournament over a queue, scored by novelty + priority.
 /// For Recover events targeting a currently-crashed node, `quick_fire_multiplier`
@@ -73,6 +97,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
     selector: &mut Q,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
+    reservations: &[Reservation],
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     if state.all_queues_empty() {
         return Ok(ScheduleResult::None);
@@ -80,12 +105,20 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
 
     let mut rng = rand::rng();
 
-    // Build QueueInfo, accounting for strict_timers eligibility
+    // Helper: check if a runnable is reserved
+    let is_reserved = |r: &Runnable<H>| reservations.iter().any(|res| res.matches(r));
+
+    // Build QueueInfo, accounting for strict_timers eligibility AND reservations.
+    // Subtract reserved items so the QueueSelector doesn't route to queues
+    // where all items are reserved (wastes iterations in fully-constrained plans).
     let timer_queue_size = if strict_timers {
         state
             .timer_queue
             .iter()
             .filter(|r| {
+                if is_reserved(r) {
+                    return false;
+                }
                 if let Runnable::Timer(t) = r {
                     t.label.as_ref().map_or(true, |l| {
                         state.allowed_timers.contains(&(t.node.index, l.clone()))
@@ -96,12 +129,16 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             })
             .count()
     } else {
-        state.timer_queue.len()
+        state.timer_queue.iter().filter(|r| !is_reserved(r)).count()
     };
 
     let info = QueueInfo {
-        local_queue_sizes: state.local_queues.iter().map(|q| q.len()).collect(),
-        network_queue_size: state.network_queue.len(),
+        local_queue_sizes: state
+            .local_queues
+            .iter()
+            .map(|q| q.iter().filter(|r| !is_reserved(r)).count())
+            .collect(),
+        network_queue_size: state.network_queue.iter().filter(|r| !is_reserved(r)).count(),
         timer_queue_size,
         step: state.crash_info.current_step,
     };
@@ -114,7 +151,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
     let runnable = match selection {
         QueueSelection::Local(node_idx) => {
             let queue = &state.local_queues[node_idx];
-            let eligible: Vec<usize> = (0..queue.len()).collect();
+            let eligible: Vec<usize> = (0..queue.len())
+                .filter(|&i| !is_reserved(&queue[i]))
+                .collect();
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
@@ -130,7 +169,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
         }
         QueueSelection::Network => {
             let queue = &state.network_queue;
-            let eligible: Vec<usize> = (0..queue.len()).collect();
+            let eligible: Vec<usize> = (0..queue.len())
+                .filter(|&i| !is_reserved(&queue[i]))
+                .collect();
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
@@ -149,6 +190,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             let eligible: Vec<usize> = if strict_timers {
                 (0..queue.len())
                     .filter(|&i| {
+                        if is_reserved(&queue[i]) {
+                            return false;
+                        }
                         if let Runnable::Timer(t) = &queue[i] {
                             t.label.as_ref().map_or(true, |l| {
                                 state.allowed_timers.contains(&(t.node.index, l.clone()))
@@ -159,7 +203,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                     })
                     .collect()
             } else {
-                (0..queue.len()).collect()
+                (0..queue.len())
+                    .filter(|&i| !is_reserved(&queue[i]))
+                    .collect()
             };
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
@@ -298,6 +344,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
 
             match other {
                 Runnable::Record(r) => {
+                    let record_entry_pc = r.entry_pc;
+                    let record_origin = r.origin_node;
+                    let record_dest = r.node;
                     let result = exec(
                         state,
                         logger,
@@ -310,7 +359,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                     )?;
                     match result {
                         Some(client_op) => Ok(ScheduleResult::ClientOp(client_op)),
-                        None => Ok(ScheduleResult::None),
+                        None => Ok(ScheduleResult::RecordExecuted {
+                            entry_pc: record_entry_pc,
+                            origin_node: record_origin,
+                            dest_node: record_dest,
+                        }),
                     }
                 }
                 Runnable::ChannelSend {

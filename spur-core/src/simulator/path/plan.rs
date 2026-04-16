@@ -20,6 +20,13 @@ pub enum ClientOpSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
+pub struct DeliverSpec {
+    pub function: String,
+    pub from: Option<i32>,
+    pub to: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum EventAction {
     ClientRequest(ClientOpSpec),
     CrashNode(i32),
@@ -27,6 +34,7 @@ pub enum EventAction {
     AllowTimer(i32, String),
     Partition(PartitionSpec),
     Heal,
+    Deliver(DeliverSpec),
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]

@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::analysis::resolver::NameId;
 use crate::simulator::core::{PurgatoryConfig, QueuePolicyConfig, SchedulePolicy};
-use crate::simulator::path::plan::{ClientOpSpec, EventAction, PlannedEvent};
+use crate::simulator::path::plan::{ClientOpSpec, DeliverSpec, EventAction, PlannedEvent};
 
 #[derive(Debug, Error)]
 pub enum PlanConfigError {
@@ -90,6 +90,13 @@ pub enum EventSpec {
     AllowTimer(i32, String),
     Partition(PartitionSpec),
     Heal,
+    Deliver {
+        function: String,
+        #[serde(default)]
+        from: Option<i32>,
+        #[serde(default)]
+        to: Option<i32>,
+    },
 }
 
 impl EventSpec {
@@ -124,6 +131,15 @@ impl EventSpec {
                 PartitionSpec::MajoritiesRing => Ok(()),
             },
             EventSpec::Heal => Ok(()),
+            EventSpec::Deliver { from, to, .. } => {
+                if let Some(f) = from {
+                    check(*f)?;
+                }
+                if let Some(t) = to {
+                    check(*t)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -142,6 +158,11 @@ impl EventSpec {
             EventSpec::AllowTimer(t, label) => EventAction::AllowTimer(*t, label.clone()),
             EventSpec::Partition(spec) => EventAction::Partition(spec.clone()),
             EventSpec::Heal => EventAction::Heal,
+            EventSpec::Deliver { function, from, to } => EventAction::Deliver(DeliverSpec {
+                function: function.clone(),
+                from: *from,
+                to: *to,
+            }),
         }
     }
 }
