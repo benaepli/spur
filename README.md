@@ -51,14 +51,14 @@ cargo build --release
 
 ### Compiling Specifications
 
-The compiler takes a Spur specification file and outputs a JSON representation of the compiled
-control flow graph.
+The compiler takes a Spur specification file and writes a directory containing
+`program.json` (CFG IR), `cfg.svg` (CFG visualization), and `program.pir` (Pure / SSA IR).
 
 **Example:**
 
 ```bash
 # Compile the simple key-value store
-cargo run -- specs/simple.spur output.json
+cargo run -- compile specs/simple.spur --output-dir output -y
 ```
 
 ## Resources

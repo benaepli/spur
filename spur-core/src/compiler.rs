@@ -1,6 +1,7 @@
 pub mod anf;
 pub mod cfg;
 pub mod lowered;
+pub mod pure;
 pub mod threaded;
 
 use crate::analysis::checker::{TypeChecker, TypeError};
@@ -10,12 +11,16 @@ use crate::analysis::{trivially_copyable, type_id};
 use crate::compiler::cfg::Compiler as CfgCompiler;
 use crate::compiler::lowered::lower_program;
 use crate::lexer::{LexError, Lexer};
+use crate::liquid::pure::ast::PProgram;
 use crate::parser::{ParseError, ValidationError, parse_program};
 use crate::{lexer, parser};
 
 /// Result of compilation that always carries diagnostics and optionally a program.
 pub struct CompileResult {
     pub program: Option<cfg::Program>,
+    /// Pure / SSA IR. Populated by `compile` after a successful type check;
+    /// `compile_lsp` leaves this `None`.
+    pub pure: Option<PProgram>,
     pub lex_errors: Vec<LexError>,
     pub parse_errors: Vec<ParseError>,
     pub validation_errors: Vec<ValidationError>,
@@ -64,6 +69,7 @@ impl CompileResult {
 pub fn compile(input: &str, name: &str) -> CompileResult {
     let mut result = CompileResult {
         program: None,
+        pure: None,
         lex_errors: Vec::new(),
         parse_errors: Vec::new(),
         validation_errors: Vec::new(),
@@ -123,14 +129,13 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     let type_ids = type_id::assign_type_ids(&typed);
 
     let lowered = lower_program(typed);
-    // lowered::remove_for_loops(&mut lowered);
 
-    // ANF flattening (Phase 1)
-    let anf = anf::lower_program(lowered.clone());
-
-    // State threading (Phase 2) — runs but CFG backend still
-    // consumes the original lowered output until full migration.
+    // Not used yet for compilation.
+    let mut lowered_copy = lowered.clone();
+    lowered::remove_for_loops(&mut lowered_copy);
+    let anf = anf::lower_program(lowered_copy);
     let _threaded = threaded::lower_program(anf);
+    result.pure = Some(pure::lower_program(_threaded));
 
     let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(lowered, type_ids);
@@ -143,6 +148,7 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
 pub fn compile_lsp(input: &str) -> CompileResult {
     let mut result = CompileResult {
         program: None,
+        pure: None,
         lex_errors: Vec::new(),
         parse_errors: Vec::new(),
         validation_errors: Vec::new(),

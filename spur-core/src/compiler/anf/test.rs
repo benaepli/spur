@@ -175,70 +175,6 @@ fn test_nested_func_call_flattening() {
 }
 
 // -----------------------------------------------------------------------
-// 4. L-value preservation
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_lhs_preservation() {
-    // db[key].field = val;
-    // The LHS should remain as ALhsExpr::FieldAccess(Index(Var(db), key), "field")
-    // The RHS should be flattened to atomic
-
-    let lhs = lexpr(
-        LExprKind::FieldAccess(
-            Box::new(lexpr(
-                LExprKind::Index(
-                    Box::new(lvar(0, "db")),
-                    Box::new(lvar(1, "key")),
-                ),
-                Type::Int,
-            )),
-            "field".to_string(),
-        ),
-        Type::Int,
-    );
-
-    let rhs = lvar(2, "val");
-
-    let stmt = LStatement {
-        kind: LStatementKind::Assignment(LAssignment {
-            target: lhs,
-            value: rhs,
-            span: dummy_span(),
-        }),
-        span: dummy_span(),
-    };
-
-    let program = make_program_with_stmts(
-        vec![lparam(0, "db"), lparam(1, "key"), lparam(2, "val")],
-        vec![stmt],
-    );
-    let anf = lower_program(program);
-    let body = first_func_body(&anf);
-
-    // Should have exactly 1 statement: the Assign
-    assert_eq!(body.statements.len(), 1);
-    if let AStatementKind::Assign(ref assign) = body.statements[0].kind {
-        // LHS should be FieldAccess(Index(Var(db), key), "field")
-        if let ALhsExpr::FieldAccess(ref inner, ref fname) = assign.target {
-            assert_eq!(fname, "field");
-            if let ALhsExpr::Index(ref base, ref idx) = **inner {
-                assert!(matches!(&**base, ALhsExpr::Var(_, name) if name == "db"));
-                assert_eq!(*idx, AAtomic::Var(id(1), "key".to_string()));
-            } else {
-                panic!("expected Index inside FieldAccess, got {:?}", inner);
-            }
-        } else {
-            panic!("expected FieldAccess LHS, got {:?}", assign.target);
-        }
-        // RHS should be atomic
-        assert_eq!(assign.value, AAtomic::Var(id(2), "val".to_string()));
-    } else {
-        panic!("expected Assign statement, got {:?}", body.statements[0].kind);
-    }
-}
-
-// -----------------------------------------------------------------------
 // 5. Conditional tail atomicity
 // -----------------------------------------------------------------------
 
@@ -354,34 +290,6 @@ fn make_program(params: Vec<LFuncParam>, mut tail_exprs: Vec<LExpr>) -> LProgram
                 statements: stmts,
                 tail_expr: tail,
                 ty: Type::Int,
-                span: dummy_span(),
-            },
-            span: dummy_span(),
-        })],
-        next_name_id: 100,
-        id_to_name: std::collections::HashMap::new(),
-        struct_defs: std::collections::HashMap::new(),
-        enum_defs: std::collections::HashMap::new(),
-    }
-}
-
-/// Like make_program but takes explicit statements (no tail expr).
-fn make_program_with_stmts(
-    params: Vec<LFuncParam>,
-    stmts: Vec<LStatement>,
-) -> LProgram {
-    LProgram {
-        top_level_defs: vec![LTopLevelDef::FreeFunc(LFuncDef {
-            name: id(99),
-            original_name: "test_fn".to_string(),
-            is_sync: true,
-            is_traced: false,
-            params,
-            return_type: Type::Nil,
-            body: LBlock {
-                statements: stmts,
-                tail_expr: None,
-                ty: Type::Nil,
                 span: dummy_span(),
             },
             span: dummy_span(),

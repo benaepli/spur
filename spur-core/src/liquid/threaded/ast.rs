@@ -99,17 +99,6 @@ pub struct TUserFuncCall {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum TLhsExpr {
-    Var(NameId, String),
-    Index(Box<TLhsExpr>, TAtomic),
-    FieldAccess(Box<TLhsExpr>, String),
-    TupleAccess(Box<TLhsExpr>, usize),
-    SafeIndex(Box<TLhsExpr>, TAtomic),
-    SafeFieldAccess(Box<TLhsExpr>, String),
-    SafeTupleAccess(Box<TLhsExpr>, usize),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct TStatement {
     pub kind: TStatementKind,
     pub span: Span,
@@ -138,7 +127,9 @@ pub struct TLetAtom {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TAssign {
-    pub target: TLhsExpr,
+    pub target_id: NameId,
+    pub target_name: String,
+    pub ty: Type,
     pub value: TAtomic,
     pub span: Span,
 }

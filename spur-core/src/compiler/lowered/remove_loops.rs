@@ -56,7 +56,6 @@ impl<'a> LoopRemover<'a> {
                 out.push(stmt);
             }
             LStatementKind::Assignment(a) => {
-                self.remove_for_loops_in_expr(&mut a.target);
                 self.remove_for_loops_in_expr(&mut a.value);
                 out.push(stmt);
             }
@@ -131,7 +130,9 @@ impl<'a> LoopRemover<'a> {
 
                 let increment = vec![LStatement {
                     kind: LStatementKind::Assignment(LAssignment {
-                        target: iter_var.clone(),
+                        target_id: tmp_iter,
+                        target_name: tmp_iter_name.clone(),
+                        ty: iter_ty.clone(),
                         value: LExpr {
                             kind: LExprKind::TupleAccess(Box::new(next_res_var.clone()), 1),
                             ty: iter_ty.clone(),
@@ -256,7 +257,6 @@ impl<'a> LoopRemover<'a> {
                             });
                         }
                         LForLoopInit::Assignment(mut a) => {
-                            self.remove_for_loops_in_expr(&mut a.target);
                             self.remove_for_loops_in_expr(&mut a.value);
                             out.push(LStatement {
                                 kind: LStatementKind::Assignment(a),
@@ -392,7 +392,6 @@ fn replace_continue_in_stmts(stmts: &mut Vec<LStatement>, increment: &[LStatemen
         match &mut stmt.kind {
             LStatementKind::VarInit(vi) => replace_continue_in_expr(&mut vi.value, increment),
             LStatementKind::Assignment(a) => {
-                replace_continue_in_expr(&mut a.target, increment);
                 replace_continue_in_expr(&mut a.value, increment);
             }
             LStatementKind::Expr(e) => replace_continue_in_expr(e, increment),

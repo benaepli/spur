@@ -152,7 +152,9 @@ pub struct LVarInit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LAssignment {
-    pub target: LExpr,
+    pub target_id: NameId,
+    pub target_name: String,
+    pub ty: Type,
     pub value: LExpr,
     pub span: Span,
 }

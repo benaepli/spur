@@ -243,7 +243,9 @@ fn test_role_var_assign_rewrite() {
         ABlock {
             statements: vec![AStatement {
                 kind: AStatementKind::Assign(AAssign {
-                    target: ALhsExpr::Var(id(0), "x".to_string()),
+                    target_id: id(0),
+                    target_name: "x".to_string(),
+                    ty: Type::Int,
                     value: AAtomic::IntLit(5),
                     span: dummy_span(),
                 }),
@@ -274,24 +276,49 @@ fn test_role_var_assign_rewrite() {
     let role = expect_role(&threaded, 1);
     let f = &role.func_defs[0];
 
-    // Find the Assign statement — should be s.x = 5
+    // Role-level writes desugar to
+    //   var __upd = Store(s, "x", 5);
+    //   s = __upd;
+    // Find the LetAtom whose value is Store(Var(s), StringLit("x"), IntLit(5)).
+    let store_let = f
+        .body
+        .statements
+        .iter()
+        .find_map(|s| match &s.kind {
+            TStatementKind::LetAtom(la) => match &la.value.kind {
+                TExprKind::Store(base, key, val) => {
+                    if matches!(base, TAtomic::Var(_, n) if n == "s")
+                        && matches!(key, TAtomic::StringLit(k) if k == "x")
+                        && matches!(val, TAtomic::IntLit(5))
+                    {
+                        Some(la)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("expected LetAtom(Store(s, \"x\", 5))");
+
+    // The following statement should be `s = __upd;` as a flat TAssign.
     let assign_stmt = f
         .body
         .statements
         .iter()
-        .find(|s| matches!(s.kind, TStatementKind::Assign(_)));
-    assert!(assign_stmt.is_some(), "expected an Assign statement");
-    let assign = expect_assign(assign_stmt.unwrap());
-
-    // LHS should be FieldAccess(Var(s), "x")
-    match &assign.target {
-        TLhsExpr::FieldAccess(base, field) => {
-            assert_eq!(field, "x");
-            assert!(matches!(**base, TLhsExpr::Var(_, ref name) if name == "s"));
+        .find(|s| matches!(s.kind, TStatementKind::Assign(_)))
+        .expect("expected an Assign statement");
+    let assign = expect_assign(assign_stmt);
+    assert_eq!(assign.target_name, "s");
+    assert!(matches!(assign.ty, Type::Struct(_, _)));
+    match &assign.value {
+        TAtomic::Var(nid, name) => {
+            assert_eq!(*nid, store_let.name);
+            assert_eq!(name, &store_let.original_name);
         }
-        other => panic!("expected FieldAccess(s, x), got {:?}", other),
+        other => panic!("expected Var(__upd), got {:?}", other),
     }
-    assert_eq!(assign.value, TAtomic::IntLit(5));
 }
 
 #[test]
@@ -464,5 +491,275 @@ fn test_send_state_injection() {
             assert_eq!(*val, TAtomic::Var(id(3), "val".to_string()));
         }
         other => panic!("expected Send, got {:?}", other),
+    }
+}
+
+/// Explicit `return val;` must wrap the value in (State, T) using the
+/// declared return type, not a hardcoded `Nil`. Previously lowered as
+/// `(State, Nil)` regardless of the function signature.
+#[test]
+fn test_explicit_return_uses_declared_return_type() {
+    let ret_ty = Type::Optional(Box::new(Type::String));
+    let func = simple_func(
+        10,
+        "get_opt",
+        vec![],
+        ret_ty.clone(),
+        ABlock {
+            statements: vec![AStatement {
+                kind: AStatementKind::Return(AAtomic::NilLit),
+                span: dummy_span(),
+            }],
+            tail_expr: None,
+            ty: ret_ty.clone(),
+            span: dummy_span(),
+        },
+    );
+
+    let program = make_role_program("Node", 50, vec![], vec![func]);
+    let threaded = lower_program(program);
+
+    let role = expect_role(&threaded, 1);
+    let f = &role.func_defs[0];
+
+    let ret_let = expect_let_atom(&f.body.statements[0]);
+    match &ret_let.ty {
+        Type::Tuple(types) => {
+            assert_eq!(types.len(), 2);
+            assert!(matches!(&types[0], Type::Struct(_, _)));
+            assert_eq!(types[1], ret_ty, "second tuple element must match declared return type");
+        }
+        other => panic!("expected Tuple type on __ret_tuple, got {:?}", other),
+    }
+}
+
+/// Async user calls (return type `chan<T>`) must lower 1:1 with just `s`
+/// prepended — no `__tup`, no tuple access. The state handoff happens at
+/// `<-` (see `test_send_state_injection` / `emit_threaded_send_recv`).
+#[test]
+fn test_async_call_no_tuple_unpack() {
+    let chan_ty = Type::Chan(Box::new(Type::String));
+    let call_expr = AExpr {
+        kind: AExprKind::FuncCall(AFuncCall::User(AUserFuncCall {
+            name: id(11),
+            original_name: "Read".to_string(),
+            args: vec![AAtomic::Var(id(2), "k".to_string())],
+            return_type: chan_ty.clone(),
+            is_free: false,
+            span: dummy_span(),
+        })),
+        ty: chan_ty.clone(),
+        span: dummy_span(),
+    };
+
+    let func = simple_func(
+        10,
+        "caller",
+        vec![aparam(2, "k", Type::String)],
+        Type::Nil,
+        ABlock {
+            statements: vec![AStatement {
+                kind: AStatementKind::LetAtom(ALetAtom {
+                    name: id(3),
+                    original_name: "ch".to_string(),
+                    ty: chan_ty.clone(),
+                    value: call_expr,
+                    span: dummy_span(),
+                }),
+                span: dummy_span(),
+            }],
+            tail_expr: None,
+            ty: Type::Nil,
+            span: dummy_span(),
+        },
+    );
+
+    let program = make_role_program("Node", 50, vec![], vec![func]);
+    let threaded = lower_program(program);
+
+    let role = expect_role(&threaded, 1);
+    let f = &role.func_defs[0];
+
+    // First statement is the direct binding `var ch: chan<string> = Read(s, k);`.
+    let ch_let = expect_let_atom(&f.body.statements[0]);
+    assert_eq!(ch_let.original_name, "ch");
+    assert_eq!(ch_let.ty, chan_ty);
+    match &ch_let.value.kind {
+        TExprKind::FuncCall(TFuncCall::User(tcall)) => {
+            assert_eq!(tcall.original_name, "Read");
+            assert_eq!(tcall.return_type, chan_ty);
+            assert_eq!(tcall.args.len(), 2);
+            assert!(matches!(&tcall.args[0], TAtomic::Var(_, n) if n == "s"));
+            assert_eq!(tcall.args[1], TAtomic::Var(id(2), "k".to_string()));
+        }
+        other => panic!("expected FuncCall, got {:?}", other),
+    }
+
+    // There must not be a tuple access or an `s = __tup.0` update generated
+    // by this call — state handoff must be deferred to `<-`.
+    for stmt in &f.body.statements {
+        if let TStatementKind::LetAtom(la) = &stmt.kind {
+            if let TExprKind::TupleAccess(_, _) = &la.value.kind {
+                panic!(
+                    "async call produced an unexpected TupleAccess: {:?}",
+                    stmt
+                );
+            }
+        }
+    }
+}
+
+/// Sync role-method calls used as expression-statements must still thread
+/// state: `f(a);` → `var __tup = f(s, a); s = __tup.0;` (no `res` binding).
+/// This is the bug that caused `enter_view_change(new_view);` in VR.spur to
+/// lose its mutations.
+#[test]
+fn test_sync_statement_call_threads_state() {
+    let call_expr = AExpr {
+        kind: AExprKind::FuncCall(AFuncCall::User(AUserFuncCall {
+            name: id(11),
+            original_name: "modify".to_string(),
+            args: vec![AAtomic::Var(id(2), "a".to_string())],
+            return_type: Type::Int,
+            is_free: false,
+            span: dummy_span(),
+        })),
+        ty: Type::Int,
+        span: dummy_span(),
+    };
+
+    let func = simple_func(
+        10,
+        "caller",
+        vec![aparam(2, "a", Type::Int)],
+        Type::Nil,
+        ABlock {
+            statements: vec![AStatement {
+                kind: AStatementKind::Expr(call_expr),
+                span: dummy_span(),
+            }],
+            tail_expr: None,
+            ty: Type::Nil,
+            span: dummy_span(),
+        },
+    );
+
+    let program = make_role_program("Node", 50, vec![], vec![func]);
+    let threaded = lower_program(program);
+
+    let role = expect_role(&threaded, 1);
+    let f = &role.func_defs[0];
+
+    // stmt[0]: let __tup = modify(s, a);
+    let tup_let = expect_let_atom(&f.body.statements[0]);
+    match &tup_let.value.kind {
+        TExprKind::FuncCall(TFuncCall::User(tcall)) => {
+            assert_eq!(tcall.original_name, "modify");
+            assert!(matches!(&tcall.args[0], TAtomic::Var(_, n) if n == "s"));
+            assert_eq!(tcall.args[1], TAtomic::Var(id(2), "a".to_string()));
+        }
+        other => panic!("expected FuncCall, got {:?}", other),
+    }
+    match &tup_let.ty {
+        Type::Tuple(types) => {
+            assert_eq!(types.len(), 2);
+            assert_eq!(types[1], Type::Int);
+        }
+        other => panic!("expected Tuple type on __tup, got {:?}", other),
+    }
+
+    // stmt[1]: let __s_new = __tup.0;
+    let s_new_let = expect_let_atom(&f.body.statements[1]);
+    match &s_new_let.value.kind {
+        TExprKind::TupleAccess(TAtomic::Var(_, n), 0) => {
+            assert_eq!(n, &tup_let.original_name);
+        }
+        other => panic!("expected TupleAccess(tup, 0), got {:?}", other),
+    }
+
+    // stmt[2]: s = __s_new;
+    let assign = expect_assign(&f.body.statements[2]);
+    assert_eq!(assign.target_name, "s");
+
+    // No subsequent LetAtom should bind `__tup.1` — the result is discarded.
+    for stmt in &f.body.statements[3..] {
+        if let TStatementKind::LetAtom(la) = &stmt.kind {
+            if let TExprKind::TupleAccess(_, 1) = &la.value.kind {
+                panic!("discard path should not bind __tup.1: {:?}", stmt);
+            }
+        }
+    }
+}
+
+/// Async role-method calls used as expression-statements become plain
+/// `f(s, args);` spawn — no state update, since the result channel is
+/// never awaited.
+#[test]
+fn test_async_statement_call_prepends_s_only() {
+    let chan_ty = Type::Chan(Box::new(Type::Nil));
+    let call_expr = AExpr {
+        kind: AExprKind::FuncCall(AFuncCall::User(AUserFuncCall {
+            name: id(11),
+            original_name: "fire".to_string(),
+            args: vec![AAtomic::Var(id(2), "a".to_string())],
+            return_type: chan_ty.clone(),
+            is_free: false,
+            span: dummy_span(),
+        })),
+        ty: chan_ty.clone(),
+        span: dummy_span(),
+    };
+
+    let func = simple_func(
+        10,
+        "caller",
+        vec![aparam(2, "a", Type::Int)],
+        Type::Nil,
+        ABlock {
+            statements: vec![AStatement {
+                kind: AStatementKind::Expr(call_expr),
+                span: dummy_span(),
+            }],
+            tail_expr: None,
+            ty: Type::Nil,
+            span: dummy_span(),
+        },
+    );
+
+    let program = make_role_program("Node", 50, vec![], vec![func]);
+    let threaded = lower_program(program);
+
+    let role = expect_role(&threaded, 1);
+    let f = &role.func_defs[0];
+
+    // Should be exactly one statement: Expr(fire(s, a))
+    // plus the trailing __ret_tuple wrapping the nil tail. Locate the spawn.
+    let spawn_stmt = f
+        .body
+        .statements
+        .iter()
+        .find(|s| matches!(&s.kind, TStatementKind::Expr(_)))
+        .expect("expected an Expr statement for the async spawn");
+    match &spawn_stmt.kind {
+        TStatementKind::Expr(texpr) => match &texpr.kind {
+            TExprKind::FuncCall(TFuncCall::User(tcall)) => {
+                assert_eq!(tcall.original_name, "fire");
+                assert_eq!(tcall.return_type, chan_ty);
+                assert_eq!(tcall.args.len(), 2);
+                assert!(matches!(&tcall.args[0], TAtomic::Var(_, n) if n == "s"));
+                assert_eq!(tcall.args[1], TAtomic::Var(id(2), "a".to_string()));
+            }
+            other => panic!("expected FuncCall, got {:?}", other),
+        },
+        other => panic!("expected Expr, got {:?}", other),
+    }
+
+    // Spawn must NOT produce a state update (no `s = __tup.0`).
+    for stmt in &f.body.statements {
+        if let TStatementKind::Assign(a) = &stmt.kind {
+            if a.target_name == "s" {
+                panic!("async spawn must not update s: {:?}", stmt);
+            }
+        }
     }
 }

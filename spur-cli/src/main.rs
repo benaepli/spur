@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use spur_core::compiler;
+use spur_core::compiler::pure::print_program as print_pure;
 use spur_core::debug::SimulatorDebugger;
 use spur_core::simulator::explorer::{run_explorer, run_explorer_genetic, run_plan};
 use spur_core::simulator::history::LogBackend;
@@ -8,7 +9,7 @@ use spur_core::visualization::{render_html_heatmap, render_svg, vertex_coverage_
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -23,13 +24,18 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Compile a specification file to JSON
+    /// Compile a specification file to a directory containing
+    /// program.json (CFG IR), cfg.svg (CFG visualization), and
+    /// program.pir (Pure / SSA IR).
     Compile {
         /// Input specification file (.spur)
         spec: PathBuf,
-        /// Compiled output file (.json)
+        /// Output directory for compiled artifacts
         #[arg(short, long)]
-        output: PathBuf,
+        output_dir: PathBuf,
+        /// Skip confirmation prompt for directory deletion
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Check a specification file for errors
     Check {
@@ -156,7 +162,11 @@ fn main() {
     let args = Args::parse();
 
     let result = match args.command {
-        Commands::Compile { spec, output } => run_compile(spec, output),
+        Commands::Compile {
+            spec,
+            output_dir,
+            yes,
+        } => run_compile(spec, output_dir, yes),
         Commands::Check { spec } => run_check(spec),
         Commands::Graph { spec, output } => run_graph(spec, output),
         Commands::Explore {
@@ -193,21 +203,78 @@ fn main() {
     }
 }
 
-fn run_compile(spec_path: PathBuf, output_path: PathBuf) -> Result<()> {
+/// Prepare an output directory for write: if it exists, prompt for deletion
+/// (skipped when `yes` is true), then `remove_dir_all`. Always recreates the
+/// directory afterwards. Returns `Ok(false)` if the user declined the prompt.
+fn prepare_output_dir(output_dir: &Path, yes: bool) -> Result<bool> {
+    if output_dir.exists() {
+        if !yes {
+            print!(
+                "Output directory '{}' already exists and will be deleted. Continue? [y/N] ",
+                output_dir.display()
+            );
+            io::stdout().flush().context("Failed to flush stdout")?;
+
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .context("Failed to read from stdin")?;
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("Aborted.");
+                return Ok(false);
+            }
+        }
+        fs::remove_dir_all(output_dir)
+            .with_context(|| format!("Failed to remove directory '{}'", output_dir.display()))?;
+    }
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("Failed to create directory '{}'", output_dir.display()))?;
+
+    Ok(true)
+}
+
+fn run_compile(spec_path: PathBuf, output_dir: PathBuf, yes: bool) -> Result<()> {
     let source_code = fs::read_to_string(&spec_path)
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
-    let program = compiler::compile(&source_code, spec_path.to_string_lossy().as_ref())
+    let mut result = compiler::compile(&source_code, spec_path.to_string_lossy().as_ref());
+    let pure = result.pure.take();
+    let program = result
         .into_program()
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
+    if !prepare_output_dir(&output_dir, yes)? {
+        return Ok(());
+    }
+
+    let json_path = output_dir.join("program.json");
+    let cfg_path = output_dir.join("cfg.svg");
+    let pir_path = output_dir.join("program.pir");
+
     let json =
         serde_json::to_string_pretty(&program).context("Failed to serialize program to JSON")?;
+    fs::write(&json_path, json)
+        .with_context(|| format!("Failed to write program JSON to {}", json_path.display()))?;
 
-    fs::write(&output_path, json)
-        .with_context(|| format!("Failed to write output to {}", output_path.display()))?;
+    let svg = render_svg(&program).map_err(|e| anyhow::anyhow!("Failed to render SVG: {}", e))?;
+    fs::write(&cfg_path, svg)
+        .with_context(|| format!("Failed to write CFG SVG to {}", cfg_path.display()))?;
 
-    println!("Successfully compiled to {}", output_path.display());
+    let pir_text = pure
+        .as_ref()
+        .map(print_pure)
+        .unwrap_or_else(|| "# Pure IR was not produced\n".to_string());
+    fs::write(&pir_path, pir_text)
+        .with_context(|| format!("Failed to write Pure IR to {}", pir_path.display()))?;
+
+    println!(
+        "Successfully compiled to {}",
+        output_dir.display()
+    );
+    println!("  - Program JSON: {}", json_path.display());
+    println!("  - CFG: {}", cfg_path.display());
+    println!("  - Pure IR: {}", pir_path.display());
     Ok(())
 }
 
@@ -255,30 +322,9 @@ fn run_explore(
         .into_program()
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
-    // Handle output directory
-    if output_dir.exists() {
-        if !yes {
-            print!(
-                "Output directory '{}' already exists and will be deleted. Continue? [y/N] ",
-                output_dir.display()
-            );
-            io::stdout().flush().context("Failed to flush stdout")?;
-
-            let mut input = String::new();
-            io::stdin()
-                .read_line(&mut input)
-                .context("Failed to read from stdin")?;
-            if !input.trim().eq_ignore_ascii_case("y") {
-                println!("Aborted.");
-                return Ok(());
-            }
-        }
-        fs::remove_dir_all(&output_dir)
-            .with_context(|| format!("Failed to remove directory '{}'", output_dir.display()))?;
+    if !prepare_output_dir(&output_dir, yes)? {
+        return Ok(());
     }
-
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("Failed to create directory '{}'", output_dir.display()))?;
 
     // Determine output path: Parquet uses the directory
     let output_path_str: String = match &backend {
@@ -371,30 +417,9 @@ fn run_run_plan(
         .into_program()
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
-    // Handle output directory
-    if output_dir.exists() {
-        if !yes {
-            print!(
-                "Output directory '{}' already exists and will be deleted. Continue? [y/N] ",
-                output_dir.display()
-            );
-            io::stdout().flush().context("Failed to flush stdout")?;
-
-            let mut input = String::new();
-            io::stdin()
-                .read_line(&mut input)
-                .context("Failed to read from stdin")?;
-            if !input.trim().eq_ignore_ascii_case("y") {
-                println!("Aborted.");
-                return Ok(());
-            }
-        }
-        fs::remove_dir_all(&output_dir)
-            .with_context(|| format!("Failed to remove directory '{}'", output_dir.display()))?;
+    if !prepare_output_dir(&output_dir, yes)? {
+        return Ok(());
     }
-
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("Failed to create directory '{}'", output_dir.display()))?;
 
     let output_path_str: String = match &backend {
         LogBackend::Parquet => output_dir

@@ -158,7 +158,9 @@ fn test_compile_assignment() {
 
     let stmt = LStatement {
         kind: LStatementKind::Assignment(LAssignment {
-            target: lexpr(LExprKind::Var(var_name, "x".to_string()), Type::Int),
+            target_id: var_name,
+            target_name: "x".to_string(),
+            ty: Type::Int,
             value: int_lit(100),
             span: dummy_span(),
         }),
@@ -674,7 +676,9 @@ fn test_compile_for_loop_continue_targets_increment() {
             condition: Some(bool_lit(true)),
             increment: vec![LStatement {
                 kind: LStatementKind::Assignment(LAssignment {
-                    target: lexpr(LExprKind::Var(var_i, "i".to_string()), Type::Int),
+                    target_id: var_i,
+                    target_name: "i".to_string(),
+                    ty: Type::Int,
                     value: int_lit(1),
                     span: dummy_span(),
                 }),

@@ -441,7 +441,6 @@ impl Compiler {
                 self.scan_expr_slots(&init.value);
             }
             LStatementKind::Assignment(assign) => {
-                self.scan_expr_slots(&assign.target);
                 self.scan_expr_slots(&assign.value);
             }
             LStatementKind::Expr(expr) => {
@@ -460,7 +459,6 @@ impl Compiler {
                             self.scan_expr_slots(&vi.value);
                         }
                         LForLoopInit::Assignment(a) => {
-                            self.scan_expr_slots(&a.target);
                             self.scan_expr_slots(&a.value);
                         }
                     }
@@ -647,7 +645,7 @@ impl Compiler {
                 self.compile_expr_to_value(&init.value, lhs, next_vertex, ctx)
             }
             LStatementKind::Assignment(assign) => {
-                let lhs = self.convert_lhs(&assign.target);
+                let lhs = Lhs::Var(self.resolve_slot(assign.target_id));
                 self.compile_expr_to_value(&assign.value, lhs, next_vertex, ctx)
             }
             LStatementKind::Expr(expr) => match &expr.kind {
@@ -1572,17 +1570,6 @@ impl Compiler {
             | LExprKind::VariantLit(_, _, Some(_))
             | LExprKind::Error => return None,
         })
-    }
-
-    fn convert_lhs(&mut self, expr: &LExpr) -> Lhs {
-        match &expr.kind {
-            LExprKind::Var(id, _name) => Lhs::Var(self.resolve_slot(*id)),
-            _ => unreachable!(
-                "Invalid assignment target. \
-                 This should have been caught by the type checker. Expression: {:?}",
-                expr
-            ),
-        }
     }
 
 }

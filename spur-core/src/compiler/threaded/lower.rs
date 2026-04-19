@@ -12,12 +12,18 @@ struct ThreadLowerer {
     next_name_id: usize,
     /// NameIds of role-level variables for the role currently being lowered.
     role_var_ids: HashSet<NameId>,
+    /// Full info (NameId, name, type) for the current role's variables.
+    /// Ordered to match the source declaration order.
+    role_vars: Vec<(NameId, String, Type)>,
     /// NameId allocated for the `s` state parameter.
     state_name_id: NameId,
     /// The Type::Struct for the current role's state.
     state_type: Option<Type>,
     /// Whether we are currently inside a role method (vs free function).
     in_role_method: bool,
+    /// Declared return type of the role method currently being lowered.
+    /// Needed so `return val;` produces `(State, T)` rather than `(State, Nil)`.
+    current_return_type: Option<Type>,
 }
 
 impl ThreadLowerer {
@@ -32,10 +38,6 @@ impl ThreadLowerer {
         TAtomic::Var(self.state_name_id, "s".to_string())
     }
 
-    fn s_lhs(&self) -> TLhsExpr {
-        TLhsExpr::Var(self.state_name_id, "s".to_string())
-    }
-
     fn lower_atomic(&self, a: AAtomic) -> TAtomic {
         match a {
             AAtomic::Var(id, name) => TAtomic::Var(id, name),
@@ -44,36 +46,6 @@ impl ThreadLowerer {
             AAtomic::BoolLit(v) => TAtomic::BoolLit(v),
             AAtomic::NilLit => TAtomic::NilLit,
             AAtomic::Never => TAtomic::Never,
-        }
-    }
-
-    fn lower_lhs(&self, lhs: ALhsExpr) -> TLhsExpr {
-        match lhs {
-            ALhsExpr::Var(id, name) => {
-                if self.in_role_method && self.role_var_ids.contains(&id) {
-                    TLhsExpr::FieldAccess(Box::new(self.s_lhs()), name)
-                } else {
-                    TLhsExpr::Var(id, name)
-                }
-            }
-            ALhsExpr::Index(base, idx) => {
-                TLhsExpr::Index(Box::new(self.lower_lhs(*base)), self.lower_atomic(idx))
-            }
-            ALhsExpr::FieldAccess(base, name) => {
-                TLhsExpr::FieldAccess(Box::new(self.lower_lhs(*base)), name)
-            }
-            ALhsExpr::TupleAccess(base, idx) => {
-                TLhsExpr::TupleAccess(Box::new(self.lower_lhs(*base)), idx)
-            }
-            ALhsExpr::SafeIndex(base, idx) => {
-                TLhsExpr::SafeIndex(Box::new(self.lower_lhs(*base)), self.lower_atomic(idx))
-            }
-            ALhsExpr::SafeFieldAccess(base, name) => {
-                TLhsExpr::SafeFieldAccess(Box::new(self.lower_lhs(*base)), name)
-            }
-            ALhsExpr::SafeTupleAccess(base, idx) => {
-                TLhsExpr::SafeTupleAccess(Box::new(self.lower_lhs(*base)), idx)
-            }
         }
     }
 
@@ -288,18 +260,92 @@ impl ThreadLowerer {
                 self.lower_let_atom(la, span, out);
             }
             AStatementKind::Assign(assign) => {
-                let tlhs = self.lower_lhs(assign.target);
                 let tval = self.lower_atomic(assign.value);
-                out.push(TStatement {
-                    kind: TStatementKind::Assign(TAssign {
-                        target: tlhs,
-                        value: tval,
-                        span: assign.span,
-                    }),
-                    span,
-                });
+                if self.in_role_method && self.role_var_ids.contains(&assign.target_id) {
+                    // Role-level variable write: rewrite as a functional
+                    // update of the state record.
+                    //   var __upd = Store(s, "<field>", value);
+                    //   s = __upd;
+                    //   <field> = value;   // keep the local role-var binding
+                    //                      // in sync so subsequent bare reads
+                    //                      // see the new value under SSA
+                    //                      // substitution.
+                    let state_type = self.state_type.clone().unwrap();
+                    let (upd_id, upd_name) = self.fresh_name("upd");
+                    out.push(TStatement {
+                        kind: TStatementKind::LetAtom(TLetAtom {
+                            name: upd_id,
+                            original_name: upd_name.clone(),
+                            ty: state_type.clone(),
+                            value: TExpr {
+                                kind: TExprKind::Store(
+                                    self.s_atomic(),
+                                    TAtomic::StringLit(assign.target_name.clone()),
+                                    tval.clone(),
+                                ),
+                                ty: state_type.clone(),
+                                span: assign.span,
+                            },
+                            span: assign.span,
+                        }),
+                        span,
+                    });
+                    out.push(TStatement {
+                        kind: TStatementKind::Assign(TAssign {
+                            target_id: self.state_name_id,
+                            target_name: "s".to_string(),
+                            ty: state_type,
+                            value: TAtomic::Var(upd_id, upd_name),
+                            span: assign.span,
+                        }),
+                        span,
+                    });
+                    out.push(TStatement {
+                        kind: TStatementKind::Assign(TAssign {
+                            target_id: assign.target_id,
+                            target_name: assign.target_name,
+                            ty: assign.ty,
+                            value: tval,
+                            span: assign.span,
+                        }),
+                        span,
+                    });
+                } else {
+                    out.push(TStatement {
+                        kind: TStatementKind::Assign(TAssign {
+                            target_id: assign.target_id,
+                            target_name: assign.target_name,
+                            ty: assign.ty,
+                            value: tval,
+                            span: assign.span,
+                        }),
+                        span,
+                    });
+                }
             }
             AStatementKind::Expr(expr) => {
+                // In a role method, user calls and Send/Recv used as
+                // expression-statements must still thread state even though
+                // the result is discarded.
+                if self.in_role_method {
+                    match &expr.kind {
+                        AExprKind::FuncCall(AFuncCall::User(call)) if !call.is_free => {
+                            let call_clone = call.clone();
+                            if matches!(call_clone.return_type, Type::Chan(_)) {
+                                self.emit_async_threaded_call(None, call_clone, span, out);
+                            } else {
+                                self.emit_threaded_call(None, call_clone, span, out);
+                            }
+                            return;
+                        }
+                        AExprKind::Send(_, _) | AExprKind::Recv(_) => {
+                            self.emit_threaded_send_recv(None, expr, span, out);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 let texpr = self.lower_expr(expr);
                 out.push(TStatement {
                     kind: TStatementKind::Expr(texpr),
@@ -321,7 +367,8 @@ impl ThreadLowerer {
                     // return val  →  var __ret = (s, val); return __ret;
                     let tval = self.lower_atomic(atomic);
                     let state_type = self.state_type.clone().unwrap();
-                    let tuple_ty = Type::Tuple(vec![state_type, Type::Nil]);
+                    let ret_ty = self.current_return_type.clone().unwrap();
+                    let tuple_ty = Type::Tuple(vec![state_type, ret_ty]);
                     let tuple_expr = TExpr {
                         kind: TExprKind::TupleLit(vec![self.s_atomic(), tval]),
                         ty: tuple_ty.clone(),
@@ -375,24 +422,41 @@ impl ThreadLowerer {
         if self.in_role_method {
             match &la.value.kind {
                 AExprKind::FuncCall(AFuncCall::User(call)) if !call.is_free => {
-                    // Role method call: var res = f(args)
-                    // →  var __tup = f(s, args); s = __tup.0; var res = __tup.1;
                     let call_clone = call.clone();
-                    self.emit_threaded_call(
-                        la.name,
-                        la.original_name,
-                        la.ty,
-                        call_clone,
-                        span,
-                        out,
-                    );
+                    if matches!(call_clone.return_type, Type::Chan(_)) {
+                        // Async role method call: the expression evaluates to
+                        // chan<T>. State is consumed by the scheduler at spawn
+                        // time; unpacking happens later when the caller awaits
+                        // via `<-`. So we just prepend `s` to args and bind
+                        // the channel 1:1.
+                        self.emit_async_threaded_call(
+                            Some((la.name, la.original_name, la.ty)),
+                            call_clone,
+                            span,
+                            out,
+                        );
+                    } else {
+                        // Sync role method call: var res = f(args)
+                        // →  var __tup = f(s, args); s = __tup.0; var res = __tup.1;
+                        self.emit_threaded_call(
+                            Some((la.name, la.original_name, la.ty)),
+                            call_clone,
+                            span,
+                            out,
+                        );
+                    }
                     return;
                 }
                 AExprKind::Send(_, _) | AExprKind::Recv(_) => {
                     // Send/Recv already have state injected via lower_expr.
                     // The threaded versions return (State, OriginalReturn).
                     // We need to unpack: var __tup = op; s = __tup.0; var res = __tup.1;
-                    self.emit_threaded_send_recv(la, span, out);
+                    self.emit_threaded_send_recv(
+                        Some((la.name, la.original_name, la.ty.clone())),
+                        la.value,
+                        span,
+                        out,
+                    );
                     return;
                 }
                 _ => {}
@@ -413,19 +477,61 @@ impl ThreadLowerer {
         });
     }
 
-    /// Emit threaded role-method call:
+    /// Emit `let __s_new = <tup>.0; s = __s_new;`.
+    fn emit_state_extract(
+        &mut self,
+        tup_id: NameId,
+        tup_name: &str,
+        span: Span,
+        out: &mut Vec<TStatement>,
+    ) {
+        let state_type = self.state_type.clone().unwrap();
+        let (s_extract_id, s_extract_name) = self.fresh_name("s_new");
+        out.push(TStatement {
+            kind: TStatementKind::LetAtom(TLetAtom {
+                name: s_extract_id,
+                original_name: s_extract_name.clone(),
+                ty: state_type.clone(),
+                value: TExpr {
+                    kind: TExprKind::TupleAccess(TAtomic::Var(tup_id, tup_name.to_string()), 0),
+                    ty: state_type.clone(),
+                    span,
+                },
+                span,
+            }),
+            span,
+        });
+        out.push(TStatement {
+            kind: TStatementKind::Assign(TAssign {
+                target_id: self.state_name_id,
+                target_name: "s".to_string(),
+                ty: state_type,
+                value: TAtomic::Var(s_extract_id, s_extract_name),
+                span,
+            }),
+            span,
+        });
+    }
+
+    /// Emit threaded role-method call. If `result` is `Some`, bind the
+    /// callee's original return value to that name; if `None`, discard it
+    /// (used for statement-form calls whose result is unused).
+    ///
     /// ```text
-    /// var res = f(args)
+    /// var res = f(args)           (result = Some(res))
     /// →
     /// var __tup = f(s, args);
     /// s = __tup.0;
     /// var res = __tup.1;
+    ///
+    /// f(args);                    (result = None)
+    /// →
+    /// var __tup = f(s, args);
+    /// s = __tup.0;
     /// ```
     fn emit_threaded_call(
         &mut self,
-        orig_name_id: NameId,
-        orig_name: String,
-        orig_ty: Type,
+        result: Option<(NameId, String, Type)>,
         call: AUserFuncCall,
         span: Span,
         out: &mut Vec<TStatement>,
@@ -442,7 +548,7 @@ impl ThreadLowerer {
                 ty: tuple_ty.clone(),
                 value: TExpr {
                     kind: TExprKind::FuncCall(TFuncCall::User(tcall)),
-                    ty: tuple_ty.clone(),
+                    ty: tuple_ty,
                     span,
                 },
                 span,
@@ -450,58 +556,102 @@ impl ThreadLowerer {
             span,
         });
 
-        // s = __tup.0;
-        let state_type = self.state_type.clone().unwrap();
-        let (s_extract_id, s_extract_name) = self.fresh_name("s_new");
-        out.push(TStatement {
-            kind: TStatementKind::LetAtom(TLetAtom {
-                name: s_extract_id,
-                original_name: s_extract_name.clone(),
-                ty: state_type,
-                value: TExpr {
-                    kind: TExprKind::TupleAccess(TAtomic::Var(tup_id, tup_name.clone()), 0),
-                    ty: self.state_type.clone().unwrap(),
-                    span,
-                },
-                span,
-            }),
-            span,
-        });
-        out.push(TStatement {
-            kind: TStatementKind::Assign(TAssign {
-                target: self.s_lhs(),
-                value: TAtomic::Var(s_extract_id, s_extract_name),
-                span,
-            }),
-            span,
-        });
+        // var __s_new = __tup.0; s = __s_new;
+        self.emit_state_extract(tup_id, &tup_name, span, out);
 
-        // var res = __tup.1;
-        out.push(TStatement {
-            kind: TStatementKind::LetAtom(TLetAtom {
-                name: orig_name_id,
-                original_name: orig_name,
-                ty: orig_ty.clone(),
-                value: TExpr {
-                    kind: TExprKind::TupleAccess(TAtomic::Var(tup_id, tup_name), 1),
-                    ty: orig_ty,
+        // var res = __tup.1;  (only when result is requested)
+        if let Some((res_id, res_name, res_ty)) = result {
+            out.push(TStatement {
+                kind: TStatementKind::LetAtom(TLetAtom {
+                    name: res_id,
+                    original_name: res_name,
+                    ty: res_ty.clone(),
+                    value: TExpr {
+                        kind: TExprKind::TupleAccess(TAtomic::Var(tup_id, tup_name), 1),
+                        ty: res_ty,
+                        span,
+                    },
                     span,
-                },
+                }),
                 span,
-            }),
-            span,
-        });
+            });
+        }
     }
 
-    /// Emit threaded Send/Recv unpacking:
-    /// The threaded Send/Recv return (State, OriginalValue).
-    fn emit_threaded_send_recv(&mut self, la: ALetAtom, span: Span, out: &mut Vec<TStatement>) {
-        let orig_ty = la.ty.clone();
+    /// Emit an async role-method call. The caller sees `chan<T>` — state
+    /// handoff happens later at the `<-` site, not here.
+    ///
+    /// ```text
+    /// var res = f(args)     (async, return type chan<T>)
+    /// →
+    /// var res: chan<T> = f(s, args);
+    ///
+    /// f(args);              (statement form; result unused)
+    /// →
+    /// f(s, args);
+    /// ```
+    fn emit_async_threaded_call(
+        &mut self,
+        result: Option<(NameId, String, Type)>,
+        call: AUserFuncCall,
+        span: Span,
+        out: &mut Vec<TStatement>,
+    ) {
+        let mut args: Vec<TAtomic> = vec![self.s_atomic()];
+        args.extend(call.args.into_iter().map(|a| self.lower_atomic(a)));
+        let return_type = call.return_type;
+        let tcall = TUserFuncCall {
+            name: call.name,
+            original_name: call.original_name,
+            args,
+            return_type: return_type.clone(),
+            is_free: call.is_free,
+            span: call.span,
+        };
+        let call_expr = TExpr {
+            kind: TExprKind::FuncCall(TFuncCall::User(tcall)),
+            ty: return_type,
+            span,
+        };
+        match result {
+            Some((res_id, res_name, res_ty)) => {
+                out.push(TStatement {
+                    kind: TStatementKind::LetAtom(TLetAtom {
+                        name: res_id,
+                        original_name: res_name,
+                        ty: res_ty,
+                        value: call_expr,
+                        span,
+                    }),
+                    span,
+                });
+            }
+            None => {
+                out.push(TStatement {
+                    kind: TStatementKind::Expr(call_expr),
+                    span,
+                });
+            }
+        }
+    }
+
+    /// Emit threaded Send/Recv unpacking. The threaded Send/Recv expressions
+    /// return `(State, OriginalValue)`. When `result` is `Some`, bind the
+    /// original value to that name; when `None`, discard it (used for
+    /// statement-form sends whose result is unused).
+    fn emit_threaded_send_recv(
+        &mut self,
+        result: Option<(NameId, String, Type)>,
+        expr: AExpr,
+        span: Span,
+        out: &mut Vec<TStatement>,
+    ) {
+        let orig_ty = expr.ty.clone();
         let state_type = self.state_type.clone().unwrap();
-        let tuple_ty = Type::Tuple(vec![state_type.clone(), orig_ty.clone()]);
+        let tuple_ty = Type::Tuple(vec![state_type, orig_ty.clone()]);
 
         // Lower the expression (Send/Recv with state injected)
-        let texpr = self.lower_expr(la.value);
+        let texpr = self.lower_expr(expr);
 
         let (tup_id, tup_name) = self.fresh_name("tup");
 
@@ -510,10 +660,10 @@ impl ThreadLowerer {
             kind: TStatementKind::LetAtom(TLetAtom {
                 name: tup_id,
                 original_name: tup_name.clone(),
-                ty: tuple_ty,
+                ty: tuple_ty.clone(),
                 value: TExpr {
                     kind: texpr.kind,
-                    ty: Type::Tuple(vec![state_type.clone(), orig_ty.clone()]),
+                    ty: tuple_ty,
                     span,
                 },
                 span,
@@ -521,46 +671,26 @@ impl ThreadLowerer {
             span,
         });
 
-        // s = __tup.0;
-        let (s_extract_id, s_extract_name) = self.fresh_name("s_new");
-        out.push(TStatement {
-            kind: TStatementKind::LetAtom(TLetAtom {
-                name: s_extract_id,
-                original_name: s_extract_name.clone(),
-                ty: state_type.clone(),
-                value: TExpr {
-                    kind: TExprKind::TupleAccess(TAtomic::Var(tup_id, tup_name.clone()), 0),
-                    ty: state_type,
-                    span,
-                },
-                span,
-            }),
-            span,
-        });
-        out.push(TStatement {
-            kind: TStatementKind::Assign(TAssign {
-                target: self.s_lhs(),
-                value: TAtomic::Var(s_extract_id, s_extract_name),
-                span,
-            }),
-            span,
-        });
+        // var __s_new = __tup.0; s = __s_new;
+        self.emit_state_extract(tup_id, &tup_name, span, out);
 
-        // var res = __tup.1;
-        out.push(TStatement {
-            kind: TStatementKind::LetAtom(TLetAtom {
-                name: la.name,
-                original_name: la.original_name,
-                ty: orig_ty.clone(),
-                value: TExpr {
-                    kind: TExprKind::TupleAccess(TAtomic::Var(tup_id, tup_name), 1),
-                    ty: orig_ty,
+        // var res = __tup.1;  (only when result is requested)
+        if let Some((res_id, res_name, res_ty)) = result {
+            out.push(TStatement {
+                kind: TStatementKind::LetAtom(TLetAtom {
+                    name: res_id,
+                    original_name: res_name,
+                    ty: orig_ty.clone(),
+                    value: TExpr {
+                        kind: TExprKind::TupleAccess(TAtomic::Var(tup_id, tup_name), 1),
+                        ty: res_ty,
+                        span,
+                    },
                     span,
-                },
+                }),
                 span,
-            }),
-            span,
-        });
+            });
+        }
     }
 
     fn lower_func_def_role(&mut self, func: AFuncDef) -> TFuncDef {
@@ -582,11 +712,41 @@ impl ThreadLowerer {
 
         // Wrap return type: T → (State, T)
         let original_return = func.return_type.clone();
-        let threaded_return = Type::Tuple(vec![state_type.clone(), original_return]);
+        let threaded_return = Type::Tuple(vec![state_type.clone(), original_return.clone()]);
 
         // Lower body
         self.in_role_method = true;
+        self.current_return_type = Some(original_return);
         let mut body = self.lower_block(func.body);
+
+        // Project each role variable out of the state record at entry so
+        // reads go through a local binding tracked by the SSA environment.
+        // Without this, a later functional @store that produces a new state
+        // record would leave subsequent reads of the role variable referring
+        // to the pre-update value.
+        let prologue: Vec<TStatement> = self
+            .role_vars
+            .iter()
+            .map(|(rid, rname, rty)| TStatement {
+                kind: TStatementKind::LetAtom(TLetAtom {
+                    name: *rid,
+                    original_name: rname.clone(),
+                    ty: rty.clone(),
+                    value: TExpr {
+                        kind: TExprKind::FieldAccess(self.s_atomic(), rname.clone()),
+                        ty: rty.clone(),
+                        span: func.span,
+                    },
+                    span: func.span,
+                }),
+                span: func.span,
+            })
+            .collect();
+        if !prologue.is_empty() {
+            let mut stmts = prologue;
+            stmts.append(&mut body.statements);
+            body.statements = stmts;
+        }
 
         // Wrap tail_expr: tail → TupleLit([s, tail])
         if let Some(tail) = body.tail_expr.take() {
@@ -610,6 +770,7 @@ impl ThreadLowerer {
         }
         body.ty = threaded_return.clone();
         self.in_role_method = false;
+        self.current_return_type = None;
 
         TFuncDef {
             name: func.name,
@@ -652,9 +813,11 @@ pub fn lower_program(program: AProgram) -> TProgram {
     let mut lowerer = ThreadLowerer {
         next_name_id: program.next_name_id,
         role_var_ids: HashSet::new(),
+        role_vars: Vec::new(),
         state_name_id: NameId(0),
         state_type: None,
         in_role_method: false,
+        current_return_type: None,
     };
 
     let mut struct_defs = program.struct_defs.clone();
@@ -702,6 +865,11 @@ fn lower_role(
 
     // 2. Configure lowerer context
     lowerer.role_var_ids = role.var_inits.iter().map(|vi| vi.name).collect();
+    lowerer.role_vars = role
+        .var_inits
+        .iter()
+        .map(|vi| (vi.name, vi.original_name.clone(), vi.type_def.clone()))
+        .collect();
     let (s_id, _) = lowerer.fresh_name("s");
     lowerer.state_name_id = s_id;
     lowerer.state_type = Some(state_type.clone());
@@ -718,6 +886,7 @@ fn lower_role(
 
     // 5. Clear context
     lowerer.role_var_ids.clear();
+    lowerer.role_vars.clear();
     lowerer.state_type = None;
 
     let trole = TRoleDef {

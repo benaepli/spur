@@ -559,42 +559,6 @@ impl AnfLowerer {
         }
     }
 
-    fn lower_lhs(&mut self, expr: LExpr, stmts: &mut Vec<AStatement>) -> ALhsExpr {
-        match expr.kind {
-            LExprKind::Var(id, name) => ALhsExpr::Var(id, name),
-            LExprKind::Index(base, idx) => {
-                let abase = self.lower_lhs(*base, stmts);
-                let aidx = self.lower_expr_to_atomic(*idx, stmts);
-                ALhsExpr::Index(Box::new(abase), aidx)
-            }
-            LExprKind::FieldAccess(base, name) => {
-                let abase = self.lower_lhs(*base, stmts);
-                ALhsExpr::FieldAccess(Box::new(abase), name)
-            }
-            LExprKind::TupleAccess(base, idx) => {
-                let abase = self.lower_lhs(*base, stmts);
-                ALhsExpr::TupleAccess(Box::new(abase), idx)
-            }
-            LExprKind::SafeIndex(base, idx) => {
-                let abase = self.lower_lhs(*base, stmts);
-                let aidx = self.lower_expr_to_atomic(*idx, stmts);
-                ALhsExpr::SafeIndex(Box::new(abase), aidx)
-            }
-            LExprKind::SafeFieldAccess(base, name) => {
-                let abase = self.lower_lhs(*base, stmts);
-                ALhsExpr::SafeFieldAccess(Box::new(abase), name)
-            }
-            LExprKind::SafeTupleAccess(base, idx) => {
-                let abase = self.lower_lhs(*base, stmts);
-                ALhsExpr::SafeTupleAccess(Box::new(abase), idx)
-            }
-            _ => panic!(
-                "unexpected LHS expression kind during ANF lowering: {:?}",
-                expr.kind
-            ),
-        }
-    }
-
     fn lower_block(&mut self, block: LBlock) -> ABlock {
         let mut astmts = Vec::new();
         for stmt in block.statements {
@@ -689,11 +653,12 @@ impl AnfLowerer {
                 });
             }
             LStatementKind::Assignment(assign) => {
-                let alhs = self.lower_lhs(assign.target, stmts);
                 let aval = self.lower_expr_to_atomic(assign.value, stmts);
                 stmts.push(AStatement {
                     kind: AStatementKind::Assign(AAssign {
-                        target: alhs,
+                        target_id: assign.target_id,
+                        target_name: assign.target_name,
+                        ty: assign.ty,
                         value: aval,
                         span: assign.span,
                     }),

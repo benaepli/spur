@@ -214,14 +214,11 @@ impl Lowerer {
                 }]
             }
             TypedAssignItem::Existing(id, name, ty) => {
-                let target = LExpr {
-                    kind: LExprKind::Var(id, name),
-                    ty,
-                    span,
-                };
                 vec![LStatement {
                     kind: LStatementKind::Assignment(LAssignment {
-                        target,
+                        target_id: id,
+                        target_name: name,
+                        ty,
                         value,
                         span,
                     }),
@@ -292,13 +289,10 @@ impl Lowerer {
                     })
                 }
                 TypedAssignItem::Existing(id, name, ty) => {
-                    let target = LExpr {
-                        kind: LExprKind::Var(id, name),
-                        ty,
-                        span,
-                    };
                     LForLoopInit::Assignment(LAssignment {
-                        target,
+                        target_id: id,
+                        target_name: name,
+                        ty,
                         value,
                         span,
                     })

@@ -101,17 +101,6 @@ pub struct AUserFuncCall {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ALhsExpr {
-    Var(NameId, String),
-    Index(Box<ALhsExpr>, AAtomic),
-    FieldAccess(Box<ALhsExpr>, String),
-    TupleAccess(Box<ALhsExpr>, usize),
-    SafeIndex(Box<ALhsExpr>, AAtomic),
-    SafeFieldAccess(Box<ALhsExpr>, String),
-    SafeTupleAccess(Box<ALhsExpr>, usize),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct AStatement {
     pub kind: AStatementKind,
     pub span: Span,
@@ -144,7 +133,9 @@ pub struct ALetAtom {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AAssign {
-    pub target: ALhsExpr,
+    pub target_id: NameId,
+    pub target_name: String,
+    pub ty: Type,
     pub value: AAtomic,
     pub span: Span,
 }
