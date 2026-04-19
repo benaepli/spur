@@ -156,8 +156,8 @@ fn prints_let_with_binop_and_return() {
 # Pure IR / SSA
 
 fn add(x: int, y: int) -> int {
-  let __t: int = x + y
-  return __t
+  let __t: int = x + y;
+  return __t;
 }
 
 ";
@@ -207,8 +207,8 @@ fn pick(c: bool) -> int {
     1
   } else {
     2
-  }
-  return r
+  };
+  return r;
 }
 
 ";
@@ -266,7 +266,7 @@ role Server {
 }
 
 [loop] fn loop_helper(n: int) -> int {
-  return n
+  return n;
 }
 
 ";
@@ -309,7 +309,7 @@ fn prints_struct_and_enum_defs_sorted() {
 # Pure IR / SSA
 
 struct Struct#3 { x: int }
-struct Struct#7 { ok: bool, id: int }
+struct Struct#7 { ok: bool; id: int }
 
 enum Enum#5 { Red }
 enum Enum#9 { Some(int), None }
@@ -360,7 +360,7 @@ fn prints_struct_and_enum_defs_with_names() {
 # Pure IR / SSA
 
 struct Color { x: int }
-struct Response { ok: bool, body: int }
+struct Response { ok: bool; body: int }
 
 enum Mood { Happy }
 enum Optional { Some(int), None }
@@ -410,9 +410,9 @@ fn prints_collision_keeps_ids() {
 # Pure IR / SSA
 
 fn f(uniq: int) -> int {
-  let __upd#100: int = uniq + 1
-  let __upd#101: int = __upd#100 + 2
-  return __upd#101
+  let __upd#100: int = uniq + 1;
+  let __upd#101: int = __upd#100 + 2;
+  return __upd#101;
 }
 
 ";

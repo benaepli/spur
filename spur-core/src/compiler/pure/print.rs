@@ -105,7 +105,7 @@ impl<'a> Printer<'a> {
                 .iter()
                 .map(|(n, t)| format!("{}: {}", n, t))
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join("; ");
             self.writeln(&format!("struct {} {{ {} }}", name, fields_str));
         }
         self.blank_line();
@@ -215,10 +215,10 @@ impl<'a> Printer<'a> {
             PStatementKind::LetAtom(la) => self.write_let(la),
             PStatementKind::Expr(e) => self.write_expr_stmt(e),
             PStatementKind::Return(a) => {
-                let s = format!("return {}", self.fmt_atomic(a));
+                let s = format!("return {};", self.fmt_atomic(a));
                 self.writeln(&s);
             }
-            PStatementKind::Error => self.writeln("error"),
+            PStatementKind::Error => self.writeln("error;"),
         }
     }
 
@@ -228,25 +228,36 @@ impl<'a> Printer<'a> {
             self.fmt_name(&la.original_name, la.name),
             la.ty
         );
-        self.write_expr_with_header(&header, &la.value);
+        // `let` always terminates with `;`, even when the value is a block
+        // or conditional.
+        self.write_expr_with_header(&header, &la.value, ";");
     }
 
     fn write_expr_stmt(&mut self, e: &PExpr) {
-        // Statement-position expression: no binding, no `=`.
-        self.write_expr_with_header("", e);
+        // Statement-position expression: no binding, no `=`. Bare
+        // block/conditional statements don't take a trailing `;` (surface
+        // grammar: block-structured exprs in statement position need no
+        // terminator). Simple-expr statements do.
+        let term = match &e.kind {
+            PExprKind::Conditional(_) | PExprKind::Block(_) => "",
+            _ => ";",
+        };
+        self.write_expr_with_header("", e, term);
     }
 
     /// Write an expression that may either fit on one line (after `header`) or
     /// expand into a multi-line block / conditional. `header` ends without a
     /// trailing space; we add one when the expression body is non-empty.
-    fn write_expr_with_header(&mut self, header: &str, e: &PExpr) {
+    /// `terminator` is appended to the final line of output (typically `";"`
+    /// for statements, `""` for tail positions / bare block statements).
+    fn write_expr_with_header(&mut self, header: &str, e: &PExpr, terminator: &str) {
         match &e.kind {
             PExprKind::Conditional(cond) => {
                 if header.is_empty() {
-                    self.write_conditional(cond);
+                    self.write_conditional(cond, terminator);
                 } else {
                     self.writeln(header);
-                    self.write_conditional(cond);
+                    self.write_conditional(cond, terminator);
                 }
             }
             PExprKind::Block(b) => {
@@ -258,20 +269,20 @@ impl<'a> Printer<'a> {
                 self.indent += 1;
                 self.write_block_body(b);
                 self.indent -= 1;
-                self.writeln("}");
+                self.writeln(&format!("}}{}", terminator));
             }
             _ => {
                 let body = self.fmt_simple_expr(&e.kind);
                 if header.is_empty() {
-                    self.writeln(&body);
+                    self.writeln(&format!("{}{}", body, terminator));
                 } else {
-                    self.writeln(&format!("{} {}", header, body));
+                    self.writeln(&format!("{} {}{}", header, body, terminator));
                 }
             }
         }
     }
 
-    fn write_conditional(&mut self, cond: &PCondExpr) {
+    fn write_conditional(&mut self, cond: &PCondExpr, terminator: &str) {
         let cond_str = self.fmt_atomic(&cond.if_branch.condition);
         self.writeln(&format!("if {} {{", cond_str));
         self.indent += 1;
@@ -293,7 +304,7 @@ impl<'a> Printer<'a> {
             self.indent -= 1;
         }
 
-        self.writeln("}");
+        self.writeln(&format!("}}{}", terminator));
     }
 
     // ===== expression / atomic formatters =====
