@@ -1,7 +1,9 @@
 use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::parser::{BinOp, Span};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub enum Type {
@@ -17,6 +19,7 @@ pub enum Type {
     Optional(Box<Type>),
     Chan(Box<Type>),
     Iter(Box<Type>),
+    Refined(Box<Type>, RefinementHandle),
 
     // Placeholder types.
     EmptyList,
@@ -25,6 +28,56 @@ pub enum Type {
     Nil,
     Never, // For diverging expressions (return, break, etc.)
     Error, // Unknown type due to earlier error — unifies with anything
+}
+
+#[derive(Debug, Clone)]
+pub struct RefinementBody {
+    pub bound: NameId,
+    pub original_bound: String,
+    pub body: TypedExpr,
+}
+
+/// Handle for a refinement body that uses identity-based equality and hashing.
+/// Two refinement handles compare equal iff they wrap the same Arc allocation.
+#[derive(Debug, Clone)]
+pub struct RefinementHandle(pub Arc<RefinementBody>);
+
+impl RefinementHandle {
+    pub fn new(body: RefinementBody) -> Self {
+        RefinementHandle(Arc::new(body))
+    }
+
+    pub fn as_ptr(&self) -> *const RefinementBody {
+        Arc::as_ptr(&self.0)
+    }
+}
+
+impl std::ops::Deref for RefinementHandle {
+    type Target = RefinementBody;
+    fn deref(&self) -> &RefinementBody {
+        &self.0
+    }
+}
+
+impl PartialEq for RefinementHandle {
+    fn eq(&self, other: &RefinementHandle) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RefinementHandle {}
+
+impl Hash for RefinementHandle {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.0) as usize).hash(state);
+    }
+}
+
+impl Serialize for RefinementHandle {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Serialize just the bound name — the body AST isn't useful in serialized form.
+        s.serialize_str(&self.0.original_bound)
+    }
 }
 
 impl std::fmt::Display for Type {
@@ -49,6 +102,9 @@ impl std::fmt::Display for Type {
             Type::Optional(t) => write!(f, "{}?", t),
             Type::Chan(t) => write!(f, "chan<{}>", t),
             Type::Iter(t) => write!(f, "iter<{}>", t),
+            Type::Refined(inner, body) => {
+                write!(f, "{} {{ {} | … }}", inner, body.original_bound)
+            }
             Type::EmptyList => write!(f, "empty list"),
             Type::EmptyMap => write!(f, "empty map"),
             Type::UnknownChannel => write!(f, "unknown channel"),

@@ -97,5 +97,6 @@ pub fn is_trivially_copyable(ty: &Type, map: &TriviallyCopyableMap) -> bool {
         Type::Never => true,
         Type::Error => true,
         Type::Iter(t) => is_trivially_copyable(t, map),
+        Type::Refined(inner, _) => is_trivially_copyable(inner, map),
     }
 }

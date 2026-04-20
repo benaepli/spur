@@ -147,6 +147,13 @@ pub enum ResolvedTypeDef {
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
     Chan(Box<ResolvedTypeDef>),
+    Refined {
+        base: Box<ResolvedTypeDef>,
+        bound: NameId,
+        original_bound: String,
+        body: Box<ResolvedExpr>,
+        span: Span,
+    },
     Error,
 }
 
@@ -785,6 +792,25 @@ impl Resolver {
                 ResolvedTypeDef::Optional(Box::new(self.resolve_type_def(*t)))
             }
             TypeDefKind::Chan(t) => ResolvedTypeDef::Chan(Box::new(self.resolve_type_def(*t))),
+            TypeDefKind::Refined {
+                base,
+                bound,
+                bound_span,
+                body,
+            } => {
+                let base_resolved = self.resolve_type_def(*base);
+                self.enter_scope();
+                let bound_id = self.declare_var(&bound, bound_span);
+                let body_resolved = self.resolve_expr(*body);
+                self.exit_scope();
+                ResolvedTypeDef::Refined {
+                    base: Box::new(base_resolved),
+                    bound: bound_id,
+                    original_bound: bound,
+                    body: Box::new(body_resolved),
+                    span,
+                }
+            }
         }
     }
 

@@ -39,7 +39,7 @@ enum_variants ::= enum_variant ( ',' enum_variant )* ','?
 
 type_alias ::= '=' type_def
 
-type_def ::= base_type ( '?' )?
+type_def ::= base_type ( '?' )? ( '{' ID '|' expr '}' )?
 
 base_type ::=
   ID
@@ -191,6 +191,20 @@ The type system is composed of:
 - Collections: `list<T>`, `map<K, V>`
 - Concurrency: `chan<T>`
 - Optional types: `T?`, which can be either `nil` or a value of type `T`
+- Refinement types: `T { x | expr }`, where `x` binds a value of type `T` and `expr` must be of type `bool`
+
+### Refinements
+
+A refinement type `T { x | expr }` attaches a boolean predicate to an existing type. The bound variable `x` has type `T` and is in scope within `expr`. Example:
+
+```
+type Positive = int { x | x > 0 };
+var n: int { v | v > 0 } = 42;
+```
+
+- Refinements can appear anywhere a type is expected: variable declarations, function parameters, return types, struct fields, type aliases, and nested inside generic types like `list<int { y | y > 0 }>`.
+- The body must be a side-effect-free expression of type `bool`. Only built-in function calls are allowed in the body (user function calls are rejected).
+- Dependent parameter refinements are supported: in `fn f(n: int, v: list<int> { xs | len(xs) == n })`, the refinement body can reference earlier parameters.
 
 ## Reference and Value Semantics
 

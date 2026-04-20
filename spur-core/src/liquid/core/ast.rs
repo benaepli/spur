@@ -1,8 +1,12 @@
 use crate::analysis::resolver::NameId;
 use crate::parser::{BinOp, Span};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+use super::refinement::RefinementExpr;
+
+#[derive(Debug, Clone)]
 pub enum CType {
     Int,
     Bool,
@@ -18,6 +22,96 @@ pub enum CType {
     Role(NameId),
     Struct(NameId),
     Variant(NameId),
+    Refined(Box<CType>, CRefinementHandle),
+}
+
+#[derive(Debug, Clone)]
+pub struct CRefinementBody {
+    pub bound: NameId,
+    pub original_bound: String,
+    pub body: RefinementExpr,
+}
+
+/// Handle for a refinement body that uses identity-based equality and hashing.
+#[derive(Debug, Clone)]
+pub struct CRefinementHandle(pub Arc<CRefinementBody>);
+
+impl CRefinementHandle {
+    pub fn new(body: CRefinementBody) -> Self {
+        CRefinementHandle(Arc::new(body))
+    }
+
+    pub fn as_ptr(&self) -> *const CRefinementBody {
+        Arc::as_ptr(&self.0)
+    }
+}
+
+impl std::ops::Deref for CRefinementHandle {
+    type Target = CRefinementBody;
+    fn deref(&self) -> &CRefinementBody {
+        &self.0
+    }
+}
+
+impl PartialEq for CRefinementHandle {
+    fn eq(&self, other: &CRefinementHandle) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CRefinementHandle {}
+
+impl Hash for CRefinementHandle {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.0) as usize).hash(state);
+    }
+}
+
+impl PartialEq for CType {
+    fn eq(&self, other: &CType) -> bool {
+        match (self, other) {
+            (CType::Int, CType::Int)
+            | (CType::Bool, CType::Bool)
+            | (CType::String, CType::String)
+            | (CType::Nil, CType::Nil)
+            | (CType::Never, CType::Never) => true,
+            (CType::Array(a), CType::Array(b)) => a == b,
+            (CType::Map(k1, v1), CType::Map(k2, v2)) => k1 == k2 && v1 == v2,
+            (CType::Tuple(a), CType::Tuple(b)) => a == b,
+            (CType::Optional(a), CType::Optional(b)) => a == b,
+            (CType::Chan(a), CType::Chan(b)) => a == b,
+            (CType::Iter(a), CType::Iter(b)) => a == b,
+            (CType::Role(a), CType::Role(b)) => a == b,
+            (CType::Struct(a), CType::Struct(b)) => a == b,
+            (CType::Variant(a), CType::Variant(b)) => a == b,
+            (CType::Refined(ia, ha), CType::Refined(ib, hb)) => ia == ib && ha == hb,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CType {}
+
+impl Hash for CType {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            CType::Int | CType::Bool | CType::String | CType::Nil | CType::Never => {}
+            CType::Array(t) | CType::Optional(t) | CType::Chan(t) | CType::Iter(t) => {
+                t.hash(state);
+            }
+            CType::Map(k, v) => {
+                k.hash(state);
+                v.hash(state);
+            }
+            CType::Tuple(ts) => ts.hash(state),
+            CType::Role(id) | CType::Struct(id) | CType::Variant(id) => id.hash(state),
+            CType::Refined(inner, body) => {
+                inner.hash(state);
+                body.hash(state);
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for CType {
@@ -44,6 +138,9 @@ impl std::fmt::Display for CType {
             CType::Role(id) => write!(f, "role#{}", id.0),
             CType::Struct(id) => write!(f, "struct#{}", id.0),
             CType::Variant(id) => write!(f, "variant#{}", id.0),
+            CType::Refined(inner, body) => {
+                write!(f, "{} {{ {} | … }}", inner, body.original_bound)
+            }
         }
     }
 }

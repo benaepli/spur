@@ -76,6 +76,9 @@ fn register_type(ty: &Type, map: &mut TypeIdMap, next_id: &mut u32) {
         Type::List(inner) | Type::Optional(inner) | Type::Chan(inner) => {
             register_type(inner, map, next_id);
         }
+        Type::Refined(inner, _) => {
+            register_type(inner, map, next_id);
+        }
         Type::Map(key, val) => {
             register_type(key, map, next_id);
             register_type(val, map, next_id);

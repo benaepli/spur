@@ -295,7 +295,12 @@ impl TypeChecker {
         // Resolve type definitions for downstream passes.
         let mut struct_defs = HashMap::new();
         let mut enum_defs = HashMap::new();
-        for (name_id, type_def) in &self.type_defs {
+        let collected_defs: Vec<(NameId, TypeDefinition)> = self
+            .type_defs
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for (name_id, type_def) in collected_defs {
             match type_def {
                 TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => {
                     let resolved_fields: Vec<(String, Type)> = fields
@@ -305,7 +310,7 @@ impl TypeChecker {
                             Err(_) => None,
                         })
                         .collect();
-                    struct_defs.insert(*name_id, resolved_fields);
+                    struct_defs.insert(name_id, resolved_fields);
                 }
                 TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Enum(variants)) => {
                     let resolved_variants: Vec<(String, Option<Type>)> = variants
@@ -320,7 +325,7 @@ impl TypeChecker {
                             Some((v.name.clone(), payload_ty))
                         })
                         .collect();
-                    enum_defs.insert(*name_id, resolved_variants);
+                    enum_defs.insert(name_id, resolved_variants);
                 }
                 _ => {}
             }
@@ -415,7 +420,7 @@ impl TypeChecker {
     }
 
     fn build_function_signature(
-        &self,
+        &mut self,
         func: &ResolvedFuncDef,
     ) -> Result<FunctionSignature, TypeError> {
         let params = func
@@ -2352,6 +2357,16 @@ impl TypeChecker {
             return Ok(typed_expr);
         }
 
+        // Refinements are not statically enforced; allow `Refined(T, _) ↔ T`.
+        // TODO: entailment-based subtyping.
+        if let Type::Refined(expected_inner, _) = expected {
+            return self.check_types_match(typed_expr, expected_inner);
+        }
+        if let Type::Refined(actual_inner, _) = actual {
+            typed_expr.ty = (**actual_inner).clone();
+            return self.check_types_match(typed_expr, expected);
+        }
+
         if let (Type::List(e), Type::EmptyList) = (expected, actual) {
             typed_expr.ty = Type::List(e.clone());
             return Ok(typed_expr);
@@ -2862,25 +2877,26 @@ impl TypeChecker {
     }
 
     fn get_field_type(
-        &self,
+        &mut self,
         struct_id: NameId,
         field_name: &str,
         span: Span,
     ) -> Result<Type, TypeError> {
         let (_, field_defs) = self.resolve_struct_definition(struct_id, span, field_name)?;
 
-        let field_def = field_defs
+        let field_def_type = field_defs
             .iter()
             .find(|f| f.name == field_name)
             .ok_or_else(|| TypeError::FieldNotFound {
                 field_name: field_name.to_string(),
                 span,
-            })?;
-
-        self.resolve_type(&field_def.type_def)
+            })?
+            .type_def
+            .clone();
+        self.resolve_type(&field_def_type)
     }
 
-    fn resolve_type(&self, type_def: &ResolvedTypeDef) -> Result<Type, TypeError> {
+    fn resolve_type(&mut self, type_def: &ResolvedTypeDef) -> Result<Type, TypeError> {
         match type_def {
             ResolvedTypeDef::Named(name_id) => {
                 if let Some(def) = self.type_defs.get(name_id) {
@@ -2904,7 +2920,10 @@ impl TypeChecker {
                         }
                         TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Alias(
                             aliased_type,
-                        )) => self.resolve_type(aliased_type),
+                        )) => {
+                            let cloned = aliased_type.clone();
+                            self.resolve_type(&cloned)
+                        }
                     }
                 } else if let Some(role_name) = self.role_defs.get(name_id) {
                     Ok(Type::Role(*name_id, role_name.clone()))
@@ -2945,6 +2964,38 @@ impl TypeChecker {
                 let base_type = self.resolve_type(t)?;
                 Ok(Type::Chan(Box::new(base_type)))
             }
+            ResolvedTypeDef::Refined {
+                base,
+                bound,
+                original_bound,
+                body,
+                ..
+            } => {
+                let inner = self.resolve_type(base)?;
+                let bound_id = *bound;
+                let original_bound = original_bound.clone();
+                let body = (**body).clone();
+                let body_span = body.span;
+                self.scopes.push(HashMap::new());
+                self.add_var(bound_id, inner.clone());
+                let typed_body = self.check_expr(body, &Type::Bool);
+                self.scopes.pop();
+                if !matches!(typed_body.ty, Type::Bool | Type::Error) {
+                    return Err(TypeError::Mismatch {
+                        expected: Type::Bool,
+                        found: typed_body.ty,
+                        span: body_span,
+                    });
+                }
+                let handle = crate::analysis::types::RefinementHandle::new(
+                    crate::analysis::types::RefinementBody {
+                        bound: bound_id,
+                        original_bound,
+                        body: typed_body,
+                    },
+                );
+                Ok(Type::Refined(Box::new(inner), handle))
+            }
             ResolvedTypeDef::Error => Ok(Type::Error),
         }
     }
@@ -2962,6 +3013,15 @@ impl TypeChecker {
 
         if expected == actual {
             return Ok(());
+        }
+
+        // Refinements are not statically enforced; treat Refined(T, _) ↔ T as compatible.
+        // TODO: entailment-based subtyping.
+        if let Type::Refined(inner, _) = expected {
+            return self.check_type_compatibility(inner, actual, span);
+        }
+        if let Type::Refined(inner, _) = actual {
+            return self.check_type_compatibility(expected, inner, span);
         }
 
         // Never is the bottom type and coerces to any type

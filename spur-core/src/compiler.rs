@@ -11,6 +11,7 @@ use crate::analysis::{trivially_copyable, type_id};
 use crate::compiler::cfg::Compiler as CfgCompiler;
 use crate::compiler::lowered::lower_program;
 use crate::lexer::{LexError, Lexer};
+use crate::liquid::core::lower::RefinementValidationError;
 use crate::liquid::pure::ast::PProgram;
 use crate::parser::{ParseError, ValidationError, parse_program};
 use crate::{lexer, parser};
@@ -26,6 +27,7 @@ pub struct CompileResult {
     pub validation_errors: Vec<ValidationError>,
     pub resolution_errors: Vec<ResolutionError>,
     pub type_errors: Vec<TypeError>,
+    pub refinement_errors: Vec<RefinementValidationError>,
 }
 
 impl CompileResult {
@@ -36,6 +38,7 @@ impl CompileResult {
             || !self.validation_errors.is_empty()
             || !self.resolution_errors.is_empty()
             || !self.type_errors.is_empty()
+            || !self.refinement_errors.is_empty()
     }
 
     /// Converts into a Result, returning the program if no errors, or an error otherwise.
@@ -61,6 +64,12 @@ impl CompileResult {
         if !self.type_errors.is_empty() {
             return Err(anyhow::anyhow!("type error: {}", self.type_errors[0]));
         }
+        if !self.refinement_errors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "refinement error: {}",
+                self.refinement_errors[0]
+            ));
+        }
         self.program
             .ok_or_else(|| anyhow::anyhow!("no output generated"))
     }
@@ -75,6 +84,7 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
         validation_errors: Vec::new(),
         resolution_errors: Vec::new(),
         type_errors: Vec::new(),
+        refinement_errors: Vec::new(),
     };
 
     let mut lexer = Lexer::new(input);
@@ -154,8 +164,8 @@ pub fn compile_lsp(input: &str) -> CompileResult {
         validation_errors: Vec::new(),
         resolution_errors: Vec::new(),
         type_errors: Vec::new(),
+        refinement_errors: Vec::new(),
     };
-
     let mut lexer = Lexer::new(input);
     let (lexed, lex_errors) = lexer.collect_all();
     result.lex_errors = lex_errors;

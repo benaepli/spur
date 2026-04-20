@@ -124,6 +124,12 @@ pub enum TypeDefKind {
     Tuple(Vec<TypeDef>),
     Optional(Box<TypeDef>),
     Chan(Box<TypeDef>),
+    Refined {
+        base: Box<TypeDef>,
+        bound: String,
+        bound_span: Span,
+        body: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -455,7 +461,9 @@ where
     }).boxed()
 }
 
-pub fn type_def_parser<'a, I>() -> impl Parser<'a, I, TypeDef, extra::Err<Rich<'a, TokenKind>>> + Clone + 'a
+pub fn type_def_parser<'a, I>(
+    expr: impl Parser<'a, I, Expr, extra::Err<Rich<'a, TokenKind>>> + Clone + 'a,
+) -> impl Parser<'a, I, TypeDef, extra::Err<Rich<'a, TokenKind>>> + Clone + 'a
 where
     I: BorrowInput<'a, Token = TokenKind, Span = SimpleSpan> + Clone,
 {
@@ -510,7 +518,7 @@ where
 
         let base_type = choice((named, map, list, tuple, chan_type));
 
-        base_type
+        let optional = base_type
             .then(just(TokenKind::Question).or_not())
             .map_with(|(base, opt_q), e| {
                 if opt_q.is_some() {
@@ -521,6 +529,28 @@ where
                 } else {
                     base
                 }
+            });
+
+        let bound_ident = ident.clone().map_with(|n, e| (n, e.span()));
+        let refinement_suffix = just(TokenKind::LeftBrace)
+            .ignore_then(bound_ident)
+            .then_ignore(just(TokenKind::Pipe))
+            .then(expr.clone())
+            .then_ignore(just(TokenKind::RightBrace));
+
+        optional
+            .then(refinement_suffix.or_not())
+            .map_with(|(base, ref_opt), e| match ref_opt {
+                Some(((bound, bound_span), body)) => TypeDef {
+                    kind: TypeDefKind::Refined {
+                        base: Box::new(base),
+                        bound,
+                        bound_span,
+                        body: Box::new(body),
+                    },
+                    span: e.span(),
+                },
+                None => base,
             })
     }).boxed()
 }
@@ -571,7 +601,7 @@ pub fn assignment_parser<'a, I>(
 where
     I: BorrowInput<'a, Token = TokenKind, Span = SimpleSpan> + Clone,
 {
-    let type_def = type_def_parser();
+    let type_def = type_def_parser(expr.clone());
     assign_target_parser()
         .then(
             just(TokenKind::Colon)
@@ -741,7 +771,7 @@ where
     I: BorrowInput<'a, Token = TokenKind, Span = SimpleSpan> + Clone,
 {
     let ident = ident_parser();
-    let type_def = type_def_parser();
+    let type_def = type_def_parser(expr.clone());
     let pattern = pattern_parser();
     
     let val = select! {
@@ -1260,8 +1290,8 @@ where
     I: BorrowInput<'a, Token = TokenKind, Span = SimpleSpan> + Clone,
 {
     let ident = ident_parser();
-    let type_def = type_def_parser();
     let expr = expr_parser();
+    let type_def = type_def_parser(expr.clone());
     let var_target = var_target_parser();
     let stmt = statement_parser(expr.clone());
     let block_p = block_parser(expr.clone(), stmt.clone());

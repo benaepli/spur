@@ -68,6 +68,7 @@ pub enum TokenKind {
     SendArrow,
     FatArrow,
     ColonEqual,
+    Pipe,
 
     // Literals
     // Literals
@@ -159,6 +160,7 @@ impl fmt::Display for TokenKind {
             TokenKind::SendArrow => write!(f, ">-"),
             TokenKind::FatArrow => write!(f, "=>"),
             TokenKind::ColonEqual => write!(f, ":="),
+            TokenKind::Pipe => write!(f, "|"),
             TokenKind::Identifier(s) => write!(f, "{}", s),
             TokenKind::String(s) => write!(f, "\"{}\"", s),
             TokenKind::FStringStart(s) => write!(f, "f\"{} {{", s),
@@ -280,6 +282,7 @@ fn is_special_char(ch: char) -> bool {
             | '='
             | '"'
             | '@'
+            | '|'
     )
 }
 
@@ -660,6 +663,8 @@ impl<'a> Iterator for Lexer<'a> {
                     Ok(TokenKind::Less)
                 }
             }
+
+            '|' => Ok(TokenKind::Pipe),
 
             '"' => self.parse_fstring(start, false),
 
