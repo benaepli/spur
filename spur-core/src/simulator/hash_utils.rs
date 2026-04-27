@@ -3,7 +3,8 @@
 //! Provides mixing functions for position-dependent hashing used by Value, Env, and State.
 //! Also defines the HashPolicy trait for conditional hashing based on simulation mode.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use rustc_hash::FxHasher;
+use std::hash::{Hash, Hasher};
 
 /// Fibonacci hash constant (golden ratio based)
 pub const HASH_PRIME: u64 = 0x9E3779B97F4A7C15;
@@ -20,7 +21,7 @@ pub fn mix(hash: u64, index: u32) -> u64 {
 /// Compute the default hash of any hashable value as a u64.
 #[inline]
 pub fn compute_hash<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
     value.hash(&mut hasher);
     hasher.finish()
 }
@@ -34,6 +35,13 @@ pub fn compute_hash<T: Hash>(value: &T) -> u64 {
 /// The trait methods will be implemented alongside the types they work with to avoid
 /// circular dependencies. WithHashing implementations will live in values.rs and state.rs.
 pub trait HashPolicy: 'static + Clone + std::fmt::Debug + Send + Sync + Hash {
+    /// Whether to eagerly compute signatures for composite values and envs.
+    /// When false, `Value::new` skips `compute_sig` for composites and sets sig = 0,
+    /// and `Env::set` / `Env::with_slots` skip the XOR-mix bookkeeping.
+    /// Leaf values that are used as map keys (Int, Bool, Node, String, Channel)
+    /// still get a lightweight signature so `ValueKind::Map` lookups stay O(1).
+    const EAGER: bool;
+
     /// Mix a hash with a position index for order-dependent aggregation.
     fn mix(sig: u64, pos: u32) -> u64;
 
@@ -53,6 +61,8 @@ pub struct WithHashing;
 pub struct NoHashing;
 
 impl HashPolicy for WithHashing {
+    const EAGER: bool = true;
+
     #[inline]
     fn mix(sig: u64, pos: u32) -> u64 {
         mix(sig, pos)
@@ -65,6 +75,8 @@ impl HashPolicy for WithHashing {
 }
 
 impl HashPolicy for NoHashing {
+    const EAGER: bool = false;
+
     #[inline]
     fn mix(_sig: u64, _pos: u32) -> u64 {
         0

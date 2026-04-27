@@ -6,7 +6,8 @@ use crate::simulator::hash_utils::HashPolicy;
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use rustc_hash::FxHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 #[inline(always)]
@@ -78,31 +79,35 @@ fn update_collection<H: HashPolicy>(
     use ValueKind::*;
     match col.kind {
         Map(m) => {
-            let mut new_sig = col.sig; // Start with existing signature
+            let new_sig = if H::EAGER {
+                let mut s = col.sig;
 
-            // Remove the old entry's contribution (if it exists)
-            if let Some(old_val) = m.get(&key) {
-                let old_entry_hash = hash_map_entry(key.sig, old_val.sig);
-                new_sig ^= old_entry_hash; // XOR removes it
-            // Also remove old length contribution and add adjusted length
-            // (length stays the same, so no change needed)
+                // Remove the old entry's contribution (if it exists)
+                if let Some(old_val) = m.get(&key) {
+                    let old_entry_hash = hash_map_entry(key.sig, old_val.sig);
+                    s ^= old_entry_hash; // XOR removes it
+                // length stays the same when replacing, so no change needed
+                } else {
+                    // Key doesn't exist, length will increase by 1
+                    // Remove old length hash, add new length hash
+                    let mut h = FxHasher::default();
+                    9u8.hash(&mut h);
+                    m.len().hash(&mut h);
+                    s ^= h.finish();
+
+                    let mut h = FxHasher::default();
+                    9u8.hash(&mut h);
+                    (m.len() + 1).hash(&mut h);
+                    s ^= h.finish();
+                }
+
+                // Add the new entry's contribution
+                let new_entry_hash = hash_map_entry(key.sig, val.sig);
+                s ^= new_entry_hash;
+                s
             } else {
-                // Key doesn't exist, length will increase by 1
-                // Remove old length hash, add new length hash
-                let mut h = DefaultHasher::new();
-                9u8.hash(&mut h);
-                m.len().hash(&mut h);
-                new_sig ^= h.finish();
-
-                let mut h = DefaultHasher::new();
-                9u8.hash(&mut h);
-                (m.len() + 1).hash(&mut h);
-                new_sig ^= h.finish();
-            }
-
-            // Add the new entry's contribution
-            let new_entry_hash = hash_map_entry(key.sig, val.sig);
-            new_sig ^= new_entry_hash;
+                0
+            };
 
             let new_map = m.update(key, val);
 

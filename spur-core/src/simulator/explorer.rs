@@ -1,7 +1,7 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
     Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
-    Value, exec_sync_on_node, make_local_env,
+    Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::history::{
@@ -64,11 +64,17 @@ pub struct ExplorerConfig {
     #[serde(rename = "num_read_ops")]
     pub num_read_ops_range: Range,
 
+    #[serde(rename = "num_keys", default = "default_num_keys_range")]
+    pub num_keys_range: Range,
+
     #[serde(rename = "num_crashes")]
     pub num_crashes_range: Range,
 
     #[serde(rename = "num_partitions", default = "default_partitions_range")]
     pub num_partitions_range: Range,
+
+    #[serde(rename = "max_concurrent_writes", default)]
+    pub max_concurrent_writes_range: Option<Range>,
 
     #[serde(rename = "dependency_density")]
     pub dependency_density_values: Vec<f64>,
@@ -89,6 +95,9 @@ pub struct ExplorerConfig {
     #[serde(default)]
     pub queue_policy: QueuePolicyConfig,
 
+    #[serde(default)]
+    pub within_queue_selector: WithinQueueSelector,
+
     #[serde(default = "default_quick_fire_multiplier")]
     pub quick_fire_multiplier: f64,
 
@@ -107,12 +116,31 @@ impl ExplorerConfig {
         self.num_read_ops_range
             .validate()
             .map_err(|e| format!("num_read_ops range error: {}", e))?;
+        self.num_keys_range
+            .validate()
+            .map_err(|e| format!("num_keys range error: {}", e))?;
+        if self.num_keys_range.min < 1 {
+            return Err(format!(
+                "num_keys range error: min must be >= 1 (got {})",
+                self.num_keys_range.min
+            ));
+        }
         self.num_crashes_range
             .validate()
             .map_err(|e| format!("num_crashes range error: {}", e))?;
         self.num_partitions_range
             .validate()
             .map_err(|e| format!("num_partitions range error: {}", e))?;
+        if let Some(r) = &self.max_concurrent_writes_range {
+            r.validate()
+                .map_err(|e| format!("max_concurrent_writes range error: {}", e))?;
+            if r.min < 1 {
+                return Err(format!(
+                    "max_concurrent_writes range error: min must be >= 1 (got {})",
+                    r.min
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -121,6 +149,14 @@ fn default_partitions_range() -> Range {
     Range {
         min: 0,
         max: 0,
+        step: 1,
+    }
+}
+
+fn default_num_keys_range() -> Range {
+    Range {
+        min: 1,
+        max: 1,
         step: 1,
     }
 }
@@ -146,13 +182,16 @@ pub struct SingleRunConfig {
     pub num_servers: i32,
     pub num_write_ops: i32,
     pub num_read_ops: i32,
+    pub num_keys: i32,
     pub num_crashes: i32,
     pub num_partitions: i32,
+    pub max_concurrent_writes: Option<i32>,
     pub dependency_density: f64,
     pub use_coverage_scheduling: bool,
     pub max_iterations: i32,
     pub schedule_policy: SchedulePolicy,
     pub queue_policy: QueuePolicyConfig,
+    pub within_queue_selector: WithinQueueSelector,
     pub quick_fire_multiplier: f64,
     pub purgatory: PurgatoryConfig,
 }
@@ -190,12 +229,19 @@ impl SingleRunConfig {
             num_read_ops: rng.random_range(
                 constraints.num_read_ops_range.min..=constraints.num_read_ops_range.max,
             ),
+            num_keys: rng.random_range(
+                constraints.num_keys_range.min..=constraints.num_keys_range.max,
+            ),
             num_crashes: rng.random_range(
                 constraints.num_crashes_range.min..=constraints.num_crashes_range.max,
             ),
             num_partitions: rng.random_range(
                 constraints.num_partitions_range.min..=constraints.num_partitions_range.max,
             ),
+            max_concurrent_writes: constraints
+                .max_concurrent_writes_range
+                .as_ref()
+                .map(|r| rng.random_range(r.min..=r.max)),
             dependency_density: *constraints
                 .dependency_density_values
                 .choose(&mut rng)
@@ -204,6 +250,7 @@ impl SingleRunConfig {
             max_iterations: constraints.max_iterations,
             schedule_policy: constraints.schedule_policy.clone(),
             queue_policy,
+            within_queue_selector: constraints.within_queue_selector.clone(),
             quick_fire_multiplier: constraints.quick_fire_multiplier,
             purgatory: constraints.purgatory.clone(),
         }
@@ -226,9 +273,17 @@ impl SingleRunConfig {
         new_config.num_servers = mutate_int(self.num_servers, &constraints.num_servers_range);
         new_config.num_write_ops = mutate_int(self.num_write_ops, &constraints.num_write_ops_range);
         new_config.num_read_ops = mutate_int(self.num_read_ops, &constraints.num_read_ops_range);
+        new_config.num_keys = mutate_int(self.num_keys, &constraints.num_keys_range);
         new_config.num_crashes = mutate_int(self.num_crashes, &constraints.num_crashes_range);
         new_config.num_partitions =
             mutate_int(self.num_partitions, &constraints.num_partitions_range);
+
+        if let (Some(current), Some(range)) = (
+            self.max_concurrent_writes,
+            constraints.max_concurrent_writes_range.as_ref(),
+        ) {
+            new_config.max_concurrent_writes = Some(mutate_int(current, range));
+        }
 
         if rng.random_bool(0.3) && !constraints.dependency_density_values.is_empty() {
             new_config.dependency_density = *constraints
@@ -392,9 +447,11 @@ pub fn run_single_simulation(
         num_servers: config.num_servers,
         num_write_ops: config.num_write_ops,
         num_read_ops: config.num_read_ops,
+        num_keys: config.num_keys,
         num_crashes: config.num_crashes,
         num_partitions: config.num_partitions,
         dependency_density: config.dependency_density,
+        max_concurrent_writes: config.max_concurrent_writes,
     };
     let plan = generate_plan(gen_config);
     let canonical = if plan.node_count() < CANON_LIMIT {
@@ -467,6 +524,7 @@ pub fn run_single_simulation(
         &config.schedule_policy,
         false,
         &config.queue_policy,
+        &config.within_queue_selector,
         config.quick_fire_multiplier,
         &config.purgatory,
     )?;
@@ -518,8 +576,13 @@ pub fn run_explorer(
         let all_servers = config.num_servers_range.expand();
         let all_writes = config.num_write_ops_range.expand();
         let all_reads = config.num_read_ops_range.expand();
+        let all_keys = config.num_keys_range.expand();
         let all_crashes = config.num_crashes_range.expand();
         let all_partitions = config.num_partitions_range.expand();
+        let all_max_concurrent: Vec<Option<i32>> = match &config.max_concurrent_writes_range {
+            Some(r) => r.expand().into_iter().map(Some).collect(),
+            None => vec![None],
+        };
         let all_densities = &config.dependency_density_values;
 
         let mut config_counter = 0;
@@ -527,8 +590,10 @@ pub fn run_explorer(
         let total_configs = all_servers.len()
             * all_writes.len()
             * all_reads.len()
+            * all_keys.len()
             * all_crashes.len()
             * all_partitions.len()
+            * all_max_concurrent.len()
             * all_densities.len();
 
         info!("Total unique configurations: {}", total_configs);
@@ -537,51 +602,64 @@ pub fn run_explorer(
         'outer: for &num_servers in &all_servers {
             for &num_writes in &all_writes {
                 for &num_reads in &all_reads {
+                    for &num_keys in &all_keys {
                     for &num_crashes in &all_crashes {
                         for &num_partitions in &all_partitions {
-                            for &density in all_densities {
-                                if cancelled_producer.load(Ordering::Relaxed) {
-                                    break 'outer;
-                                }
-                                config_counter += 1;
+                            for &max_concurrent in &all_max_concurrent {
+                                for &density in all_densities {
+                                    if cancelled_producer.load(Ordering::Relaxed) {
+                                        break 'outer;
+                                    }
+                                    config_counter += 1;
 
-                                let run_config = SingleRunConfig {
-                                    num_servers,
-                                    num_write_ops: num_writes,
-                                    num_read_ops: num_reads,
-                                    num_crashes,
-                                    num_partitions,
-                                    dependency_density: density,
-                                    use_coverage_scheduling: config.use_coverage_scheduling,
-                                    max_iterations: config.max_iterations,
-                                    schedule_policy: config.schedule_policy.clone(),
-                                    queue_policy: config.queue_policy.clone(),
-                                    quick_fire_multiplier: config.quick_fire_multiplier,
-                                    purgatory: config.purgatory.clone(),
-                                };
+                                    let run_config = SingleRunConfig {
+                                        num_servers,
+                                        num_write_ops: num_writes,
+                                        num_read_ops: num_reads,
+                                        num_keys,
+                                        num_crashes,
+                                        num_partitions,
+                                        max_concurrent_writes: max_concurrent,
+                                        dependency_density: density,
+                                        use_coverage_scheduling: config.use_coverage_scheduling,
+                                        max_iterations: config.max_iterations,
+                                        schedule_policy: config.schedule_policy.clone(),
+                                        queue_policy: config.queue_policy.clone(),
+                                        within_queue_selector: config
+                                            .within_queue_selector
+                                            .clone(),
+                                        quick_fire_multiplier: config.quick_fire_multiplier,
+                                        purgatory: config.purgatory.clone(),
+                                    };
 
-                                info!("{}", "=".repeat(70));
-                                info!(
-                                    "Queuing Config {}/{}: s{}_w{}_r{}_crash{}_part{}_d{:.2}",
-                                    config_counter,
-                                    total_configs,
-                                    num_servers,
-                                    num_writes,
-                                    num_reads,
-                                    num_crashes,
-                                    num_partitions,
-                                    density
-                                );
-                                info!("{}", "=".repeat(70));
+                                    info!("{}", "=".repeat(70));
+                                    info!(
+                                        "Queuing Config {}/{}: s{}_w{}_r{}_k{}_crash{}_part{}_mcw{}_d{:.2}",
+                                        config_counter,
+                                        total_configs,
+                                        num_servers,
+                                        num_writes,
+                                        num_reads,
+                                        num_keys,
+                                        num_crashes,
+                                        num_partitions,
+                                        max_concurrent
+                                            .map(|k| k.to_string())
+                                            .unwrap_or_else(|| "-".to_string()),
+                                        density
+                                    );
+                                    info!("{}", "=".repeat(70));
 
-                                for _ in 1..=config.num_runs_per_config {
-                                    run_counter += 1;
-                                    if sender.send((run_counter, run_config.clone())).is_err() {
-                                        return;
+                                    for _ in 1..=config.num_runs_per_config {
+                                        run_counter += 1;
+                                        if sender.send((run_counter, run_config.clone())).is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
                     }
                 }
             }
@@ -628,6 +706,7 @@ fn run_single_plan(
     policy: &SchedulePolicy,
     strict_timers: bool,
     queue_policy: &QueuePolicyConfig,
+    within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<f64, Box<dyn Error>> {
@@ -690,6 +769,7 @@ fn run_single_plan(
         policy,
         strict_timers,
         queue_policy,
+        within_queue,
         quick_fire_multiplier,
         purgatory_config,
     )?;
@@ -759,6 +839,7 @@ pub fn run_plan(
             &config.schedule_policy,
             config.strict_timers,
             &config.queue_policy,
+            &config.within_queue_selector,
             config.quick_fire_multiplier,
             &config.purgatory,
         ) {

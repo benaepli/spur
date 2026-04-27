@@ -3,7 +3,9 @@ use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::make_local_env;
 use crate::simulator::core::exec::{exec, exec_sync_on_node};
 use crate::simulator::core::partition::{activate_partition, heal_partition};
-use crate::simulator::core::queue_selector::{QueueInfo, QueueSelection, QueueSelector};
+use crate::simulator::core::queue_selector::{
+    QueueInfo, QueueSelection, QueueSelector, WithinQueueSelector,
+};
 use crate::simulator::core::state::{
     Continuation, Logger, NodeId, PurgatoryConfig, Record, Runnable, RunnableCategory,
     SchedulePolicy, ScheduleResult, State,
@@ -41,46 +43,101 @@ impl Reservation {
     }
 }
 
-/// Stochastic beam selection: K-tournament over a queue, scored by novelty + priority.
-/// For Recover events targeting a currently-crashed node, `quick_fire_multiplier`
-/// increases the weight of priority relative to novelty while keeping scores in [0, 1].
-fn beam_select<H: HashPolicy>(
+/// Score a runnable in [0, 1] by combining novelty and priority. For Recover
+/// events targeting a currently-crashed node, `quick_fire_multiplier` increases
+/// the weight of priority relative to novelty while keeping the result in [0, 1].
+fn score_runnable<H: HashPolicy>(
+    r: &Runnable<H>,
+    global_snapshot: Option<&VertexMap>,
+    currently_crashed: &OrdSet<NodeId>,
+    quick_fire_multiplier: f64,
+) -> f64 {
+    let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
+    let priority = r.priority();
+    let is_quick_fire =
+        matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
+    if is_quick_fire {
+        let w = 0.75 * quick_fire_multiplier;
+        (0.25 * novelty + w * priority) / (0.25 + w)
+    } else {
+        0.25 * novelty + 0.75 * priority
+    }
+}
+
+/// Select an eligible item from a single queue.
+///
+/// `Tournament` samples `k` indices uniformly and takes the highest-scoring
+/// (near-greedy for typical k). `Proportional` uses Efraimidis-Spirakis weighted
+/// reservoir sampling with weight `score^exponent`, giving exact proportional
+/// selection in a single O(eligible) pass.
+fn select_within_queue<H: HashPolicy>(
     queue: &Vector<Runnable<H>>,
     eligible: &[usize],
     global_snapshot: Option<&VertexMap>,
     currently_crashed: &OrdSet<NodeId>,
     quick_fire_multiplier: f64,
+    selector: &WithinQueueSelector,
     rng: &mut impl Rng,
 ) -> usize {
-    let score = |r: &Runnable<H>| -> f64 {
-        let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
-        let priority = r.priority();
-        let is_quick_fire =
-            matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
-        if is_quick_fire {
-            let w = 0.75 * quick_fire_multiplier;
-            (0.25 * novelty + w * priority) / (0.25 + w)
-        } else {
-            0.25 * novelty + 0.75 * priority
-        }
-    };
-
     if eligible.len() <= 1 {
         return eligible[0];
     }
 
-    const K: usize = 10;
-    let mut best_idx = eligible[rng.random_range(0..eligible.len())];
-    let mut best_score = score(&queue[best_idx]);
-    for _ in 1..K.min(eligible.len()) {
-        let i = eligible[rng.random_range(0..eligible.len())];
-        let s = score(&queue[i]);
-        if s > best_score {
-            best_idx = i;
-            best_score = s;
+    match selector {
+        WithinQueueSelector::Tournament { k } => {
+            let k = (*k).max(1);
+            let mut best_idx = eligible[rng.random_range(0..eligible.len())];
+            let mut best_score = score_runnable(
+                &queue[best_idx],
+                global_snapshot,
+                currently_crashed,
+                quick_fire_multiplier,
+            );
+            for _ in 1..k.min(eligible.len()) {
+                let i = eligible[rng.random_range(0..eligible.len())];
+                let s = score_runnable(
+                    &queue[i],
+                    global_snapshot,
+                    currently_crashed,
+                    quick_fire_multiplier,
+                );
+                if s > best_score {
+                    best_idx = i;
+                    best_score = s;
+                }
+            }
+            best_idx
+        }
+        WithinQueueSelector::Proportional { exponent } => {
+            // Efraimidis-Spirakis: argmax of (ln(u_i) / w_i) is exact weighted
+            // sampling proportional to w_i. Both ln(u) (u in (0,1)) and w are
+            // negative/positive respectively, so the largest key wins.
+            //
+            // Floor weight to keep zero-score items reachable; without this,
+            // a score of exactly 0 would have 0 selection probability and a
+            // score of 0 with exponent 0 would produce 0/0.
+            let mut best_idx = eligible[0];
+            let mut best_key = f64::NEG_INFINITY;
+            for &i in eligible {
+                let s = score_runnable(
+                    &queue[i],
+                    global_snapshot,
+                    currently_crashed,
+                    quick_fire_multiplier,
+                );
+                let weight = s.powf(*exponent).max(1e-9);
+                let u: f64 = rng.random();
+                // u is in (0, 1); ln(u) is negative; key = ln(u) / weight is negative.
+                // Higher weight → key closer to 0 (larger), so argmax is correct.
+                let key = u.ln() / weight;
+                if key > best_key {
+                    best_key = key;
+                    best_idx = i;
+                }
+            }
+            best_idx
         }
     }
-    best_idx
 }
 
 pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
@@ -95,6 +152,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
     policy: &SchedulePolicy,
     strict_timers: bool,
     selector: &mut Q,
+    within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
     reservations: &[Reservation],
@@ -157,12 +215,13 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(
+            let idx = select_within_queue(
                 queue,
                 &eligible,
                 global_snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
+                within_queue,
                 &mut rng,
             );
             state.local_queues[node_idx].remove(idx)
@@ -175,12 +234,13 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(
+            let idx = select_within_queue(
                 queue,
                 &eligible,
                 global_snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
+                within_queue,
                 &mut rng,
             );
             state.network_queue.remove(idx)
@@ -210,12 +270,13 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = beam_select(
+            let idx = select_within_queue(
                 queue,
                 &eligible,
                 global_snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
+                within_queue,
                 &mut rng,
             );
             state.timer_queue.remove(idx)
@@ -615,4 +676,158 @@ fn recover_node<H: HashPolicy, L: Logger>(
         purgatory_config,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulator::hash_utils::NoHashing;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    fn heal(priority: f64) -> Runnable<NoHashing> {
+        Runnable::Heal { priority }
+    }
+
+    /// Score under default `score_runnable` parameters (no novelty signal,
+    /// no quick-fire boost) is `0.25 + 0.75 * priority`.
+    fn expected_score(priority: f64) -> f64 {
+        0.25 + 0.75 * priority
+    }
+
+    #[test]
+    fn proportional_selection_matches_expected_distribution() {
+        let queue: Vector<Runnable<NoHashing>> = vec![
+            heal(0.0), // score 0.25
+            heal(0.5), // score 0.625
+            heal(1.0), // score 1.00
+        ]
+        .into();
+        let eligible: Vec<usize> = (0..queue.len()).collect();
+        let crashed = OrdSet::new();
+        let selector = WithinQueueSelector::Proportional { exponent: 1.0 };
+
+        let mut rng = StdRng::seed_from_u64(0xdeadbeef);
+        let trials = 50_000usize;
+        let mut counts = [0usize; 3];
+        for _ in 0..trials {
+            let idx = select_within_queue(
+                &queue,
+                &eligible,
+                None,
+                &crashed,
+                1.0,
+                &selector,
+                &mut rng,
+            );
+            counts[idx] += 1;
+        }
+
+        let total_score: f64 = (0..3)
+            .map(|i| expected_score(queue[i].priority()))
+            .sum();
+        for i in 0..3 {
+            let expected = expected_score(queue[i].priority()) / total_score;
+            let observed = counts[i] as f64 / trials as f64;
+            // Binomial std error ≈ sqrt(p(1-p)/n); with n=50k and p ~0.5 that's
+            // ~0.0022. Allow 0.015 (≈7σ) to keep the test robust.
+            assert!(
+                (observed - expected).abs() < 0.015,
+                "bucket {}: expected ~{:.3}, observed {:.3} (n={})",
+                i,
+                expected,
+                observed,
+                trials,
+            );
+        }
+    }
+
+    #[test]
+    fn proportional_with_zero_exponent_is_uniform() {
+        let queue: Vector<Runnable<NoHashing>> = vec![heal(0.0), heal(0.5), heal(1.0)].into();
+        let eligible: Vec<usize> = (0..queue.len()).collect();
+        let crashed = OrdSet::new();
+        let selector = WithinQueueSelector::Proportional { exponent: 0.0 };
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let trials = 30_000usize;
+        let mut counts = [0usize; 3];
+        for _ in 0..trials {
+            let idx = select_within_queue(
+                &queue,
+                &eligible,
+                None,
+                &crashed,
+                1.0,
+                &selector,
+                &mut rng,
+            );
+            counts[idx] += 1;
+        }
+        for i in 0..3 {
+            let observed = counts[i] as f64 / trials as f64;
+            assert!(
+                (observed - 1.0 / 3.0).abs() < 0.02,
+                "bucket {} should be ~uniform 0.333, got {:.3}",
+                i,
+                observed,
+            );
+        }
+    }
+
+    #[test]
+    fn tournament_default_preserves_existing_behavior() {
+        // Default selector is Tournament { k: 10 }. With sampling-with-replacement,
+        // the top-scoring item should dominate but not deterministically.
+        let queue: Vector<Runnable<NoHashing>> = vec![heal(0.1), heal(0.9)].into();
+        let eligible: Vec<usize> = (0..queue.len()).collect();
+        let crashed = OrdSet::new();
+        let selector = WithinQueueSelector::default();
+        assert!(matches!(selector, WithinQueueSelector::Tournament { k: 10 }));
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut counts = [0usize; 2];
+        for _ in 0..4_000 {
+            let idx = select_within_queue(
+                &queue,
+                &eligible,
+                None,
+                &crashed,
+                1.0,
+                &selector,
+                &mut rng,
+            );
+            counts[idx] += 1;
+        }
+        // P(top wins) = 1 - (1/2)^k.min(2) = 0.75. Allow a wide margin.
+        assert!(
+            counts[1] > counts[0] * 2,
+            "tournament should favor higher-score index 1: got {:?}",
+            counts
+        );
+    }
+
+    #[test]
+    fn select_within_queue_handles_singleton() {
+        let queue: Vector<Runnable<NoHashing>> = vec![heal(0.5)].into();
+        let eligible = vec![0];
+        let crashed = OrdSet::new();
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let tournament = WithinQueueSelector::Tournament { k: 10 };
+        let proportional = WithinQueueSelector::Proportional { exponent: 1.0 };
+
+        for selector in [&tournament, &proportional] {
+            let idx = select_within_queue(
+                &queue,
+                &eligible,
+                None,
+                &crashed,
+                1.0,
+                selector,
+                &mut rng,
+            );
+            assert_eq!(idx, 0);
+        }
+    }
 }

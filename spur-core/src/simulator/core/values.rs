@@ -4,7 +4,8 @@ use crate::simulator::hash_utils::{HashPolicy, mix};
 use ecow::EcoString;
 use imbl::{HashMap as ImHashMap, Vector};
 use std::cmp::Ordering;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use rustc_hash::FxHasher;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -48,7 +49,11 @@ pub fn hash_map_entry(k_sig: u64, v_sig: u64) -> u64 {
 impl<H: HashPolicy> Value<H> {
     /// Create a new Value with computed signature.
     pub fn new(kind: ValueKind<H>) -> Self {
-        let sig = Self::compute_sig(&kind);
+        let sig = if H::EAGER {
+            Self::compute_sig(&kind)
+        } else {
+            Self::compute_sig_leaf_only(&kind)
+        };
         Self {
             kind,
             sig,
@@ -56,46 +61,51 @@ impl<H: HashPolicy> Value<H> {
         }
     }
 
+    /// Signature for leaf variants only; composites get sig = 0.
+    /// Used under `NoHashing` so map-keyable leaves (Int/Bool/Node/String/Channel)
+    /// still discriminate for `imbl::HashMap` bucketing, while composites skip work.
+    fn compute_sig_leaf_only(kind: &ValueKind<H>) -> u64 {
+        match kind {
+            ValueKind::Int(_)
+            | ValueKind::Bool(_)
+            | ValueKind::String(_)
+            | ValueKind::Node(_)
+            | ValueKind::Channel(_)
+            | ValueKind::Unit => Self::compute_sig(kind),
+            ValueKind::Option(_)
+            | ValueKind::Tuple(_)
+            | ValueKind::List(_)
+            | ValueKind::Map(_)
+            | ValueKind::Variant(_, _, _) => 0,
+        }
+    }
+
     /// Compute signature for a ValueKind.
     fn compute_sig(kind: &ValueKind<H>) -> u64 {
+        use crate::simulator::hash_utils::HASH_PRIME;
         match kind {
-            ValueKind::Int(i) => {
-                let mut h = DefaultHasher::new();
-                0u8.hash(&mut h); // discriminant
-                i.hash(&mut h);
-                h.finish()
-            }
-            ValueKind::Bool(b) => {
-                let mut h = DefaultHasher::new();
-                1u8.hash(&mut h);
-                b.hash(&mut h);
-                h.finish()
-            }
-            ValueKind::String(s) => {
-                let mut h = DefaultHasher::new();
-                2u8.hash(&mut h);
-                s.hash(&mut h);
-                h.finish()
-            }
+            // Leaves: direct mix, no hasher allocation. The wrapping_mul by
+            // HASH_PRIME gives avalanche so small bit-level differences don't
+            // cancel under XOR in parent composites.
+            ValueKind::Int(i) => mix((*i as u64).wrapping_mul(HASH_PRIME), 0),
+            ValueKind::Bool(b) => mix((*b as u64).wrapping_mul(HASH_PRIME), 1),
+            ValueKind::Unit => mix(0, 4),
             ValueKind::Node(n) => {
-                let mut h = DefaultHasher::new();
-                3u8.hash(&mut h);
-                n.hash(&mut h);
-                h.finish()
-            }
-            ValueKind::Unit => {
-                let mut h = DefaultHasher::new();
-                4u8.hash(&mut h);
-                h.finish()
+                mix((n.role.0 as u64).wrapping_mul(HASH_PRIME), 3)
+                    ^ mix((n.index as u64).wrapping_mul(HASH_PRIME), 103)
             }
             ValueKind::Channel(c) => {
-                let mut h = DefaultHasher::new();
-                5u8.hash(&mut h);
-                c.hash(&mut h);
-                h.finish()
+                mix((c.node.role.0 as u64).wrapping_mul(HASH_PRIME), 5)
+                    ^ mix((c.node.index as u64).wrapping_mul(HASH_PRIME), 105)
+                    ^ mix((c.id as u64).wrapping_mul(HASH_PRIME), 205)
+            }
+            ValueKind::String(s) => {
+                let mut h = FxHasher::default();
+                s.hash(&mut h);
+                mix(h.finish(), 2)
             }
             ValueKind::Option(o) => {
-                let mut h = DefaultHasher::new();
+                let mut h = FxHasher::default();
                 6u8.hash(&mut h);
                 match o {
                     None => 0u8.hash(&mut h),
@@ -109,7 +119,7 @@ impl<H: HashPolicy> Value<H> {
             ValueKind::Tuple(v) => {
                 // Position-dependent XOR for order sensitivity
                 let mut sig = 0u64;
-                let mut h = DefaultHasher::new();
+                let mut h = FxHasher::default();
                 7u8.hash(&mut h);
                 v.len().hash(&mut h);
                 sig ^= h.finish();
@@ -121,7 +131,7 @@ impl<H: HashPolicy> Value<H> {
             ValueKind::List(v) => {
                 // Position-dependent XOR for order sensitivity
                 let mut sig = 0u64;
-                let mut h = DefaultHasher::new();
+                let mut h = FxHasher::default();
                 8u8.hash(&mut h);
                 v.len().hash(&mut h);
                 sig ^= h.finish();
@@ -133,7 +143,7 @@ impl<H: HashPolicy> Value<H> {
             ValueKind::Map(m) => {
                 // Order-independent XOR for maps
                 let mut sig = 0u64;
-                let mut h = DefaultHasher::new();
+                let mut h = FxHasher::default();
                 9u8.hash(&mut h);
                 m.len().hash(&mut h);
                 sig ^= h.finish();
@@ -144,7 +154,7 @@ impl<H: HashPolicy> Value<H> {
                 sig
             }
             ValueKind::Variant(enum_id, name, payload) => {
-                let mut h = DefaultHasher::new();
+                let mut h = FxHasher::default();
                 10u8.hash(&mut h); // discriminant
                 enum_id.hash(&mut h);
                 name.hash(&mut h);
@@ -469,7 +479,7 @@ impl<H: HashPolicy> Eq for Env<H> {}
 
 #[derive(Clone, Debug)]
 pub struct Env<H: HashPolicy> {
-    pub slots: Vec<Value<H>>,
+    pub slots: Vector<Value<H>>,
     pub sig: u64,
     _marker: PhantomData<H>,
 }
@@ -483,7 +493,7 @@ impl<H: HashPolicy> Hash for Env<H> {
 impl<H: HashPolicy> Default for Env<H> {
     fn default() -> Self {
         Self {
-            slots: Vec::new(),
+            slots: Vector::new(),
             sig: 0,
             _marker: PhantomData,
         }
@@ -493,13 +503,14 @@ impl<H: HashPolicy> Default for Env<H> {
 impl<H: HashPolicy> Env<H> {
     /// Create an environment with `n` slots, all initialized to Unit
     pub fn with_slots(n: usize) -> Self {
-        let unit_val = Value::<H>::unit();
-        let unit_sig = unit_val.sig;
-        let slots: Vec<Value<H>> = (0..n).map(|_| Value::<H>::unit()).collect();
+        let slots: Vector<Value<H>> = (0..n).map(|_| Value::<H>::unit()).collect();
 
         let mut sig = 0u64;
-        for i in 0..n {
-            sig ^= H::mix(unit_sig, i as u32);
+        if H::EAGER {
+            let unit_sig = Value::<H>::unit().sig;
+            for i in 0..n {
+                sig ^= H::mix(unit_sig, i as u32);
+            }
         }
 
         Self {
@@ -520,16 +531,22 @@ impl<H: HashPolicy> Env<H> {
         if idx >= self.slots.len() {
             // Extending requires recomputing signature
             let old_len = self.slots.len();
-            self.slots.resize(idx + 1, Value::<H>::unit());
-            let unit_sig = Value::<H>::unit().sig;
-            for i in old_len..idx {
-                self.sig ^= H::mix(unit_sig, i as u32);
+            while self.slots.len() < idx + 1 {
+                self.slots.push_back(Value::<H>::unit());
             }
-            self.sig ^= H::mix(value.sig, slot);
+            if H::EAGER {
+                let unit_sig = Value::<H>::unit().sig;
+                for i in old_len..idx {
+                    self.sig ^= H::mix(unit_sig, i as u32);
+                }
+                self.sig ^= H::mix(value.sig, slot);
+            }
             self.slots[idx] = value;
         } else {
-            let old_sig = self.slots[idx].sig;
-            self.sig = H::update_env_sig(self.sig, old_sig, value.sig, slot);
+            if H::EAGER {
+                let old_sig = self.slots[idx].sig;
+                self.sig = H::update_env_sig(self.sig, old_sig, value.sig, slot);
+            }
             self.slots[idx] = value;
         }
     }
@@ -543,10 +560,14 @@ impl<H: HashPolicy> Env<H> {
     pub fn ensure_slots(&mut self, n: usize) {
         if self.slots.len() < n {
             let old_len = self.slots.len();
-            self.slots.resize(n, Value::<H>::unit());
-            let unit_sig = Value::<H>::unit().sig;
-            for i in old_len..n {
-                self.sig ^= H::mix(unit_sig, i as u32);
+            while self.slots.len() < n {
+                self.slots.push_back(Value::<H>::unit());
+            }
+            if H::EAGER {
+                let unit_sig = Value::<H>::unit().sig;
+                for i in old_len..n {
+                    self.sig ^= H::mix(unit_sig, i as u32);
+                }
             }
         }
     }

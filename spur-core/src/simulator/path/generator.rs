@@ -1,3 +1,4 @@
+use petgraph::algo::has_path_connecting;
 use petgraph::graph::{DiGraph, NodeIndex};
 use rand::prelude::*;
 use rand::rng;
@@ -25,11 +26,21 @@ pub struct GeneratorConfig {
     // Client operations
     pub num_write_ops: i32,
     pub num_read_ops: i32,
+    /// Number of distinct keys (`key1`..`keyN`) used by generated Write/Read
+    /// invocations. Must be >= 1. Defaults to 1 in the explorer config; a
+    /// single key concentrates per-key interleavings and surfaces most
+    /// linearizability bugs faster.
+    pub num_keys: i32,
     // Fault specs
     pub num_crashes: i32,     // Number of crash/recover pairs
     pub num_partitions: i32,  // Number of partition/heal pairs
     // Dependency specs
     pub dependency_density: f64, // Probability (0.0 to 1.0)
+    /// Cap on concurrent in-flight Write operations. When set to K >= 1,
+    /// each write[i] depends on write[i - K] (declaration order, global across
+    /// keys), so at most K writes can be ready simultaneously. `None` disables
+    /// the cap. The simulator rejects `Some(0)` during config validation.
+    pub max_concurrent_writes: Option<i32>,
 }
 
 /// Generates a bag of action stubs based on the config.
@@ -37,7 +48,8 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
     let mut actions = Vec::new();
 
     let rand_server = || rng().random_range(0..config.num_servers);
-    let rand_key = || format!("key{}", rng().random_range(1..=3));
+    let num_keys = config.num_keys.max(1);
+    let rand_key = || format!("key{}", rng().random_range(1..=num_keys));
 
     for _ in 0..config.num_write_ops {
         let action = ClientOpSpec::Write(rand_server(), ecow::EcoString::from(rand_key()));
@@ -156,23 +168,45 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
         }
     }
 
+    // Write-chain pass: enforce max_concurrent_writes by adding a mandatory
+    // edge writes[i - K] -> writes[i]. Declaration order; keys are not tracked
+    // separately, so K is a global cap (strict upper bound on per-key blowup).
+    if let Some(k) = config.max_concurrent_writes
+        && k >= 1
+    {
+        let write_indices: Vec<NodeIndex> = nodes
+            .iter()
+            .filter(|(idx, _)| {
+                matches!(
+                    graph[*idx].action,
+                    EventAction::ClientRequest(ClientOpSpec::Write(..))
+                )
+            })
+            .map(|(idx, _)| *idx)
+            .collect();
+        let k = k as usize;
+        for i in k..write_indices.len() {
+            graph.add_edge(write_indices[i - k], write_indices[i], ());
+        }
+    }
+
     // Shuffle node order for dependency generation
     nodes.shuffle(&mut rng);
 
-    // Second pass: add probabilistic dependencies
+    // Second pass: add probabilistic dependencies. Skip any candidate edge
+    // whose target already has a path back to the source — this guards
+    // against cycles with every mandatory edge (write-chain, crash/recover
+    // serialization, partition/heal serialization).
     let mut seen: Vec<(NodeIndex, Option<(i32, PairPos)>)> = Vec::new();
     for (current_idx, current_pair) in &nodes {
-        for (prev_idx, prev_pair) in &seen {
-            // Skip cycle-forming edges within same pair
-            let is_cycle = match (current_pair, prev_pair) {
-                (Some((g1, PairPos::First)), Some((g2, PairPos::Second))) => g1 == g2,
-                (Some((g1, PairPos::Second)), Some((g2, PairPos::First))) => g1 == g2,
-                _ => false,
-            };
-
-            if !is_cycle && rng.random::<f64>() < config.dependency_density {
-                graph.add_edge(*prev_idx, *current_idx, ());
+        for (prev_idx, _prev_pair) in &seen {
+            if rng.random::<f64>() >= config.dependency_density {
+                continue;
             }
+            if has_path_connecting(&graph, *current_idx, *prev_idx, None) {
+                continue;
+            }
+            graph.add_edge(*prev_idx, *current_idx, ());
         }
         seen.push((*current_idx, *current_pair));
     }

@@ -19,6 +19,7 @@ simulator = [
     "dep:nauty-pet",
     "dep:ctrlc",
     "dep:csv",
+    "dep:rustc-hash",
 ]
 
 [dependencies]
@@ -48,6 +49,7 @@ scalable_cuckoo_filter = { version = "0.5.1", optional = true }
 nauty-pet = { version = "0.14.0", optional = true }
 ctrlc = { version = "3.4", optional = true }
 csv = { version = "1.4.0", optional = true }
+rustc-hash = { version = "2", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

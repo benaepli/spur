@@ -3,8 +3,8 @@ use crate::compiler::cfg::{Program, Vertex};
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, PurgatoryConfig,
     QueuePolicyConfig, QueueSelector, Record, Reservation, Runnable, RunnableCategory,
-    RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, make_local_env,
-    schedule_runnable,
+    RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, WithinQueueSelector,
+    make_local_env, schedule_runnable,
 };
 use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
@@ -192,6 +192,7 @@ pub fn exec_plan<H: HashPolicy>(
     policy: &SchedulePolicy,
     strict_timers: bool,
     queue_policy: &QueuePolicyConfig,
+    within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
@@ -429,6 +430,7 @@ pub fn exec_plan<H: HashPolicy>(
                 policy,
                 strict_timers,
                 &mut selector,
+                within_queue,
                 quick_fire_multiplier,
                 purgatory_config,
                 &reservations,

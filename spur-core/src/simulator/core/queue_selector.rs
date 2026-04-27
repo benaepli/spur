@@ -210,3 +210,40 @@ impl QueuePolicyConfig {
         }
     }
 }
+
+/// Within-queue selection method. Decides which runnable, among the eligible
+/// items in a single queue, gets executed next. Orthogonal to `QueuePolicyConfig`,
+/// which decides *which* queue to draw from.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum WithinQueueSelector {
+    /// K-tournament: sample `k` indices uniformly, take the highest score.
+    /// Near-greedy for typical k. This is the historical behavior.
+    Tournament {
+        #[serde(default = "default_tournament_k")]
+        k: usize,
+    },
+    /// Proportional lottery (Waldspurger-style): selection probability is
+    /// proportional to `score^exponent`. `exponent = 1.0` is plain proportional;
+    /// `exponent = 0.0` is uniform; large `exponent` approaches greedy.
+    Proportional {
+        #[serde(default = "default_proportional_exponent")]
+        exponent: f64,
+    },
+}
+
+fn default_tournament_k() -> usize {
+    10
+}
+
+fn default_proportional_exponent() -> f64 {
+    1.0
+}
+
+impl Default for WithinQueueSelector {
+    fn default() -> Self {
+        WithinQueueSelector::Tournament {
+            k: default_tournament_k(),
+        }
+    }
+}

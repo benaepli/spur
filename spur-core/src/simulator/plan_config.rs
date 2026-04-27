@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::analysis::resolver::NameId;
-use crate::simulator::core::{PurgatoryConfig, QueuePolicyConfig, SchedulePolicy};
+use crate::simulator::core::{
+    PurgatoryConfig, QueuePolicyConfig, SchedulePolicy, WithinQueueSelector,
+};
 use crate::simulator::path::plan::{ClientOpSpec, DeliverSpec, EventAction, PlannedEvent};
 
 #[derive(Debug, Error)]
@@ -181,6 +183,9 @@ pub struct PlanFileConfig {
 
     #[serde(default)]
     pub queue_policy: QueuePolicyConfig,
+
+    #[serde(default)]
+    pub within_queue_selector: WithinQueueSelector,
 
     #[serde(default = "default_quick_fire_multiplier")]
     pub quick_fire_multiplier: f64,

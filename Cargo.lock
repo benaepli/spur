@@ -2244,6 +2244,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "rayon",
+ "rustc-hash",
  "scalable_cuckoo_filter",
  "serde",
  "serde_json",
