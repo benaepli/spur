@@ -83,7 +83,7 @@ impl PartitionSpec {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSpec {
-    Write(i32, String, String),
+    Write(i32, String),
     Read(i32, String),
     Crash(i32),
     Recover(i32),
@@ -114,7 +114,7 @@ impl EventSpec {
         };
 
         match self {
-            EventSpec::Write(t, _, _)
+            EventSpec::Write(t, _)
             | EventSpec::Read(t, _)
             | EventSpec::Crash(t)
             | EventSpec::Recover(t)
@@ -145,10 +145,9 @@ impl EventSpec {
 
     fn to_event_action(&self) -> EventAction {
         match self {
-            EventSpec::Write(t, k, v) => EventAction::ClientRequest(ClientOpSpec::Write(
+            EventSpec::Write(t, k) => EventAction::ClientRequest(ClientOpSpec::Write(
                 *t,
                 EcoString::from(k.as_str()),
-                EcoString::from(v.as_str()),
             )),
             EventSpec::Read(t, k) => {
                 EventAction::ClientRequest(ClientOpSpec::Read(*t, EcoString::from(k.as_str())))

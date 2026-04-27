@@ -15,7 +15,7 @@ pub enum PlanError {
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum ClientOpSpec {
-    Write(i32, EcoString, EcoString),
+    Write(i32, EcoString),
     Read(i32, EcoString),
 }
 

@@ -38,14 +38,9 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
 
     let rand_server = || rng().random_range(0..config.num_servers);
     let rand_key = || format!("key{}", rng().random_range(1..=3));
-    let rand_val = || format!("val{}", rng().random_range(0..100));
 
     for _ in 0..config.num_write_ops {
-        let action = ClientOpSpec::Write(
-            rand_server(),
-            ecow::EcoString::from(rand_key()),
-            ecow::EcoString::from(rand_val()),
-        );
+        let action = ClientOpSpec::Write(rand_server(), ecow::EcoString::from(rand_key()));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 

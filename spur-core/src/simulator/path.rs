@@ -117,7 +117,7 @@ fn schedule_client_op<H: HashPolicy>(
 ) -> Result<(), RuntimeError> {
     let client_id = client_node_id.index as i32;
     let (op_name, actuals) = match op_spec {
-        ClientOpSpec::Write(target, key, val) => (
+        ClientOpSpec::Write(target, key) => (
             "ClientInterface.Write",
             vec![
                 Value::<H>::node(NodeId {
@@ -125,7 +125,7 @@ fn schedule_client_op<H: HashPolicy>(
                     index: *target as usize,
                 }),
                 Value::<H>::string(EcoString::from(key.as_str())),
-                Value::<H>::string(EcoString::from(val.as_str())),
+                Value::<H>::int(op_id as i64),
             ],
         ),
         ClientOpSpec::Read(target, key) => (
@@ -332,7 +332,7 @@ pub fn exec_plan<H: HashPolicy>(
 
                     // Validate target server in op_spec
                     let target_idx = match op_spec {
-                        ClientOpSpec::Write(t, _, _) => *t as usize,
+                        ClientOpSpec::Write(t, _) => *t as usize,
                         ClientOpSpec::Read(t, _) => *t as usize,
                     };
                     validate_node(&path_state.state, target_idx, server_role, "Node")?;
