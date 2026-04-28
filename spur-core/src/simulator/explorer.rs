@@ -64,6 +64,9 @@ pub struct ExplorerConfig {
     #[serde(rename = "num_read_ops")]
     pub num_read_ops_range: Range,
 
+    #[serde(rename = "num_rmw_ops", default = "default_zero_range")]
+    pub num_rmw_ops_range: Range,
+
     #[serde(rename = "num_keys", default = "default_num_keys_range")]
     pub num_keys_range: Range,
 
@@ -116,6 +119,17 @@ impl ExplorerConfig {
         self.num_read_ops_range
             .validate()
             .map_err(|e| format!("num_read_ops range error: {}", e))?;
+        self.num_rmw_ops_range
+            .validate()
+            .map_err(|e| format!("num_rmw_ops range error: {}", e))?;
+        // Soft warning: RMW correctness is checked only via subsequent reads.
+        // A run with RMWs but no reads exercises zero of the kv_rmw checking logic.
+        if self.num_rmw_ops_range.max > 0 && self.num_read_ops_range.max == 0 {
+            warn!(
+                "num_rmw_ops > 0 but num_read_ops == 0: RMW prev_uid chains are validated only \
+                 through Read responses, so this configuration will not catch RMW bugs."
+            );
+        }
         self.num_keys_range
             .validate()
             .map_err(|e| format!("num_keys range error: {}", e))?;
@@ -153,6 +167,14 @@ fn default_partitions_range() -> Range {
     }
 }
 
+fn default_zero_range() -> Range {
+    Range {
+        min: 0,
+        max: 0,
+        step: 1,
+    }
+}
+
 fn default_num_keys_range() -> Range {
     Range {
         min: 1,
@@ -182,6 +204,7 @@ pub struct SingleRunConfig {
     pub num_servers: i32,
     pub num_write_ops: i32,
     pub num_read_ops: i32,
+    pub num_rmw_ops: i32,
     pub num_keys: i32,
     pub num_crashes: i32,
     pub num_partitions: i32,
@@ -229,6 +252,9 @@ impl SingleRunConfig {
             num_read_ops: rng.random_range(
                 constraints.num_read_ops_range.min..=constraints.num_read_ops_range.max,
             ),
+            num_rmw_ops: rng.random_range(
+                constraints.num_rmw_ops_range.min..=constraints.num_rmw_ops_range.max,
+            ),
             num_keys: rng.random_range(
                 constraints.num_keys_range.min..=constraints.num_keys_range.max,
             ),
@@ -273,6 +299,7 @@ impl SingleRunConfig {
         new_config.num_servers = mutate_int(self.num_servers, &constraints.num_servers_range);
         new_config.num_write_ops = mutate_int(self.num_write_ops, &constraints.num_write_ops_range);
         new_config.num_read_ops = mutate_int(self.num_read_ops, &constraints.num_read_ops_range);
+        new_config.num_rmw_ops = mutate_int(self.num_rmw_ops, &constraints.num_rmw_ops_range);
         new_config.num_keys = mutate_int(self.num_keys, &constraints.num_keys_range);
         new_config.num_crashes = mutate_int(self.num_crashes, &constraints.num_crashes_range);
         new_config.num_partitions =
@@ -447,6 +474,7 @@ pub fn run_single_simulation(
         num_servers: config.num_servers,
         num_write_ops: config.num_write_ops,
         num_read_ops: config.num_read_ops,
+        num_rmw_ops: config.num_rmw_ops,
         num_keys: config.num_keys,
         num_crashes: config.num_crashes,
         num_partitions: config.num_partitions,
@@ -576,6 +604,7 @@ pub fn run_explorer(
         let all_servers = config.num_servers_range.expand();
         let all_writes = config.num_write_ops_range.expand();
         let all_reads = config.num_read_ops_range.expand();
+        let all_rmws = config.num_rmw_ops_range.expand();
         let all_keys = config.num_keys_range.expand();
         let all_crashes = config.num_crashes_range.expand();
         let all_partitions = config.num_partitions_range.expand();
@@ -590,6 +619,7 @@ pub fn run_explorer(
         let total_configs = all_servers.len()
             * all_writes.len()
             * all_reads.len()
+            * all_rmws.len()
             * all_keys.len()
             * all_crashes.len()
             * all_partitions.len()
@@ -602,6 +632,7 @@ pub fn run_explorer(
         'outer: for &num_servers in &all_servers {
             for &num_writes in &all_writes {
                 for &num_reads in &all_reads {
+                    for &num_rmws in &all_rmws {
                     for &num_keys in &all_keys {
                     for &num_crashes in &all_crashes {
                         for &num_partitions in &all_partitions {
@@ -616,6 +647,7 @@ pub fn run_explorer(
                                         num_servers,
                                         num_write_ops: num_writes,
                                         num_read_ops: num_reads,
+                                        num_rmw_ops: num_rmws,
                                         num_keys,
                                         num_crashes,
                                         num_partitions,
@@ -634,12 +666,13 @@ pub fn run_explorer(
 
                                     info!("{}", "=".repeat(70));
                                     info!(
-                                        "Queuing Config {}/{}: s{}_w{}_r{}_k{}_crash{}_part{}_mcw{}_d{:.2}",
+                                        "Queuing Config {}/{}: s{}_w{}_r{}_rmw{}_k{}_crash{}_part{}_mcw{}_d{:.2}",
                                         config_counter,
                                         total_configs,
                                         num_servers,
                                         num_writes,
                                         num_reads,
+                                        num_rmws,
                                         num_keys,
                                         num_crashes,
                                         num_partitions,
@@ -659,6 +692,7 @@ pub fn run_explorer(
                                 }
                             }
                         }
+                    }
                     }
                     }
                 }

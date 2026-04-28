@@ -26,6 +26,7 @@ pub struct GeneratorConfig {
     // Client operations
     pub num_write_ops: i32,
     pub num_read_ops: i32,
+    pub num_rmw_ops: i32,
     /// Number of distinct keys (`key1`..`keyN`) used by generated Write/Read
     /// invocations. Must be >= 1. Defaults to 1 in the explorer config; a
     /// single key concentrates per-key interleavings and surfaces most
@@ -36,10 +37,11 @@ pub struct GeneratorConfig {
     pub num_partitions: i32,  // Number of partition/heal pairs
     // Dependency specs
     pub dependency_density: f64, // Probability (0.0 to 1.0)
-    /// Cap on concurrent in-flight Write operations. When set to K >= 1,
-    /// each write[i] depends on write[i - K] (declaration order, global across
-    /// keys), so at most K writes can be ready simultaneously. `None` disables
-    /// the cap. The simulator rejects `Some(0)` during config validation.
+    /// Cap on concurrent in-flight write-like operations (Write and RMW).
+    /// When set to K >= 1, each write-like[i] depends on write-like[i - K]
+    /// (declaration order, global across keys), so at most K can be ready
+    /// simultaneously. `None` disables the cap. The simulator rejects
+    /// `Some(0)` during config validation.
     pub max_concurrent_writes: Option<i32>,
 }
 
@@ -58,6 +60,11 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
 
     for _ in 0..config.num_read_ops {
         let action = ClientOpSpec::Read(rand_server(), ecow::EcoString::from(rand_key()));
+        actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
+    }
+
+    for _ in 0..config.num_rmw_ops {
+        let action = ClientOpSpec::Rmw(rand_server(), ecow::EcoString::from(rand_key()));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
@@ -171,6 +178,7 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
     // Write-chain pass: enforce max_concurrent_writes by adding a mandatory
     // edge writes[i - K] -> writes[i]. Declaration order; keys are not tracked
     // separately, so K is a global cap (strict upper bound on per-key blowup).
+    // Both Write and Rmw participate (both mutate state).
     if let Some(k) = config.max_concurrent_writes
         && k >= 1
     {
@@ -180,6 +188,7 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
                 matches!(
                     graph[*idx].action,
                     EventAction::ClientRequest(ClientOpSpec::Write(..))
+                        | EventAction::ClientRequest(ClientOpSpec::Rmw(..))
                 )
             })
             .map(|(idx, _)| *idx)

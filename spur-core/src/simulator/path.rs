@@ -138,6 +138,17 @@ fn schedule_client_op<H: HashPolicy>(
                 Value::<H>::string(EcoString::from(key.as_str())),
             ],
         ),
+        ClientOpSpec::Rmw(target, key) => (
+            "ClientInterface.RMW",
+            vec![
+                Value::<H>::node(NodeId {
+                    role: server_role,
+                    index: *target as usize,
+                }),
+                Value::<H>::string(EcoString::from(key.as_str())),
+                Value::<H>::int(op_id as i64),
+            ],
+        ),
     };
 
     let op_func = prog
@@ -336,6 +347,7 @@ pub fn exec_plan<H: HashPolicy>(
                     let target_idx = match op_spec {
                         ClientOpSpec::Write(t, _) => *t as usize,
                         ClientOpSpec::Read(t, _) => *t as usize,
+                        ClientOpSpec::Rmw(t, _) => *t as usize,
                     };
                     validate_node(&path_state.state, target_idx, server_role, "Node")?;
 

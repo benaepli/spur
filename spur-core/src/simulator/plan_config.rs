@@ -87,6 +87,7 @@ impl PartitionSpec {
 pub enum EventSpec {
     Write(i32, String),
     Read(i32, String),
+    Rmw(i32, String),
     Crash(i32),
     Recover(i32),
     AllowTimer(i32, String),
@@ -118,6 +119,7 @@ impl EventSpec {
         match self {
             EventSpec::Write(t, _)
             | EventSpec::Read(t, _)
+            | EventSpec::Rmw(t, _)
             | EventSpec::Crash(t)
             | EventSpec::Recover(t)
             | EventSpec::AllowTimer(t, _) => check(*t),
@@ -153,6 +155,9 @@ impl EventSpec {
             )),
             EventSpec::Read(t, k) => {
                 EventAction::ClientRequest(ClientOpSpec::Read(*t, EcoString::from(k.as_str())))
+            }
+            EventSpec::Rmw(t, k) => {
+                EventAction::ClientRequest(ClientOpSpec::Rmw(*t, EcoString::from(k.as_str())))
             }
             EventSpec::Crash(t) => EventAction::CrashNode(*t),
             EventSpec::Recover(t) => EventAction::RecoverNode(*t),
