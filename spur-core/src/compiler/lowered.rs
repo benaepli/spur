@@ -614,6 +614,11 @@ impl Lowerer {
                 ty,
                 span,
             },
+            TypedExprKind::Fifo(e) => LExpr {
+                kind: LExprKind::Fifo(Box::new(self.lower_expr(*e))),
+                ty,
+                span,
+            },
 
             TypedExprKind::Index(a, b) => LExpr {
                 kind: LExprKind::Index(

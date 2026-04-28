@@ -103,6 +103,8 @@ pub enum TypeError {
     MissingStructField { field_name: String, span: Span },
     #[error("RPC call target must be a role type, found `{ty}`")]
     RpcCallTargetNotRole { ty: Type, span: Span },
+    #[error("`fifo()` argument must be a role, found `{ty}`")]
+    FifoTargetNotRole { ty: Type, span: Span },
     #[error("List operation requires a list type, found `{ty}`")]
     NotAList { ty: Type, span: Span },
     #[error("Operator `!` can only be used on an optional, found `{ty}`")]
@@ -1964,6 +1966,27 @@ impl TypeChecker {
                 ty: Type::Chan(Box::new(Type::Tuple(vec![]))),
                 span,
             },
+            ResolvedExprKind::Fifo(target) => {
+                let typed_target = self.infer_expr(*target);
+                match &typed_target.ty {
+                    Type::Role(_, _) => {
+                        let link_ty = Type::FifoLink(Box::new(typed_target.ty.clone()));
+                        TypedExpr {
+                            kind: TypedExprKind::Fifo(Box::new(typed_target)),
+                            ty: link_ty,
+                            span,
+                        }
+                    }
+                    Type::Error => self.error_expr(span),
+                    _ => {
+                        self.emit(TypeError::FifoTargetNotRole {
+                            ty: typed_target.ty.clone(),
+                            span: typed_target.span,
+                        });
+                        self.error_expr(span)
+                    }
+                }
+            }
             ResolvedExprKind::Index(target, index) => self.infer_index(*target, *index, span),
             ResolvedExprKind::Slice(target, start, end) => {
                 let typed_target = self.infer_expr(*target);
@@ -2242,6 +2265,17 @@ impl TypeChecker {
                 let typed_target = self.infer_expr(*target);
                 let role_id = match &typed_target.ty {
                     Type::Role(id, _) => *id,
+                    Type::FifoLink(inner) => match inner.as_ref() {
+                        Type::Role(id, _) => *id,
+                        Type::Error => return self.error_expr(span),
+                        _ => {
+                            self.emit(TypeError::RpcCallTargetNotRole {
+                                ty: typed_target.ty.clone(),
+                                span: typed_target.span,
+                            });
+                            return self.error_expr(span);
+                        }
+                    },
                     Type::Error => return self.error_expr(span),
                     _ => {
                         self.emit(TypeError::RpcCallTargetNotRole {
@@ -2963,6 +2997,10 @@ impl TypeChecker {
             ResolvedTypeDef::Chan(t) => {
                 let base_type = self.resolve_type(t)?;
                 Ok(Type::Chan(Box::new(base_type)))
+            }
+            ResolvedTypeDef::FifoLink(t) => {
+                let base_type = self.resolve_type(t)?;
+                Ok(Type::FifoLink(Box::new(base_type)))
             }
             ResolvedTypeDef::Refined {
                 base,

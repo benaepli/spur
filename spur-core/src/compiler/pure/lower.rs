@@ -197,6 +197,7 @@ impl PureLowerer {
             ),
             TExprKind::Recv(s, c) => PExprKind::Recv(self.lower_atomic(s), self.lower_atomic(c)),
             TExprKind::SetTimer(label) => PExprKind::SetTimer(label),
+            TExprKind::Fifo(a) => PExprKind::Fifo(self.lower_atomic(a)),
             TExprKind::Index(a, b) => PExprKind::Index(self.lower_atomic(a), self.lower_atomic(b)),
             TExprKind::Slice(a, b, c) => PExprKind::Slice(
                 self.lower_atomic(a),
@@ -1255,7 +1256,8 @@ fn reads_expr(e: &TExpr, reads: &mut HashSet<NameId>) {
         | TupleAccess(a, _)
         | FieldAccess(a, _)
         | SafeFieldAccess(a, _)
-        | SafeTupleAccess(a, _) => reads_atomic(a, reads),
+        | SafeTupleAccess(a, _)
+        | Fifo(a) => reads_atomic(a, reads),
         BinOp(_, a, b)
         | Append(a, b)
         | Prepend(a, b)

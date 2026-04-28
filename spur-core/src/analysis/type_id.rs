@@ -73,7 +73,10 @@ fn register_type(ty: &Type, map: &mut TypeIdMap, next_id: &mut u32) {
     map.insert(ty.clone(), id);
 
     match ty {
-        Type::List(inner) | Type::Optional(inner) | Type::Chan(inner) => {
+        Type::List(inner)
+        | Type::Optional(inner)
+        | Type::Chan(inner)
+        | Type::FifoLink(inner) => {
             register_type(inner, map, next_id);
         }
         Type::Refined(inner, _) => {
@@ -222,6 +225,7 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
         | TypedExprKind::Len(e)
         | TypedExprKind::UnwrapOptional(e)
         | TypedExprKind::Recv(e)
+        | TypedExprKind::Fifo(e)
         | TypedExprKind::TupleAccess(e, _)
         | TypedExprKind::FieldAccess(e, _)
         | TypedExprKind::SafeFieldAccess(e, _)

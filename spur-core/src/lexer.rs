@@ -122,6 +122,8 @@ pub enum TokenKind {
     DiscardData,
     RetrieveData,
     With,
+    Fifo,
+    FifoLink,
 }
 
 impl fmt::Display for TokenKind {
@@ -209,6 +211,8 @@ impl fmt::Display for TokenKind {
             TokenKind::DiscardData => write!(f, "discard_data"),
             TokenKind::RetrieveData => write!(f, "retrieve_data"),
             TokenKind::With => write!(f, "with"),
+            TokenKind::Fifo => write!(f, "fifo"),
+            TokenKind::FifoLink => write!(f, "FifoLink"),
         }
     }
 }
@@ -256,6 +260,8 @@ static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "discard_data" => TokenKind::DiscardData,
     "retrieve_data" => TokenKind::RetrieveData,
     "with" => TokenKind::With,
+    "fifo" => TokenKind::Fifo,
+    "FifoLink" => TokenKind::FifoLink,
 };
 
 fn is_special_char(ch: char) -> bool {

@@ -147,6 +147,7 @@ pub enum ResolvedTypeDef {
     Tuple(Vec<ResolvedTypeDef>),
     Optional(Box<ResolvedTypeDef>),
     Chan(Box<ResolvedTypeDef>),
+    FifoLink(Box<ResolvedTypeDef>),
     Refined {
         base: Box<ResolvedTypeDef>,
         bound: NameId,
@@ -283,6 +284,7 @@ pub enum ResolvedExprKind {
     Recv(Box<ResolvedExpr>),
 
     SetTimer(Option<String>),
+    Fifo(Box<ResolvedExpr>),
     Index(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Slice(Box<ResolvedExpr>, Box<ResolvedExpr>, Box<ResolvedExpr>),
     TupleAccess(Box<ResolvedExpr>, usize),
@@ -792,6 +794,9 @@ impl Resolver {
                 ResolvedTypeDef::Optional(Box::new(self.resolve_type_def(*t)))
             }
             TypeDefKind::Chan(t) => ResolvedTypeDef::Chan(Box::new(self.resolve_type_def(*t))),
+            TypeDefKind::FifoLink(t) => {
+                ResolvedTypeDef::FifoLink(Box::new(self.resolve_type_def(*t)))
+            }
             TypeDefKind::Refined {
                 base,
                 bound,
@@ -1095,6 +1100,7 @@ impl Resolver {
             ),
             ExprKind::Recv(ch) => ResolvedExprKind::Recv(Box::new(self.resolve_expr(*ch))),
             ExprKind::SetTimer(label) => ResolvedExprKind::SetTimer(label),
+            ExprKind::Fifo(e) => ResolvedExprKind::Fifo(Box::new(self.resolve_expr(*e))),
             ExprKind::Index(e, i) => ResolvedExprKind::Index(
                 Box::new(self.resolve_expr(*e)),
                 Box::new(self.resolve_expr(*i)),

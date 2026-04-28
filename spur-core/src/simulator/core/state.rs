@@ -3,7 +3,7 @@ use crate::analysis::type_id::TypeId;
 use crate::compiler::cfg::{Lhs, Vertex};
 use crate::simulator::core::eval::store;
 use crate::simulator::core::partition::{PartitionInfo, PartitionType};
-use crate::simulator::core::values::{ChannelId, Env, Value};
+use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use rand::Rng;
@@ -236,6 +236,9 @@ pub struct Record<H: HashPolicy> {
     /// Links this record (and its traces) back to the client operation that caused it.
     pub causal_operation_id: Option<i32>,
     pub trace_id: Option<i64>,
+    /// FIFO link tag: `Some((link_id, seq))` if this RPC was sent through a
+    /// FIFO link. Delivery is gated on `seq == link_deliver_seq[link_id]`.
+    pub link_seq: Option<(LinkId, u32)>,
 }
 
 impl<H: HashPolicy> Record<H> {
@@ -255,6 +258,7 @@ impl<H: HashPolicy> Hash for Record<H> {
         self.env.hash(state);
         self.entry_pc.hash(state);
         self.initial_env.hash(state);
+        self.link_seq.hash(state);
     }
 }
 
@@ -482,6 +486,15 @@ pub struct State<H: HashPolicy> {
     pub allowed_timers: HashSet<(usize, String)>,
     next_channel_id: usize,
     next_unique_id: usize,
+    next_link_id: usize,
+    /// Per-link metadata: (sender, receiver). Used for debugging/visualisation.
+    pub link_meta: ImHashMap<LinkId, (NodeId, NodeId)>,
+    /// Per-link sender-side counter: the next sequence number to assign on send.
+    pub link_send_seq: ImHashMap<LinkId, u32>,
+    /// Per-link receiver-side counter: the next sequence number eligible for delivery.
+    /// A FIFO-tagged runnable with `(link_id, seq)` is only deliverable when
+    /// `seq == link_deliver_seq[link_id]`. Bumped on successful delivery.
+    pub link_deliver_seq: ImHashMap<LinkId, u32>,
 }
 
 impl<H: HashPolicy> State<H> {
@@ -520,7 +533,17 @@ impl<H: HashPolicy> State<H> {
             allowed_timers: HashSet::new(),
             next_channel_id: 0,
             next_unique_id: 0,
+            next_link_id: 0,
+            link_meta: ImHashMap::new(),
+            link_send_seq: ImHashMap::new(),
+            link_deliver_seq: ImHashMap::new(),
         }
+    }
+
+    pub fn alloc_link_id(&mut self) -> LinkId {
+        let id = LinkId(self.next_link_id);
+        self.next_link_id += 1;
+        id
     }
 
     /// Dynamically add a new node with the given role.
@@ -645,6 +668,17 @@ impl<H: HashPolicy> State<H> {
         for (chan_id, chan_state) in self.channels.iter() {
             let chan_hash = compute_hash(&(chan_id, chan_state));
             h ^= chan_hash;
+        }
+
+        // FIFO link state: order-independent XOR
+        for (link_id, (sender, receiver)) in self.link_meta.iter() {
+            h ^= compute_hash(&(link_id.0, sender, receiver));
+        }
+        for (link_id, &seq) in self.link_send_seq.iter() {
+            h ^= H::mix(compute_hash(&(link_id.0, seq)), 3000);
+        }
+        for (link_id, &seq) in self.link_deliver_seq.iter() {
+            h ^= H::mix(compute_hash(&(link_id.0, seq)), 3001);
         }
 
         // crash_info

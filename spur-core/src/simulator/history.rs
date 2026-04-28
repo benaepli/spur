@@ -109,6 +109,10 @@ fn json_of_value<H: crate::simulator::hash_utils::HashPolicy>(v: &Value<H>) -> J
         "type": "VChannel",
         "value": { "node": node, "id": id }
         }),
+        ValueKind::FifoLink(link_id, peer) => json!({
+        "type": "VFifoLink",
+        "value": { "link_id": link_id.0, "peer": peer }
+        }),
         ValueKind::Map(m) => {
             let json_pairs: Vec<JsonValue> = m
                 .iter()

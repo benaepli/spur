@@ -524,6 +524,7 @@ impl Compiler {
             | IterIsDone(e)
             | IterNext(e)
             | Recv(e)
+            | Fifo(e)
             | TupleAccess(e, _)
             | FieldAccess(e, _)
             | SafeFieldAccess(e, _)
@@ -1182,6 +1183,13 @@ impl Compiler {
 
             LExprKind::SetTimer(label) => self.add_label(Label::SetTimer(target, next_vertex, label.clone())),
 
+            LExprKind::Fifo(peer_expr) => {
+                let peer_tmp = self.alloc_temp_slot();
+                let make_vertex =
+                    self.add_label(Label::MakeFifoLink(target, Expr::Var(peer_tmp), next_vertex));
+                self.compile_expr_to_value(peer_expr, Lhs::Var(peer_tmp), make_vertex, ctx)
+            }
+
             LExprKind::PersistData(e) => {
                 let assign_vertex =
                     self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
@@ -1567,6 +1575,7 @@ impl Compiler {
             | LExprKind::RetrieveData(_)
             | LExprKind::DiscardData
             | LExprKind::SetTimer(_)
+            | LExprKind::Fifo(_)
             | LExprKind::VariantLit(_, _, Some(_))
             | LExprKind::Error => return None,
         })

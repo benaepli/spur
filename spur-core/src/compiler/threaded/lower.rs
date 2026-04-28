@@ -131,6 +131,7 @@ impl ThreadLowerer {
                 }
             }
             AExprKind::SetTimer(label) => TExprKind::SetTimer(label),
+            AExprKind::Fifo(a) => TExprKind::Fifo(self.lower_atomic(a)),
             AExprKind::Index(a, b) => TExprKind::Index(self.lower_atomic(a), self.lower_atomic(b)),
             AExprKind::Slice(a, b, c) => TExprKind::Slice(
                 self.lower_atomic(a),

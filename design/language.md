@@ -46,6 +46,7 @@ base_type ::=
   | 'map' '<' type_def ',' type_def '>'
   | 'list' '<' type_def '>'
   | 'chan' '<' type_def '>'
+  | 'FifoLink' '<' type_def '>'
   | '(' type_def_list? ')'
 
 (* If the last item is an expression without a
@@ -133,6 +134,7 @@ primary_base ::=
   | 'send' '(' expr ',' expr ')'
   | 'recv' '(' expr ')'
   | 'set_timer' '(' string_literal? ')'
+  | 'fifo' '(' expr ')'
   | ID
   | '(' expr ')'
 
@@ -315,6 +317,41 @@ to call a function on a target role instance:
 ```
 var f: chan<string> = other_role->some_func(1, 2);
 ```
+
+### FIFO RPC links
+
+By default, Spur's simulator makes no ordering guarantee between RPCs — two
+RPCs from node A to node B can be delivered in any order. For protocols that
+assume a TCP-like FIFO link (original VR, some Paxos variants), use an
+explicit `FifoLink<T>`:
+
+```
+var link: FifoLink<Node> = fifo(peer);
+var ch1: chan<Response> = link->Handler(args1);
+var ch2: chan<Response> = link->Handler(args2);
+```
+
+RPCs sent through the same link are guaranteed to be delivered to the
+receiver in send order. Direct `peer->Handler(...)` calls remain unordered.
+Multiple `fifo(peer)` calls to the same peer create independent links with
+no ordering relationship between them.
+
+`FifoLink<T>` values are ordinary in-memory state — they live in a node's
+env and are lost on crash. The simulator owns the per-link sequence state,
+so:
+
+- **Receiver crash**: messages already enqueued through a link are buffered
+  across the crash and delivered in original send order once the receiver
+  recovers (same as non-FIFO messages, just with ordering preserved).
+- **Sender crash**: the link value is lost (normal env cleanup). Messages
+  sent before the crash retain their sequence tags and still drain in
+  order. After recovery, a fresh `fifo(peer)` returns a new link with its
+  own independent sequence — pre- and post-crash sends are not ordered.
+
+FIFO ordering applies to the request direction only; responses come back
+on per-RPC `chan<T>` and carry no cross-response ordering. Handlers at the
+receiver still run concurrently — FIFO orders *delivery* (the order in
+which handler tasks are spawned), not handler execution.
 
 ### Channels
 

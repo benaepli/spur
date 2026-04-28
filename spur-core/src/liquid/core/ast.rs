@@ -18,6 +18,7 @@ pub enum CType {
     Tuple(Vec<CType>),
     Optional(Box<CType>),
     Chan(Box<CType>),
+    FifoLink(Box<CType>),
     Iter(Box<CType>),
     Role(NameId),
     Struct(NameId),
@@ -80,6 +81,7 @@ impl PartialEq for CType {
             (CType::Tuple(a), CType::Tuple(b)) => a == b,
             (CType::Optional(a), CType::Optional(b)) => a == b,
             (CType::Chan(a), CType::Chan(b)) => a == b,
+            (CType::FifoLink(a), CType::FifoLink(b)) => a == b,
             (CType::Iter(a), CType::Iter(b)) => a == b,
             (CType::Role(a), CType::Role(b)) => a == b,
             (CType::Struct(a), CType::Struct(b)) => a == b,
@@ -97,7 +99,11 @@ impl Hash for CType {
         std::mem::discriminant(self).hash(state);
         match self {
             CType::Int | CType::Bool | CType::String | CType::Nil | CType::Never => {}
-            CType::Array(t) | CType::Optional(t) | CType::Chan(t) | CType::Iter(t) => {
+            CType::Array(t)
+            | CType::Optional(t)
+            | CType::Chan(t)
+            | CType::FifoLink(t)
+            | CType::Iter(t) => {
                 t.hash(state);
             }
             CType::Map(k, v) => {
@@ -134,6 +140,7 @@ impl std::fmt::Display for CType {
             }
             CType::Optional(t) => write!(f, "{}?", t),
             CType::Chan(t) => write!(f, "chan<{}>", t),
+            CType::FifoLink(t) => write!(f, "FifoLink<{}>", t),
             CType::Iter(t) => write!(f, "iter<{}>", t),
             CType::Role(id) => write!(f, "role#{}", id.0),
             CType::Struct(id) => write!(f, "struct#{}", id.0),

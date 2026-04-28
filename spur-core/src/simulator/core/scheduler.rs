@@ -43,6 +43,22 @@ impl Reservation {
     }
 }
 
+/// A FIFO-tagged runnable is only deliverable when its sequence number matches
+/// the link's next-expected-deliver counter. All other runnables (non-FIFO or
+/// non-Record) are always eligible.
+fn is_fifo_blocked<H: HashPolicy>(
+    runnable: &Runnable<H>,
+    link_deliver_seq: &imbl::HashMap<crate::simulator::core::values::LinkId, u32>,
+) -> bool {
+    if let Runnable::Record(r) = runnable {
+        if let Some((link_id, seq)) = r.link_seq {
+            let expected = link_deliver_seq.get(&link_id).copied().unwrap_or(0);
+            return seq != expected;
+        }
+    }
+    false
+}
+
 /// Score a runnable in [0, 1] by combining novelty and priority. For Recover
 /// events targeting a currently-crashed node, `quick_fire_multiplier` increases
 /// the weight of priority relative to novelty while keeping the result in [0, 1].
@@ -163,8 +179,12 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
 
     let mut rng = rand::rng();
 
-    // Helper: check if a runnable is reserved
-    let is_reserved = |r: &Runnable<H>| reservations.iter().any(|res| res.matches(r));
+    // Helper: check if a runnable is reserved OR FIFO-blocked. Both exclude the
+    // item from scheduling via the same plumbing, so combine them here.
+    let link_deliver_seq = state.link_deliver_seq.clone();
+    let is_ineligible = |r: &Runnable<H>| {
+        reservations.iter().any(|res| res.matches(r)) || is_fifo_blocked(r, &link_deliver_seq)
+    };
 
     // Build QueueInfo, accounting for strict_timers eligibility AND reservations.
     // Subtract reserved items so the QueueSelector doesn't route to queues
@@ -174,7 +194,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             .timer_queue
             .iter()
             .filter(|r| {
-                if is_reserved(r) {
+                if is_ineligible(r) {
                     return false;
                 }
                 if let Runnable::Timer(t) = r {
@@ -187,16 +207,16 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             })
             .count()
     } else {
-        state.timer_queue.iter().filter(|r| !is_reserved(r)).count()
+        state.timer_queue.iter().filter(|r| !is_ineligible(r)).count()
     };
 
     let info = QueueInfo {
         local_queue_sizes: state
             .local_queues
             .iter()
-            .map(|q| q.iter().filter(|r| !is_reserved(r)).count())
+            .map(|q| q.iter().filter(|r| !is_ineligible(r)).count())
             .collect(),
-        network_queue_size: state.network_queue.iter().filter(|r| !is_reserved(r)).count(),
+        network_queue_size: state.network_queue.iter().filter(|r| !is_ineligible(r)).count(),
         timer_queue_size,
         step: state.crash_info.current_step,
     };
@@ -210,7 +230,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
         QueueSelection::Local(node_idx) => {
             let queue = &state.local_queues[node_idx];
             let eligible: Vec<usize> = (0..queue.len())
-                .filter(|&i| !is_reserved(&queue[i]))
+                .filter(|&i| !is_ineligible(&queue[i]))
                 .collect();
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
@@ -229,7 +249,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
         QueueSelection::Network => {
             let queue = &state.network_queue;
             let eligible: Vec<usize> = (0..queue.len())
-                .filter(|&i| !is_reserved(&queue[i]))
+                .filter(|&i| !is_ineligible(&queue[i]))
                 .collect();
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
@@ -250,7 +270,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             let eligible: Vec<usize> = if strict_timers {
                 (0..queue.len())
                     .filter(|&i| {
-                        if is_reserved(&queue[i]) {
+                        if is_ineligible(&queue[i]) {
                             return false;
                         }
                         if let Runnable::Timer(t) = &queue[i] {
@@ -264,7 +284,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                     .collect()
             } else {
                 (0..queue.len())
-                    .filter(|&i| !is_reserved(&queue[i]))
+                    .filter(|&i| !is_ineligible(&queue[i]))
                     .collect()
             };
             if eligible.is_empty() {
@@ -408,6 +428,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                     let record_entry_pc = r.entry_pc;
                     let record_origin = r.origin_node;
                     let record_dest = r.node;
+                    // Bump the link's deliver counter so the next FIFO message
+                    // in this link becomes schedulable.
+                    if let Some((link_id, seq)) = r.link_seq {
+                        state.link_deliver_seq.insert(link_id, seq + 1);
+                    }
                     let result = exec(
                         state,
                         logger,
@@ -663,6 +688,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
         priority: policy.sample(&mut rng, RunnableCategory::Record),
         causal_operation_id: None,
         trace_id: None,
+        link_seq: None,
     };
 
     exec(

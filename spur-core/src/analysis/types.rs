@@ -18,6 +18,7 @@ pub enum Type {
     Role(NameId, String),
     Optional(Box<Type>),
     Chan(Box<Type>),
+    FifoLink(Box<Type>),
     Iter(Box<Type>),
     Refined(Box<Type>, RefinementHandle),
 
@@ -101,6 +102,7 @@ impl std::fmt::Display for Type {
             Type::Role(_, name) => write!(f, "{}", name),
             Type::Optional(t) => write!(f, "{}?", t),
             Type::Chan(t) => write!(f, "chan<{}>", t),
+            Type::FifoLink(t) => write!(f, "FifoLink<{}>", t),
             Type::Iter(t) => write!(f, "iter<{}>", t),
             Type::Refined(inner, body) => {
                 write!(f, "{} {{ {} | … }}", inner, body.original_bound)
@@ -163,6 +165,7 @@ pub enum TypedExprKind {
     Recv(Box<TypedExpr>),
 
     SetTimer(Option<String>),
+    Fifo(Box<TypedExpr>),
 
     Index(Box<TypedExpr>, Box<TypedExpr>),
     Slice(Box<TypedExpr>, Box<TypedExpr>, Box<TypedExpr>),

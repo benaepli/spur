@@ -58,6 +58,7 @@ pub enum LExprKind {
     Recv(Box<LExpr>),
 
     SetTimer(Option<String>),
+    Fifo(Box<LExpr>),
 
     Index(Box<LExpr>, Box<LExpr>),
     Slice(Box<LExpr>, Box<LExpr>, Box<LExpr>),

@@ -484,6 +484,22 @@ impl CoreLowerer {
                 self.emit_extern_call(BuiltinKind::TimerSet, vec![], vec![], chan_ty, vec![])
             }
 
+            PExprKind::Fifo(peer) => {
+                let role_ty = lower_type_simple(&self.atomic_p_type(&peer));
+                let inner = match result_ty {
+                    Type::FifoLink(t) => self.lower_type(t),
+                    _ => role_ty.clone(),
+                };
+                let link_ty = CType::FifoLink(Box::new(inner));
+                self.emit_extern_call(
+                    BuiltinKind::FifoCreate,
+                    vec![role_ty.clone()],
+                    vec![role_ty],
+                    link_ty,
+                    vec![peer],
+                )
+            }
+
             PExprKind::Index(coll, idx) => CExprKind::Index(lower_atomic(coll), lower_atomic(idx)),
             PExprKind::TupleAccess(t, i) => CExprKind::TupleAccess(lower_atomic(t), i),
             PExprKind::FieldAccess(s, f) => CExprKind::FieldAccess(lower_atomic(s), f),
@@ -708,6 +724,7 @@ fn lower_type_simple(ty: &Type) -> CType {
         Type::Role(id, _) => CType::Role(*id),
         Type::Optional(t) => CType::Optional(Box::new(lower_type_simple(t))),
         Type::Chan(t) => CType::Chan(Box::new(lower_type_simple(t))),
+        Type::FifoLink(t) => CType::FifoLink(Box::new(lower_type_simple(t))),
         Type::Iter(t) => CType::Iter(Box::new(lower_type_simple(t))),
         Type::Refined(inner, _) => lower_type_simple(inner),
         Type::EmptyList => CType::Array(Box::new(CType::Never)),
@@ -737,6 +754,7 @@ impl CoreLowerer {
             Type::Role(id, _) => CType::Role(*id),
             Type::Optional(t) => CType::Optional(Box::new(self.lower_type(t))),
             Type::Chan(t) => CType::Chan(Box::new(self.lower_type(t))),
+            Type::FifoLink(t) => CType::FifoLink(Box::new(self.lower_type(t))),
             Type::Iter(t) => CType::Iter(Box::new(self.lower_type(t))),
             Type::Refined(inner, handle) => {
                 let ci = self.lower_type(inner);
@@ -1154,6 +1172,7 @@ impl CoreLowerer {
             TypedExprKind::Send(_, _) => self.disallowed("channel send", span),
             TypedExprKind::Recv(_) => self.disallowed("channel recv", span),
             TypedExprKind::SetTimer(_) => self.disallowed("set-timer", span),
+            TypedExprKind::Fifo(_) => self.disallowed("fifo", span),
             TypedExprKind::PersistData(_) => self.disallowed("persist-data", span),
             TypedExprKind::RetrieveData(_) => self.disallowed("retrieve-data", span),
             TypedExprKind::DiscardData => self.disallowed("discard-data", span),

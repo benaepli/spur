@@ -370,6 +370,14 @@ impl AnfLowerer {
                 ty,
                 span,
             },
+            LExprKind::Fifo(e) => {
+                let a = self.lower_expr_to_atomic(*e, stmts);
+                AExpr {
+                    kind: AExprKind::Fifo(a),
+                    ty,
+                    span,
+                }
+            }
 
             // Indexing / access
             LExprKind::Index(a, b) => {

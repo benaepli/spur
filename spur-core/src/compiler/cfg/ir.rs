@@ -124,6 +124,7 @@ pub enum Label {
     Pause(Vertex /* next_vertex */),
     MakeChannel(Lhs, Option<usize>, Vertex),
     SetTimer(Lhs, Vertex, Option<String>),
+    MakeFifoLink(Lhs, Expr /* peer node expr */, Vertex),
     UniqueId(Lhs, Vertex),
     Send(Expr, Expr, Vertex),
     Recv(Lhs, Expr, Vertex),

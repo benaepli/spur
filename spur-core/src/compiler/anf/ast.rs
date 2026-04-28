@@ -66,6 +66,7 @@ pub enum AExprKind {
     Recv(AAtomic),
 
     SetTimer(Option<String>),
+    Fifo(AAtomic),
 
     Index(AAtomic, AAtomic),
     Slice(AAtomic, AAtomic, AAtomic),

@@ -64,6 +64,7 @@ pub enum TExprKind {
     Recv(TAtomic, TAtomic),          // (state, current_chan)
 
     SetTimer(Option<String>),
+    Fifo(TAtomic),
 
     Index(TAtomic, TAtomic),
     Slice(TAtomic, TAtomic, TAtomic),

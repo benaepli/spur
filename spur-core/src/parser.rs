@@ -124,6 +124,7 @@ pub enum TypeDefKind {
     Tuple(Vec<TypeDef>),
     Optional(Box<TypeDef>),
     Chan(Box<TypeDef>),
+    FifoLink(Box<TypeDef>),
     Refined {
         base: Box<TypeDef>,
         bound: String,
@@ -292,6 +293,7 @@ pub enum ExprKind {
     Send(Box<Expr>, Box<Expr>),
     Recv(Box<Expr>),
     SetTimer(Option<String>),
+    Fifo(Box<Expr>),
 
     // Postfix operations
     Index(Box<Expr>, Box<Expr>),
@@ -516,7 +518,17 @@ where
                 span: e.span(),
             });
 
-        let base_type = choice((named, map, list, tuple, chan_type));
+        let fifo_link_type = just(TokenKind::FifoLink)
+            .ignore_then(
+                type_def.clone()
+                    .delimited_by(just(TokenKind::Less), just(TokenKind::Greater)),
+            )
+            .map_with(|t, e| TypeDef {
+                kind: TypeDefKind::FifoLink(Box::new(t)),
+                span: e.span(),
+            });
+
+        let base_type = choice((named, map, list, tuple, chan_type, fifo_link_type));
 
         let optional = base_type
             .then(just(TokenKind::Question).or_not())
@@ -992,6 +1004,7 @@ where
         one_arg_builtin(TokenKind::Head, ExprKind::Head),
         one_arg_builtin(TokenKind::Tail, ExprKind::Tail),
         one_arg_builtin(TokenKind::Len, ExprKind::Len),
+        one_arg_builtin(TokenKind::Fifo, ExprKind::Fifo),
         one_arg_builtin(TokenKind::PersistData, ExprKind::PersistData),
         zero_arg_builtin(TokenKind::DiscardData, ExprKind::DiscardData),
         just(TokenKind::RetrieveData)
@@ -1579,7 +1592,7 @@ fn validate_expr(expr: &Expr, errors: &mut Vec<ValidationError>) {
         ExprKind::Not(a) | ExprKind::Negate(a) | ExprKind::Head(a) | ExprKind::Tail(a) |
         ExprKind::Len(a) | ExprKind::TupleAccess(a, _) | ExprKind::SafeTupleAccess(a, _) | ExprKind::FieldAccess(a, _) |
         ExprKind::Unwrap(a) | ExprKind::SafeFieldAccess(a, _) | ExprKind::PersistData(a) |
-        ExprKind::Recv(a) | ExprKind::Return(Some(a)) => {
+        ExprKind::Recv(a) | ExprKind::Fifo(a) | ExprKind::Return(Some(a)) => {
             validate_expr(a, errors);
         }
         ExprKind::FuncCall(fc) => {

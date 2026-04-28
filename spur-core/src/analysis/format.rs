@@ -443,6 +443,19 @@ pub fn report_type_errors(
                     .eprint((filename, Source::from(source)))?;
             }
 
+            TypeError::FifoTargetNotRole { ty, span } => {
+                Report::build(ReportKind::Error, filename, span.start)
+                    .with_message("invalid `fifo()` argument")
+                    .with_label(
+                        Label::new((filename, span.start..span.end))
+                            .with_message(format!("expected role type, found `{}`", ty))
+                            .with_color(Color::Red),
+                    )
+                    .with_note("help: `fifo()` requires a role value (e.g. a peer node)")
+                    .finish()
+                    .eprint((filename, Source::from(source)))?;
+            }
+
             TypeError::NotAList { ty, span } => {
                 Report::build(ReportKind::Error, filename, span.start)
                     .with_message("list operation on non-list type")

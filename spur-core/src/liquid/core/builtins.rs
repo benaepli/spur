@@ -34,6 +34,9 @@ pub enum BuiltinKind {
     // Timers
     TimerSet,
 
+    // FIFO RPC links
+    FifoCreate,
+
     // Optionals
     OptionalWrap,
     OptionalUnwrap,
@@ -79,6 +82,7 @@ impl BuiltinKind {
             BuiltinKind::ChanSend => "chan_send".into(),
             BuiltinKind::ChanRecv => "chan_recv".into(),
             BuiltinKind::TimerSet => "timer_set".into(),
+            BuiltinKind::FifoCreate => "fifo_create".into(),
             BuiltinKind::OptionalWrap => "optional_wrap".into(),
             BuiltinKind::OptionalUnwrap => "optional_unwrap".into(),
             BuiltinKind::SafeField(field) => format!("safe_field_{}", field),

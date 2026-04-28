@@ -305,6 +305,7 @@ impl<'a> LoopRemover<'a> {
             | LExprKind::IterIsDone(e)
             | LExprKind::IterNext(e)
             | LExprKind::Recv(e)
+            | LExprKind::Fifo(e)
             | LExprKind::WrapInOptional(e)
             | LExprKind::PersistData(e)
             | LExprKind::Return(e) => {
@@ -449,6 +450,7 @@ fn replace_continue_in_expr(expr: &mut LExpr, increment: &[LStatement]) {
         | LExprKind::IterIsDone(e)
         | LExprKind::IterNext(e)
         | LExprKind::Recv(e)
+        | LExprKind::Fifo(e)
         | LExprKind::WrapInOptional(e)
         | LExprKind::PersistData(e)
         | LExprKind::Return(e) => {

@@ -90,6 +90,7 @@ fn make_record_with_cont(
         priority: 0.5,
         causal_operation_id: None,
         trace_id: None,
+        link_seq: None,
     }
 }
 

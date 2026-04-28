@@ -436,6 +436,8 @@ impl<'a> Printer<'a> {
                 None => "@set_timer()".to_string(),
             },
 
+            PExprKind::Fifo(a) => format!("@fifo({})", self.fmt_atomic(a)),
+
             PExprKind::Index(a, b) => {
                 format!("{}[{}]", self.fmt_atomic(a), self.fmt_atomic(b))
             }
@@ -639,6 +641,7 @@ impl DisambVisitor {
             }
 
             PExprKind::SetTimer(_) => {}
+            PExprKind::Fifo(a) => self.visit_atomic(a),
 
             PExprKind::Index(a, b) => {
                 self.visit_atomic(a);

@@ -106,6 +106,7 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             | Label::Print(_, next)
             | Label::MakeChannel(_, _, next)
             | Label::SetTimer(_, next, _)
+            | Label::MakeFifoLink(_, _, next)
             | Label::UniqueId(_, next)
             | Label::Send(_, _, next)
             | Label::Recv(_, _, next)
@@ -220,6 +221,14 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
                 "<B>Set Timer{}</B><BR/>{}",
                 html_escape(&label_str),
                 html_escape(&pretty_lhs(prog, lhs))
+            );
+        }
+        Label::MakeFifoLink(lhs, peer, _) => {
+            header_color = "#C8E6C9"; // Green
+            content = format!(
+                "<B>Make Fifo Link</B><BR/>{} = fifo({})",
+                html_escape(&pretty_lhs(prog, lhs)),
+                html_escape(&pretty_expr(prog, peer))
             );
         }
         Label::UniqueId(lhs, _) => {
@@ -570,6 +579,7 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         | Label::Pause(n)
         | Label::MakeChannel(_, _, n)
         | Label::SetTimer(_, n, _)
+        | Label::MakeFifoLink(_, _, n)
         | Label::UniqueId(_, n)
         | Label::Send(_, _, n)
         | Label::Recv(_, _, n)

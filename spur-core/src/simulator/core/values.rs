@@ -15,6 +15,9 @@ pub struct ChannelId {
     pub id: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LinkId(pub usize);
+
 /// The inner representation of a value, without cached signature.
 #[derive(Clone, Debug)]
 pub enum ValueKind<H: HashPolicy> {
@@ -25,6 +28,10 @@ pub enum ValueKind<H: HashPolicy> {
     Option(Option<Arc<Value<H>>>),
     Channel(ChannelId),
     Node(NodeId),
+    /// FIFO RPC link: `(link_id, peer)`. Pair the per-link sequence identity
+    /// with the peer node so RPCs through the link route deterministically
+    /// even after sender crash + recovery.
+    FifoLink(LinkId, NodeId),
     String(EcoString),
     Unit,
     Tuple(Vector<Value<H>>),
@@ -71,6 +78,7 @@ impl<H: HashPolicy> Value<H> {
             | ValueKind::String(_)
             | ValueKind::Node(_)
             | ValueKind::Channel(_)
+            | ValueKind::FifoLink(_, _)
             | ValueKind::Unit => Self::compute_sig(kind),
             ValueKind::Option(_)
             | ValueKind::Tuple(_)
@@ -98,6 +106,11 @@ impl<H: HashPolicy> Value<H> {
                 mix((c.node.role.0 as u64).wrapping_mul(HASH_PRIME), 5)
                     ^ mix((c.node.index as u64).wrapping_mul(HASH_PRIME), 105)
                     ^ mix((c.id as u64).wrapping_mul(HASH_PRIME), 205)
+            }
+            ValueKind::FifoLink(link_id, peer) => {
+                mix((link_id.0 as u64).wrapping_mul(HASH_PRIME), 11)
+                    ^ mix((peer.role.0 as u64).wrapping_mul(HASH_PRIME), 111)
+                    ^ mix((peer.index as u64).wrapping_mul(HASH_PRIME), 211)
             }
             ValueKind::String(s) => {
                 let mut h = FxHasher::default();
@@ -202,6 +215,11 @@ impl<H: HashPolicy> Value<H> {
     }
 
     #[inline]
+    pub fn fifo_link(link_id: LinkId, peer: NodeId) -> Self {
+        Self::new(ValueKind::FifoLink(link_id, peer))
+    }
+
+    #[inline]
     pub fn option(o: Option<Arc<Value<H>>>) -> Self {
         Self::new(ValueKind::Option(o))
     }
@@ -261,6 +279,7 @@ impl<H: HashPolicy> PartialEq for Value<H> {
             (List(a), List(b)) => a == b,
             (Map(a), Map(b)) => a == b,
             (Channel(a), Channel(b)) => a == b,
+            (FifoLink(la, pa), FifoLink(lb, pb)) => la == lb && pa == pb,
             (Variant(id_a, name_a, p_a), Variant(id_b, name_b, p_b)) => {
                 id_a == id_b && name_a == name_b && p_a == p_b
             }
@@ -296,6 +315,7 @@ impl<H: HashPolicy> Ord for Value<H> {
                 a_vec.cmp(&b_vec)
             }
             (Channel(a), Channel(b)) => a.cmp(b),
+            (FifoLink(la, pa), FifoLink(lb, pb)) => (la, pa).cmp(&(lb, pb)),
             (Variant(id_a, name_a, p_a), Variant(id_b, name_b, p_b)) => {
                 (id_a, name_a, p_a).cmp(&(id_b, name_b, p_b))
             }
@@ -320,6 +340,8 @@ impl<H: HashPolicy> Ord for Value<H> {
             (_, Map(_)) => Ordering::Greater,
             (Channel(_), _) => Ordering::Less,
             (_, Channel(_)) => Ordering::Greater,
+            (FifoLink(_, _), _) => Ordering::Less,
+            (_, FifoLink(_, _)) => Ordering::Greater,
         }
     }
 }
@@ -342,6 +364,7 @@ impl<H: HashPolicy> std::fmt::Display for Value<H> {
             Option(None) => write!(f, "None"),
             Option(Some(v)) => write!(f, "Some({})", v),
             Channel(ch) => write!(f, "channel({}, {})", ch.node, ch.id),
+            FifoLink(link_id, peer) => write!(f, "fifo_link({}, {})", link_id.0, peer),
             Tuple(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
@@ -388,6 +411,7 @@ impl<H: HashPolicy> Value<H> {
             List(_) => "list",
             Option(_) => "option",
             Channel(_) => "channel",
+            FifoLink(_, _) => "fifo_link",
             Node(_) => "node",
             String(_) => "string",
             Unit => "unit",
@@ -424,6 +448,19 @@ impl<H: HashPolicy> Value<H> {
                 expected: "node",
                 got: self.type_name(),
             })
+        }
+    }
+    /// Resolve an RPC target. Either a bare `Node` (no FIFO discipline) or a
+    /// `FifoLink(link_id, peer)` (FIFO ordering on that link). Returns the
+    /// destination node and optional link identity.
+    pub fn as_rpc_target(&self) -> Result<(NodeId, Option<LinkId>), RuntimeError> {
+        match &self.kind {
+            ValueKind::Node(n) => Ok((*n, None)),
+            ValueKind::FifoLink(link_id, peer) => Ok((*peer, Some(*link_id))),
+            _ => Err(RuntimeError::TypeError {
+                expected: "node or fifo_link",
+                got: self.type_name(),
+            }),
         }
     }
     pub fn as_map(&self) -> Result<&ImHashMap<Value<H>, Value<H>>, RuntimeError> {

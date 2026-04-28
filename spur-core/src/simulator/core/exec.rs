@@ -115,8 +115,8 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                 Ok(Some(StepOutcome::Continue(*next)))
             }
             Instr::Async(lhs, node_expr, func_name, args) => {
-                let target_node =
-                    eval(local_env, node_env, node_expr, &program.id_to_name)?.as_node()?;
+                let target_val = eval(local_env, node_env, node_expr, &program.id_to_name)?;
+                let (target_node, link_id) = target_val.as_rpc_target()?;
                 let arg_vals: Result<Vec<Value<H>>, _> = args
                     .iter()
                     .map(|a| eval(local_env, node_env, a, &program.id_to_name))
@@ -147,6 +147,14 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     &program.id_to_name,
                 );
 
+                // Tag with FIFO sequence number if routed through a FIFO link.
+                // Allocates the next sender-side seq for this link.
+                let link_seq = link_id.map(|lid| {
+                    let next = state.link_send_seq.get(&lid).copied().unwrap_or(0);
+                    state.link_send_seq.insert(lid, next + 1);
+                    (lid, next)
+                });
+
                 let mut rng = rand::rng();
                 let new_record = Record {
                     pc: func_info.entry,
@@ -159,6 +167,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     priority: policy.sample(&mut rng, RunnableCategory::Record),
                     causal_operation_id,
                     trace_id: pending_trace_id.take(),
+                    link_seq,
                 };
 
                 if purgatory_config.delay_probability > 0.0
@@ -187,6 +196,15 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
             };
             state.channels.insert(cid, ChannelState::new());
             store(lhs, Value::channel(cid), local_env, node_env)?;
+            Ok(Some(StepOutcome::Continue(*next)))
+        }
+        Label::MakeFifoLink(lhs, peer_expr, next) => {
+            let peer = eval(local_env, node_env, peer_expr, &program.id_to_name)?.as_node()?;
+            let link_id = state.alloc_link_id();
+            state.link_meta.insert(link_id, (node_id, peer));
+            state.link_send_seq.insert(link_id, 0);
+            state.link_deliver_seq.insert(link_id, 0);
+            store(lhs, Value::fifo_link(link_id, peer), local_env, node_env)?;
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::SetTimer(lhs, next, label) => {
@@ -598,6 +616,7 @@ pub fn exec<H: HashPolicy, L: Logger>(
             Label::Instr(_, _)
             | Label::MakeChannel(_, _, _)
             | Label::SetTimer(_, _, _)
+            | Label::MakeFifoLink(_, _, _)
             | Label::UniqueId(_, _)
             | Label::Cond(_, _, _)
             | Label::Return(_)

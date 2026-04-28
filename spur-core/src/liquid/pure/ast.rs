@@ -64,6 +64,7 @@ pub enum PExprKind {
     Recv(PAtomic, PAtomic),          // (state, current_chan)
 
     SetTimer(Option<String>),
+    Fifo(PAtomic),
 
     Index(PAtomic, PAtomic),
     Slice(PAtomic, PAtomic, PAtomic),

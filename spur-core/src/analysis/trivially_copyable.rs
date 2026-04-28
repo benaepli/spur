@@ -81,6 +81,7 @@ pub fn is_trivially_copyable(ty: &Type, map: &TriviallyCopyableMap) -> bool {
     match ty {
         Type::Int | Type::String | Type::Bool => true,
         Type::Chan(_) => false,
+        Type::FifoLink(_) => false,
         Type::List(elem) => is_trivially_copyable(elem, map),
         Type::Map(key, val) => is_trivially_copyable(key, map) && is_trivially_copyable(val, map),
         Type::Tuple(elems) => elems.iter().all(|e| is_trivially_copyable(e, map)),

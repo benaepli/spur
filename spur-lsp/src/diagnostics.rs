@@ -123,6 +123,7 @@ fn type_error_span(e: &TypeError) -> spur_core::parser::Span {
         | UndefinedStructField { span, .. }
         | MissingStructField { span, .. }
         | RpcCallTargetNotRole { span, .. }
+        | FifoTargetNotRole { span, .. }
         | NotAList { span, .. }
         | UnwrapOnNonOptional { span, .. }
         | NotAChannel { span, .. }
