@@ -1,7 +1,7 @@
 use crate::analysis::resolver::NameId;
-use crate::parser::{BinOp, Span};
+use crate::parser::Span;
 
-use super::ast::CType;
+use super::ast::{CBinOp, CType};
 
 /// A pure, tree-form expression representing a lowered refinement-body
 /// predicate. Refinements are restricted to side-effect-free expressions, so
@@ -24,7 +24,7 @@ pub enum RefinementExprKind {
     BoolLit(bool),
     NilLit,
 
-    BinOp(BinOp, Box<RefinementExpr>, Box<RefinementExpr>),
+    BinOp(CBinOp, Box<RefinementExpr>, Box<RefinementExpr>),
     Not(Box<RefinementExpr>),
     Negate(Box<RefinementExpr>),
 

@@ -52,6 +52,10 @@ pub enum BuiltinKind {
     // RPC — keyed by the user function being invoked remotely
     Rpc(NameId),
 
+    // Equality (polymorphic over operand type)
+    Eq,
+    Neq,
+
     // Existing resolver builtins
     Println,
     IntToString,
@@ -92,6 +96,8 @@ impl BuiltinKind {
             BuiltinKind::Retrieve => "retrieve".into(),
             BuiltinKind::Discard => "discard".into(),
             BuiltinKind::Rpc(target) => format!("rpc_to_{}", target.0),
+            BuiltinKind::Eq => "eq".into(),
+            BuiltinKind::Neq => "neq".into(),
             BuiltinKind::Println => "println".into(),
             BuiltinKind::IntToString => "int_to_string".into(),
             BuiltinKind::BoolToString => "bool_to_string".into(),

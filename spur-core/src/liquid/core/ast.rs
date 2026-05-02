@@ -1,5 +1,5 @@
 use crate::analysis::resolver::NameId;
-use crate::parser::{BinOp, Span};
+use crate::parser::Span;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -152,6 +152,21 @@ impl std::fmt::Display for CType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CBinOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    And,
+    Or,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CAtomic {
     Var(NameId, String),
@@ -173,7 +188,7 @@ pub struct CExpr {
 pub enum CExprKind {
     Atomic(CAtomic),
 
-    BinOp(BinOp, CAtomic, CAtomic),
+    BinOp(CBinOp, CAtomic, CAtomic),
     Not(CAtomic),
     Negate(CAtomic),
 

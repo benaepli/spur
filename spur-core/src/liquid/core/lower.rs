@@ -4,6 +4,7 @@ use crate::analysis::resolver::{BuiltinFn, NameId};
 use crate::analysis::types::{
     RefinementBody, Type, TypedBlock, TypedCondExpr, TypedExpr, TypedExprKind, TypedFuncCall,
 };
+use crate::parser::BinOp;
 use crate::liquid::pure::ast::*;
 
 use super::ast::*;
@@ -11,6 +12,25 @@ use super::builtins::BuiltinKind;
 use super::refinement::{
     RefinementCond, RefinementExpr, RefinementExprKind, RefinementIfBranch,
 };
+
+fn to_cbinop(op: &BinOp) -> CBinOp {
+    match op {
+        BinOp::Add => CBinOp::Add,
+        BinOp::Subtract => CBinOp::Subtract,
+        BinOp::Multiply => CBinOp::Multiply,
+        BinOp::Divide => CBinOp::Divide,
+        BinOp::Modulo => CBinOp::Modulo,
+        BinOp::Less => CBinOp::Less,
+        BinOp::LessEqual => CBinOp::LessEqual,
+        BinOp::Greater => CBinOp::Greater,
+        BinOp::GreaterEqual => CBinOp::GreaterEqual,
+        BinOp::And => CBinOp::And,
+        BinOp::Or => CBinOp::Or,
+        BinOp::Equal | BinOp::NotEqual | BinOp::Coalesce => {
+            unreachable!("polymorphic/desugared ops should not reach to_cbinop")
+        }
+    }
+}
 
 pub struct LowerOutput {
     pub program: CProgram,
@@ -189,7 +209,24 @@ impl CoreLowerer {
     fn lower_expr_kind(&mut self, kind: PExprKind, result_ty: &Type) -> CExprKind {
         match kind {
             PExprKind::Atomic(a) => CExprKind::Atomic(lower_atomic(a)),
-            PExprKind::BinOp(op, a, b) => CExprKind::BinOp(op, lower_atomic(a), lower_atomic(b)),
+            PExprKind::BinOp(op, a, b) => match op {
+                BinOp::Equal | BinOp::NotEqual => {
+                    let operand_ty = self.lower_type(&self.atomic_p_type(&a));
+                    let kind = if op == BinOp::Equal {
+                        BuiltinKind::Eq
+                    } else {
+                        BuiltinKind::Neq
+                    };
+                    self.emit_extern_call(
+                        kind,
+                        vec![operand_ty.clone()],
+                        vec![operand_ty.clone(), operand_ty],
+                        CType::Bool,
+                        vec![a, b],
+                    )
+                }
+                _ => CExprKind::BinOp(to_cbinop(&op), lower_atomic(a), lower_atomic(b)),
+            },
             PExprKind::Not(a) => CExprKind::Not(lower_atomic(a)),
             PExprKind::Negate(a) => CExprKind::Negate(lower_atomic(a)),
 
@@ -797,11 +834,34 @@ impl CoreLowerer {
             TypedExprKind::BoolLit(v) => RefinementExprKind::BoolLit(*v),
             TypedExprKind::NilLit => RefinementExprKind::NilLit,
 
-            TypedExprKind::BinOp(op, l, r) => {
-                let l = Box::new(self.lower_refinement_expr(l));
-                let r = Box::new(self.lower_refinement_expr(r));
-                RefinementExprKind::BinOp(op.clone(), l, r)
-            }
+            TypedExprKind::BinOp(op, l, r) => match op {
+                BinOp::Equal | BinOp::NotEqual => {
+                    let operand_ty = self.lower_type(&l.ty);
+                    let kind = if *op == BinOp::Equal {
+                        BuiltinKind::Eq
+                    } else {
+                        BuiltinKind::Neq
+                    };
+                    let target = self.intern_extern(
+                        kind,
+                        vec![operand_ty.clone()],
+                        vec![operand_ty.clone(), operand_ty],
+                        CType::Bool,
+                    );
+                    let l = self.lower_refinement_expr(l);
+                    let r = self.lower_refinement_expr(r);
+                    RefinementExprKind::ExternCall {
+                        target,
+                        args: vec![l, r],
+                        return_type: CType::Bool,
+                    }
+                }
+                _ => {
+                    let l = Box::new(self.lower_refinement_expr(l));
+                    let r = Box::new(self.lower_refinement_expr(r));
+                    RefinementExprKind::BinOp(to_cbinop(op), l, r)
+                }
+            },
             TypedExprKind::Not(e) => {
                 let e = Box::new(self.lower_refinement_expr(e));
                 RefinementExprKind::Not(e)
@@ -1617,7 +1677,7 @@ mod tests {
         };
         assert_eq!(**inner, CType::Int);
         match &handle.body.kind {
-            RefinementExprKind::BinOp(BinOp::Greater, l, r) => {
+            RefinementExprKind::BinOp(CBinOp::Greater, l, r) => {
                 assert!(matches!(l.kind, RefinementExprKind::Var(NameId(7), _)));
                 assert!(matches!(r.kind, RefinementExprKind::IntLit(0)));
             }
@@ -1776,8 +1836,11 @@ mod tests {
         let c = lowered.program;
 
         assert!(lowered.refinement_errors.is_empty());
-        assert_eq!(c.extern_funcs.len(), 1);
-        assert_eq!(c.extern_funcs[0].original_name, "array_len<int>");
+        // Two externs: array_len<int> and eq<int> (equality is now monomorphized)
+        assert_eq!(c.extern_funcs.len(), 2);
+        let names: Vec<_> = c.extern_funcs.iter().map(|e| e.original_name.as_str()).collect();
+        assert!(names.contains(&"array_len<int>"));
+        assert!(names.contains(&"eq<int>"));
 
         // Both the param's and return type's refinement handles must be the
         // *same* CRefinementHandle (Arc identity) thanks to body_memo.
