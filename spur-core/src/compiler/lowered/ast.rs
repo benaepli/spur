@@ -148,6 +148,7 @@ pub struct LVarInit {
     pub original_name: String,
     pub type_def: Type,
     pub value: LExpr,
+    pub user_annotated: bool,
     pub span: Span,
 }
 

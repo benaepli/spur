@@ -523,7 +523,28 @@ impl TypeChecker {
             });
         }
 
-        let typed_body = self.check_block(body);
+        let mut typed_body = self.check_block(body);
+
+        // Every function body ends with a return node in the typed AST.
+        if sig.return_type == Type::Tuple(vec![]) && typed_body.ty != Type::Never {
+            let unit_span = typed_body.span;
+            let unit_lit = TypedExpr {
+                kind: TypedExprKind::TupleLit(vec![]),
+                ty: Type::Tuple(vec![]),
+                span: unit_span,
+            };
+            let ret_expr = TypedExpr {
+                kind: TypedExprKind::Return(Box::new(unit_lit)),
+                ty: Type::Never,
+                span: unit_span,
+            };
+            typed_body.statements.push(TypedStatement {
+                kind: TypedStatementKind::Expr(ret_expr),
+                span: unit_span,
+            });
+            typed_body.ty = Type::Never;
+        }
+
         let body_type = typed_body.ty.clone();
 
         // Non-unit return type requires divergence (body_type == Never)
@@ -548,6 +569,7 @@ impl TypeChecker {
 
     fn check_var_init(&mut self, var_init: ResolvedVarInit) -> TypedVarInit {
         let span = var_init.span;
+        let user_annotated = var_init.type_def.is_some();
         let (typed_value, type_def) = if let Some(def) = var_init.type_def {
             match self.resolve_type(&def) {
                 Ok(expected_ty) => {
@@ -616,6 +638,7 @@ impl TypeChecker {
             target,
             type_def,
             value: typed_value,
+            user_annotated,
             span,
         }
     }
@@ -1012,6 +1035,7 @@ impl TypeChecker {
 
     fn check_assignment(&mut self, assign: ResolvedAssignment) -> TypedAssignment {
         let span = assign.span;
+        let user_annotated = assign.type_def.is_some();
 
         // Resolve the overall type: annotation or infer from RHS
         let (typed_value, overall_ty) = if let Some(def) = assign.type_def {
@@ -1039,7 +1063,7 @@ impl TypeChecker {
         // Single target: match against overall type directly
         // Multi target: expect a tuple type and match element-wise
         let targets = if assign.targets.len() == 1 {
-            vec![self.check_assign_item(assign.targets.into_iter().next().unwrap(), &overall_ty, span)]
+            vec![self.check_assign_item(assign.targets.into_iter().next().unwrap(), &overall_ty, span, user_annotated)]
         } else {
             match &overall_ty {
                 Type::Tuple(types) => {
@@ -1051,20 +1075,20 @@ impl TypeChecker {
                         });
                         assign.targets
                             .into_iter()
-                            .map(|item| self.check_assign_item(item, &Type::Error, span))
+                            .map(|item| self.check_assign_item(item, &Type::Error, span, user_annotated))
                             .collect()
                     } else {
                         assign.targets
                             .into_iter()
                             .zip(types.iter())
-                            .map(|(item, ty)| self.check_assign_item(item, ty, span))
+                            .map(|(item, ty)| self.check_assign_item(item, ty, span, user_annotated))
                             .collect()
                     }
                 }
                 Type::Error => {
                     assign.targets
                         .into_iter()
-                        .map(|item| self.check_assign_item(item, &Type::Error, span))
+                        .map(|item| self.check_assign_item(item, &Type::Error, span, user_annotated))
                         .collect()
                 }
                 _ => {
@@ -1074,7 +1098,7 @@ impl TypeChecker {
                     });
                     assign.targets
                         .into_iter()
-                        .map(|item| self.check_assign_item(item, &Type::Error, span))
+                        .map(|item| self.check_assign_item(item, &Type::Error, span, user_annotated))
                         .collect()
                 }
             }
@@ -1083,6 +1107,7 @@ impl TypeChecker {
         TypedAssignment {
             targets,
             value: typed_value,
+            user_annotated,
             span,
         }
     }
@@ -1117,6 +1142,7 @@ impl TypeChecker {
         item: ResolvedAssignItem,
         expected_ty: &Type,
         span: Span,
+        user_annotated: bool,
     ) -> TypedAssignItem {
         match item {
             ResolvedAssignItem::Existing(id, name) => {
@@ -1133,7 +1159,7 @@ impl TypeChecker {
             }
             ResolvedAssignItem::Declare(id, name) => {
                 self.add_var(id, expected_ty.clone());
-                TypedAssignItem::Declare(id, name, expected_ty.clone())
+                TypedAssignItem::Declare(id, name, expected_ty.clone(), user_annotated)
             }
             ResolvedAssignItem::Wildcard => {
                 TypedAssignItem::Wildcard(expected_ty.clone())
@@ -1149,20 +1175,20 @@ impl TypeChecker {
                             });
                             items
                                 .into_iter()
-                                .map(|i| self.check_assign_item(i, &Type::Error, span))
+                                .map(|i| self.check_assign_item(i, &Type::Error, span, user_annotated))
                                 .collect()
                         } else {
                             items
                                 .into_iter()
                                 .zip(types.iter())
-                                .map(|(i, ty)| self.check_assign_item(i, ty, span))
+                                .map(|(i, ty)| self.check_assign_item(i, ty, span, user_annotated))
                                 .collect()
                         }
                     }
                     Type::Error => {
                         items
                             .into_iter()
-                            .map(|i| self.check_assign_item(i, &Type::Error, span))
+                            .map(|i| self.check_assign_item(i, &Type::Error, span, user_annotated))
                             .collect()
                     }
                     _ => {
@@ -1172,7 +1198,7 @@ impl TypeChecker {
                         });
                         items
                             .into_iter()
-                            .map(|i| self.check_assign_item(i, &Type::Error, span))
+                            .map(|i| self.check_assign_item(i, &Type::Error, span, user_annotated))
                             .collect()
                     }
                 };
@@ -2391,8 +2417,7 @@ impl TypeChecker {
             return Ok(typed_expr);
         }
 
-        // Refinements are not statically enforced; allow `Refined(T, _) ↔ T`.
-        // TODO: entailment-based subtyping.
+        // Refinements are checked later.
         if let Type::Refined(expected_inner, _) = expected {
             return self.check_types_match(typed_expr, expected_inner);
         }
@@ -3053,8 +3078,7 @@ impl TypeChecker {
             return Ok(());
         }
 
-        // Refinements are not statically enforced; treat Refined(T, _) ↔ T as compatible.
-        // TODO: entailment-based subtyping.
+        // Refinements are checked later.
         if let Type::Refined(inner, _) = expected {
             return self.check_type_compatibility(inner, actual, span);
         }

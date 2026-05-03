@@ -143,26 +143,36 @@ impl Lowerer {
     fn lower_var_init_to_stmts(&mut self, vi: TypedVarInit) -> Vec<LStatement> {
         let pattern = var_target_to_pattern(vi.target, vi.type_def.clone(), vi.span);
         let value = self.lower_expr(vi.value);
-        self.bind_pattern(&pattern, value)
+        self.bind_pattern(&pattern, value, vi.user_annotated)
     }
 
     fn lower_assignment_to_stmts(&mut self, a: TypedAssignment) -> Vec<LStatement> {
         let span = a.span;
+        let user_annotated = a.user_annotated;
         let value = self.lower_expr(a.value);
 
         if a.targets.len() == 1 {
-            self.lower_assign_item(a.targets.into_iter().next().unwrap(), value, span)
+            self.lower_assign_item(
+                a.targets.into_iter().next().unwrap(),
+                value,
+                user_annotated,
+                span,
+            )
         } else {
-            self.destructure_items(a.targets, value, "__assign_tmp", span)
+            self.destructure_items(a.targets, value, "__assign_tmp", user_annotated, span)
         }
     }
 
     /// Bind `value` to a temp variable, then tuple-access each element into `items`.
+    /// `user_annotated` is the surrounding assignment's user-annotated flag; the
+    /// temp's type is exactly the user-annotated tuple type, so it inherits the
+    /// flag, and nested destructures slice further into that same type.
     fn destructure_items(
         &mut self,
         items: Vec<TypedAssignItem>,
         value: LExpr,
         tmp_name: &str,
+        user_annotated: bool,
         span: Span,
     ) -> Vec<LStatement> {
         let tmp_id = self.fresh_name_id();
@@ -178,6 +188,7 @@ impl Lowerer {
                 original_name: tmp_name.to_string(),
                 type_def: tmp_ty,
                 value,
+                user_annotated,
                 span,
             }),
             span,
@@ -189,7 +200,7 @@ impl Lowerer {
                 ty: elem_ty,
                 span,
             };
-            stmts.extend(self.lower_assign_item(item, access, span));
+            stmts.extend(self.lower_assign_item(item, access, user_annotated, span));
         }
         stmts
     }
@@ -198,16 +209,18 @@ impl Lowerer {
         &mut self,
         item: TypedAssignItem,
         value: LExpr,
+        parent_user_annotated: bool,
         span: Span,
     ) -> Vec<LStatement> {
         match item {
-            TypedAssignItem::Declare(id, name, ty) => {
+            TypedAssignItem::Declare(id, name, ty, user_annotated) => {
                 vec![LStatement {
                     kind: LStatementKind::VarInit(LVarInit {
                         name: id,
                         original_name: name,
                         type_def: ty,
                         value,
+                        user_annotated,
                         span,
                     }),
                     span,
@@ -227,7 +240,15 @@ impl Lowerer {
             }
             TypedAssignItem::Wildcard(_) => vec![],
             TypedAssignItem::Nested(items, _) => {
-                self.destructure_items(items, value, "__nested_tmp", span)
+                // The nested temp's type is an exact slice of the parent
+                // user-annotated tuple type, so inherit the flag.
+                self.destructure_items(
+                    items,
+                    value,
+                    "__nested_tmp",
+                    parent_user_annotated,
+                    span,
+                )
             }
         }
     }
@@ -279,12 +300,13 @@ impl Lowerer {
             let item = a.targets.into_iter().next().unwrap();
             let value = self.lower_expr(a.value);
             match item {
-                TypedAssignItem::Declare(id, name, ty) => {
+                TypedAssignItem::Declare(id, name, ty, user_annotated) => {
                     LForLoopInit::VarInit(LVarInit {
                         name: id,
                         original_name: name,
                         type_def: ty,
                         value,
+                        user_annotated,
                         span,
                     })
                 }
@@ -337,7 +359,7 @@ impl Lowerer {
                     ty: fil.pattern.ty.clone(),
                     span: fil.pattern.span,
                 };
-                let mut destructure_stmts = self.bind_pattern(&fil.pattern, tmp_var);
+                let mut destructure_stmts = self.bind_pattern(&fil.pattern, tmp_var, false);
                 destructure_stmts.append(&mut body);
                 LForInLoop {
                     binding_name: tmp_id,
@@ -753,6 +775,7 @@ impl Lowerer {
                 original_name: scrutinee_name,
                 type_def: scrutinee_ty,
                 value: lowered_scrutinee,
+                user_annotated: false,
                 span: scrutinee_span,
             }),
             span: scrutinee_span,
@@ -858,6 +881,7 @@ impl Lowerer {
                             original_name: name.clone(),
                             type_def: arm.pattern.ty.clone(),
                             value: scrutinee_var.clone(),
+                            user_annotated: false,
                             span: arm.pattern.span,
                         }),
                         span: arm.pattern.span,
@@ -873,7 +897,7 @@ impl Lowerer {
             }
             TypedPatternKind::Tuple(_) => {
                 let mut body = self.lower_block(arm.body.clone());
-                let bind_stmts = self.bind_pattern(&arm.pattern, scrutinee_var.clone());
+                let bind_stmts = self.bind_pattern(&arm.pattern, scrutinee_var.clone(), false);
                 let mut new_stmts = bind_stmts;
                 new_stmts.append(&mut body.statements);
                 body.statements = new_stmts;
@@ -909,7 +933,7 @@ impl Lowerer {
                 ty: pat.ty.clone(),
                 span: pat.span,
             };
-            let bind_stmts = self.bind_pattern(pat, payload_expr);
+            let bind_stmts = self.bind_pattern(pat, payload_expr, false);
             let mut new_stmts = bind_stmts;
             new_stmts.append(&mut lowered_block.statements);
             lowered_block.statements = new_stmts;
@@ -918,7 +942,7 @@ impl Lowerer {
         lowered_block
     }
 
-    fn bind_pattern(&mut self, pat: &TypedPattern, value: LExpr) -> Vec<LStatement> {
+    fn bind_pattern(&mut self, pat: &TypedPattern, value: LExpr, user_annotated: bool) -> Vec<LStatement> {
         match &pat.kind {
             TypedPatternKind::Var(name_id, name) => {
                 vec![LStatement {
@@ -927,6 +951,7 @@ impl Lowerer {
                         original_name: name.clone(),
                         type_def: pat.ty.clone(),
                         value,
+                        user_annotated,
                         span: pat.span,
                     }),
                     span: pat.span,
@@ -943,7 +968,7 @@ impl Lowerer {
                         ty: sub_pat.ty.clone(),
                         span: sub_pat.span,
                     };
-                    stmts.extend(self.bind_pattern(sub_pat, access));
+                    stmts.extend(self.bind_pattern(sub_pat, access, user_annotated));
                 }
                 stmts
             }
@@ -954,7 +979,7 @@ impl Lowerer {
                         ty: payload_pat.ty.clone(),
                         span: payload_pat.span,
                     };
-                    self.bind_pattern(payload_pat, payload_expr)
+                    self.bind_pattern(payload_pat, payload_expr, user_annotated)
                 } else {
                     vec![]
                 }

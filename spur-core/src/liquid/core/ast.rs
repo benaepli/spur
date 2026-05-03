@@ -165,6 +165,10 @@ pub enum CBinOp {
     GreaterEqual,
     And,
     Or,
+    IntEq,
+    IntNeq,
+    BoolEq,
+    BoolNeq,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,6 +249,7 @@ pub struct CLetAtom {
     pub original_name: String,
     pub ty: CType,
     pub value: CExpr,
+    pub user_annotated: bool,
     pub span: Span,
 }
 

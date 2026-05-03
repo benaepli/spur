@@ -17,6 +17,10 @@ pub struct PureLowerer {
     type_env: HashMap<NameId, Type>,
     /// Threaded NameId -> original (user-facing) name.
     orig_name: HashMap<NameId, String>,
+    /// Threaded NameId -> whether the binding's type was user-annotated.
+    /// Populated alongside `type_env` so SSA join projections and loop
+    /// live-out projections can inherit the flag from the original binding.
+    user_annotated_env: HashMap<NameId, bool>,
     /// Cloned from TProgram; read-only during lowering.
     struct_defs: HashMap<NameId, Vec<(String, Type)>>,
     /// Mutable: gets extra entries for each lifted loop's LoopResult enum.
@@ -44,10 +48,12 @@ struct LoopCtx {
     /// Lifted function — used for self-recursion (fallthrough and continue).
     func_name_id: NameId,
     func_original_name: String,
-    /// Ordered list of (threaded NameId, original name, type) for parameters
-    /// of the lifted function. These are also the live-out variables (we use
-    /// `live_in = live_out` conservatively).
-    live_vars: Vec<(NameId, String, Type)>,
+    /// Ordered list of (threaded NameId, original name, type, user_annotated)
+    /// for parameters of the lifted function. These are also the live-out
+    /// variables (we use `live_in = live_out` conservatively). The
+    /// `user_annotated` flag is the original binding's annotation status, so
+    /// the post-loop live-out rebind can preserve it.
+    live_vars: Vec<(NameId, String, Type, bool)>,
     /// Type of the Exit variant payload = Tuple(live_vars' types).
     exit_payload_ty: Type,
     span: Span,
@@ -65,6 +71,7 @@ impl PureLowerer {
             env: HashMap::new(),
             type_env: HashMap::new(),
             orig_name: HashMap::new(),
+            user_annotated_env: HashMap::new(),
             struct_defs,
             enum_defs,
             id_to_name,
@@ -272,7 +279,7 @@ impl PureLowerer {
                 // Conditional RHS may need mutation-aware lowering with join.
                 if let TExprKind::Conditional(cond) = la.value.kind {
                     self.lower_cond_stmt(
-                        Some((la.name, la.original_name, la.ty.clone())),
+                        Some((la.name, la.original_name, la.ty.clone(), la.user_annotated)),
                         la.ty,
                         *cond,
                         la.span,
@@ -286,12 +293,14 @@ impl PureLowerer {
                             original_name: la.original_name.clone(),
                             ty: la.ty.clone(),
                             value,
+                            user_annotated: la.user_annotated,
                             span: la.span,
                         }),
                         span,
                     });
                     self.type_env.insert(la.name, la.ty);
                     self.orig_name.insert(la.name, la.original_name.clone());
+                    self.user_annotated_env.insert(la.name, la.user_annotated);
                     self.env
                         .insert(la.name, PAtomic::Var(la.name, la.original_name));
                 }
@@ -333,7 +342,7 @@ impl PureLowerer {
     /// projects.
     fn lower_cond_stmt(
         &mut self,
-        binding: Option<(NameId, String, Type)>,
+        binding: Option<(NameId, String, Type, bool)>,
         cond_value_ty: Type,
         cond: TCondExpr,
         span: Span,
@@ -404,7 +413,7 @@ impl PureLowerer {
         }
         joined_ids.sort_by_key(|n| n.0);
 
-        let joined_vars: Vec<(NameId, String, Type)> = joined_ids
+        let joined_vars: Vec<(NameId, String, Type, bool)> = joined_ids
             .iter()
             .map(|nid| {
                 let name = self
@@ -417,7 +426,12 @@ impl PureLowerer {
                     .get(nid)
                     .cloned()
                     .unwrap_or_else(|| panic!("no type for joined var {:?}", nid));
-                (*nid, name, ty)
+                let user_annotated = self
+                    .user_annotated_env
+                    .get(nid)
+                    .copied()
+                    .unwrap_or(false);
+                (*nid, name, ty, user_annotated)
             })
             .collect();
 
@@ -426,7 +440,7 @@ impl PureLowerer {
         // Fast path: no joins — emit as a plain conditional.
         if joined_vars.is_empty() {
             if has_value {
-                let (bind_id, bind_name, bind_ty) = binding.unwrap();
+                let (bind_id, bind_name, bind_ty, bind_user_annotated) = binding.unwrap();
                 let cond_pexpr = PExpr {
                     kind: PExprKind::Conditional(Box::new(PCondExpr {
                         if_branch: PIfBranch {
@@ -454,12 +468,15 @@ impl PureLowerer {
                         original_name: bind_name.clone(),
                         ty: bind_ty.clone(),
                         value: cond_pexpr,
+                        user_annotated: bind_user_annotated,
                         span,
                     }),
                     span,
                 });
                 self.type_env.insert(bind_id, bind_ty);
                 self.orig_name.insert(bind_id, bind_name.clone());
+                self.user_annotated_env
+                    .insert(bind_id, bind_user_annotated);
                 self.env.insert(bind_id, PAtomic::Var(bind_id, bind_name));
             } else {
                 let cond_pexpr = PExpr {
@@ -498,7 +515,7 @@ impl PureLowerer {
             if has_value {
                 ts.push(cond_value_ty.clone());
             }
-            for (_, _, t) in &joined_vars {
+            for (_, _, t, _) in &joined_vars {
                 ts.push(t.clone());
             }
             ts
@@ -509,7 +526,7 @@ impl PureLowerer {
                        body: &mut PBlock,
                        child_env: &HashMap<NameId, PAtomic>,
                        snapshot: &HashMap<NameId, PAtomic>,
-                       joined_vars: &[(NameId, String, Type)],
+                       joined_vars: &[(NameId, String, Type, bool)],
                        has_value: bool,
                        tup_ty: &Type,
                        span: Span| {
@@ -518,7 +535,7 @@ impl PureLowerer {
             if has_value {
                 tuple_elems.push(original_tail.unwrap_or(PAtomic::Never));
             }
-            for (xid, xname, _) in joined_vars {
+            for (xid, xname, _, _) in joined_vars {
                 let val = child_env
                     .get(xid)
                     .cloned()
@@ -537,6 +554,7 @@ impl PureLowerer {
                         ty: tup_ty.clone(),
                         span,
                     },
+                    user_annotated: false,
                     span,
                 }),
                 span,
@@ -594,7 +612,7 @@ impl PureLowerer {
                 if has_value {
                     tuple_elems.push(PAtomic::Never);
                 }
-                for (xid, xname, _) in &joined_vars {
+                for (xid, xname, _, _) in &joined_vars {
                     tuple_elems.push(
                         snapshot
                             .get(xid)
@@ -613,6 +631,7 @@ impl PureLowerer {
                             ty: tup_ty.clone(),
                             span,
                         },
+                        user_annotated: false,
                         span,
                     }),
                     span,
@@ -648,6 +667,7 @@ impl PureLowerer {
                 original_name: result_name.clone(),
                 ty: tup_ty.clone(),
                 value: cond_pexpr,
+                user_annotated: false,
                 span,
             }),
             span,
@@ -656,7 +676,7 @@ impl PureLowerer {
 
         // Project the tuple: [value?, joined_vars...].
         let mut idx = 0usize;
-        if let Some((bind_id, bind_name, bind_ty)) = binding {
+        if let Some((bind_id, bind_name, bind_ty, bind_user_annotated)) = binding {
             out.push(PStatement {
                 kind: PStatementKind::LetAtom(PLetAtom {
                     name: bind_id,
@@ -667,16 +687,19 @@ impl PureLowerer {
                         ty: bind_ty.clone(),
                         span,
                     },
+                    user_annotated: bind_user_annotated,
                     span,
                 }),
                 span,
             });
             self.type_env.insert(bind_id, bind_ty);
             self.orig_name.insert(bind_id, bind_name.clone());
+            self.user_annotated_env
+                .insert(bind_id, bind_user_annotated);
             self.env.insert(bind_id, PAtomic::Var(bind_id, bind_name));
             idx += 1;
         }
-        for (xid, xname, xty) in joined_vars {
+        for (xid, xname, xty, xua) in joined_vars {
             let (new_xid, new_xname) = self.fresh_name(&xname);
             out.push(PStatement {
                 kind: PStatementKind::LetAtom(PLetAtom {
@@ -688,12 +711,14 @@ impl PureLowerer {
                         ty: xty.clone(),
                         span,
                     },
+                    user_annotated: xua,
                     span,
                 }),
                 span,
             });
             self.type_env.insert(new_xid, xty);
             self.orig_name.insert(new_xid, xname);
+            self.user_annotated_env.insert(new_xid, xua);
             self.env.insert(xid, PAtomic::Var(new_xid, new_xname));
             idx += 1;
         }
@@ -704,6 +729,7 @@ impl PureLowerer {
             .insert(p.name, PAtomic::Var(p.name, p.original_name.clone()));
         self.type_env.insert(p.name, p.ty.clone());
         self.orig_name.insert(p.name, p.original_name.clone());
+        self.user_annotated_env.insert(p.name, false);
         PFuncParam {
             name: p.name,
             original_name: p.original_name,
@@ -784,6 +810,7 @@ impl PureLowerer {
                         ty: ret_ty.clone(),
                         span,
                     },
+                    user_annotated: false,
                     span,
                 }),
                 span,
@@ -825,6 +852,7 @@ impl PureLowerer {
                     ty: ret_ty.clone(),
                     span,
                 },
+                user_annotated: false,
                 span,
             }),
             span,
@@ -864,6 +892,7 @@ impl PureLowerer {
                     ty: ret_ty.clone(),
                     span,
                 },
+                user_annotated: false,
                 span,
             }),
             span,
@@ -886,7 +915,7 @@ impl PureLowerer {
         let elems: Vec<PAtomic> = ctx
             .live_vars
             .iter()
-            .map(|(nid, name, _)| {
+            .map(|(nid, name, _, _)| {
                 self.env
                     .get(nid)
                     .cloned()
@@ -904,6 +933,7 @@ impl PureLowerer {
                     ty: ctx.exit_payload_ty.clone(),
                     span,
                 },
+                user_annotated: false,
                 span,
             }),
             span,
@@ -914,7 +944,7 @@ impl PureLowerer {
     /// Compute the live-in set for a loop body: threaded NameIds that are
     /// read inside the body and were NOT (re-)bound inside the body. Filtered
     /// to those currently in scope (`env.contains_key`).
-    fn loop_live_in(&self, body: &[TStatement]) -> Vec<(NameId, String, Type)> {
+    fn loop_live_in(&self, body: &[TStatement]) -> Vec<(NameId, String, Type, bool)> {
         let mut reads: HashSet<NameId> = HashSet::new();
         let mut defs: HashSet<NameId> = HashSet::new();
         for stmt in body {
@@ -938,7 +968,12 @@ impl PureLowerer {
                     .get(&nid)
                     .cloned()
                     .unwrap_or_else(|| panic!("no type for live-in var {:?}", nid));
-                (nid, name, ty)
+                let user_annotated = self
+                    .user_annotated_env
+                    .get(&nid)
+                    .copied()
+                    .unwrap_or(false);
+                (nid, name, ty, user_annotated)
             })
             .collect()
     }
@@ -955,7 +990,7 @@ impl PureLowerer {
         // 2. Synthesize __LoopResult_N enum.
         let (enum_id, enum_name) = self.fresh_name("LoopResult");
         let exit_payload_ty =
-            Type::Tuple(live_vars.iter().map(|(_, _, t)| t.clone()).collect());
+            Type::Tuple(live_vars.iter().map(|(_, _, t, _)| t.clone()).collect());
         let return_payload_ty = self
             .current_func_return_type
             .clone()
@@ -978,12 +1013,12 @@ impl PureLowerer {
         //    reads of each live-in threaded NameId resolve to its param Var.
         let fresh_params: Vec<(NameId, String)> = live_vars
             .iter()
-            .map(|(_, name, _)| self.fresh_name(name))
+            .map(|(_, name, _, _)| self.fresh_name(name))
             .collect();
         let params: Vec<PFuncParam> = live_vars
             .iter()
             .zip(fresh_params.iter())
-            .map(|((_, _, ty), (pid, pname))| PFuncParam {
+            .map(|((_, _, ty, _), (pid, pname))| PFuncParam {
                 name: *pid,
                 original_name: pname.clone(),
                 ty: ty.clone(),
@@ -1003,11 +1038,12 @@ impl PureLowerer {
         };
 
         let saved_env = std::mem::replace(&mut self.env, HashMap::new());
-        for ((orig_nid, _, ty), (pid, pname)) in live_vars.iter().zip(fresh_params.iter()) {
+        for ((orig_nid, _, ty, _), (pid, pname)) in live_vars.iter().zip(fresh_params.iter()) {
             self.env
                 .insert(*orig_nid, PAtomic::Var(*pid, pname.clone()));
             self.type_env.insert(*pid, ty.clone());
             self.orig_name.insert(*pid, pname.clone());
+            self.user_annotated_env.insert(*pid, false);
         }
         self.loop_stack.push(ctx.clone());
 
@@ -1037,6 +1073,7 @@ impl PureLowerer {
                     ty: loop_result_ty.clone(),
                     span: loop_span,
                 },
+                user_annotated: false,
                 span: loop_span,
             }),
             span: loop_span,
@@ -1072,7 +1109,7 @@ impl PureLowerer {
         let outer_args: Vec<PAtomic> = ctx
             .live_vars
             .iter()
-            .map(|(nid, name, _)| {
+            .map(|(nid, name, _, _)| {
                 self.env
                     .get(nid)
                     .cloned()
@@ -1098,6 +1135,7 @@ impl PureLowerer {
                     ty: loop_result_ty.clone(),
                     span: loop_span,
                 },
+                user_annotated: false,
                 span: loop_span,
             }),
             span: loop_span,
@@ -1116,6 +1154,7 @@ impl PureLowerer {
                     ty: Type::Bool,
                     span: loop_span,
                 },
+                user_annotated: false,
                 span: loop_span,
             }),
             span: loop_span,
@@ -1138,6 +1177,7 @@ impl PureLowerer {
                     ty: return_payload_ty.clone(),
                     span: loop_span,
                 },
+                user_annotated: false,
                 span: loop_span,
             }),
             span: loop_span,
@@ -1185,12 +1225,13 @@ impl PureLowerer {
                     ty: ctx.exit_payload_ty.clone(),
                     span: loop_span,
                 },
+                user_annotated: false,
                 span: loop_span,
             }),
             span: loop_span,
         });
         // For each live-out var, project and rebind in outer env.
-        for (i, (xid, xname, xty)) in ctx.live_vars.iter().enumerate() {
+        for (i, (xid, xname, xty, xua)) in ctx.live_vars.iter().enumerate() {
             let (new_xid, new_xname) = self.fresh_name(xname);
             out.push(PStatement {
                 kind: PStatementKind::LetAtom(PLetAtom {
@@ -1205,12 +1246,14 @@ impl PureLowerer {
                         ty: xty.clone(),
                         span: loop_span,
                     },
+                    user_annotated: *xua,
                     span: loop_span,
                 }),
                 span: loop_span,
             });
             self.type_env.insert(new_xid, xty.clone());
             self.orig_name.insert(new_xid, xname.clone());
+            self.user_annotated_env.insert(new_xid, *xua);
             self.env.insert(*xid, PAtomic::Var(new_xid, new_xname));
         }
     }
@@ -1218,7 +1261,7 @@ impl PureLowerer {
     fn collect_live_args(&self, ctx: &LoopCtx) -> Vec<PAtomic> {
         ctx.live_vars
             .iter()
-            .map(|(nid, name, _)| {
+            .map(|(nid, name, _, _)| {
                 self.env
                     .get(nid)
                     .cloned()

@@ -60,6 +60,7 @@ fn tlet(nid: usize, name: &str, ty: Type, value: TExpr) -> TStatement {
             original_name: name.to_string(),
             ty,
             value,
+            user_annotated: false,
             span: dummy_span(),
         }),
         span: dummy_span(),

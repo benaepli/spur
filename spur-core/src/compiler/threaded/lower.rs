@@ -287,6 +287,7 @@ impl ThreadLowerer {
                                 ty: state_type.clone(),
                                 span: assign.span,
                             },
+                            user_annotated: false,
                             span: assign.span,
                         }),
                         span,
@@ -382,6 +383,7 @@ impl ThreadLowerer {
                             original_name: tname.clone(),
                             ty: tuple_ty,
                             value: tuple_expr,
+                            user_annotated: false,
                             span,
                         }),
                         span,
@@ -431,7 +433,7 @@ impl ThreadLowerer {
                         // via `<-`. So we just prepend `s` to args and bind
                         // the channel 1:1.
                         self.emit_async_threaded_call(
-                            Some((la.name, la.original_name, la.ty)),
+                            Some((la.name, la.original_name, la.ty, la.user_annotated)),
                             call_clone,
                             span,
                             out,
@@ -440,7 +442,7 @@ impl ThreadLowerer {
                         // Sync role method call: var res = f(args)
                         // →  var __tup = f(s, args); s = __tup.0; var res = __tup.1;
                         self.emit_threaded_call(
-                            Some((la.name, la.original_name, la.ty)),
+                            Some((la.name, la.original_name, la.ty, la.user_annotated)),
                             call_clone,
                             span,
                             out,
@@ -453,7 +455,7 @@ impl ThreadLowerer {
                     // The threaded versions return (State, OriginalReturn).
                     // We need to unpack: var __tup = op; s = __tup.0; var res = __tup.1;
                     self.emit_threaded_send_recv(
-                        Some((la.name, la.original_name, la.ty.clone())),
+                        Some((la.name, la.original_name, la.ty.clone(), la.user_annotated)),
                         la.value,
                         span,
                         out,
@@ -472,6 +474,7 @@ impl ThreadLowerer {
                 original_name: la.original_name,
                 ty: la.ty,
                 value: texpr,
+                user_annotated: la.user_annotated,
                 span: la.span,
             }),
             span,
@@ -498,6 +501,7 @@ impl ThreadLowerer {
                     ty: state_type.clone(),
                     span,
                 },
+                user_annotated: false,
                 span,
             }),
             span,
@@ -532,7 +536,7 @@ impl ThreadLowerer {
     /// ```
     fn emit_threaded_call(
         &mut self,
-        result: Option<(NameId, String, Type)>,
+        result: Option<(NameId, String, Type, bool)>,
         call: AUserFuncCall,
         span: Span,
         out: &mut Vec<TStatement>,
@@ -552,6 +556,7 @@ impl ThreadLowerer {
                     ty: tuple_ty,
                     span,
                 },
+                user_annotated: false,
                 span,
             }),
             span,
@@ -561,7 +566,7 @@ impl ThreadLowerer {
         self.emit_state_extract(tup_id, &tup_name, span, out);
 
         // var res = __tup.1;  (only when result is requested)
-        if let Some((res_id, res_name, res_ty)) = result {
+        if let Some((res_id, res_name, res_ty, res_user_annotated)) = result {
             out.push(TStatement {
                 kind: TStatementKind::LetAtom(TLetAtom {
                     name: res_id,
@@ -572,6 +577,7 @@ impl ThreadLowerer {
                         ty: res_ty,
                         span,
                     },
+                    user_annotated: res_user_annotated,
                     span,
                 }),
                 span,
@@ -593,7 +599,7 @@ impl ThreadLowerer {
     /// ```
     fn emit_async_threaded_call(
         &mut self,
-        result: Option<(NameId, String, Type)>,
+        result: Option<(NameId, String, Type, bool)>,
         call: AUserFuncCall,
         span: Span,
         out: &mut Vec<TStatement>,
@@ -615,13 +621,14 @@ impl ThreadLowerer {
             span,
         };
         match result {
-            Some((res_id, res_name, res_ty)) => {
+            Some((res_id, res_name, res_ty, res_user_annotated)) => {
                 out.push(TStatement {
                     kind: TStatementKind::LetAtom(TLetAtom {
                         name: res_id,
                         original_name: res_name,
                         ty: res_ty,
                         value: call_expr,
+                        user_annotated: res_user_annotated,
                         span,
                     }),
                     span,
@@ -642,7 +649,7 @@ impl ThreadLowerer {
     /// statement-form sends whose result is unused).
     fn emit_threaded_send_recv(
         &mut self,
-        result: Option<(NameId, String, Type)>,
+        result: Option<(NameId, String, Type, bool)>,
         expr: AExpr,
         span: Span,
         out: &mut Vec<TStatement>,
@@ -667,6 +674,7 @@ impl ThreadLowerer {
                     ty: tuple_ty,
                     span,
                 },
+                user_annotated: false,
                 span,
             }),
             span,
@@ -676,7 +684,7 @@ impl ThreadLowerer {
         self.emit_state_extract(tup_id, &tup_name, span, out);
 
         // var res = __tup.1;  (only when result is requested)
-        if let Some((res_id, res_name, res_ty)) = result {
+        if let Some((res_id, res_name, res_ty, res_user_annotated)) = result {
             out.push(TStatement {
                 kind: TStatementKind::LetAtom(TLetAtom {
                     name: res_id,
@@ -687,6 +695,7 @@ impl ThreadLowerer {
                         ty: res_ty,
                         span,
                     },
+                    user_annotated: res_user_annotated,
                     span,
                 }),
                 span,
@@ -738,6 +747,7 @@ impl ThreadLowerer {
                         ty: rty.clone(),
                         span: func.span,
                     },
+                    user_annotated: false,
                     span: func.span,
                 }),
                 span: func.span,
@@ -763,6 +773,7 @@ impl ThreadLowerer {
                     original_name: tname.clone(),
                     ty: threaded_return.clone(),
                     value: tuple_expr,
+                    user_annotated: false,
                     span: body.span,
                 }),
                 span: body.span,
@@ -929,6 +940,7 @@ fn generate_init_func(
                         original_name: tname.clone(),
                         ty: vi.type_def.clone(),
                         value: texpr,
+                        user_annotated: vi.user_annotated,
                         span: vi.span,
                     }),
                     span: vi.span,
@@ -951,6 +963,7 @@ fn generate_init_func(
             original_name: ret_name.clone(),
             ty: state_type.clone(),
             value: struct_lit,
+            user_annotated: false,
             span: role.span,
         }),
         span: role.span,

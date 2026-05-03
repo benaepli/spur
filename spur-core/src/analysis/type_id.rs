@@ -154,7 +154,7 @@ fn register_assignment(assign: &TypedAssignment, map: &mut TypeIdMap, next_id: &
 fn register_assign_item(item: &TypedAssignItem, map: &mut TypeIdMap, next_id: &mut u32) {
     match item {
         TypedAssignItem::Existing(_, _, ty)
-        | TypedAssignItem::Declare(_, _, ty)
+        | TypedAssignItem::Declare(_, _, ty, _)
         | TypedAssignItem::Wildcard(ty) => {
             register_type(ty, map, next_id);
         }

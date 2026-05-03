@@ -129,6 +129,7 @@ pub struct ALetAtom {
     pub original_name: String,
     pub ty: Type,
     pub value: AExpr,
+    pub user_annotated: bool,
     pub span: Span,
 }
 
@@ -172,6 +173,7 @@ pub struct AVarInit {
     pub type_def: Type,
     pub stmts: Vec<AStatement>,
     pub value: AExpr,
+    pub user_annotated: bool,
     pub span: Span,
 }
 

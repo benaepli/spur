@@ -182,6 +182,7 @@ impl CoreLowerer {
                     original_name: let_atom.original_name,
                     ty,
                     value,
+                    user_annotated: let_atom.user_annotated,
                     span: let_atom.span,
                 })
             }
@@ -212,18 +213,29 @@ impl CoreLowerer {
             PExprKind::BinOp(op, a, b) => match op {
                 BinOp::Equal | BinOp::NotEqual => {
                     let operand_ty = self.lower_type(&self.atomic_p_type(&a));
-                    let kind = if op == BinOp::Equal {
-                        BuiltinKind::Eq
-                    } else {
-                        BuiltinKind::Neq
+                    let prim_op = match (&operand_ty, &op) {
+                        (CType::Int, BinOp::Equal) => Some(CBinOp::IntEq),
+                        (CType::Int, BinOp::NotEqual) => Some(CBinOp::IntNeq),
+                        (CType::Bool, BinOp::Equal) => Some(CBinOp::BoolEq),
+                        (CType::Bool, BinOp::NotEqual) => Some(CBinOp::BoolNeq),
+                        _ => None,
                     };
-                    self.emit_extern_call(
-                        kind,
-                        vec![operand_ty.clone()],
-                        vec![operand_ty.clone(), operand_ty],
-                        CType::Bool,
-                        vec![a, b],
-                    )
+                    if let Some(prim_op) = prim_op {
+                        CExprKind::BinOp(prim_op, lower_atomic(a), lower_atomic(b))
+                    } else {
+                        let kind = if op == BinOp::Equal {
+                            BuiltinKind::Eq
+                        } else {
+                            BuiltinKind::Neq
+                        };
+                        self.emit_extern_call(
+                            kind,
+                            vec![operand_ty.clone()],
+                            vec![operand_ty.clone(), operand_ty],
+                            CType::Bool,
+                            vec![a, b],
+                        )
+                    }
                 }
                 _ => CExprKind::BinOp(to_cbinop(&op), lower_atomic(a), lower_atomic(b)),
             },
@@ -837,23 +849,36 @@ impl CoreLowerer {
             TypedExprKind::BinOp(op, l, r) => match op {
                 BinOp::Equal | BinOp::NotEqual => {
                     let operand_ty = self.lower_type(&l.ty);
-                    let kind = if *op == BinOp::Equal {
-                        BuiltinKind::Eq
-                    } else {
-                        BuiltinKind::Neq
+                    let prim_op = match (&operand_ty, op) {
+                        (CType::Int, BinOp::Equal) => Some(CBinOp::IntEq),
+                        (CType::Int, BinOp::NotEqual) => Some(CBinOp::IntNeq),
+                        (CType::Bool, BinOp::Equal) => Some(CBinOp::BoolEq),
+                        (CType::Bool, BinOp::NotEqual) => Some(CBinOp::BoolNeq),
+                        _ => None,
                     };
-                    let target = self.intern_extern(
-                        kind,
-                        vec![operand_ty.clone()],
-                        vec![operand_ty.clone(), operand_ty],
-                        CType::Bool,
-                    );
-                    let l = self.lower_refinement_expr(l);
-                    let r = self.lower_refinement_expr(r);
-                    RefinementExprKind::ExternCall {
-                        target,
-                        args: vec![l, r],
-                        return_type: CType::Bool,
+                    if let Some(prim_op) = prim_op {
+                        let l = Box::new(self.lower_refinement_expr(l));
+                        let r = Box::new(self.lower_refinement_expr(r));
+                        RefinementExprKind::BinOp(prim_op, l, r)
+                    } else {
+                        let kind = if *op == BinOp::Equal {
+                            BuiltinKind::Eq
+                        } else {
+                            BuiltinKind::Neq
+                        };
+                        let target = self.intern_extern(
+                            kind,
+                            vec![operand_ty.clone()],
+                            vec![operand_ty.clone(), operand_ty],
+                            CType::Bool,
+                        );
+                        let l = self.lower_refinement_expr(l);
+                        let r = self.lower_refinement_expr(r);
+                        RefinementExprKind::ExternCall {
+                            target,
+                            args: vec![l, r],
+                            return_type: CType::Bool,
+                        }
                     }
                 }
                 _ => {
@@ -1420,6 +1445,7 @@ mod tests {
                 original_name: format!("v{}", name),
                 ty,
                 value,
+                user_annotated: false,
                 span: span(),
             }),
             span: span(),
@@ -1836,11 +1862,10 @@ mod tests {
         let c = lowered.program;
 
         assert!(lowered.refinement_errors.is_empty());
-        // Two externs: array_len<int> and eq<int> (equality is now monomorphized)
-        assert_eq!(c.extern_funcs.len(), 2);
-        let names: Vec<_> = c.extern_funcs.iter().map(|e| e.original_name.as_str()).collect();
-        assert!(names.contains(&"array_len<int>"));
-        assert!(names.contains(&"eq<int>"));
+        // One extern: array_len<int>. Equality on int is now a CBinOp, so no
+        // eq<int> extern is interned.
+        assert_eq!(c.extern_funcs.len(), 1);
+        assert_eq!(c.extern_funcs[0].original_name, "array_len<int>");
 
         // Both the param's and return type's refinement handles must be the
         // *same* CRefinementHandle (Arc identity) thanks to body_memo.
@@ -1851,6 +1876,16 @@ mod tests {
             panic!("expected refined return");
         };
         assert!(std::ptr::eq(p_handle.as_ptr(), r_handle.as_ptr()));
+
+        // The top of the refinement body is `len(xs) == 1`, lowered to a
+        // BinOp(IntEq, ExternCall(array_len<int>, [xs]), IntLit(1)).
+        match &p_handle.body.kind {
+            RefinementExprKind::BinOp(CBinOp::IntEq, l, r) => {
+                assert!(matches!(l.kind, RefinementExprKind::ExternCall { .. }));
+                assert!(matches!(r.kind, RefinementExprKind::IntLit(1)));
+            }
+            other => panic!("expected BinOp(IntEq, ..), got {:?}", other),
+        }
     }
 
     #[test]
@@ -1879,5 +1914,91 @@ mod tests {
         assert_eq!(c.funcs[0].role, Some(nid(99)));
         assert_eq!(c.funcs[1].role, Some(nid(99)));
         assert_eq!(c.funcs[2].role, None);
+    }
+
+    /// Build a single-function program whose body is `let _: bool = a == b;`
+    /// (or `!=` if `not_equal`) where `a` and `b` are parameters of `ty`.
+    fn lower_eq_program(ty: Type, not_equal: bool) -> CProgram {
+        let op = if not_equal {
+            BinOp::NotEqual
+        } else {
+            BinOp::Equal
+        };
+        let body = block(
+            vec![let_atom(
+                10,
+                Type::Bool,
+                PExpr {
+                    kind: PExprKind::BinOp(op, var(1), var(2)),
+                    ty: Type::Bool,
+                    span: span(),
+                },
+            )],
+            None,
+            Type::Tuple(vec![]),
+        );
+        let f = func(
+            5,
+            vec![(1, ty.clone()), (2, ty)],
+            Type::Tuple(vec![]),
+            body,
+        );
+        let mut prog = empty_program(20);
+        prog.top_level_defs.push(PTopLevelDef::FreeFunc(f));
+        lower_program(prog).program
+    }
+
+    fn first_let_value_kind(c: &CProgram) -> &CExprKind {
+        let stmt = &c.funcs[0].body.statements[0];
+        match &stmt.kind {
+            CStatementKind::LetAtom(la) => &la.value.kind,
+            other => panic!("expected LetAtom, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eq_on_int_lowers_to_binop_no_extern() {
+        let c = lower_eq_program(Type::Int, false);
+        assert!(c.extern_funcs.is_empty(), "expected no externs, got {:?}", c.extern_funcs);
+        match first_let_value_kind(&c) {
+            CExprKind::BinOp(CBinOp::IntEq, _, _) => {}
+            other => panic!("expected BinOp(IntEq, ..), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn neq_on_int_lowers_to_binop_no_extern() {
+        let c = lower_eq_program(Type::Int, true);
+        assert!(c.extern_funcs.is_empty());
+        match first_let_value_kind(&c) {
+            CExprKind::BinOp(CBinOp::IntNeq, _, _) => {}
+            other => panic!("expected BinOp(IntNeq, ..), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eq_on_bool_lowers_to_binop_no_extern() {
+        let c = lower_eq_program(Type::Bool, false);
+        assert!(c.extern_funcs.is_empty());
+        match first_let_value_kind(&c) {
+            CExprKind::BinOp(CBinOp::BoolEq, _, _) => {}
+            other => panic!("expected BinOp(BoolEq, ..), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eq_on_string_still_lowers_to_extern() {
+        let c = lower_eq_program(Type::String, false);
+        assert_eq!(c.extern_funcs.len(), 1);
+        let ext = &c.extern_funcs[0];
+        assert_eq!(ext.original_name, "eq<string>");
+        let expected_target = ext.name;
+        match first_let_value_kind(&c) {
+            CExprKind::FuncCall(call) => {
+                assert_eq!(call.target, expected_target);
+                assert_eq!(call.return_type, CType::Bool);
+            }
+            other => panic!("expected FuncCall, got {:?}", other),
+        }
     }
 }

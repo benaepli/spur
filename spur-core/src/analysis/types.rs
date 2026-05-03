@@ -263,13 +263,14 @@ pub struct TypedVarInit {
     pub target: TypedVarTarget,
     pub type_def: Type,
     pub value: TypedExpr,
+    pub user_annotated: bool,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedAssignItem {
     Existing(NameId, String, Type),
-    Declare(NameId, String, Type),
+    Declare(NameId, String, Type, bool),
     Wildcard(Type),
     Nested(Vec<TypedAssignItem>, Type),
 }
@@ -278,7 +279,7 @@ impl TypedAssignItem {
     pub fn ty(&self) -> &Type {
         match self {
             TypedAssignItem::Existing(_, _, ty)
-            | TypedAssignItem::Declare(_, _, ty)
+            | TypedAssignItem::Declare(_, _, ty, _)
             | TypedAssignItem::Wildcard(ty)
             | TypedAssignItem::Nested(_, ty) => ty,
         }
@@ -289,6 +290,7 @@ impl TypedAssignItem {
 pub struct TypedAssignment {
     pub targets: Vec<TypedAssignItem>,
     pub value: TypedExpr,
+    pub user_annotated: bool,
     pub span: Span,
 }
 

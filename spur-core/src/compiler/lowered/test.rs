@@ -156,14 +156,16 @@ fn test_lower_for_loop_with_init() {
     let mut l = lowerer();
     let for_loop = TypedForLoop {
         init: Some(TypedAssignment {
-            targets: vec![TypedAssignItem::Declare(id(0), "x".to_string(), Type::Int)],
+            targets: vec![TypedAssignItem::Declare(id(0), "x".to_string(), Type::Int, false)],
             value: typed_int(0),
+            user_annotated: false,
             span: dummy_span(),
         }),
         condition: Some(typed_bool(true)),
         increment: Some(TypedAssignment {
             targets: vec![TypedAssignItem::Existing(id(0), "x".to_string(), Type::Int)],
             value: typed_int(1),
+            user_annotated: false,
             span: dummy_span(),
         }),
         body: vec![],

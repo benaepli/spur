@@ -39,6 +39,7 @@ fn plet(name_id: usize, name: &str, ty: Type, value: PExpr) -> PStatement {
             original_name: name.to_string(),
             ty,
             value,
+            user_annotated: false,
             span: dummy_span(),
         }),
         span: dummy_span(),

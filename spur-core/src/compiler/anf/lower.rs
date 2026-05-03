@@ -51,6 +51,7 @@ impl AnfLowerer {
                 original_name: name.clone(),
                 ty: ty,
                 value: aexpr,
+                user_annotated: false,
                 span,
             }),
             span,
@@ -655,6 +656,7 @@ impl AnfLowerer {
                         original_name: init.original_name,
                         ty: init.type_def,
                         value: aexpr,
+                        user_annotated: init.user_annotated,
                         span: init.span,
                     }),
                     span,
@@ -773,6 +775,7 @@ impl AnfLowerer {
                     type_def: vi.type_def,
                     stmts,
                     value: aexpr,
+                    user_annotated: vi.user_annotated,
                     span: vi.span,
                 }
             })

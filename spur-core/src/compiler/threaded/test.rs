@@ -137,6 +137,7 @@ fn test_role_state_extraction() {
                 ty: Type::Map(Box::new(Type::String), Box::new(Type::Int)),
                 span: dummy_span(),
             },
+            user_annotated: false,
             span: dummy_span(),
         },
         AVarInit {
@@ -149,6 +150,7 @@ fn test_role_state_extraction() {
                 ty: Type::Int,
                 span: dummy_span(),
             },
+            user_annotated: false,
             span: dummy_span(),
         },
     ];
@@ -267,6 +269,7 @@ fn test_role_var_assign_rewrite() {
             ty: Type::Int,
             span: dummy_span(),
         },
+        user_annotated: false,
         span: dummy_span(),
     }];
 
@@ -349,6 +352,7 @@ fn test_role_method_call_threading() {
                     original_name: "res".to_string(),
                     ty: Type::Int,
                     value: call_expr,
+                    user_annotated: false,
                     span: dummy_span(),
                 }),
                 span: dummy_span(),
@@ -465,6 +469,7 @@ fn test_send_state_injection() {
                     original_name: "res".to_string(),
                     ty: Type::Nil,
                     value: send_expr,
+                    user_annotated: false,
                     span: dummy_span(),
                 }),
                 span: dummy_span(),
@@ -564,6 +569,7 @@ fn test_async_call_no_tuple_unpack() {
                     original_name: "ch".to_string(),
                     ty: chan_ty.clone(),
                     value: call_expr,
+                    user_annotated: false,
                     span: dummy_span(),
                 }),
                 span: dummy_span(),

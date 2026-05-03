@@ -123,6 +123,7 @@ pub struct TLetAtom {
     pub original_name: String,
     pub ty: Type,
     pub value: TExpr,
+    pub user_annotated: bool,
     pub span: Span,
 }
 

@@ -671,6 +671,7 @@ fn test_compile_for_loop_continue_targets_increment() {
                 original_name: "i".to_string(),
                 type_def: Type::Int,
                 value: int_lit(0),
+                user_annotated: false,
                 span: dummy_span(),
             })),
             condition: Some(bool_lit(true)),

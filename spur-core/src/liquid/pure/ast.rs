@@ -120,6 +120,7 @@ pub struct PLetAtom {
     pub original_name: String,
     pub ty: Type,
     pub value: PExpr,
+    pub user_annotated: bool,
     pub span: Span,
 }
 

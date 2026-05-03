@@ -103,6 +103,7 @@ impl<'a> LoopRemover<'a> {
                         ty: iter_ty.clone(),
                         span: fil.span,
                     },
+                    user_annotated: false,
                     span: fil.span,
                 });
 
@@ -154,6 +155,7 @@ impl<'a> LoopRemover<'a> {
                                 ty: tuple_ty.clone(),
                                 span: fil.span,
                             },
+                            user_annotated: false,
                             span: fil.span,
                         }),
                         span: fil.span,
@@ -168,6 +170,7 @@ impl<'a> LoopRemover<'a> {
                                 ty: element_ty.clone(),
                                 span: fil.span,
                             },
+                            user_annotated: false,
                             span: fil.span,
                         }),
                         span: fil.span,
