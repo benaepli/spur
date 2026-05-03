@@ -52,10 +52,7 @@ pub enum RefinementExprKind {
 
     Conditional(Box<RefinementCond>),
 
-    /// Placeholder produced when a refinement body contains a construct that
-    /// is not legal in a predicate (e.g. a user function call). The lowerer
-    /// records a [`RefinementValidationError`] alongside emitting this node so
-    /// downstream passes don't have to re-walk the body to detect errors.
+    // Placeholder.
     Error,
 }
 
@@ -72,4 +69,25 @@ pub struct RefinementIfBranch {
     pub condition: RefinementExpr,
     pub body: RefinementExpr,
     pub span: Span,
+}
+
+/// Returns true if `e` is an integer-valued expression whose value is
+/// determined entirely at compile time, built only from `IntLit`, unary
+/// `Negate`, and the integer arithmetic `BinOp`s applied recursively to
+/// constant subtrees.
+pub fn is_constant_int(e: &RefinementExpr) -> bool {
+    match &e.kind {
+        RefinementExprKind::IntLit(_) => true,
+        RefinementExprKind::Negate(c) => is_constant_int(c),
+        RefinementExprKind::BinOp(
+            CBinOp::Add
+            | CBinOp::Subtract
+            | CBinOp::Multiply
+            | CBinOp::Divide
+            | CBinOp::Modulo,
+            l,
+            r,
+        ) => is_constant_int(l) && is_constant_int(r),
+        _ => false,
+    }
 }

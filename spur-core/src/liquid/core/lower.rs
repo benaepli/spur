@@ -92,16 +92,19 @@ pub fn lower_program(program: PProgram) -> LowerOutput {
         }
     }
 
+    let program = CProgram {
+        funcs: lowerer.funcs,
+        extern_funcs: lowerer.extern_funcs,
+        struct_defs: lowerer.struct_defs,
+        enum_defs: lowerer.enum_defs,
+        next_name_id: lowerer.next_name_id,
+        id_to_name: lowerer.id_to_name,
+    };
+    let mut refinement_errors = lowerer.refinement_errors;
+    refinement_errors.extend(super::validate::validate_refinements(&program));
     LowerOutput {
-        program: CProgram {
-            funcs: lowerer.funcs,
-            extern_funcs: lowerer.extern_funcs,
-            struct_defs: lowerer.struct_defs,
-            enum_defs: lowerer.enum_defs,
-            next_name_id: lowerer.next_name_id,
-            id_to_name: lowerer.id_to_name,
-        },
-        refinement_errors: lowerer.refinement_errors,
+        program,
+        refinement_errors,
     }
 }
 
@@ -1393,6 +1396,9 @@ pub enum RefinementValidationErrorKind {
     /// Some other side-effecting or non-pure construct (RPC, channel op,
     /// persistence, control flow, etc.) appeared inside a refinement body.
     DisallowedExpression(&'static str),
+    /// A refinement body contains `*`, `/`, or `%` whose operands are both
+    /// non-constant. 
+    NonLinearArithmetic { op: CBinOp },
 }
 
 impl std::fmt::Display for RefinementValidationError {
@@ -1403,6 +1409,19 @@ impl std::fmt::Display for RefinementValidationError {
             }
             RefinementValidationErrorKind::DisallowedExpression(desc) => {
                 write!(f, "{} is not allowed in a refinement body", desc)
+            }
+            RefinementValidationErrorKind::NonLinearArithmetic { op } => {
+                let sym = match op {
+                    CBinOp::Multiply => "*",
+                    CBinOp::Divide => "/",
+                    CBinOp::Modulo => "%",
+                    _ => "?",
+                };
+                write!(
+                    f,
+                    "non-linear arithmetic ('{}' requires at least one constant operand) is not allowed in a refinement body",
+                    sym
+                )
             }
         }
     }
@@ -1886,6 +1905,77 @@ mod tests {
             }
             other => panic!("expected BinOp(IntEq, ..), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn refinement_non_linear_arithmetic_is_rejected_end_to_end() {
+        // int { x | x * x > 0 }
+        // The lowerer will faithfully produce a BinOp(Multiply, x, x) in the
+        // refinement body, then the post-lowering validation pass should
+        // surface a NonLinearArithmetic error.
+        let body = typed(
+            TypedExprKind::BinOp(
+                BinOp::Greater,
+                Box::new(typed(
+                    TypedExprKind::BinOp(
+                        BinOp::Multiply,
+                        Box::new(typed(
+                            TypedExprKind::Var(nid(7), "x".to_string()),
+                            Type::Int,
+                        )),
+                        Box::new(typed(
+                            TypedExprKind::Var(nid(7), "x".to_string()),
+                            Type::Int,
+                        )),
+                    ),
+                    Type::Int,
+                )),
+                Box::new(typed(TypedExprKind::IntLit(0), Type::Int)),
+            ),
+            Type::Bool,
+        );
+        let refined_ty = refined(Type::Int, 7, body);
+
+        let lowered = lower_with_refinement(refined_ty);
+
+        assert_eq!(lowered.refinement_errors.len(), 1);
+        assert!(matches!(
+            lowered.refinement_errors[0].kind,
+            RefinementValidationErrorKind::NonLinearArithmetic {
+                op: CBinOp::Multiply
+            }
+        ));
+    }
+
+    #[test]
+    fn refinement_linear_multiplication_is_accepted_end_to_end() {
+        // int { x | x * 2 > 0 } — at least one operand is constant.
+        let body = typed(
+            TypedExprKind::BinOp(
+                BinOp::Greater,
+                Box::new(typed(
+                    TypedExprKind::BinOp(
+                        BinOp::Multiply,
+                        Box::new(typed(
+                            TypedExprKind::Var(nid(7), "x".to_string()),
+                            Type::Int,
+                        )),
+                        Box::new(typed(TypedExprKind::IntLit(2), Type::Int)),
+                    ),
+                    Type::Int,
+                )),
+                Box::new(typed(TypedExprKind::IntLit(0), Type::Int)),
+            ),
+            Type::Bool,
+        );
+        let refined_ty = refined(Type::Int, 7, body);
+
+        let lowered = lower_with_refinement(refined_ty);
+        assert!(
+            lowered.refinement_errors.is_empty(),
+            "unexpected: {:?}",
+            lowered.refinement_errors
+        );
     }
 
     #[test]
