@@ -588,12 +588,14 @@ impl<H: HashPolicy> Env<H> {
         }
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn len(&self) -> usize {
         self.slots.len()
     }
 
     /// Ensure we have at least `n` slots
+    #[allow(dead_code)]
     pub fn ensure_slots(&mut self, n: usize) {
         if self.slots.len() < n {
             let old_len = self.slots.len();

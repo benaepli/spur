@@ -264,6 +264,7 @@ impl TypeChecker {
         }
     }
 
+    #[allow(dead_code)]
     fn error_stmt(&self, span: Span) -> (TypedStatement, bool) {
         (
             TypedStatement {
@@ -689,6 +690,7 @@ impl TypeChecker {
         }
     }
 
+    #[allow(dead_code)]
     fn check_tailless_block(
         &mut self,
         block: Vec<ResolvedStatement>,
@@ -2609,7 +2611,7 @@ impl TypeChecker {
 
     fn check_call_args(
         &mut self,
-        expected_params: &Vec<Type>,
+        expected_params: &[Type],
         args: Vec<ResolvedExpr>,
         call_span: Span,
     ) -> Vec<TypedExpr> {

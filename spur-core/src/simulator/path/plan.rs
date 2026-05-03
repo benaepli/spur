@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum PlanError {
     #[error("event not found: {0:?}")]
     EventNotFound(NodeIndex),
@@ -118,6 +119,7 @@ impl PlanEngine {
     }
 
     /// Reverts an InProgress event back to Ready.
+    #[allow(dead_code)]
     pub fn mark_as_ready(&mut self, idx: NodeIndex) -> Result<(), PlanError> {
         match self.statuses.get(&idx) {
             Some(EventStatus::InProgress) => {

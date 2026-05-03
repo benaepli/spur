@@ -13,11 +13,13 @@ pub enum BuiltinKind {
     ArrayHead,
     ArrayTail,
     ArraySlice,
+    ArrayIndex,
 
     // Map ops
     MapStore,
     MapExists,
     MapErase,
+    MapIndex,
 
     // Misc data
     Min,
@@ -77,9 +79,11 @@ impl BuiltinKind {
             BuiltinKind::ArrayHead => "array_head".into(),
             BuiltinKind::ArrayTail => "array_tail".into(),
             BuiltinKind::ArraySlice => "array_slice".into(),
+            BuiltinKind::ArrayIndex => "array_index".into(),
             BuiltinKind::MapStore => "map_store".into(),
             BuiltinKind::MapExists => "map_exists".into(),
             BuiltinKind::MapErase => "map_erase".into(),
+            BuiltinKind::MapIndex => "map_index".into(),
             BuiltinKind::Min => "min".into(),
             BuiltinKind::IterMake => "iter_make".into(),
             BuiltinKind::IterIsDone => "iter_is_done".into(),

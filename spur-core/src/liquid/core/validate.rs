@@ -130,14 +130,12 @@ impl HandleCollector {
             | CExprKind::BinOp(_, _, _)
             | CExprKind::Not(_)
             | CExprKind::Negate(_)
-            | CExprKind::ListLit(_)
             | CExprKind::TupleLit(_)
             | CExprKind::MapLit(_)
             | CExprKind::StructLit(_, _)
             | CExprKind::VariantLit(_, _, _)
             | CExprKind::IsVariant(_, _)
             | CExprKind::VariantPayload(_)
-            | CExprKind::Index(_, _)
             | CExprKind::TupleAccess(_, _)
             | CExprKind::FieldAccess(_, _) => {}
         }
@@ -174,7 +172,7 @@ impl HandleCollector {
                     self.walk_refinement_expr(a);
                 }
             }
-            RefinementExprKind::ListLit(es) | RefinementExprKind::TupleLit(es) => {
+            RefinementExprKind::TupleLit(es) => {
                 for x in es {
                     self.walk_refinement_expr(x);
                 }
@@ -197,10 +195,6 @@ impl HandleCollector {
             }
             RefinementExprKind::IsVariant(e, _) | RefinementExprKind::VariantPayload(e) => {
                 self.walk_refinement_expr(e);
-            }
-            RefinementExprKind::Index(a, b) => {
-                self.walk_refinement_expr(a);
-                self.walk_refinement_expr(b);
             }
             RefinementExprKind::TupleAccess(e, _) | RefinementExprKind::FieldAccess(e, _) => {
                 self.walk_refinement_expr(e);
@@ -256,7 +250,7 @@ fn walk_check(e: &RefinementExpr, errs: &mut Vec<RefinementValidationError>) {
                 walk_check(a, errs);
             }
         }
-        RefinementExprKind::ListLit(es) | RefinementExprKind::TupleLit(es) => {
+        RefinementExprKind::TupleLit(es) => {
             for x in es {
                 walk_check(x, errs);
             }
@@ -279,10 +273,6 @@ fn walk_check(e: &RefinementExpr, errs: &mut Vec<RefinementValidationError>) {
         }
         RefinementExprKind::IsVariant(e, _) | RefinementExprKind::VariantPayload(e) => {
             walk_check(e, errs);
-        }
-        RefinementExprKind::Index(a, b) => {
-            walk_check(a, errs);
-            walk_check(b, errs);
         }
         RefinementExprKind::TupleAccess(e, _) | RefinementExprKind::FieldAccess(e, _) => {
             walk_check(e, errs);

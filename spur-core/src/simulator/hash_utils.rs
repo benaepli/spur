@@ -53,6 +53,7 @@ pub trait HashPolicy: 'static + Clone + std::fmt::Debug + Send + Sync + Hash {
 /// Full hashing implementation - computes actual signatures.
 /// Used by model checker for state deduplication.
 #[derive(Clone, Debug, Hash)]
+#[allow(dead_code)]
 pub struct WithHashing;
 
 /// No-op hashing implementation - always returns 0.

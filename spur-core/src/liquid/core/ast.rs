@@ -198,7 +198,6 @@ pub enum CExprKind {
 
     FuncCall(CFuncCall),
 
-    ListLit(Vec<CAtomic>),
     TupleLit(Vec<CAtomic>),
     MapLit(Vec<(CAtomic, CAtomic)>),
     StructLit(NameId, Vec<(String, CAtomic)>),
@@ -206,7 +205,6 @@ pub enum CExprKind {
     IsVariant(CAtomic, String),
     VariantPayload(CAtomic),
 
-    Index(CAtomic, CAtomic),
     TupleAccess(CAtomic, usize),
     FieldAccess(CAtomic, String),
 

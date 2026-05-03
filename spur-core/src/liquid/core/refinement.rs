@@ -37,7 +37,6 @@ pub enum RefinementExprKind {
         return_type: CType,
     },
 
-    ListLit(Vec<RefinementExpr>),
     TupleLit(Vec<RefinementExpr>),
     MapLit(Vec<(RefinementExpr, RefinementExpr)>),
     StructLit(NameId, Vec<(String, RefinementExpr)>),
@@ -46,7 +45,6 @@ pub enum RefinementExprKind {
     IsVariant(Box<RefinementExpr>, String),
     VariantPayload(Box<RefinementExpr>),
 
-    Index(Box<RefinementExpr>, Box<RefinementExpr>),
     TupleAccess(Box<RefinementExpr>, usize),
     FieldAccess(Box<RefinementExpr>, String),
 

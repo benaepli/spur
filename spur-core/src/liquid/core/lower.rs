@@ -50,6 +50,7 @@ pub fn lower_program(program: PProgram) -> LowerOutput {
         body_memo: HashMap::new(),
         refinement_errors: Vec::new(),
         list_invariant_cache: HashMap::new(),
+        list_nonempty_cache: HashMap::new(),
         pending_stmts: Vec::new(),
     };
 
@@ -128,6 +129,9 @@ struct CoreLowerer {
     /// Cache of the baked-in `array_len(xs) >= 0` invariant per element type.
     /// Ensures every `list<T>` produced by `lower_type` reuses one handle.
     list_invariant_cache: HashMap<CType, CRefinementHandle>,
+    /// Cache of the `{ _xs | array_len(_xs) >= 1 }` non-empty precondition,
+    /// shared by `array_head` and `array_tail` parameter slots.
+    list_nonempty_cache: HashMap<CType, CRefinementHandle>,
     /// Statements emitted as side-effects of lowering an expression (e.g. the
     /// `array_empty`/`array_append` chain for `[a, b, c]`). `lower_block`
     /// drains this buffer in front of each statement it pushes.
@@ -368,46 +372,147 @@ impl CoreLowerer {
             PExprKind::Erase(map, key) => {
                 let (k, v) = self.map_kv_of(&map);
                 let map_ty = CType::Map(Box::new(k.clone()), Box::new(v.clone()));
-                self.emit_extern_call(
+                let k_for_param = k.clone();
+                let map_for_param = map_ty.clone();
+                let k_for_post = k.clone();
+                let v_for_post = v.clone();
+                let map_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |_this, _params| map_for_param);
+                let key_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |_this, _params| k_for_param);
+                let target = self.intern_extern_with_dependent_params(
                     BuiltinKind::MapErase,
                     vec![k.clone(), v],
-                    vec![map_ty.clone(), k],
-                    map_ty,
-                    vec![map, key],
-                )
+                    vec![
+                        ("m".to_string(), map_builder),
+                        ("k".to_string(), key_builder),
+                    ],
+                    move |this, params| {
+                        let post = this.make_map_erase_return_handle(
+                            k_for_post,
+                            v_for_post,
+                            params[1].name,
+                            params[1].original_name.clone(),
+                        );
+                        CType::Refined(Box::new(map_ty), post)
+                    },
+                );
+                let return_type = self.extern_return_type(target);
+                CExprKind::FuncCall(CFuncCall {
+                    target,
+                    args: vec![lower_atomic(map), lower_atomic(key)],
+                    return_type,
+                })
             }
             PExprKind::Store(map, key, val) => {
                 let (k, v) = self.map_kv_of(&map);
                 let map_ty = CType::Map(Box::new(k.clone()), Box::new(v.clone()));
-                self.emit_extern_call(
+                let k_for_param = k.clone();
+                let v_for_param = v.clone();
+                let map_for_param = map_ty.clone();
+                let k_for_post = k.clone();
+                let v_for_post = v.clone();
+                let map_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |_this, _params| map_for_param);
+                let key_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |_this, _params| k_for_param);
+                let val_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |_this, _params| v_for_param);
+                let target = self.intern_extern_with_dependent_params(
                     BuiltinKind::MapStore,
                     vec![k.clone(), v.clone()],
-                    vec![map_ty.clone(), k, v],
-                    map_ty,
-                    vec![map, key, val],
-                )
+                    vec![
+                        ("m".to_string(), map_builder),
+                        ("k".to_string(), key_builder),
+                        ("v".to_string(), val_builder),
+                    ],
+                    move |this, params| {
+                        let post = this.make_map_store_return_handle(
+                            k_for_post,
+                            v_for_post,
+                            params[1].name,
+                            params[1].original_name.clone(),
+                        );
+                        CType::Refined(Box::new(map_ty), post)
+                    },
+                );
+                let return_type = self.extern_return_type(target);
+                CExprKind::FuncCall(CFuncCall {
+                    target,
+                    args: vec![lower_atomic(map), lower_atomic(key), lower_atomic(val)],
+                    return_type,
+                })
             }
             PExprKind::Head(list) => {
                 let elem = self.array_elem_of(&list);
-                let list_ty = CType::Array(Box::new(elem.clone()));
-                self.emit_extern_call(
+                let raw_array = CType::Array(Box::new(elem.clone()));
+                let elem_for_pre = elem.clone();
+                let elem_for_ret = elem.clone();
+                let xs_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |this, _params| {
+                    let nonempty =
+                        this.make_array_nonempty_precondition_handle(elem_for_pre);
+                    CType::Refined(Box::new(raw_array), nonempty)
+                });
+                let target = self.intern_extern_with_dependent_params(
                     BuiltinKind::ArrayHead,
-                    vec![elem.clone()],
-                    vec![list_ty],
-                    elem,
-                    vec![list],
-                )
+                    vec![elem],
+                    vec![("xs".to_string(), xs_builder)],
+                    move |_this, _params| elem_for_ret,
+                );
+                let return_type = self.extern_return_type(target);
+                CExprKind::FuncCall(CFuncCall {
+                    target,
+                    args: vec![lower_atomic(list)],
+                    return_type,
+                })
             }
             PExprKind::Tail(list) => {
                 let elem = self.array_elem_of(&list);
-                let list_ty = CType::Array(Box::new(elem.clone()));
-                self.emit_extern_call(
+                let raw_array = CType::Array(Box::new(elem.clone()));
+                let elem_for_pre = elem.clone();
+                let elem_for_inner_inv = elem.clone();
+                let elem_for_post = elem.clone();
+                let raw_array_for_pre = raw_array.clone();
+                let xs_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |this, _params| {
+                    let nonempty =
+                        this.make_array_nonempty_precondition_handle(elem_for_pre);
+                    CType::Refined(Box::new(raw_array_for_pre), nonempty)
+                });
+                let target = self.intern_extern_with_dependent_params(
                     BuiltinKind::ArrayTail,
-                    vec![elem.clone()],
-                    vec![list_ty.clone()],
-                    list_ty,
-                    vec![list],
-                )
+                    vec![elem],
+                    vec![("xs".to_string(), xs_builder)],
+                    move |this, params| {
+                        let inner_invariant =
+                            this.make_list_invariant_handle(elem_for_inner_inv.clone());
+                        let inner_refined = CType::Refined(
+                            Box::new(CType::Array(Box::new(elem_for_inner_inv.clone()))),
+                            inner_invariant,
+                        );
+                        let outer = this.make_array_tail_return_handle(
+                            elem_for_post,
+                            params[0].name,
+                            params[0].original_name.clone(),
+                        );
+                        CType::Refined(Box::new(inner_refined), outer)
+                    },
+                );
+                let return_type = self.extern_return_type(target);
+                let _ = raw_array;
+                CExprKind::FuncCall(CFuncCall {
+                    target,
+                    args: vec![lower_atomic(list)],
+                    return_type,
+                })
             }
             PExprKind::Len(list) => {
                 let elem = self.array_elem_of(&list);
@@ -422,14 +527,62 @@ impl CoreLowerer {
             }
             PExprKind::Slice(list, lo, hi) => {
                 let elem = self.array_elem_of(&list);
-                let list_ty = CType::Array(Box::new(elem.clone()));
-                self.emit_extern_call(
+                let raw_array = CType::Array(Box::new(elem.clone()));
+                let elem_for_hi = elem.clone();
+                let elem_for_inner_inv = elem.clone();
+                let elem_for_post = elem.clone();
+                let xs_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |_this, _params| raw_array);
+                let lo_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |this, _params| {
+                    let pre = this.make_array_slice_lo_precondition_handle();
+                    CType::Refined(Box::new(CType::Int), pre)
+                });
+                let hi_builder: Box<
+                    dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                > = Box::new(move |this, params| {
+                    let pre = this.make_array_slice_hi_precondition_handle(
+                        elem_for_hi,
+                        params[1].name,
+                        params[1].original_name.clone(),
+                        params[0].name,
+                        params[0].original_name.clone(),
+                    );
+                    CType::Refined(Box::new(CType::Int), pre)
+                });
+                let target = self.intern_extern_with_dependent_params(
                     BuiltinKind::ArraySlice,
-                    vec![elem.clone()],
-                    vec![list_ty.clone(), CType::Int, CType::Int],
-                    list_ty,
-                    vec![list, lo, hi],
-                )
+                    vec![elem],
+                    vec![
+                        ("xs".to_string(), xs_builder),
+                        ("lo".to_string(), lo_builder),
+                        ("hi".to_string(), hi_builder),
+                    ],
+                    move |this, params| {
+                        let inner_invariant =
+                            this.make_list_invariant_handle(elem_for_inner_inv.clone());
+                        let inner_refined = CType::Refined(
+                            Box::new(CType::Array(Box::new(elem_for_inner_inv.clone()))),
+                            inner_invariant,
+                        );
+                        let outer = this.make_array_slice_return_handle(
+                            elem_for_post,
+                            params[1].name,
+                            params[1].original_name.clone(),
+                            params[2].name,
+                            params[2].original_name.clone(),
+                        );
+                        CType::Refined(Box::new(inner_refined), outer)
+                    },
+                );
+                let return_type = self.extern_return_type(target);
+                CExprKind::FuncCall(CFuncCall {
+                    target,
+                    args: vec![lower_atomic(list), lower_atomic(lo), lower_atomic(hi)],
+                    return_type,
+                })
             }
 
             PExprKind::RpcCall(dest, call) => {
@@ -595,7 +748,81 @@ impl CoreLowerer {
                 )
             }
 
-            PExprKind::Index(coll, idx) => CExprKind::Index(lower_atomic(coll), lower_atomic(idx)),
+            PExprKind::Index(coll, idx) => {
+                let coll_ty = self.atomic_p_type(&coll);
+                match coll_ty {
+                    Type::List(_) => {
+                        let elem = self.array_elem_of(&coll);
+                        let raw_array = CType::Array(Box::new(elem.clone()));
+                        let elem_for_i = elem.clone();
+                        let elem_for_ret = elem.clone();
+                        let xs_builder: Box<
+                            dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                        > = Box::new(move |_this, _params| raw_array);
+                        let i_builder: Box<
+                            dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                        > = Box::new(move |this, params| {
+                            let precondition = this.make_index_precondition_handle(
+                                elem_for_i,
+                                params[0].name,
+                                params[0].original_name.clone(),
+                            );
+                            CType::Refined(Box::new(CType::Int), precondition)
+                        });
+                        let target = self.intern_extern_with_dependent_params(
+                            BuiltinKind::ArrayIndex,
+                            vec![elem],
+                            vec![
+                                ("xs".to_string(), xs_builder),
+                                ("i".to_string(), i_builder),
+                            ],
+                            move |_this, _params| elem_for_ret,
+                        );
+                        let return_type = self.extern_return_type(target);
+                        CExprKind::FuncCall(CFuncCall {
+                            target,
+                            args: vec![lower_atomic(coll), lower_atomic(idx)],
+                            return_type,
+                        })
+                    }
+                    _ => {
+                        let (k, v) = self.map_kv_of(&coll);
+                        let map_ty = CType::Map(Box::new(k.clone()), Box::new(v.clone()));
+                        let k_for_pre = k.clone();
+                        let v_for_pre = v.clone();
+                        let v_for_ret = v.clone();
+                        let map_builder: Box<
+                            dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                        > = Box::new(move |_this, _params| map_ty);
+                        let key_builder: Box<
+                            dyn FnOnce(&mut Self, &[CExternParam]) -> CType,
+                        > = Box::new(move |this, params| {
+                            let precondition = this.make_map_index_precondition_handle(
+                                k_for_pre.clone(),
+                                v_for_pre,
+                                params[0].name,
+                                params[0].original_name.clone(),
+                            );
+                            CType::Refined(Box::new(k_for_pre), precondition)
+                        });
+                        let target = self.intern_extern_with_dependent_params(
+                            BuiltinKind::MapIndex,
+                            vec![k, v],
+                            vec![
+                                ("m".to_string(), map_builder),
+                                ("k".to_string(), key_builder),
+                            ],
+                            move |_this, _params| v_for_ret,
+                        );
+                        let return_type = self.extern_return_type(target);
+                        CExprKind::FuncCall(CFuncCall {
+                            target,
+                            args: vec![lower_atomic(coll), lower_atomic(idx)],
+                            return_type,
+                        })
+                    }
+                }
+            }
             PExprKind::TupleAccess(t, i) => CExprKind::TupleAccess(lower_atomic(t), i),
             PExprKind::FieldAccess(s, f) => CExprKind::FieldAccess(lower_atomic(s), f),
 
@@ -903,6 +1130,48 @@ impl CoreLowerer {
         id
     }
 
+    /// Like `intern_extern_with_params`, but each parameter's type is built
+    /// lazily by a closure that receives the slice of already-minted earlier
+    /// parameters. Used when a later parameter's refinement needs to
+    /// reference an earlier parameter's NameId — e.g. `array_index<T>`'s
+    /// index parameter, whose precondition `0 <= i && i < array_len(xs)`
+    /// references the `xs` parameter. Cache key is unchanged: `(kind,
+    /// type_args)`.
+    fn intern_extern_with_dependent_params<G>(
+        &mut self,
+        kind: BuiltinKind,
+        type_args: Vec<CType>,
+        param_specs: Vec<(String, Box<dyn FnOnce(&mut Self, &[CExternParam]) -> CType>)>,
+        return_type_builder: G,
+    ) -> NameId
+    where
+        G: FnOnce(&mut Self, &[CExternParam]) -> CType,
+    {
+        let key = (kind.clone(), type_args.clone());
+        if let Some(id) = self.extern_cache.get(&key) {
+            return *id;
+        }
+        let mut params: Vec<CExternParam> = Vec::with_capacity(param_specs.len());
+        for (hint, builder) in param_specs {
+            let ty = builder(self, &params);
+            let p = self.mint_extern_param(&hint, ty);
+            params.push(p);
+        }
+        let return_type = return_type_builder(self, &params);
+        let id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        let original_name = format_extern_name(&kind, &type_args);
+        self.id_to_name.insert(id, original_name.clone());
+        self.extern_funcs.push(CExternFunc {
+            name: id,
+            original_name,
+            params,
+            return_type,
+        });
+        self.extern_cache.insert(key, id);
+        id
+    }
+
     /// Allocate a fresh NameId for an extern parameter binder.
     fn mint_extern_param(&mut self, hint: &str, ty: CType) -> CExternParam {
         let id = NameId(self.next_name_id);
@@ -1107,6 +1376,542 @@ impl CoreLowerer {
                 CBinOp::IntEq,
                 Box::new(len_ys),
                 Box::new(xs_plus_one),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "ys".to_string(),
+            body,
+        })
+    }
+
+    /// Build the bounds precondition for `array_index<T>`'s index parameter:
+    /// `{ i | 0 <= i && i < array_len(list_param) }`, where `list_param` is
+    /// the input-list parameter NameId of the *enclosing* extern. The body
+    /// has a free Var referencing the extern's first parameter binder — the
+    /// same trick used by `make_append_return_handle`.
+    fn make_index_precondition_handle(
+        &mut self,
+        elem: CType,
+        list_param: NameId,
+        list_param_name: String,
+    ) -> CRefinementHandle {
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "i".to_string());
+
+        let raw_array = CType::Array(Box::new(elem.clone()));
+        let i_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "i".to_string()),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let xs_var = RefinementExpr {
+            kind: RefinementExprKind::Var(list_param, list_param_name),
+            ty: raw_array.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let array_len_id = self.intern_extern(
+            BuiltinKind::ArrayLen,
+            vec![elem],
+            vec![raw_array],
+            CType::Int,
+        );
+        let len_xs = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: array_len_id,
+                args: vec![xs_var],
+                return_type: CType::Int,
+            },
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let zero = RefinementExpr {
+            kind: RefinementExprKind::IntLit(0),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let lower_bound = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::LessEqual,
+                Box::new(zero),
+                Box::new(i_var.clone()),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        let upper_bound = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::Less,
+                Box::new(i_var),
+                Box::new(len_xs),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        let body = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::And,
+                Box::new(lower_bound),
+                Box::new(upper_bound),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "i".to_string(),
+            body,
+        })
+    }
+
+    /// Build the bounds precondition for `map_index<K, V>`'s key parameter:
+    /// `{ k | map_exists(map_param, k) }`, where `map_param` is the input-map
+    /// parameter NameId of the *enclosing* extern. The body has a free Var
+    /// referencing the extern's first parameter binder.
+    fn make_map_index_precondition_handle(
+        &mut self,
+        k_ty: CType,
+        v_ty: CType,
+        map_param: NameId,
+        map_param_name: String,
+    ) -> CRefinementHandle {
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "k".to_string());
+
+        let map_ty = CType::Map(Box::new(k_ty.clone()), Box::new(v_ty.clone()));
+        let k_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "k".to_string()),
+            ty: k_ty.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let m_var = RefinementExpr {
+            kind: RefinementExprKind::Var(map_param, map_param_name),
+            ty: map_ty.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let exists_id = self.intern_extern(
+            BuiltinKind::MapExists,
+            vec![k_ty.clone(), v_ty],
+            vec![map_ty, k_ty],
+            CType::Bool,
+        );
+        let body = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: exists_id,
+                args: vec![m_var, k_var],
+                return_type: CType::Bool,
+            },
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "k".to_string(),
+            body,
+        })
+    }
+
+    /// Build the return-type refinement for `map_store<K, V>`:
+    /// `{ ys | map_exists(ys, key_param) }`, where `key_param` is the key
+    /// parameter NameId of the enclosing extern. The body has a free Var
+    /// referencing the key binder.
+    fn make_map_store_return_handle(
+        &mut self,
+        k_ty: CType,
+        v_ty: CType,
+        key_param: NameId,
+        key_param_name: String,
+    ) -> CRefinementHandle {
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "ys".to_string());
+
+        let map_ty = CType::Map(Box::new(k_ty.clone()), Box::new(v_ty.clone()));
+        let ys_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "ys".to_string()),
+            ty: map_ty.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let k_var = RefinementExpr {
+            kind: RefinementExprKind::Var(key_param, key_param_name),
+            ty: k_ty.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let exists_id = self.intern_extern(
+            BuiltinKind::MapExists,
+            vec![k_ty.clone(), v_ty],
+            vec![map_ty, k_ty],
+            CType::Bool,
+        );
+        let body = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: exists_id,
+                args: vec![ys_var, k_var],
+                return_type: CType::Bool,
+            },
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "ys".to_string(),
+            body,
+        })
+    }
+
+    /// Build the return-type refinement for `map_erase<K, V>`:
+    /// `{ ys | !map_exists(ys, key_param) }`.
+    fn make_map_erase_return_handle(
+        &mut self,
+        k_ty: CType,
+        v_ty: CType,
+        key_param: NameId,
+        key_param_name: String,
+    ) -> CRefinementHandle {
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "ys".to_string());
+
+        let map_ty = CType::Map(Box::new(k_ty.clone()), Box::new(v_ty.clone()));
+        let ys_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "ys".to_string()),
+            ty: map_ty.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let k_var = RefinementExpr {
+            kind: RefinementExprKind::Var(key_param, key_param_name),
+            ty: k_ty.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let exists_id = self.intern_extern(
+            BuiltinKind::MapExists,
+            vec![k_ty.clone(), v_ty],
+            vec![map_ty, k_ty],
+            CType::Bool,
+        );
+        let exists_call = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: exists_id,
+                args: vec![ys_var, k_var],
+                return_type: CType::Bool,
+            },
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        let body = RefinementExpr {
+            kind: RefinementExprKind::Not(Box::new(exists_call)),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "ys".to_string(),
+            body,
+        })
+    }
+
+    /// Build (or fetch) the `{ _xs | array_len(_xs) >= 1 }` non-empty
+    /// precondition shared by `array_head` and `array_tail`.
+    fn make_array_nonempty_precondition_handle(&mut self, elem: CType) -> CRefinementHandle {
+        if let Some(handle) = self.list_nonempty_cache.get(&elem) {
+            return handle.clone();
+        }
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "_xs".to_string());
+
+        let raw_array = CType::Array(Box::new(elem.clone()));
+        let xs_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "_xs".to_string()),
+            ty: raw_array.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let array_len_id = self.intern_extern(
+            BuiltinKind::ArrayLen,
+            vec![elem.clone()],
+            vec![raw_array],
+            CType::Int,
+        );
+        let len_call = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: array_len_id,
+                args: vec![xs_var],
+                return_type: CType::Int,
+            },
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let one = RefinementExpr {
+            kind: RefinementExprKind::IntLit(1),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let body = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::GreaterEqual,
+                Box::new(len_call),
+                Box::new(one),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        let handle = CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "_xs".to_string(),
+            body,
+        });
+        self.list_nonempty_cache.insert(elem, handle.clone());
+        handle
+    }
+
+    /// Build the return-type refinement for `array_tail<T>`:
+    /// `{ ys | array_len(ys) == array_len(list_param) - 1 }`.
+    fn make_array_tail_return_handle(
+        &mut self,
+        elem: CType,
+        list_param: NameId,
+        list_param_name: String,
+    ) -> CRefinementHandle {
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "ys".to_string());
+
+        let raw_array = CType::Array(Box::new(elem.clone()));
+        let ys_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "ys".to_string()),
+            ty: raw_array.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let xs_var = RefinementExpr {
+            kind: RefinementExprKind::Var(list_param, list_param_name),
+            ty: raw_array.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let array_len_id = self.intern_extern(
+            BuiltinKind::ArrayLen,
+            vec![elem],
+            vec![raw_array],
+            CType::Int,
+        );
+        let len_ys = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: array_len_id,
+                args: vec![ys_var],
+                return_type: CType::Int,
+            },
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let len_xs = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: array_len_id,
+                args: vec![xs_var],
+                return_type: CType::Int,
+            },
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let one = RefinementExpr {
+            kind: RefinementExprKind::IntLit(1),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let xs_minus_one = RefinementExpr {
+            kind: RefinementExprKind::BinOp(CBinOp::Subtract, Box::new(len_xs), Box::new(one)),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let body = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::IntEq,
+                Box::new(len_ys),
+                Box::new(xs_minus_one),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "ys".to_string(),
+            body,
+        })
+    }
+
+    /// Build the precondition for `array_slice<T>`'s `lo` parameter:
+    /// `{ lo | 0 <= lo }`.
+    fn make_array_slice_lo_precondition_handle(&mut self) -> CRefinementHandle {
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "lo".to_string());
+
+        let lo_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "lo".to_string()),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let zero = RefinementExpr {
+            kind: RefinementExprKind::IntLit(0),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let body = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::LessEqual,
+                Box::new(zero),
+                Box::new(lo_var),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "lo".to_string(),
+            body,
+        })
+    }
+
+    /// Build the precondition for `array_slice<T>`'s `hi` parameter:
+    /// `{ hi | lo_param <= hi && hi <= array_len(list_param) }`.
+    fn make_array_slice_hi_precondition_handle(
+        &mut self,
+        elem: CType,
+        lo_param: NameId,
+        lo_param_name: String,
+        list_param: NameId,
+        list_param_name: String,
+    ) -> CRefinementHandle {
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "hi".to_string());
+
+        let raw_array = CType::Array(Box::new(elem.clone()));
+        let hi_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "hi".to_string()),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let lo_var = RefinementExpr {
+            kind: RefinementExprKind::Var(lo_param, lo_param_name),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let xs_var = RefinementExpr {
+            kind: RefinementExprKind::Var(list_param, list_param_name),
+            ty: raw_array.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let array_len_id = self.intern_extern(
+            BuiltinKind::ArrayLen,
+            vec![elem],
+            vec![raw_array],
+            CType::Int,
+        );
+        let len_xs = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: array_len_id,
+                args: vec![xs_var],
+                return_type: CType::Int,
+            },
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let lower_bound = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::LessEqual,
+                Box::new(lo_var),
+                Box::new(hi_var.clone()),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        let upper_bound = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::LessEqual,
+                Box::new(hi_var),
+                Box::new(len_xs),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        let body = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::And,
+                Box::new(lower_bound),
+                Box::new(upper_bound),
+            ),
+            ty: CType::Bool,
+            span: crate::parser::Span::default(),
+        };
+        CRefinementHandle::new(CRefinementBody {
+            bound: bound_id,
+            original_bound: "hi".to_string(),
+            body,
+        })
+    }
+
+    /// Build the return-type refinement for `array_slice<T>`:
+    /// `{ ys | array_len(ys) == hi_param - lo_param }`.
+    fn make_array_slice_return_handle(
+        &mut self,
+        elem: CType,
+        lo_param: NameId,
+        lo_param_name: String,
+        hi_param: NameId,
+        hi_param_name: String,
+    ) -> CRefinementHandle {
+        let bound_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        self.id_to_name.insert(bound_id, "ys".to_string());
+
+        let raw_array = CType::Array(Box::new(elem.clone()));
+        let ys_var = RefinementExpr {
+            kind: RefinementExprKind::Var(bound_id, "ys".to_string()),
+            ty: raw_array.clone(),
+            span: crate::parser::Span::default(),
+        };
+        let lo_var = RefinementExpr {
+            kind: RefinementExprKind::Var(lo_param, lo_param_name),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let hi_var = RefinementExpr {
+            kind: RefinementExprKind::Var(hi_param, hi_param_name),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let array_len_id = self.intern_extern(
+            BuiltinKind::ArrayLen,
+            vec![elem],
+            vec![raw_array],
+            CType::Int,
+        );
+        let len_ys = RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target: array_len_id,
+                args: vec![ys_var],
+                return_type: CType::Int,
+            },
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let hi_minus_lo = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::Subtract,
+                Box::new(hi_var),
+                Box::new(lo_var),
+            ),
+            ty: CType::Int,
+            span: crate::parser::Span::default(),
+        };
+        let body = RefinementExpr {
+            kind: RefinementExprKind::BinOp(
+                CBinOp::IntEq,
+                Box::new(len_ys),
+                Box::new(hi_minus_lo),
             ),
             ty: CType::Bool,
             span: crate::parser::Span::default(),
@@ -1622,9 +2427,46 @@ impl CoreLowerer {
             }
 
             TypedExprKind::Index(coll, idx) => {
-                let coll_l = Box::new(self.lower_refinement_expr(coll));
-                let idx_l = Box::new(self.lower_refinement_expr(idx));
-                RefinementExprKind::Index(coll_l, idx_l)
+                let coll_l = self.lower_refinement_expr(coll);
+                let idx_l = self.lower_refinement_expr(idx);
+                match &coll.ty {
+                    Type::List(t) => {
+                        let elem = self.lower_type(t);
+                        let raw_array = CType::Array(Box::new(elem.clone()));
+                        let target = self.intern_extern(
+                            BuiltinKind::ArrayIndex,
+                            vec![elem.clone()],
+                            vec![raw_array, CType::Int],
+                            elem.clone(),
+                        );
+                        RefinementExprKind::ExternCall {
+                            target,
+                            args: vec![coll_l, idx_l],
+                            return_type: elem,
+                        }
+                    }
+                    Type::Map(k, v) => {
+                        let k_c = self.lower_type(k);
+                        let v_c = self.lower_type(v);
+                        let map_ty =
+                            CType::Map(Box::new(k_c.clone()), Box::new(v_c.clone()));
+                        let target = self.intern_extern(
+                            BuiltinKind::MapIndex,
+                            vec![k_c.clone(), v_c.clone()],
+                            vec![map_ty, k_c],
+                            v_c.clone(),
+                        );
+                        RefinementExprKind::ExternCall {
+                            target,
+                            args: vec![coll_l, idx_l],
+                            return_type: v_c,
+                        }
+                    }
+                    _ => {
+                        let _ = (coll_l, idx_l);
+                        RefinementExprKind::Error
+                    }
+                }
             }
             TypedExprKind::TupleAccess(t, i) => {
                 let t_l = Box::new(self.lower_refinement_expr(t));

@@ -208,7 +208,7 @@ pub fn exec_plan<H: HashPolicy>(
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
-    let mut selector = queue_policy.into_selector();
+    let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
     // Map from node_id index to the plan engine NodeIndex for pending crash/recover events

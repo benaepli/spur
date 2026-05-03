@@ -1348,7 +1348,7 @@ impl Compiler {
     fn compile_builtin_call(
         &mut self,
         builtin: BuiltinFn,
-        args: &Vec<LExpr>,
+        args: &[LExpr],
         target: Lhs,
         next_vertex: Vertex,
         ctx: CompileCtx,

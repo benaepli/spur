@@ -408,6 +408,7 @@ impl<H: HashPolicy> Hash for Runnable<H> {
 
 impl<H: HashPolicy> Runnable<H> {
     /// Get the node this runnable belongs to, if applicable.
+    #[allow(dead_code)]
     pub fn node(&self) -> Option<NodeId> {
         match self {
             Runnable::Timer(t) => Some(t.node),
@@ -457,7 +458,10 @@ pub enum ScheduleResult<H: HashPolicy> {
     /// A labeled timer fired.
     TimerFired { node_id: NodeId, label: String },
     /// A network partition was activated.
-    Partition { partition_type: PartitionType },
+    Partition {
+        #[allow(dead_code)]
+        partition_type: PartitionType,
+    },
     /// A network partition was healed.
     Heal,
     /// A non-client Record runnable was executed (internal RPC delivery).

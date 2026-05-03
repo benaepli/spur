@@ -13,6 +13,7 @@ pub struct QueueInfo {
     pub local_queue_sizes: Vec<usize>,
     pub network_queue_size: usize,
     pub timer_queue_size: usize,
+    #[allow(dead_code)]
     pub step: i32,
 }
 
@@ -190,7 +191,7 @@ impl Default for QueuePolicyConfig {
 }
 
 impl QueuePolicyConfig {
-    pub fn into_selector(&self) -> AnySelector {
+    pub fn to_selector(&self) -> AnySelector {
         match self {
             QueuePolicyConfig::Probabilistic { p_local, p_timer } => {
                 AnySelector::Probabilistic(ProbabilisticSelector {

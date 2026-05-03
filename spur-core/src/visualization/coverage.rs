@@ -24,8 +24,8 @@ pub fn vertex_coverage_to_byte_coverage(
         if let Some(span) = vertex_to_span.get(vertex) {
             let start = span.start;
             let end = span.end.min(source_len);
-            for i in start..end {
-                byte_hits[i] += count;
+            for hit in &mut byte_hits[start..end] {
+                *hit += count;
             }
         }
     }

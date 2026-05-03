@@ -786,8 +786,8 @@ mod tests {
             );
             counts[idx] += 1;
         }
-        for i in 0..3 {
-            let observed = counts[i] as f64 / trials as f64;
+        for (i, &count) in counts.iter().enumerate() {
+            let observed = count as f64 / trials as f64;
             assert!(
                 (observed - 1.0 / 3.0).abs() < 0.02,
                 "bucket {} should be ~uniform 0.333, got {:.3}",
