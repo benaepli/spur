@@ -499,8 +499,8 @@ impl ParquetWriter {
                         logs,
                         traces,
                     } => {
-                        if !history.is_empty() {
-                            if let Err(e) =
+                        if !history.is_empty()
+                            && let Err(e) =
                                 append_executions_batch(&mut exec_writer, run_id, &history)
                             {
                                 error!(
@@ -508,18 +508,15 @@ impl ParquetWriter {
                                     run_id, e
                                 );
                             }
-                        }
-                        if !logs.is_empty() {
-                            if let Err(e) = append_logs_batch(&mut log_writer, run_id, &logs) {
+                        if !logs.is_empty()
+                            && let Err(e) = append_logs_batch(&mut log_writer, run_id, &logs) {
                                 error!("failed to save logs parquet for run {}: {}", run_id, e);
                             }
-                        }
-                        if !traces.is_empty() {
-                            if let Err(e) = append_traces_batch(&mut trace_writer, run_id, &traces)
+                        if !traces.is_empty()
+                            && let Err(e) = append_traces_batch(&mut trace_writer, run_id, &traces)
                             {
                                 error!("failed to save traces parquet for run {}: {}", run_id, e);
                             }
-                        }
 
                         writes_in_batch += 1;
 
@@ -622,27 +619,22 @@ impl HistoryWriter for ParquetWriter {
         if let Err(e) = self.sender.send(HistoryCommand::Shutdown) {
             log::error!("Failed to send shutdown command to parquet writer: {}", e);
         }
-        if let Ok(mut guard) = self.handle.lock() {
-            if let Some(h) = guard.take() {
-                if let Err(e) = h.join() {
+        if let Ok(mut guard) = self.handle.lock()
+            && let Some(h) = guard.take()
+                && let Err(e) = h.join() {
                     log::error!("Parquet writer thread panicked: {:?}", e);
                 }
-            }
-        }
     }
 }
 
 /// Which storage backend to use for logging history.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum LogBackend {
+    #[default]
     Parquet,
 }
 
-impl Default for LogBackend {
-    fn default() -> Self {
-        LogBackend::Parquet
-    }
-}
 
 /// Creates the appropriate HistoryWriter for the given backend.
 pub fn create_writer(

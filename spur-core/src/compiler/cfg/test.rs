@@ -90,7 +90,7 @@ fn test_compile_simple_literals() {
     match label {
         Label::Instr(Instr::Assign(lhs, Expr::Bool(val)), n) => {
             assert_eq!(lhs, &target);
-            assert_eq!(*val, true);
+            assert!(*val);
             assert_eq!(*n, next);
         }
         _ => panic!("expected Assign Bool, got {:?}", label),
@@ -711,7 +711,7 @@ fn test_compile_for_loop_continue_targets_increment() {
     // The Continue target should be the increment vertex, which should
     // eventually lead to an assignment (the increment i = 1).
     let mut found_continue = false;
-    for (_v, label) in compiler.cfg.iter().enumerate() {
+    for label in compiler.cfg.iter() {
         if let Label::Continue(target) = label {
             found_continue = true;
             // The continue target should NOT be entry (the init/loop head).

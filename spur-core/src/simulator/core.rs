@@ -13,5 +13,4 @@ pub use state::*;
 pub use eval::*;
 pub use exec::*;
 pub use scheduler::*;
-pub use partition::*;
 pub use queue_selector::*;

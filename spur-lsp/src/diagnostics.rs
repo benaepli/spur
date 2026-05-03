@@ -58,9 +58,7 @@ fn parse_error_to_diagnostic(e: &ParseError, line_index: &LineIndex) -> Diagnost
 }
 
 fn validation_error_to_diagnostic(e: &ValidationError, line_index: &LineIndex) -> Diagnostic {
-    let span = match e {
-        ValidationError::VarDeclInForIncrement(s) => s,
-    };
+    let ValidationError::VarDeclInForIncrement(span) = e;
     Diagnostic {
         range: line_index.span_to_range(span.start, span.end),
         severity: Some(DiagnosticSeverity::ERROR),

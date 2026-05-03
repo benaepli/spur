@@ -816,7 +816,7 @@ fn block_contains_variant_lit_named(block: &PBlock, target: &str) -> bool {
                         .any(|b| block_contains_variant_lit_named(&b.body, target))
                     || c.else_branch
                         .as_ref()
-                        .map_or(false, |b| block_contains_variant_lit_named(b, target))
+                        .is_some_and(|b| block_contains_variant_lit_named(b, target))
             }
             PExprKind::Block(b) => block_contains_variant_lit_named(b, target),
             _ => false,
@@ -829,7 +829,7 @@ fn block_contains_variant_lit_named(block: &PBlock, target: &str) -> bool {
                         .any(|b| block_contains_variant_lit_named(&b.body, target))
                     || c.else_branch
                         .as_ref()
-                        .map_or(false, |b| block_contains_variant_lit_named(b, target))
+                        .is_some_and(|b| block_contains_variant_lit_named(b, target))
             }
             PExprKind::Block(b) => block_contains_variant_lit_named(b, target),
             _ => false,
@@ -849,7 +849,7 @@ fn block_contains_plain_return(block: &PBlock) -> bool {
                         .any(|b| block_contains_plain_return(&b.body))
                     || c.else_branch
                         .as_ref()
-                        .map_or(false, |b| block_contains_plain_return(b))
+                        .is_some_and(block_contains_plain_return)
             }
             PExprKind::Block(b) => block_contains_plain_return(b),
             _ => false,

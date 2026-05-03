@@ -160,11 +160,10 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
                 }
 
                 // Serialization: partitions are globally serialized
-                if matches!(action1, EventAction::Partition(_)) {
-                    if let Some(prev_heal) = last_heal {
+                if matches!(action1, EventAction::Partition(_))
+                    && let Some(prev_heal) = last_heal {
                         graph.add_edge(prev_heal, idx1, ());
                     }
-                }
                 if matches!(action2, EventAction::Heal) {
                     last_heal = Some(idx2);
                 }

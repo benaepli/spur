@@ -33,8 +33,8 @@ impl Reservation {
         match runnable {
             Runnable::Record(r) => {
                 r.entry_pc == self.entry_pc
-                    && self.to.map_or(true, |t| r.node.index == t)
-                    && self.from.map_or(true, |f| r.origin_node.index == f)
+                    && self.to.is_none_or(|t| r.node.index == t)
+                    && self.from.is_none_or(|f| r.origin_node.index == f)
             }
             // ChannelSend runnables are not matchable by delivers.
             // All VR inter-node messages are RPCs (Record runnables).
@@ -50,12 +50,11 @@ fn is_fifo_blocked<H: HashPolicy>(
     runnable: &Runnable<H>,
     link_deliver_seq: &imbl::HashMap<crate::simulator::core::values::LinkId, u32>,
 ) -> bool {
-    if let Runnable::Record(r) = runnable {
-        if let Some((link_id, seq)) = r.link_seq {
+    if let Runnable::Record(r) = runnable
+        && let Some((link_id, seq)) = r.link_seq {
             let expected = link_deliver_seq.get(&link_id).copied().unwrap_or(0);
             return seq != expected;
         }
-    }
     false
 }
 
@@ -198,7 +197,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                     return false;
                 }
                 if let Runnable::Timer(t) = r {
-                    t.label.as_ref().map_or(true, |l| {
+                    t.label.as_ref().is_none_or(|l| {
                         state.allowed_timers.contains(&(t.node.index, l.clone()))
                     })
                 } else {
@@ -274,7 +273,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                             return false;
                         }
                         if let Runnable::Timer(t) = &queue[i] {
-                            t.label.as_ref().map_or(true, |l| {
+                            t.label.as_ref().is_none_or(|l| {
                                 state.allowed_timers.contains(&(t.node.index, l.clone()))
                             })
                         } else {
@@ -379,13 +378,12 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             };
 
             if state.crash_info.currently_crashed.contains(&dest_node) {
-                if let Runnable::Record(r) = other {
-                    if src_node != dest_node {
+                if let Runnable::Record(r) = other
+                    && src_node != dest_node {
                         let mut r = r;
                         r.reset();
                         state.crash_info.queued_messages.push_back((dest_node, r));
                     }
-                }
                 return Ok(ScheduleResult::None);
             }
 
@@ -492,8 +490,8 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     // 1. Process local queue for crashed node: save external records, drop the rest
     let local = std::mem::take(&mut state.local_queues[node_id.index]);
     for task in local {
-        if let Runnable::Record(record) = task {
-            if record.origin_node != record.node {
+        if let Runnable::Record(record) = task
+            && record.origin_node != record.node {
                 let mut record = record;
                 record.reset();
                 state
@@ -501,7 +499,6 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
                     .queued_messages
                     .push_back((node_id, record));
             }
-        }
     }
 
     // 2. Filter network queue: remove items targeting the crashed node
@@ -525,11 +522,10 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     // 3. Filter timer queue: remove timers for the crashed node
     let timers = std::mem::take(&mut state.timer_queue);
     for task in timers {
-        if let Runnable::Timer(ref t) = task {
-            if t.node == node_id {
+        if let Runnable::Timer(ref t) = task
+            && t.node == node_id {
                 continue;
             }
-        }
         state.timer_queue.push_back(task);
     }
 }

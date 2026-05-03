@@ -503,11 +503,10 @@ impl Resolver {
             Some(&self.client_func_scope)
         };
 
-        if let Some(scope) = scope_to_check {
-            if let Some(id) = scope.get(name) {
+        if let Some(scope) = scope_to_check
+            && let Some(id) = scope.get(name) {
                 return Ok(*id);
             }
-        }
 
         // Fall through to global free functions
         if let Some(id) = self.global_func_scope.get(name) {
@@ -663,11 +662,7 @@ impl Resolver {
             .map(|p| self.resolve_func_param(p))
             .collect();
 
-        let return_type = if let Some(t) = func.return_type {
-            Some(self.resolve_type_def(t))
-        } else {
-            None
-        };
+        let return_type = func.return_type.map(|t| self.resolve_type_def(t));
 
         let body = self.resolve_block(func.body);
         self.exit_scope();
@@ -1025,12 +1020,10 @@ impl Resolver {
                         resolved_args,
                         fc.span,
                     ))
+                } else if let Some(resolved_call) = self.resolve_user_func_call(fc) {
+                    ResolvedExprKind::FuncCall(ResolvedFuncCall::User(resolved_call))
                 } else {
-                    if let Some(resolved_call) = self.resolve_user_func_call(fc) {
-                        ResolvedExprKind::FuncCall(ResolvedFuncCall::User(resolved_call))
-                    } else {
-                        ResolvedExprKind::Error
-                    }
+                    ResolvedExprKind::Error
                 }
             }
             ExprKind::MapLit(pairs) => {

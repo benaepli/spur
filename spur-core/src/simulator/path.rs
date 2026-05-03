@@ -2,7 +2,7 @@ use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, Vertex};
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, PurgatoryConfig,
-    QueuePolicyConfig, QueueSelector, Record, Reservation, Runnable, RunnableCategory,
+    QueuePolicyConfig, Record, Reservation, Runnable, RunnableCategory,
     RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, WithinQueueSelector,
     make_local_env, schedule_runnable,
 };
@@ -311,8 +311,8 @@ pub fn exec_plan<H: HashPolicy>(
                     let (client_node_id, is_new) =
                         path_state.client_pool.get(&mut path_state.state);
 
-                    if is_new {
-                        if let Some(init_fn) =
+                    if is_new
+                        && let Some(init_fn) =
                             program.get_func_by_name("ClientInterface.BASE_NODE_INIT")
                         {
                             let mut env = make_local_env(
@@ -341,7 +341,6 @@ pub fn exec_plan<H: HashPolicy>(
                                 );
                             }
                         }
-                    }
 
                     // Validate target server in op_spec
                     let target_idx = match op_spec {
@@ -537,10 +536,10 @@ pub fn exec_plan<H: HashPolicy>(
                                     spec.function == func_name
                                         && spec
                                             .to
-                                            .map_or(true, |t| dest_node.index == t as usize)
+                                            .is_none_or(|t| dest_node.index == t as usize)
                                         && spec
                                             .from
-                                            .map_or(true, |f| origin_node.index == f as usize)
+                                            .is_none_or(|f| origin_node.index == f as usize)
                                 } else {
                                     false
                                 }

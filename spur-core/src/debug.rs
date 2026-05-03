@@ -333,11 +333,10 @@ impl SimulatorDebugger {
             for i in 0..batch.num_rows() {
                 if run_id_arr.value(i) == run_id {
                     let n_id = node_id_arr.value(i);
-                    if let Some(target_node) = node_id {
-                        if n_id != target_node {
+                    if let Some(target_node) = node_id
+                        && n_id != target_node {
                             continue;
                         }
-                    }
 
                     let cop = if causal_operation_id_arr.is_valid(i) {
                         Some(causal_operation_id_arr.value(i))

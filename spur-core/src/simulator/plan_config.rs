@@ -56,7 +56,7 @@ impl PartitionSpec {
                 let a: OrdSet<NodeId> = side_a.iter().map(|&i| make_node(i)).collect();
                 let b: OrdSet<NodeId> = (0..num_servers)
                     .filter(|i| !side_a.contains(i))
-                    .map(|i| make_node(i))
+                    .map(&make_node)
                     .collect();
                 PartitionType::Halves { side_a: a, side_b: b }
             }

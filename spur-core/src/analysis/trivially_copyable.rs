@@ -54,13 +54,12 @@ pub fn compute_trivially_copyable(
                 continue;
             }
             for (_variant_name, payload_ty) in variants {
-                if let Some(ty) = payload_ty {
-                    if !is_trivially_copyable(ty, &map) {
+                if let Some(ty) = payload_ty
+                    && !is_trivially_copyable(ty, &map) {
                         map.insert(*name_id, TriviallyCopyable::NonTrivial);
                         changed = true;
                         break;
                     }
-                }
             }
         }
 

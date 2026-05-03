@@ -222,10 +222,17 @@ pub struct CFuncCall {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CExternParam {
+    pub name: NameId,
+    pub original_name: String,
+    pub ty: CType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CExternFunc {
     pub name: NameId,
     pub original_name: String,
-    pub params: Vec<CType>,
+    pub params: Vec<CExternParam>,
     pub return_type: CType,
 }
 

@@ -91,7 +91,7 @@ impl PartitionType {
                 let i = src.index;
                 let j = dest.index;
                 let dist = {
-                    let d = if i > j { i - j } else { j - i };
+                    let d = i.abs_diff(j);
                     d.min(n - d)
                 };
                 dist <= reach
@@ -106,9 +106,9 @@ impl PartitionType {
                     return true;
                 }
                 // Non-bridge nodes can only reach nodes in their own half
-                let same_side = (side_a.contains(&src) && side_a.contains(&dest))
-                    || (side_b.contains(&src) && side_b.contains(&dest));
-                same_side
+                
+                (side_a.contains(&src) && side_a.contains(&dest))
+                    || (side_b.contains(&src) && side_b.contains(&dest))
             }
         }
     }

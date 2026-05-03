@@ -46,8 +46,8 @@ impl HandleCollector {
             self.walk_block(&f.body);
         }
         for ext in &p.extern_funcs {
-            for ty in &ext.params {
-                self.walk_type(ty);
+            for param in &ext.params {
+                self.walk_type(&param.ty);
             }
             self.walk_type(&ext.return_type);
         }

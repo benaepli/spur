@@ -49,7 +49,7 @@ impl AnfLowerer {
             kind: AStatementKind::LetAtom(ALetAtom {
                 name: id,
                 original_name: name.clone(),
-                ty: ty,
+                ty,
                 value: aexpr,
                 user_annotated: false,
                 span,

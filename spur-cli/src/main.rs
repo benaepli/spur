@@ -199,7 +199,7 @@ fn main() {
         },
     };
     if result.is_err() {
-        println!("Result: {}", result.err().unwrap().to_string());
+        println!("Result: {}", result.err().unwrap());
     }
 }
 

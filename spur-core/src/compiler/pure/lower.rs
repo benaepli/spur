@@ -1037,7 +1037,7 @@ impl PureLowerer {
             span: loop_span,
         };
 
-        let saved_env = std::mem::replace(&mut self.env, HashMap::new());
+        let saved_env = std::mem::take(&mut self.env);
         for ((orig_nid, _, ty, _), (pid, pname)) in live_vars.iter().zip(fresh_params.iter()) {
             self.env
                 .insert(*orig_nid, PAtomic::Var(*pid, pname.clone()));

@@ -6,6 +6,7 @@ use crate::analysis::resolver::NameId;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BuiltinKind {
     // Array ops
+    ArrayEmpty,
     ArrayAppend,
     ArrayPrepend,
     ArrayLen,
@@ -69,6 +70,7 @@ impl BuiltinKind {
     /// are appended by the lowerer, e.g. `array_append<int>`.
     pub fn base_name(&self) -> String {
         match self {
+            BuiltinKind::ArrayEmpty => "array_empty".into(),
             BuiltinKind::ArrayAppend => "array_append".into(),
             BuiltinKind::ArrayPrepend => "array_prepend".into(),
             BuiltinKind::ArrayLen => "array_len".into(),

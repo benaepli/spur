@@ -168,13 +168,11 @@ pub fn report_type_errors(
                             .with_color(Color::Red),
                     )
                     .with_note(
-                        vec![
-                            format!(
+                        [format!(
                                 "help: only struct types have fields, but `{}` is not a struct",
                                 ty
                             ),
-                            format!("note: cannot access field `{}` on this type", field_name),
-                        ]
+                            format!("note: cannot access field `{}` on this type", field_name)]
                         .join("\n"),
                     )
                     .finish()
@@ -506,10 +504,8 @@ pub fn report_type_errors(
                             .with_message("recv (`<-`) not allowed here")
                             .with_color(Color::Red),
                     )
-                    .with_note(vec![
-                        "help: recv can only be used in async functions, but this function is marked as `sync`",
-                        "note: remove the `sync` keyword from the function declaration to use recv"
-                    ].join("\n"))
+                    .with_note(["help: recv can only be used in async functions, but this function is marked as `sync`",
+                        "note: remove the `sync` keyword from the function declaration to use recv"].join("\n"))
                     .finish()
                     .eprint((filename, Source::from(source)))?;
             }
@@ -522,10 +518,8 @@ pub fn report_type_errors(
                             .with_message("send (`>-`) not allowed here")
                             .with_color(Color::Red),
                     )
-                    .with_note(vec![
-                        "help: send can only be used in async functions, but this function is marked as `sync`",
-                        "note: remove the `sync` keyword from the function declaration to use send"
-                    ].join("\n"))
+                    .with_note(["help: send can only be used in async functions, but this function is marked as `sync`",
+                        "note: remove the `sync` keyword from the function declaration to use send"].join("\n"))
                     .finish()
                     .eprint((filename, Source::from(source)))?;
             }
@@ -538,10 +532,8 @@ pub fn report_type_errors(
                             .with_message(format!("`{}` is a sync function", func_name))
                             .with_color(Color::Red),
                     )
-                    .with_note(vec![
-                        format!("help: RPC calls can only target async functions, but `{}` is marked as sync", func_name),
-                        "note: consider removing the `sync` keyword from the target function".to_string()
-                    ].join("\n"))
+                    .with_note([format!("help: RPC calls can only target async functions, but `{}` is marked as sync", func_name),
+                        "note: consider removing the `sync` keyword from the target function".to_string()].join("\n"))
                     .finish()
                     .eprint((filename, Source::from(source)))?;
             }
@@ -670,10 +662,8 @@ pub fn report_type_errors(
                             .with_message(format!("type `{}` cannot be persisted or retrieved", ty))
                             .with_color(Color::Red),
                     )
-                    .with_note(vec![
-                        "help: only trivially copyable types (int, string, bool, lists/maps/structs of these) can be used with persist_data and retrieve_data",
-                        "note: channels and types containing channels are not trivially copyable"
-                    ].join("\n"))
+                    .with_note(["help: only trivially copyable types (int, string, bool, lists/maps/structs of these) can be used with persist_data and retrieve_data",
+                        "note: channels and types containing channels are not trivially copyable"].join("\n"))
                     .finish()
                     .eprint((filename, Source::from(source)))?;
             }
@@ -686,10 +676,8 @@ pub fn report_type_errors(
                             .with_message(format!("type `{}` is not optional", ty))
                             .with_color(Color::Red),
                     )
-                    .with_note(vec![
-                        format!("help: the `?.` and `?[]` operators can only be used on optional types, but `{}` is not optional", ty),
-                        "note: use `.` or `[]` for non-optional access".to_string()
-                    ].join("\n"))
+                    .with_note([format!("help: the `?.` and `?[]` operators can only be used on optional types, but `{}` is not optional", ty),
+                        "note: use `.` or `[]` for non-optional access".to_string()].join("\n"))
                     .finish()
                     .eprint((filename, Source::from(source)))?;
             }

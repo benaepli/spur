@@ -75,7 +75,7 @@ impl<'a> LoopRemover<'a> {
                 let mut iterable = fil.iterable.clone();
                 self.remove_for_loops_in_expr(&mut iterable);
 
-                let mut body = fil.body.clone();
+                let body = fil.body.clone();
 
                 let element_ty = match &iterable.ty {
                     crate::analysis::types::Type::List(t) => *t.clone(),

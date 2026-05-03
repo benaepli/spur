@@ -27,14 +27,14 @@ pub fn assign_type_ids(program: &TypedProgram) -> TypeIdMap {
     };
 
     // Register types from struct definitions.
-    for (_name_id, fields) in &program.struct_defs {
+    for fields in program.struct_defs.values() {
         for (_field_name, field_ty) in fields {
             register(field_ty, &mut map, &mut next_id);
         }
     }
 
     // Register types from enum definitions.
-    for (_name_id, variants) in &program.enum_defs {
+    for variants in program.enum_defs.values() {
         for (_variant_name, payload_ty) in variants {
             if let Some(ty) = payload_ty {
                 register(ty, &mut map, &mut next_id);

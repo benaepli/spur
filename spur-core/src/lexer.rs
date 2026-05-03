@@ -378,7 +378,7 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
 
         loop {
-            let ch = self.input.next().ok_or_else(|| {
+            let ch = self.input.next().ok_or({
                 LexError::UnterminatedString(Span {
                     context: (),
                     start,
@@ -455,7 +455,7 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
 
         loop {
-            let ch = self.input.next().ok_or_else(|| {
+            let ch = self.input.next().ok_or({
                 LexError::UnterminatedString(Span {
                     context: (),
                     start,

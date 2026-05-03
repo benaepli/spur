@@ -604,14 +604,13 @@ fn test_async_call_no_tuple_unpack() {
     // There must not be a tuple access or an `s = __tup.0` update generated
     // by this call — state handoff must be deferred to `<-`.
     for stmt in &f.body.statements {
-        if let TStatementKind::LetAtom(la) = &stmt.kind {
-            if let TExprKind::TupleAccess(_, _) = &la.value.kind {
+        if let TStatementKind::LetAtom(la) = &stmt.kind
+            && let TExprKind::TupleAccess(_, _) = &la.value.kind {
                 panic!(
                     "async call produced an unexpected TupleAccess: {:?}",
                     stmt
                 );
             }
-        }
     }
 }
 
@@ -689,11 +688,10 @@ fn test_sync_statement_call_threads_state() {
 
     // No subsequent LetAtom should bind `__tup.1` — the result is discarded.
     for stmt in &f.body.statements[3..] {
-        if let TStatementKind::LetAtom(la) = &stmt.kind {
-            if let TExprKind::TupleAccess(_, 1) = &la.value.kind {
+        if let TStatementKind::LetAtom(la) = &stmt.kind
+            && let TExprKind::TupleAccess(_, 1) = &la.value.kind {
                 panic!("discard path should not bind __tup.1: {:?}", stmt);
             }
-        }
     }
 }
 
@@ -762,10 +760,9 @@ fn test_async_statement_call_prepends_s_only() {
 
     // Spawn must NOT produce a state update (no `s = __tup.0`).
     for stmt in &f.body.statements {
-        if let TStatementKind::Assign(a) = &stmt.kind {
-            if a.target_name == "s" {
+        if let TStatementKind::Assign(a) = &stmt.kind
+            && a.target_name == "s" {
                 panic!("async spawn must not update s: {:?}", stmt);
             }
-        }
     }
 }
