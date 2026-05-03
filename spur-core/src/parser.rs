@@ -3,10 +3,9 @@ pub mod format;
 use crate::lexer::{Token, TokenKind};
 use chumsky::input::BorrowInput;
 use chumsky::prelude::*;
-use chumsky::span::SimpleSpan;
 use thiserror::Error;
 
-pub type Span = SimpleSpan<usize>;
+pub use spur_ast::span::Span;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -323,49 +322,7 @@ pub struct FuncCall {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum BinOp {
-    // Logical
-    And,
-    Or,
-
-    // Comparison
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-
-    // Arithmetic
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Modulo,
-    Coalesce,
-}
-
-impl std::fmt::Display for BinOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BinOp::And => write!(f, "and"),
-            BinOp::Or => write!(f, "or"),
-            BinOp::Equal => write!(f, "=="),
-            BinOp::NotEqual => write!(f, "!="),
-            BinOp::Less => write!(f, "<"),
-            BinOp::LessEqual => write!(f, "<="),
-            BinOp::Greater => write!(f, ">"),
-            BinOp::GreaterEqual => write!(f, ">="),
-            BinOp::Add => write!(f, "+"),
-            BinOp::Subtract => write!(f, "-"),
-            BinOp::Multiply => write!(f, "*"),
-            BinOp::Divide => write!(f, "/"),
-            BinOp::Modulo => write!(f, "%"),
-            BinOp::Coalesce => write!(f, "??"),
-        }
-    }
-}
+pub use spur_ast::binop::BinOp;
 
 // Helper to build a parser for a left-associative binary operation
 fn build_binary_op<'a, I, P>(

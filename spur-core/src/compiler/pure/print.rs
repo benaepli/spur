@@ -93,17 +93,17 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn write_struct_defs(&mut self, defs: &HashMap<NameId, Vec<(String, Type)>>) {
+    fn write_struct_defs(&mut self, defs: &HashMap<NameId, Vec<(NameId, String, Type)>>) {
         if defs.is_empty() {
             return;
         }
-        let mut entries: Vec<(&NameId, &Vec<(String, Type)>)> = defs.iter().collect();
+        let mut entries: Vec<(&NameId, &Vec<(NameId, String, Type)>)> = defs.iter().collect();
         entries.sort_by_key(|(nid, _)| nid.0);
         for (nid, fields) in entries {
             let name = self.type_name(*nid, "Struct");
             let fields_str = fields
                 .iter()
-                .map(|(n, t)| format!("{}: {}", n, t))
+                .map(|(_, n, t)| format!("{}: {}", n, t))
                 .collect::<Vec<_>>()
                 .join("; ");
             self.writeln(&format!("struct {} {{ {} }}", name, fields_str));
@@ -111,17 +111,17 @@ impl<'a> Printer<'a> {
         self.blank_line();
     }
 
-    fn write_enum_defs(&mut self, defs: &HashMap<NameId, Vec<(String, Option<Type>)>>) {
+    fn write_enum_defs(&mut self, defs: &HashMap<NameId, Vec<(NameId, String, Option<Type>)>>) {
         if defs.is_empty() {
             return;
         }
-        let mut entries: Vec<(&NameId, &Vec<(String, Option<Type>)>)> = defs.iter().collect();
+        let mut entries: Vec<(&NameId, &Vec<(NameId, String, Option<Type>)>)> = defs.iter().collect();
         entries.sort_by_key(|(nid, _)| nid.0);
         for (nid, variants) in entries {
             let name = self.type_name(*nid, "Enum");
             let variants_str = variants
                 .iter()
-                .map(|(vname, payload)| match payload {
+                .map(|(_, vname, payload)| match payload {
                     Some(t) => format!("{}({})", vname, t),
                     None => vname.clone(),
                 })
@@ -411,7 +411,7 @@ impl<'a> Printer<'a> {
                     None => format!("{}::{}", enum_name, variant),
                 }
             }
-            PExprKind::IsVariant(a, name) => format!("{} is {}", self.fmt_atomic(a), name),
+            PExprKind::IsVariant(a, _enum_id, variant_id) => format!("{} is {:?}", self.fmt_atomic(a), variant_id),
             PExprKind::VariantPayload(a) => format!("@payload({})", self.fmt_atomic(a)),
 
             PExprKind::UnwrapOptional(a) => format!("{}!", self.fmt_atomic(a)),
@@ -621,7 +621,7 @@ impl DisambVisitor {
                     self.visit_atomic(p);
                 }
             }
-            PExprKind::IsVariant(a, _) | PExprKind::VariantPayload(a) => self.visit_atomic(a),
+            PExprKind::IsVariant(a, _, _) | PExprKind::VariantPayload(a) => self.visit_atomic(a),
 
             PExprKind::UnwrapOptional(a) => self.visit_atomic(a),
 

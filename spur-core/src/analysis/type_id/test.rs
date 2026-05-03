@@ -24,9 +24,9 @@ fn test_primitives_get_distinct_ids() {
     program.struct_defs.insert(
         id(1),
         vec![
-            ("a".to_string(), Type::Int),
-            ("b".to_string(), Type::String),
-            ("c".to_string(), Type::Bool),
+            (NameId(100), "a".to_string(), Type::Int),
+            (NameId(101), "b".to_string(), Type::String),
+            (NameId(102), "c".to_string(), Type::Bool),
         ],
     );
 
@@ -44,8 +44,8 @@ fn test_equal_types_get_same_id() {
     program.struct_defs.insert(
         id(1),
         vec![
-            ("a".to_string(), list_int.clone()),
-            ("b".to_string(), list_int.clone()),
+            (NameId(100), "a".to_string(), list_int.clone()),
+            (NameId(101), "b".to_string(), list_int.clone()),
         ],
     );
 
@@ -62,7 +62,7 @@ fn test_compound_types_register_components() {
     let map_type = Type::Map(Box::new(Type::String), Box::new(Type::Int));
     program
         .struct_defs
-        .insert(id(1), vec![("m".to_string(), map_type.clone())]);
+        .insert(id(1), vec![(NameId(100), "m".to_string(), map_type.clone())]);
 
     let map = assign_type_ids(&program);
     assert!(map.contains_key(&map_type));
@@ -76,7 +76,7 @@ fn test_tuple_registers_element_types() {
     let tuple_type = Type::Tuple(vec![Type::Int, Type::Bool]);
     program
         .struct_defs
-        .insert(id(1), vec![("t".to_string(), tuple_type.clone())]);
+        .insert(id(1), vec![(NameId(100), "t".to_string(), tuple_type.clone())]);
 
     let map = assign_type_ids(&program);
     assert!(map.contains_key(&tuple_type));
@@ -90,7 +90,7 @@ fn test_optional_registers_inner() {
     let opt = Type::Optional(Box::new(Type::String));
     program
         .struct_defs
-        .insert(id(1), vec![("o".to_string(), opt.clone())]);
+        .insert(id(1), vec![(NameId(100), "o".to_string(), opt.clone())]);
 
     let map = assign_type_ids(&program);
     assert!(map.contains_key(&opt));
@@ -105,8 +105,8 @@ fn test_different_types_get_different_ids() {
     program.struct_defs.insert(
         id(1),
         vec![
-            ("a".to_string(), list_int.clone()),
-            ("b".to_string(), list_string.clone()),
+            (NameId(100), "a".to_string(), list_int.clone()),
+            (NameId(101), "b".to_string(), list_string.clone()),
         ],
     );
 
@@ -120,8 +120,8 @@ fn test_enum_payloads_registered() {
     program.enum_defs.insert(
         id(1),
         vec![
-            ("None".to_string(), None),
-            ("Some".to_string(), Some(Type::Int)),
+            (NameId(100), "None".to_string(), None),
+            (NameId(101), "Some".to_string(), Some(Type::Int)),
         ],
     );
 

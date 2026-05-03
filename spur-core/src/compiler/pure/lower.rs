@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::analysis::resolver::NameId;
 use crate::analysis::types::Type;
 use crate::liquid::pure::ast::*;
-use crate::liquid::threaded::ast::*;
+use crate::compiler::threaded::ast::*;
 use crate::parser::Span;
 
 /// Lowers the state-threaded IR into the pure / SSA IR used by the refinement
@@ -22,9 +22,9 @@ pub struct PureLowerer {
     /// live-out projections can inherit the flag from the original binding.
     user_annotated_env: HashMap<NameId, bool>,
     /// Cloned from TProgram; read-only during lowering.
-    struct_defs: HashMap<NameId, Vec<(String, Type)>>,
+    struct_defs: HashMap<NameId, Vec<(NameId, String, Type)>>,
     /// Mutable: gets extra entries for each lifted loop's LoopResult enum.
-    enum_defs: HashMap<NameId, Vec<(String, Option<Type>)>>,
+    enum_defs: HashMap<NameId, Vec<(NameId, String, Option<Type>)>>,
     /// Mutable: gets extra entries for synthesized enum / function names.
     id_to_name: HashMap<NameId, String>,
     /// Loop functions lifted out of inline Loop statements.
@@ -45,6 +45,8 @@ pub struct PureLowerer {
 struct LoopCtx {
     loop_result_enum_id: NameId,
     loop_result_enum_name: String,
+    exit_variant_id: NameId,
+    return_variant_id: NameId,
     /// Lifted function — used for self-recursion (fallthrough and continue).
     func_name_id: NameId,
     func_original_name: String,
@@ -62,8 +64,8 @@ struct LoopCtx {
 impl PureLowerer {
     fn new(
         next_name_id: usize,
-        struct_defs: HashMap<NameId, Vec<(String, Type)>>,
-        enum_defs: HashMap<NameId, Vec<(String, Option<Type>)>>,
+        struct_defs: HashMap<NameId, Vec<(NameId, String, Type)>>,
+        enum_defs: HashMap<NameId, Vec<(NameId, String, Option<Type>)>>,
         id_to_name: HashMap<NameId, String>,
     ) -> Self {
         Self {
@@ -187,10 +189,12 @@ impl PureLowerer {
                 PExprKind::Conditional(Box::new(self.lower_cond_expr_plain(*cond)))
             }
             TExprKind::Block(b) => PExprKind::Block(Box::new(self.lower_block(*b))),
-            TExprKind::VariantLit(enum_id, variant, payload) => {
-                PExprKind::VariantLit(enum_id, variant, payload.map(|a| self.lower_atomic(a)))
+            TExprKind::VariantLit(enum_id, variant_id, payload) => {
+                PExprKind::VariantLit(enum_id, variant_id, payload.map(|a| self.lower_atomic(a)))
             }
-            TExprKind::IsVariant(a, name) => PExprKind::IsVariant(self.lower_atomic(a), name),
+            TExprKind::IsVariant(a, enum_id, variant_id) => {
+                PExprKind::IsVariant(self.lower_atomic(a), enum_id, variant_id)
+            }
             TExprKind::VariantPayload(a) => PExprKind::VariantPayload(self.lower_atomic(a)),
             TExprKind::UnwrapOptional(a) => PExprKind::UnwrapOptional(self.lower_atomic(a)),
             TExprKind::MakeIter(a) => PExprKind::MakeIter(self.lower_atomic(a)),
@@ -212,9 +216,11 @@ impl PureLowerer {
                 self.lower_atomic(c),
             ),
             TExprKind::TupleAccess(a, i) => PExprKind::TupleAccess(self.lower_atomic(a), i),
-            TExprKind::FieldAccess(a, name) => PExprKind::FieldAccess(self.lower_atomic(a), name),
-            TExprKind::SafeFieldAccess(a, name) => {
-                PExprKind::SafeFieldAccess(self.lower_atomic(a), name)
+            TExprKind::FieldAccess(a, field_id) => {
+                PExprKind::FieldAccess(self.lower_atomic(a), field_id)
+            }
+            TExprKind::SafeFieldAccess(a, field_id) => {
+                PExprKind::SafeFieldAccess(self.lower_atomic(a), field_id)
             }
             TExprKind::SafeIndex(a, b) => {
                 PExprKind::SafeIndex(self.lower_atomic(a), self.lower_atomic(b))
@@ -224,7 +230,7 @@ impl PureLowerer {
                 struct_id,
                 fields
                     .into_iter()
-                    .map(|(n, a)| (n, self.lower_atomic(a)))
+                    .map(|(field_id, a)| (field_id, self.lower_atomic(a)))
                     .collect(),
             ),
             TExprKind::WrapInOptional(a) => PExprKind::WrapInOptional(self.lower_atomic(a)),
@@ -804,7 +810,7 @@ impl PureLowerer {
                     value: PExpr {
                         kind: PExprKind::VariantLit(
                             ctx.loop_result_enum_id,
-                            "Return".to_string(),
+                            ctx.return_variant_id,
                             Some(v),
                         ),
                         ty: ret_ty.clone(),
@@ -846,7 +852,7 @@ impl PureLowerer {
                 value: PExpr {
                     kind: PExprKind::VariantLit(
                         ctx.loop_result_enum_id,
-                        "Exit".to_string(),
+                        ctx.exit_variant_id,
                         Some(payload),
                     ),
                     ty: ret_ty.clone(),
@@ -989,6 +995,8 @@ impl PureLowerer {
 
         // 2. Synthesize __LoopResult_N enum.
         let (enum_id, enum_name) = self.fresh_name("LoopResult");
+        let (exit_variant_id, _) = self.fresh_name("Exit");
+        let (return_variant_id, _) = self.fresh_name("Return");
         let exit_payload_ty =
             Type::Tuple(live_vars.iter().map(|(_, _, t, _)| t.clone()).collect());
         let return_payload_ty = self
@@ -998,11 +1006,13 @@ impl PureLowerer {
         self.enum_defs.insert(
             enum_id,
             vec![
-                ("Exit".to_string(), Some(exit_payload_ty.clone())),
-                ("Return".to_string(), Some(return_payload_ty)),
+                (exit_variant_id, "Exit".to_string(), Some(exit_payload_ty.clone())),
+                (return_variant_id, "Return".to_string(), Some(return_payload_ty)),
             ],
         );
         self.id_to_name.insert(enum_id, enum_name.clone());
+        self.id_to_name.insert(exit_variant_id, "Exit".to_string());
+        self.id_to_name.insert(return_variant_id, "Return".to_string());
         let loop_result_ty = Type::Enum(enum_id, enum_name.clone());
 
         // 3. Allocate the lifted function name.
@@ -1030,6 +1040,8 @@ impl PureLowerer {
         let ctx = LoopCtx {
             loop_result_enum_id: enum_id,
             loop_result_enum_name: enum_name.clone(),
+            exit_variant_id,
+            return_variant_id,
             func_name_id: func_id,
             func_original_name: func_name.clone(),
             live_vars: live_vars.clone(),
@@ -1150,7 +1162,7 @@ impl PureLowerer {
                 original_name: isret_name.clone(),
                 ty: Type::Bool,
                 value: PExpr {
-                    kind: PExprKind::IsVariant(outer_r_atom.clone(), "Return".to_string()),
+                    kind: PExprKind::IsVariant(outer_r_atom.clone(), ctx.loop_result_enum_id, ctx.return_variant_id),
                     ty: Type::Bool,
                     span: loop_span,
                 },
@@ -1294,7 +1306,7 @@ fn reads_expr(e: &TExpr, reads: &mut HashSet<NameId>) {
         | IterNext(a)
         | WrapInOptional(a)
         | PersistData(a)
-        | IsVariant(a, _)
+        | IsVariant(a, _, _)
         | VariantPayload(a)
         | TupleAccess(a, _)
         | FieldAccess(a, _)

@@ -21,8 +21,8 @@ pub type TriviallyCopyableMap = HashMap<NameId, TriviallyCopyable>;
 /// then repeatedly check until no changes occur. This correctly handles mutually
 /// recursive type definitions.
 pub fn compute_trivially_copyable(
-    struct_defs: &HashMap<NameId, Vec<(String, Type)>>,
-    enum_defs: &HashMap<NameId, Vec<(String, Option<Type>)>>,
+    struct_defs: &HashMap<NameId, Vec<(NameId, String, Type)>>,
+    enum_defs: &HashMap<NameId, Vec<(NameId, String, Option<Type>)>>,
 ) -> TriviallyCopyableMap {
     let mut map = TriviallyCopyableMap::new();
 
@@ -40,7 +40,7 @@ pub fn compute_trivially_copyable(
             if map[name_id] == TriviallyCopyable::NonTrivial {
                 continue; // Already non-trivial, can't change.
             }
-            for (_field_name, field_ty) in fields {
+            for (_, _field_name, field_ty) in fields {
                 if !is_trivially_copyable(field_ty, &map) {
                     map.insert(*name_id, TriviallyCopyable::NonTrivial);
                     changed = true;
@@ -53,7 +53,7 @@ pub fn compute_trivially_copyable(
             if map[name_id] == TriviallyCopyable::NonTrivial {
                 continue;
             }
-            for (_variant_name, payload_ty) in variants {
+            for (_, _variant_name, payload_ty) in variants {
                 if let Some(ty) = payload_ty
                     && !is_trivially_copyable(ty, &map) {
                         map.insert(*name_id, TriviallyCopyable::NonTrivial);

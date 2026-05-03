@@ -1,42 +1,8 @@
 use crate::parser::*;
-use serde::Serialize;
 use std::collections::HashMap;
-use std::str::FromStr;
 use thiserror::Error;
 
-// A unique identifier for every named entity (variable, function, type, role).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-pub struct NameId(pub usize);
-
-impl std::fmt::Display for NameId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NameId({})", self.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BuiltinFn {
-    Println,
-    IntToString,
-    BoolToString,
-    RoleToString,
-    UniqueId,
-}
-
-impl FromStr for BuiltinFn {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "println" => Ok(BuiltinFn::Println),
-            "int_to_string" => Ok(BuiltinFn::IntToString),
-            "bool_to_string" => Ok(BuiltinFn::BoolToString),
-            "role_to_string" => Ok(BuiltinFn::RoleToString),
-            "unique_id" => Ok(BuiltinFn::UniqueId),
-            _ => Err(()),
-        }
-    }
-}
+pub use spur_ast::name::{BuiltinFn, NameId};
 
 #[derive(Error, Debug, PartialEq, Clone)]
 pub enum ResolutionError {
@@ -127,6 +93,7 @@ pub enum ResolvedTypeDefStmtKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedEnumVariant {
+    pub id: NameId,
     pub name: String,
     pub payload: Option<ResolvedTypeDef>,
     pub span: Span,
@@ -134,7 +101,8 @@ pub struct ResolvedEnumVariant {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedFieldDef {
-    pub name: String, // Field names don't need resolution as they live in a struct's namespace
+    pub id: NameId,
+    pub name: String,
     pub type_def: ResolvedTypeDef,
     pub span: Span,
 }
@@ -750,7 +718,9 @@ impl Resolver {
     }
 
     fn resolve_field_def(&mut self, field: FieldDef) -> ResolvedFieldDef {
+        let id = self.new_name_id(&field.name);
         ResolvedFieldDef {
+            id,
             name: field.name,
             type_def: self.resolve_type_def(field.type_def),
             span: field.span,
@@ -758,7 +728,9 @@ impl Resolver {
     }
 
     fn resolve_enum_variant(&mut self, variant: EnumVariant) -> ResolvedEnumVariant {
+        let id = self.new_name_id(&variant.name);
         ResolvedEnumVariant {
+            id,
             name: variant.name,
             payload: variant.payload.map(|t| self.resolve_type_def(t)),
             span: variant.span,

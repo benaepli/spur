@@ -36,11 +36,26 @@ enum Commands {
         /// Skip confirmation prompt for directory deletion
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Run the SMT-backed refinement type checker after compilation.
+        /// Requires a build with `--features formulog`.
+        #[arg(long)]
+        refinements: bool,
+        /// Wall-clock budget (seconds) for the refinement check. Ignored
+        /// when `--refinements` is not set.
+        #[arg(long, default_value_t = 60)]
+        refinements_timeout: u64,
     },
     /// Check a specification file for errors
     Check {
         /// Input specification file (.spur)
         spec: PathBuf,
+        /// Run the SMT-backed refinement type checker. Requires a build
+        /// with `--features formulog`.
+        #[arg(long)]
+        refinements: bool,
+        /// Wall-clock budget (seconds) for the refinement check.
+        #[arg(long, default_value_t = 60)]
+        refinements_timeout: u64,
     },
     /// Generate a CFG visualization for a specification
     Graph {
@@ -166,8 +181,14 @@ fn main() {
             spec,
             output_dir,
             yes,
-        } => run_compile(spec, output_dir, yes),
-        Commands::Check { spec } => run_check(spec),
+            refinements,
+            refinements_timeout,
+        } => run_compile(spec, output_dir, yes, refinements, refinements_timeout),
+        Commands::Check {
+            spec,
+            refinements,
+            refinements_timeout,
+        } => run_check(spec, refinements, refinements_timeout),
         Commands::Graph { spec, output } => run_graph(spec, output),
         Commands::Explore {
             spec,
@@ -234,9 +255,23 @@ fn prepare_output_dir(output_dir: &Path, yes: bool) -> Result<bool> {
     Ok(true)
 }
 
-fn run_compile(spec_path: PathBuf, output_dir: PathBuf, yes: bool) -> Result<()> {
+fn run_compile(
+    spec_path: PathBuf,
+    output_dir: PathBuf,
+    yes: bool,
+    refinements: bool,
+    refinements_timeout: u64,
+) -> Result<()> {
     let source_code = fs::read_to_string(&spec_path)
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
+
+    if refinements {
+        run_refinements(
+            &source_code,
+            spec_path.to_string_lossy().as_ref(),
+            refinements_timeout,
+        )?;
+    }
 
     let mut result = compiler::compile(&source_code, spec_path.to_string_lossy().as_ref());
     let pure = result.pure.take();
@@ -278,7 +313,7 @@ fn run_compile(spec_path: PathBuf, output_dir: PathBuf, yes: bool) -> Result<()>
     Ok(())
 }
 
-fn run_check(spec_path: PathBuf) -> Result<()> {
+fn run_check(spec_path: PathBuf, refinements: bool, refinements_timeout: u64) -> Result<()> {
     let source_code = fs::read_to_string(&spec_path)
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
@@ -286,8 +321,62 @@ fn run_check(spec_path: PathBuf) -> Result<()> {
         .into_program()
         .map_err(|e| anyhow::anyhow!("Check failed: {}", e))?;
 
+    if refinements {
+        run_refinements(
+            &source_code,
+            spec_path.to_string_lossy().as_ref(),
+            refinements_timeout,
+        )?;
+    }
+
     println!("Successfully checked {}", spec_path.display());
     Ok(())
+}
+
+#[cfg(feature = "formulog")]
+fn run_refinements(source: &str, name: &str, timeout_secs: u64) -> Result<()> {
+    use std::time::Duration;
+
+    let bin = spur_liquid::flg_binary_path()
+        .ok_or_else(|| anyhow::anyhow!(
+            "the spur-liquid build did not produce a `flg` binary; \
+             rebuild the CLI with `--features formulog` or set SPUR_FLG_BIN \
+             to a prebuilt binary path"
+        ))?;
+    let result = compiler::compile_with_refinements(
+        source,
+        name,
+        &bin,
+        Duration::from_secs(timeout_secs),
+    )
+    .map_err(|e| anyhow::anyhow!("Refinement check failed: {}", e))?;
+
+    if !result.refinement_check_errors.is_empty() {
+        for e in &result.refinement_check_errors {
+            let label = result
+                .refinement_ir
+                .as_ref()
+                .and_then(|p| p.funcs.iter().find(|f| f.name == e.function))
+                .map(|f| f.original_name.clone())
+                .unwrap_or_else(|| format!("#{}", e.function.0));
+            eprintln!("refinement error: function `{}` failed to verify", label);
+        }
+        return Err(anyhow::anyhow!(
+            "refinement check failed for {} function(s)",
+            result.refinement_check_errors.len()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "formulog"))]
+fn run_refinements(_source: &str, _name: &str, _timeout_secs: u64) -> Result<()> {
+    anyhow::bail!(
+        "refinement checking is unavailable because the CLI was not built with \
+         `--features formulog`. Rebuild with\n\n  \
+         cargo build --release --features formulog -p spur-cli\n\n\
+         and retry."
+    );
 }
 
 fn run_graph(spec_path: PathBuf, output_path: PathBuf) -> Result<()> {

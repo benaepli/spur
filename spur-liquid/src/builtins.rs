@@ -1,4 +1,4 @@
-use crate::analysis::resolver::NameId;
+use spur_ast::name::NameId;
 
 /// Closed enum naming every language operator that lowering folds into the
 /// `extern_funcs` header. Each `(BuiltinKind, Vec<CType>)` instantiation
@@ -16,6 +16,7 @@ pub enum BuiltinKind {
     ArrayIndex,
 
     // Map ops
+    MapEmpty,
     MapStore,
     MapExists,
     MapErase,
@@ -43,7 +44,7 @@ pub enum BuiltinKind {
     // Optionals
     OptionalWrap,
     OptionalUnwrap,
-    SafeField(String),
+    SafeField(NameId),
     SafeIndex,
     SafeTupleAccess(usize),
 
@@ -80,6 +81,7 @@ impl BuiltinKind {
             BuiltinKind::ArrayTail => "array_tail".into(),
             BuiltinKind::ArraySlice => "array_slice".into(),
             BuiltinKind::ArrayIndex => "array_index".into(),
+            BuiltinKind::MapEmpty => "map_empty".into(),
             BuiltinKind::MapStore => "map_store".into(),
             BuiltinKind::MapExists => "map_exists".into(),
             BuiltinKind::MapErase => "map_erase".into(),
@@ -95,7 +97,7 @@ impl BuiltinKind {
             BuiltinKind::FifoCreate => "fifo_create".into(),
             BuiltinKind::OptionalWrap => "optional_wrap".into(),
             BuiltinKind::OptionalUnwrap => "optional_unwrap".into(),
-            BuiltinKind::SafeField(field) => format!("safe_field_{}", field),
+            BuiltinKind::SafeField(field_id) => format!("safe_field_{}", field_id.0),
             BuiltinKind::SafeIndex => "safe_index".into(),
             BuiltinKind::SafeTupleAccess(i) => format!("safe_tuple_{}", i),
             BuiltinKind::Persist => "persist".into(),

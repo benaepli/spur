@@ -1,7 +1,7 @@
-use crate::analysis::resolver::NameId;
-use crate::parser::Span;
+use spur_ast::name::NameId;
+use spur_ast::span::Span;
 
-use super::ast::{CBinOp, CType};
+use crate::ir::{CBinOp, CType};
 
 /// A pure, tree-form expression representing a lowered refinement-body
 /// predicate. Refinements are restricted to side-effect-free expressions, so
@@ -38,15 +38,14 @@ pub enum RefinementExprKind {
     },
 
     TupleLit(Vec<RefinementExpr>),
-    MapLit(Vec<(RefinementExpr, RefinementExpr)>),
-    StructLit(NameId, Vec<(String, RefinementExpr)>),
-    VariantLit(NameId, String, Option<Box<RefinementExpr>>),
+    StructLit(NameId, Vec<(NameId, RefinementExpr)>),
+    VariantLit(NameId, NameId, Option<Box<RefinementExpr>>),
 
-    IsVariant(Box<RefinementExpr>, String),
+    IsVariant(Box<RefinementExpr>, NameId, NameId),
     VariantPayload(Box<RefinementExpr>),
 
     TupleAccess(Box<RefinementExpr>, usize),
-    FieldAccess(Box<RefinementExpr>, String),
+    FieldAccess(Box<RefinementExpr>, NameId),
 
     Conditional(Box<RefinementCond>),
 

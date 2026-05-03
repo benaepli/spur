@@ -282,25 +282,25 @@ fn prints_struct_and_enum_defs_sorted() {
     struct_defs.insert(
         nid(7),
         vec![
-            ("ok".to_string(), Type::Bool),
-            ("id".to_string(), Type::Int),
+            (NameId(100), "ok".to_string(), Type::Bool),
+            (NameId(101), "id".to_string(), Type::Int),
         ],
     );
-    struct_defs.insert(nid(3), vec![("x".to_string(), Type::Int)]);
+    struct_defs.insert(nid(3), vec![(NameId(102), "x".to_string(), Type::Int)]);
 
     let mut enum_defs = HashMap::new();
     enum_defs.insert(
         nid(9),
         vec![
-            ("Some".to_string(), Some(Type::Int)),
-            ("None".to_string(), None),
+            (NameId(103), "Some".to_string(), Some(Type::Int)),
+            (NameId(104), "None".to_string(), None),
         ],
     );
-    enum_defs.insert(nid(5), vec![("Red".to_string(), None)]);
+    enum_defs.insert(nid(5), vec![(NameId(105), "Red".to_string(), None)]);
 
     let prog = PProgram {
         top_level_defs: vec![],
-        next_name_id: 100,
+        next_name_id: 200,
         id_to_name: HashMap::new(),
         struct_defs,
         enum_defs,
@@ -327,21 +327,21 @@ fn prints_struct_and_enum_defs_with_names() {
     struct_defs.insert(
         nid(7),
         vec![
-            ("ok".to_string(), Type::Bool),
-            ("body".to_string(), Type::Int),
+            (NameId(106), "ok".to_string(), Type::Bool),
+            (NameId(107), "body".to_string(), Type::Int),
         ],
     );
-    struct_defs.insert(nid(3), vec![("x".to_string(), Type::Int)]);
+    struct_defs.insert(nid(3), vec![(NameId(108), "x".to_string(), Type::Int)]);
 
     let mut enum_defs = HashMap::new();
     enum_defs.insert(
         nid(9),
         vec![
-            ("Some".to_string(), Some(Type::Int)),
-            ("None".to_string(), None),
+            (NameId(109), "Some".to_string(), Some(Type::Int)),
+            (NameId(110), "None".to_string(), None),
         ],
     );
-    enum_defs.insert(nid(5), vec![("Happy".to_string(), None)]);
+    enum_defs.insert(nid(5), vec![(NameId(111), "Happy".to_string(), None)]);
 
     let mut id_to_name = HashMap::new();
     id_to_name.insert(nid(3), "Color".to_string());
@@ -351,7 +351,7 @@ fn prints_struct_and_enum_defs_with_names() {
 
     let prog = PProgram {
         top_level_defs: vec![],
-        next_name_id: 100,
+        next_name_id: 200,
         id_to_name,
         struct_defs,
         enum_defs,

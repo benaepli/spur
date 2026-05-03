@@ -51,8 +51,8 @@ pub enum AExprKind {
     Conditional(Box<ACondExpr>),
     Block(Box<ABlock>),
 
-    VariantLit(NameId, String, Option<AAtomic>),
-    IsVariant(AAtomic, String),
+    VariantLit(NameId, NameId, Option<AAtomic>),
+    IsVariant(AAtomic, NameId, NameId),
     VariantPayload(AAtomic),
 
     UnwrapOptional(AAtomic),
@@ -71,13 +71,13 @@ pub enum AExprKind {
     Index(AAtomic, AAtomic),
     Slice(AAtomic, AAtomic, AAtomic),
     TupleAccess(AAtomic, usize),
-    FieldAccess(AAtomic, String),
+    FieldAccess(AAtomic, NameId),
 
-    SafeFieldAccess(AAtomic, String),
+    SafeFieldAccess(AAtomic, NameId),
     SafeIndex(AAtomic, AAtomic),
     SafeTupleAccess(AAtomic, usize),
 
-    StructLit(NameId, Vec<(String, AAtomic)>),
+    StructLit(NameId, Vec<(NameId, AAtomic)>),
 
     WrapInOptional(AAtomic),
     PersistData(AAtomic),
@@ -217,6 +217,6 @@ pub struct AProgram {
     pub top_level_defs: Vec<ATopLevelDef>,
     pub next_name_id: usize,
     pub id_to_name: HashMap<NameId, String>,
-    pub struct_defs: HashMap<NameId, Vec<(String, Type)>>,
-    pub enum_defs: HashMap<NameId, Vec<(String, Option<Type>)>>,
+    pub struct_defs: HashMap<NameId, Vec<(NameId, String, Type)>>,
+    pub enum_defs: HashMap<NameId, Vec<(NameId, String, Option<Type>)>>,
 }

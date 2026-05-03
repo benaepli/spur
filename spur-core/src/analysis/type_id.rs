@@ -28,14 +28,14 @@ pub fn assign_type_ids(program: &TypedProgram) -> TypeIdMap {
 
     // Register types from struct definitions.
     for fields in program.struct_defs.values() {
-        for (_field_name, field_ty) in fields {
+        for (_, _field_name, field_ty) in fields {
             register(field_ty, &mut map, &mut next_id);
         }
     }
 
     // Register types from enum definitions.
     for variants in program.enum_defs.values() {
-        for (_variant_name, payload_ty) in variants {
+        for (_, _variant_name, payload_ty) in variants {
             if let Some(ty) = payload_ty {
                 register(ty, &mut map, &mut next_id);
             }
@@ -227,8 +227,8 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
         | TypedExprKind::Recv(e)
         | TypedExprKind::Fifo(e)
         | TypedExprKind::TupleAccess(e, _)
-        | TypedExprKind::FieldAccess(e, _)
-        | TypedExprKind::SafeFieldAccess(e, _)
+        | TypedExprKind::FieldAccess(e, _, _)
+        | TypedExprKind::SafeFieldAccess(e, _, _)
         | TypedExprKind::SafeTupleAccess(e, _)
         | TypedExprKind::WrapInOptional(e)
         | TypedExprKind::PersistData(e) => {
@@ -286,13 +286,13 @@ fn register_expr(expr: &TypedExpr, map: &mut TypeIdMap, next_id: &mut u32) {
         TypedExprKind::Block(block) => {
             register_block(block, map, next_id);
         }
-        TypedExprKind::VariantLit(_, _, payload) => {
+        TypedExprKind::VariantLit(_, _, _, payload) => {
             if let Some(p) = payload {
                 register_expr(p, map, next_id);
             }
         }
         TypedExprKind::StructLit(_, fields) => {
-            for (_, e) in fields {
+            for (_, _, e) in fields {
                 register_expr(e, map, next_id);
             }
         }
@@ -329,7 +329,7 @@ fn register_pattern(pat: &TypedPattern, map: &mut TypeIdMap, next_id: &mut u32) 
                 register_pattern(p, map, next_id);
             }
         }
-        TypedPatternKind::Variant(_, _, payload) => {
+        TypedPatternKind::Variant(_, _, _, payload) => {
             if let Some(p) = payload {
                 register_pattern(p, map, next_id);
             }

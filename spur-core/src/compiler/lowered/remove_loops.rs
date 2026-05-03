@@ -367,7 +367,7 @@ impl<'a> LoopRemover<'a> {
             LExprKind::VariantLit(_, _, Some(e)) => {
                 self.remove_for_loops_in_expr(e);
             }
-            LExprKind::IsVariant(e, _)
+            LExprKind::IsVariant(e, _, _)
             | LExprKind::FieldAccess(e, _)
             | LExprKind::SafeFieldAccess(e, _)
             | LExprKind::TupleAccess(e, _)
@@ -512,7 +512,7 @@ fn replace_continue_in_expr(expr: &mut LExpr, increment: &[LStatement]) {
         LExprKind::VariantLit(_, _, Some(e)) => {
             replace_continue_in_expr(e, increment);
         }
-        LExprKind::IsVariant(e, _)
+        LExprKind::IsVariant(e, _, _)
         | LExprKind::FieldAccess(e, _)
         | LExprKind::SafeFieldAccess(e, _)
         | LExprKind::TupleAccess(e, _)

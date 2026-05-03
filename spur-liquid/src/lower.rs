@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
-use crate::analysis::resolver::{BuiltinFn, NameId};
-use crate::analysis::types::{
+use spur_ast::binop::BinOp;
+use spur_ast::name::{BuiltinFn, NameId};
+use spur_ast::pure::*;
+use spur_ast::types::{
     RefinementBody, Type, TypedBlock, TypedCondExpr, TypedExpr, TypedExprKind, TypedFuncCall,
 };
-use crate::parser::BinOp;
-use crate::liquid::pure::ast::*;
 
-use super::ast::*;
-use super::builtins::BuiltinKind;
-use super::refinement::{
+use crate::builtins::BuiltinKind;
+use crate::ir::*;
+use crate::refinement::{
     RefinementCond, RefinementExpr, RefinementExprKind, RefinementIfBranch,
 };
 
@@ -70,7 +70,7 @@ pub fn lower_program(program: PProgram) -> LowerOutput {
     for (id, fields) in struct_entries {
         let lowered: Vec<_> = fields
             .iter()
-            .map(|(name, ty)| (name.clone(), lowerer.lower_type(ty)))
+            .map(|(field_id, name, ty)| (*field_id, name.clone(), lowerer.lower_type(ty)))
             .collect();
         lowerer.struct_defs.insert(id, lowered);
     }
@@ -82,7 +82,7 @@ pub fn lower_program(program: PProgram) -> LowerOutput {
     for (id, variants) in enum_entries {
         let lowered: Vec<_> = variants
             .iter()
-            .map(|(name, payload)| (name.clone(), payload.as_ref().map(|p| lowerer.lower_type(p))))
+            .map(|(variant_id, name, payload)| (*variant_id, name.clone(), payload.as_ref().map(|p| lowerer.lower_type(p))))
             .collect();
         lowerer.enum_defs.insert(id, lowered);
     }
@@ -112,7 +112,7 @@ pub fn lower_program(program: PProgram) -> LowerOutput {
         id_to_name: lowerer.id_to_name,
     };
     let mut refinement_errors = lowerer.refinement_errors;
-    refinement_errors.extend(super::validate::validate_refinements(&program));
+    refinement_errors.extend(crate::validate::validate_refinements(&program));
     LowerOutput {
         program,
         refinement_errors,
@@ -126,8 +126,8 @@ struct CoreLowerer {
     var_types: HashMap<NameId, Type>,
     extern_cache: HashMap<(BuiltinKind, Vec<CType>), NameId>,
     extern_funcs: Vec<CExternFunc>,
-    struct_defs: HashMap<NameId, Vec<(String, CType)>>,
-    enum_defs: HashMap<NameId, Vec<(String, Option<CType>)>>,
+    struct_defs: HashMap<NameId, Vec<(NameId, String, CType)>>,
+    enum_defs: HashMap<NameId, Vec<(NameId, String, Option<CType>)>>,
     funcs: Vec<CFuncDef>,
     /// Cache keyed by `Arc::as_ptr` of source refinement bodies so identical
     /// refinements produce the same lowered CRefinementHandle.
@@ -297,12 +297,7 @@ impl CoreLowerer {
             PExprKind::TupleLit(items) => {
                 CExprKind::TupleLit(items.into_iter().map(lower_atomic).collect())
             }
-            PExprKind::MapLit(pairs) => CExprKind::MapLit(
-                pairs
-                    .into_iter()
-                    .map(|(k, v)| (lower_atomic(k), lower_atomic(v)))
-                    .collect(),
-            ),
+            PExprKind::MapLit(pairs) => self.desugar_map_lit_stmt(pairs, result_ty),
 
             PExprKind::Append(list, item) => {
                 let elem = self.array_elem_of(&list);
@@ -597,10 +592,12 @@ impl CoreLowerer {
             }
             PExprKind::Block(b) => CExprKind::Block(Box::new(self.lower_block(*b))),
 
-            PExprKind::VariantLit(id, name, payload) => {
-                CExprKind::VariantLit(id, name, payload.map(lower_atomic))
+            PExprKind::VariantLit(enum_id, variant_id, payload) => {
+                CExprKind::VariantLit(enum_id, variant_id, payload.map(lower_atomic))
             }
-            PExprKind::IsVariant(a, name) => CExprKind::IsVariant(lower_atomic(a), name),
+            PExprKind::IsVariant(a, enum_id, variant_id) => {
+                CExprKind::IsVariant(lower_atomic(a), enum_id, variant_id)
+            }
             PExprKind::VariantPayload(a) => CExprKind::VariantPayload(lower_atomic(a)),
 
             PExprKind::UnwrapOptional(a) => {
@@ -918,7 +915,7 @@ impl CoreLowerer {
             Type::EmptyList => CType::Never,
             other => extract_array_elem(&self.lower_type(other)).unwrap_or(CType::Never),
         };
-        let span = crate::parser::Span::default();
+        let span = spur_ast::span::Span::default();
 
         // Build the empty list as the seed.
         let empty_value = self.lower_array_empty_stmt(elem.clone(), span);
@@ -999,6 +996,102 @@ impl CoreLowerer {
         }
         let _ = current_ty;
         CExprKind::Atomic(CAtomic::Var(current_id, format!("_list_lit{}", current_id.0)))
+    }
+
+    /// Desugar `{k1: v1, k2: v2, ...}` (statement-side) into a chain of
+    /// `map_empty` + `map_store` calls. Mirrors `desugar_list_lit_stmt`. The
+    /// empty case `{}` pushes a single `map_empty` let and returns its var.
+    fn desugar_map_lit_stmt(
+        &mut self,
+        pairs: Vec<(PAtomic, PAtomic)>,
+        result_ty: &Type,
+    ) -> CExprKind {
+        let (k_ty, v_ty) = match result_ty {
+            Type::Map(k, v) => (self.lower_type(k), self.lower_type(v)),
+            Type::EmptyMap => (CType::Never, CType::Never),
+            other => match self.lower_type(other) {
+                CType::Map(k, v) => ((*k).clone(), (*v).clone()),
+                _ => (CType::Never, CType::Never),
+            },
+        };
+        let span = spur_ast::span::Span::default();
+
+        let empty_value = self.lower_map_empty_stmt(k_ty.clone(), v_ty.clone(), span);
+        let mut current_id = NameId(self.next_name_id);
+        self.next_name_id += 1;
+        let current_orig = format!("_map_lit{}", current_id.0);
+        self.id_to_name.insert(current_id, current_orig.clone());
+        let mut current_ty = empty_value.ty.clone();
+        self.pending_stmts.push(CStatement {
+            kind: CStatementKind::LetAtom(CLetAtom {
+                name: current_id,
+                original_name: current_orig,
+                ty: current_ty.clone(),
+                value: empty_value,
+                user_annotated: false,
+                span,
+            }),
+            span,
+        });
+
+        for (k_atom, v_atom) in pairs {
+            let map_ty = CType::Map(Box::new(k_ty.clone()), Box::new(v_ty.clone()));
+            let k_for_post = k_ty.clone();
+            let v_for_post = v_ty.clone();
+            let target = self.intern_extern_with_dependent_params(
+                BuiltinKind::MapStore,
+                vec![k_ty.clone(), v_ty.clone()],
+                vec![
+                    ("m".to_string(), const_param(map_ty.clone())),
+                    ("k".to_string(), const_param(k_ty.clone())),
+                    ("v".to_string(), const_param(v_ty.clone())),
+                ],
+                move |this, params| {
+                    let post = this.make_map_store_return_handle(
+                        k_for_post,
+                        v_for_post,
+                        params[1].name,
+                        params[1].original_name.clone(),
+                    );
+                    CType::Refined(Box::new(map_ty), post)
+                },
+            );
+            let return_type = self.extern_return_type(target);
+            let kind = CExprKind::FuncCall(CFuncCall {
+                target,
+                args: vec![
+                    CAtomic::Var(current_id, format!("_map_lit{}", current_id.0)),
+                    lower_atomic(k_atom),
+                    lower_atomic(v_atom),
+                ],
+                return_type: return_type.clone(),
+            });
+            let value = CExpr {
+                kind,
+                ty: return_type.clone(),
+                span,
+            };
+
+            let next_id = NameId(self.next_name_id);
+            self.next_name_id += 1;
+            let next_orig = format!("_map_lit{}", next_id.0);
+            self.id_to_name.insert(next_id, next_orig.clone());
+            self.pending_stmts.push(CStatement {
+                kind: CStatementKind::LetAtom(CLetAtom {
+                    name: next_id,
+                    original_name: next_orig,
+                    ty: return_type.clone(),
+                    value,
+                    user_annotated: false,
+                    span,
+                }),
+                span,
+            });
+            current_id = next_id;
+            current_ty = return_type;
+        }
+        let _ = current_ty;
+        CExprKind::Atomic(CAtomic::Var(current_id, format!("_map_lit{}", current_id.0)))
     }
 
     /// Resolve-or-allocate an extern entry, then build the FuncCall expression.
@@ -1178,7 +1271,7 @@ impl CoreLowerer {
         RefinementExpr {
             kind: RefinementExprKind::Var(id, name.to_string()),
             ty,
-            span: crate::parser::Span::default(),
+            span: spur_ast::span::Span::default(),
         }
     }
 
@@ -1186,7 +1279,7 @@ impl CoreLowerer {
         RefinementExpr {
             kind: RefinementExprKind::IntLit(n),
             ty: CType::Int,
-            span: crate::parser::Span::default(),
+            span: spur_ast::span::Span::default(),
         }
     }
 
@@ -1200,7 +1293,7 @@ impl CoreLowerer {
         RefinementExpr {
             kind: RefinementExprKind::BinOp(op, Box::new(l), Box::new(r)),
             ty,
-            span: crate::parser::Span::default(),
+            span: spur_ast::span::Span::default(),
         }
     }
 
@@ -1217,7 +1310,7 @@ impl CoreLowerer {
                 return_type: return_type.clone(),
             },
             ty: return_type,
-            span: crate::parser::Span::default(),
+            span: spur_ast::span::Span::default(),
         }
     }
 
@@ -1225,7 +1318,7 @@ impl CoreLowerer {
         RefinementExpr {
             kind: RefinementExprKind::Not(Box::new(e)),
             ty: CType::Bool,
-            span: crate::parser::Span::default(),
+            span: spur_ast::span::Span::default(),
         }
     }
 
@@ -1798,13 +1891,51 @@ impl CoreLowerer {
             },
 
             TypedExprKind::MapLit(pairs) => {
-                let lowered: Vec<(RefinementExpr, RefinementExpr)> = pairs
-                    .iter()
-                    .map(|(k, v)| {
-                        (self.lower_refinement_expr(k), self.lower_refinement_expr(v))
-                    })
-                    .collect();
-                RefinementExprKind::MapLit(lowered)
+                let (k_ty, v_ty) = match &expr.ty {
+                    Type::Map(k, v) => (self.lower_type(k), self.lower_type(v)),
+                    Type::EmptyMap => (CType::Never, CType::Never),
+                    _ => match self.lower_type(&expr.ty) {
+                        CType::Map(k, v) => ((*k).clone(), (*v).clone()),
+                        _ => (CType::Never, CType::Never),
+                    },
+                };
+                let mut current = self.lower_map_empty_refinement(k_ty.clone(), v_ty.clone());
+                for (k_expr, v_expr) in pairs {
+                    let k_l = self.lower_refinement_expr(k_expr);
+                    let v_l = self.lower_refinement_expr(v_expr);
+                    let map_ty = CType::Map(Box::new(k_ty.clone()), Box::new(v_ty.clone()));
+                    let k_for_post = k_ty.clone();
+                    let v_for_post = v_ty.clone();
+                    let target = self.intern_extern_with_dependent_params(
+                        BuiltinKind::MapStore,
+                        vec![k_ty.clone(), v_ty.clone()],
+                        vec![
+                            ("m".to_string(), const_param(map_ty.clone())),
+                            ("k".to_string(), const_param(k_ty.clone())),
+                            ("v".to_string(), const_param(v_ty.clone())),
+                        ],
+                        move |this, params| {
+                            let post = this.make_map_store_return_handle(
+                                k_for_post,
+                                v_for_post,
+                                params[1].name,
+                                params[1].original_name.clone(),
+                            );
+                            CType::Refined(Box::new(map_ty), post)
+                        },
+                    );
+                    let return_type = self.extern_return_type(target);
+                    current = RefinementExpr {
+                        kind: RefinementExprKind::ExternCall {
+                            target,
+                            args: vec![current, k_l, v_l],
+                            return_type: return_type.clone(),
+                        },
+                        ty: return_type,
+                        span,
+                    };
+                }
+                return current;
             }
             TypedExprKind::ListLit(es) => {
                 let elem = if let Some(first) = es.first() {
@@ -2029,16 +2160,16 @@ impl CoreLowerer {
                 let t_l = Box::new(self.lower_refinement_expr(t));
                 RefinementExprKind::TupleAccess(t_l, *i)
             }
-            TypedExprKind::FieldAccess(s, f) => {
+            TypedExprKind::FieldAccess(s, field_id, _name) => {
                 let s_l = Box::new(self.lower_refinement_expr(s));
-                RefinementExprKind::FieldAccess(s_l, f.clone())
+                RefinementExprKind::FieldAccess(s_l, *field_id)
             }
-            TypedExprKind::SafeFieldAccess(s, field) => {
+            TypedExprKind::SafeFieldAccess(s, field_id, _name) => {
                 let struct_ty = self.lower_type(&s.ty);
                 let ret_c = self.lower_type(&expr.ty);
                 let s_l = self.lower_refinement_expr(s);
                 let target = self.intern_extern(
-                    BuiltinKind::SafeField(field.clone()),
+                    BuiltinKind::SafeField(*field_id),
                     vec![struct_ty.clone(), ret_c.clone()],
                     vec![struct_ty],
                     ret_c.clone(),
@@ -2088,16 +2219,18 @@ impl CoreLowerer {
                 *id,
                 fields
                     .iter()
-                    .map(|(n, e)| (n.clone(), self.lower_refinement_expr(e)))
+                    .map(|(field_id, _name, e)| (*field_id, self.lower_refinement_expr(e)))
                     .collect(),
             ),
-            TypedExprKind::VariantLit(id, name, payload) => RefinementExprKind::VariantLit(
-                *id,
-                name.clone(),
-                payload
-                    .as_ref()
-                    .map(|p| Box::new(self.lower_refinement_expr(p))),
-            ),
+            TypedExprKind::VariantLit(enum_id, variant_id, _name, payload) => {
+                RefinementExprKind::VariantLit(
+                    *enum_id,
+                    *variant_id,
+                    payload
+                        .as_ref()
+                        .map(|p| Box::new(self.lower_refinement_expr(p))),
+                )
+            }
 
             TypedExprKind::Conditional(cond) => {
                 let lowered = self.lower_refinement_cond(cond);
@@ -2147,7 +2280,7 @@ impl CoreLowerer {
         }
     }
 
-    fn disallowed(&mut self, what: &'static str, span: crate::parser::Span) -> RefinementExprKind {
+    fn disallowed(&mut self, what: &'static str, span: spur_ast::span::Span) -> RefinementExprKind {
         self.refinement_errors.push(RefinementValidationError {
             kind: RefinementValidationErrorKind::DisallowedExpression(what),
             span,
@@ -2236,14 +2369,62 @@ impl CoreLowerer {
                 return_type: return_type.clone(),
             },
             ty: return_type,
-            span: crate::parser::Span::default(),
+            span: spur_ast::span::Span::default(),
         }
+    }
+
+    /// Build a refinement-side `map_empty<K, V>()` ExternCall expression.
+    /// The extern's return type is plain `Map(K, V)` — successive `map_store`
+    /// calls layer the per-key `map_exists` invariants on top.
+    fn lower_map_empty_refinement(&mut self, k_ty: CType, v_ty: CType) -> RefinementExpr {
+        let k_for_builder = k_ty.clone();
+        let v_for_builder = v_ty.clone();
+        let target = self.intern_extern_with_params(
+            BuiltinKind::MapEmpty,
+            vec![k_ty.clone(), v_ty.clone()],
+            vec![],
+            move |_this, _params| CType::Map(Box::new(k_for_builder), Box::new(v_for_builder)),
+        );
+        let return_type = self.extern_return_type(target);
+        RefinementExpr {
+            kind: RefinementExprKind::ExternCall {
+                target,
+                args: vec![],
+                return_type: return_type.clone(),
+            },
+            ty: return_type,
+            span: spur_ast::span::Span::default(),
+        }
+    }
+
+    /// Build a statement-side `map_empty<K, V>()` FuncCall. Returns a `CExpr`
+    /// suitable for use as a let-atom value.
+    fn lower_map_empty_stmt(
+        &mut self,
+        k_ty: CType,
+        v_ty: CType,
+        span: spur_ast::span::Span,
+    ) -> CExpr {
+        let k_for_builder = k_ty.clone();
+        let v_for_builder = v_ty.clone();
+        let kind = self.emit_extern_call_with_params(
+            BuiltinKind::MapEmpty,
+            vec![k_ty.clone(), v_ty.clone()],
+            vec![],
+            move |_this, _params| CType::Map(Box::new(k_for_builder), Box::new(v_for_builder)),
+            vec![],
+        );
+        let ty = match &kind {
+            CExprKind::FuncCall(call) => call.return_type.clone(),
+            _ => unreachable!("emit_extern_call_with_params returns FuncCall"),
+        };
+        CExpr { kind, ty, span }
     }
 
     /// Build a statement-side `array_empty<T>()` FuncCall. Returns a `CExpr`
     /// suitable for use as a let-atom value. The extern's return type matches
     /// the refinement-side construction (layered refined list).
-    fn lower_array_empty_stmt(&mut self, elem: CType, span: crate::parser::Span) -> CExpr {
+    fn lower_array_empty_stmt(&mut self, elem: CType, span: spur_ast::span::Span) -> CExpr {
         let elem_for_builder = elem.clone();
         let kind = self.emit_extern_call_with_params(
             BuiltinKind::ArrayEmpty,
@@ -2301,7 +2482,7 @@ impl CoreLowerer {
     fn lower_refinement_block(
         &mut self,
         block: &TypedBlock,
-        span: crate::parser::Span,
+        span: spur_ast::span::Span,
     ) -> Option<RefinementExpr> {
         if !block.statements.is_empty() {
             self.refinement_errors.push(RefinementValidationError {
@@ -2321,7 +2502,7 @@ impl CoreLowerer {
     fn lower_refinement_block_or_error(
         &mut self,
         block: &TypedBlock,
-        span: crate::parser::Span,
+        span: spur_ast::span::Span,
     ) -> RefinementExpr {
         match self.lower_refinement_block(block, span) {
             Some(e) => e,
@@ -2337,7 +2518,7 @@ impl CoreLowerer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefinementValidationError {
     pub kind: RefinementValidationErrorKind,
-    pub span: crate::parser::Span,
+    pub span: spur_ast::span::Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

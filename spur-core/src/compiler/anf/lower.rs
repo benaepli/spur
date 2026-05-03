@@ -282,18 +282,18 @@ impl AnfLowerer {
             }
 
             // Variant
-            LExprKind::VariantLit(id, name, payload) => {
+            LExprKind::VariantLit(enum_id, variant_id, payload) => {
                 let apayload = payload.map(|e| self.lower_expr_to_atomic(*e, stmts));
                 AExpr {
-                    kind: AExprKind::VariantLit(id, name, apayload),
+                    kind: AExprKind::VariantLit(enum_id, variant_id, apayload),
                     ty,
                     span,
                 }
             }
-            LExprKind::IsVariant(e, name) => {
+            LExprKind::IsVariant(e, enum_id, variant_id) => {
                 let a = self.lower_expr_to_atomic(*e, stmts);
                 AExpr {
-                    kind: AExprKind::IsVariant(a, name),
+                    kind: AExprKind::IsVariant(a, enum_id, variant_id),
                     ty,
                     span,
                 }
@@ -408,19 +408,19 @@ impl AnfLowerer {
                     span,
                 }
             }
-            LExprKind::FieldAccess(e, name) => {
+            LExprKind::FieldAccess(e, field_id) => {
                 let a = self.lower_expr_to_atomic(*e, stmts);
                 AExpr {
-                    kind: AExprKind::FieldAccess(a, name),
+                    kind: AExprKind::FieldAccess(a, field_id),
                     ty,
                     span,
                 }
             }
 
-            LExprKind::SafeFieldAccess(e, name) => {
+            LExprKind::SafeFieldAccess(e, field_id) => {
                 let a = self.lower_expr_to_atomic(*e, stmts);
                 AExpr {
-                    kind: AExprKind::SafeFieldAccess(a, name),
+                    kind: AExprKind::SafeFieldAccess(a, field_id),
                     ty,
                     span,
                 }
@@ -447,9 +447,9 @@ impl AnfLowerer {
             LExprKind::StructLit(id, fields) => {
                 let afields: Vec<_> = fields
                     .into_iter()
-                    .map(|(name, e)| {
+                    .map(|(field_id, e)| {
                         let a = self.lower_expr_to_atomic(e, stmts);
-                        (name, a)
+                        (field_id, a)
                     })
                     .collect();
                 AExpr {

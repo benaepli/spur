@@ -1,0 +1,998 @@
+type name_id = i32
+
+type binop =
+  | and_op
+  | or_op
+  | less
+  | less_equal
+  | greater
+  | greater_equal
+  | add
+  | subtract
+  | multiply
+  | divide
+  | modulo
+  | int_eq
+  | int_neq
+  | bool_eq
+  | bool_neq
+
+type c_type =
+  | t_int
+  | t_bool
+  | t_string
+  | t_nil
+  | t_never
+  | t_tuple(c_type list)
+  | t_array(c_type)
+  | t_map(c_type, c_type)
+  | t_optional(c_type)
+  | t_chan(c_type)
+  | t_fifo_link(c_type)
+  | t_iter(c_type)
+  | t_struct(name_id)
+  | t_variant(name_id)
+  | t_role(name_id)
+  | t_refined(name_id, c_type, refexpr)
+
+and refexpr =
+  | r_var(name_id)
+  | r_int_lit(i64)
+  | r_string_lit(string)
+  | r_bool_lit(bool)
+  | r_nil
+  | r_bin_op(binop, refexpr, refexpr)
+  | r_not(refexpr)
+  | r_negate(refexpr)
+  | r_eq(refexpr, refexpr)
+  | r_is_variant(name_id, name_id, name_id)
+  | r_app(name_id, refexpr list)
+
+type c_atomic =
+  | a_var(name_id)
+  | a_int_lit(i64)
+  | a_string_lit(string)
+  | a_bool_lit(bool)
+  | a_nil
+  | a_never
+
+type c_stmt =
+  | s_let(name_id, c_type option, c_expr)
+  | s_expr(c_expr)
+  | s_return(c_atomic)
+
+and c_block = block(c_stmt list, c_atomic option)
+
+and c_cond_branch = cond_branch(c_atomic, c_block)
+
+and c_expr =
+  | e_atomic(c_atomic)
+  | e_binop(binop, c_atomic, c_atomic)
+  | e_func_call(name_id, c_atomic list)
+  | e_tuple_lit(c_atomic list)
+  | e_struct_lit(name_id, (name_id * c_atomic) list)
+  | e_field_access(c_atomic, name_id)
+  | e_not(c_atomic)
+  | e_negate(c_atomic)
+  | e_tuple_access(c_atomic, i32)
+  | e_variant_lit(name_id, name_id, c_atomic option)
+  | e_is_variant(c_atomic, name_id, name_id)
+  | e_variant_payload(c_atomic, name_id, name_id)
+  | e_block(c_block)
+  | e_cond(c_cond_branch list, c_block)
+
+type env = (name_id * c_type) list
+
+type func_param = fparam(name_id, c_type)
+type func_sig = fsig(func_param list, c_type)
+type func_env = (name_id * func_sig) list
+type func_def = fdef(name_id, func_param list, c_type, c_block)
+
+type struct_env = (name_id * (name_id * c_type) list) list
+type enum_env = (name_id * (name_id * c_type option) list) list
+type global_ctx = gctx(func_env, struct_env, enum_env)
+
+@edb rel tuple_accessor(i32, name_id)
+@edb rel program_in(global_ctx, func_def list, i32)
+@edb rel fn_to_check(name_id)
+@edb rel expr_origin(i32, i32, i32)
+
+fun subst_refexpr(NewExpr: refexpr, Old_id: name_id, Expr: refexpr) : refexpr =
+    match Expr with
+    | r_var(Id) =>
+        if Id = Old_id then NewExpr else Expr
+    | r_bin_op(Op, Lhs, Rhs) =>
+        r_bin_op(Op, subst_refexpr(NewExpr, Old_id, Lhs), subst_refexpr(NewExpr, Old_id, Rhs))
+    | r_not(Inner) =>
+        r_not(subst_refexpr(NewExpr, Old_id, Inner))
+    | r_negate(Inner) =>
+        r_negate(subst_refexpr(NewExpr, Old_id, Inner))
+    | r_eq(Lhs, Rhs) =>
+        r_eq(subst_refexpr(NewExpr, Old_id, Lhs), subst_refexpr(NewExpr, Old_id, Rhs))
+    | r_app(FuncId, Args) =>
+        r_app(FuncId, subst_refexpr_list(NewExpr, Old_id, Args))
+    | _ => Expr
+    end
+
+and subst_refexpr_list(NewExpr: refexpr, Old_id: name_id, Lst: refexpr list) : refexpr list =
+    match Lst with
+    | [] => []
+    | H :: Rest =>
+        subst_refexpr(NewExpr, Old_id, H) :: subst_refexpr_list(NewExpr, Old_id, Rest)
+    end
+
+(* Joins nested refinements by logically ANDing them together. *)
+fun canonicalize(T: c_type) : c_type =
+    match T with
+    | t_refined(V_out, t_refined(V_in, Base_ty, P_in), P_out) =>
+        let P_in_subbed = subst_refexpr(r_var(V_out), V_in, P_in) in
+        let P_combined = r_bin_op(and_op, P_in_subbed, P_out) in
+        canonicalize(t_refined(V_out, Base_ty, P_combined))
+    | t_refined(V, Base_ty, P) =>
+        t_refined(V, canonicalize(Base_ty), P)
+    | t_array(Inner) =>
+        t_array(canonicalize(Inner))
+    | _ => T
+    end
+
+fun env_lookup(X: name_id, Env: env) : c_type option =
+    match Env with
+    | [] => none
+    | (Id, T) :: Rest =>
+        if Id = X then some(T) else env_lookup(X, Rest)
+    end
+
+fun fenv_lookup(F: name_id, Fenv: func_env) : func_sig option =
+    match Fenv with
+    | [] => none
+    | (Id, Sig) :: Rest =>
+        if Id = F then some(Sig) else fenv_lookup(F, Rest)
+    end
+
+fun struct_lookup(S: name_id, Senv: struct_env) : (name_id * c_type) list option =
+    match Senv with
+    | [] => none
+    | (Id, Fields) :: Rest =>
+        if Id = S then some(Fields) else struct_lookup(S, Rest)
+    end
+
+fun field_lookup(F: name_id, Fields: (name_id * c_type) list) : c_type option =
+    match Fields with
+    | [] => none
+    | (Id, T) :: Rest =>
+        if Id = F then some(T) else field_lookup(F, Rest)
+    end
+
+fun assoc_lookup(Key: name_id, Assocs: (name_id * c_atomic) list) : c_atomic option =
+    match Assocs with
+    | [] => none
+    | (K, V) :: Rest =>
+        if K = Key then some(V) else assoc_lookup(Key, Rest)
+    end
+
+fun enum_lookup(E: name_id, Eenv: enum_env) : (name_id * c_type option) list option =
+    match Eenv with
+    | [] => none
+    | (Id, Ctors) :: Rest =>
+        if Id = E then some(Ctors) else enum_lookup(E, Rest)
+    end
+
+fun ctor_lookup(C: name_id, Ctors: (name_id * c_type option) list) : c_type option option =
+    match Ctors with
+    | [] => none
+    | (Id, PayloadTy) :: Rest =>
+        if Id = C then some(PayloadTy) else ctor_lookup(C, Rest)
+    end
+
+fun base_type(T: c_type) : c_type =
+    match T with
+    | t_refined(_V, Base, _P) => base_type(Base)
+    | _ => T
+    end
+
+fun list_nth(Lst: c_type list, N: i32) : c_type option =
+    match Lst with
+    | [] => none
+    | H :: Rest =>
+        if N = 0 then some(H) else list_nth(Rest, N - 1)
+    end
+
+fun is_arithmetic_op(Op: binop) : bool =
+    match Op with
+    | add => true
+    | subtract => true
+    | multiply => true
+    | divide => true
+    | modulo => true
+    | _ => false
+    end
+
+fun is_comparison_op(Op: binop) : bool =
+    match Op with
+    | less => true
+    | less_equal => true
+    | greater => true
+    | greater_equal => true
+    | int_eq => true
+    | int_neq => true
+    | _ => false
+    end
+
+fun is_logical_op(Op: binop) : bool =
+    match Op with
+    | and_op => true
+    | or_op => true
+    | bool_eq => true
+    | bool_neq => true
+    | _ => false
+    end
+
+fun atomic_to_refexpr(A: c_atomic) : refexpr =
+    match A with
+    | a_var(Id) => r_var(Id)
+    | a_int_lit(N) => r_int_lit(N)
+    | a_string_lit(S) => r_string_lit(S)
+    | a_bool_lit(B) => r_bool_lit(B)
+    | a_nil => r_nil
+    | a_never => r_var(-9999)
+    end
+
+fun iff_refexpr(V: refexpr, P: refexpr) : refexpr =
+    r_bin_op(and_op,
+        r_bin_op(or_op, r_not(V), P),
+        r_bin_op(or_op, V, r_not(P)))
+
+fun fresh(Ctr: i32) : i32 * i32 = (Ctr, Ctr - 1)
+
+fun refine_env_true(Env: env, Cond: c_atomic, Ctr: i32) : env * i32 =
+    let (V, Ctr1) = fresh(Ctr) in
+    ((V, t_refined(V, t_bool, atomic_to_refexpr(Cond))) :: Env, Ctr1)
+
+fun refine_env_false(Env: env, Cond: c_atomic, Ctr: i32) : env * i32 =
+    let (V, Ctr1) = fresh(Ctr) in
+    ((V, t_refined(V, t_bool, r_not(atomic_to_refexpr(Cond)))) :: Env, Ctr1)
+
+fun subst_type(NewExpr: refexpr, Old_id: name_id, T: c_type) : c_type =
+    match T with
+    | t_refined(V, Base, Ref) =>
+        if V = Old_id then T
+        else t_refined(V, subst_type(NewExpr, Old_id, Base),
+                       subst_refexpr(NewExpr, Old_id, Ref))
+    | t_array(Inner) => t_array(subst_type(NewExpr, Old_id, Inner))
+    | _ => T
+    end
+
+fun subst_params(NewExpr: refexpr, Old_id: name_id, Params: func_param list) : func_param list =
+    match Params with
+    | [] => []
+    | fparam(Id, Ty) :: Rest =>
+        fparam(Id, subst_type(NewExpr, Old_id, Ty)) :: subst_params(NewExpr, Old_id, Rest)
+    end
+
+uninterpreted fun ast_var_bool(i32 smt) : bool smt
+uninterpreted fun ast_var_int(i32 smt)  : int smt
+uninterpreted fun smt_is_variant(int smt, int smt, int smt) : bool smt
+uninterpreted fun smt_apply(int smt, int smt) : int smt
+uninterpreted fun smt_to_bool(int smt) : bool smt
+
+fun create_smt_bool_var(Id: name_id): bool smt =
+    `ast_var_bool(Id)`
+
+fun create_smt_int_var(Id: name_id): int smt =
+    `ast_var_int(Id)`
+
+(* Creates a boolean SMT statement for a particular refinement expression. *)
+fun to_smt_bool(Expr: refexpr): bool smt = 
+    match Expr with
+    | r_bool_lit(true) => `true`
+    | r_bool_lit(false) => `false`
+    | r_var(Id) =>
+        create_smt_bool_var(Id)
+    | r_not(Inner) =>
+        let SmtInner = to_smt_bool(Inner) in
+        `~SmtInner`
+    | r_eq(Lhs, Rhs) =>
+        let SmtLhs = to_smt_int(Lhs) in
+        let SmtRhs = to_smt_int(Rhs) in
+        `SmtLhs #= SmtRhs`
+    | r_bin_op(Op, Lhs, Rhs) =>
+        match Op with
+        | and_op        =>
+            let SmtLhs = to_smt_bool(Lhs) in
+            let SmtRhs = to_smt_bool(Rhs) in
+            `SmtLhs /\ SmtRhs`
+        | or_op         =>
+            let SmtLhs = to_smt_bool(Lhs) in
+            let SmtRhs = to_smt_bool(Rhs) in
+            `SmtLhs \/ SmtRhs`
+        | less          =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_lt(SmtLhs, SmtRhs)`
+        | less_equal    =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_le(SmtLhs, SmtRhs)`
+        | greater       =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_gt(SmtLhs, SmtRhs)`
+        | greater_equal =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_ge(SmtLhs, SmtRhs)`
+        | int_eq =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `SmtLhs #= SmtRhs`
+        | int_neq =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `~(SmtLhs #= SmtRhs)`
+        | bool_eq =>
+            let SmtLhs = to_smt_bool(Lhs) in
+            let SmtRhs = to_smt_bool(Rhs) in
+            `(SmtLhs /\ SmtRhs) \/ (~SmtLhs /\ ~SmtRhs)`
+        | bool_neq =>
+            let SmtLhs = to_smt_bool(Lhs) in
+            let SmtRhs = to_smt_bool(Rhs) in
+            `(SmtLhs /\ ~SmtRhs) \/ (~SmtLhs /\ SmtRhs)`
+        | _ => `false`
+        end
+    | r_is_variant(ScrutId, EnumId, CtorId) =>
+        let S = create_smt_int_var(ScrutId) in
+        let E = create_smt_int_var(EnumId) in
+        let C = create_smt_int_var(CtorId) in
+        `smt_is_variant(S, E, C)`
+    | r_app(FuncId, Args) =>
+        let FuncSmt = create_smt_int_var(FuncId) in
+        let Result = apply_args_smt(FuncSmt, Args) in
+        `smt_to_bool(Result)`
+    | _ => `false`
+    end
+
+and to_smt_int(Expr: refexpr): int smt =
+    match Expr with
+    | r_int_lit(Val) =>
+        `int_big_const(Val)`
+    | r_var(Id) =>
+        create_smt_int_var(Id)
+    | r_bin_op(Op, Lhs, Rhs) =>
+        match Op with
+        | add      =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_add(SmtLhs, SmtRhs)`
+        | subtract =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_sub(SmtLhs, SmtRhs)`
+        | multiply =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_mul(SmtLhs, SmtRhs)`
+        | divide   =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_div(SmtLhs, SmtRhs)`
+        | modulo   =>
+            let SmtLhs = to_smt_int(Lhs) in
+            let SmtRhs = to_smt_int(Rhs) in
+            `int_mod(SmtLhs, SmtRhs)`
+        | _ => `int_big_const(0L)`
+        end
+    | r_app(FuncId, Args) =>
+        let FuncSmt = create_smt_int_var(FuncId) in
+        apply_args_smt(FuncSmt, Args)
+    | _ => `int_big_const(0L)`
+    end
+
+and apply_args_smt(Acc: int smt, Args: refexpr list) : int smt =
+    match Args with
+    | [] => Acc
+    | Arg :: Rest =>
+        let SmtArg = to_smt_int(Arg) in
+        let Next = `smt_apply(Acc, SmtArg)` in
+        apply_args_smt(Next, Rest)
+    end
+
+fun env_to_smt(Env: env) : bool smt =
+    match Env with
+    | [] => `true`
+    | (Id, t_refined(BindId, _BaseType, Ref)) :: Rest =>
+        let RenamedRef = subst_refexpr(r_var(Id), BindId, Ref) in
+        let SmtRef = to_smt_bool(RenamedRef) in
+        let SmtRest = env_to_smt(Rest) in
+        `SmtRef /\ SmtRest`
+    | _ :: Rest =>
+        env_to_smt(Rest)
+    end
+
+fun subtype_list(Env: env, Ts1: c_type list, Ts2: c_type list) : bool =
+    match (Ts1, Ts2) with
+    | ([], []) => true
+    | (H1 :: R1, H2 :: R2) =>
+        if subtype(Env, H1, H2) then subtype_list(Env, R1, R2) else false
+    | _ => false
+    end
+
+and subtype(Env: env, T1: c_type, T2: c_type) : bool =
+    match (canonicalize(T1), canonicalize(T2)) with
+    | (t_never, _) => true
+    | (t_int, t_int)       => true
+    | (t_bool, t_bool)     => true
+    | (t_string, t_string) => true
+    | (t_nil, t_nil)       => true
+    | (t_tuple(Ts1), t_tuple(Ts2)) => subtype_list(Env, Ts1, Ts2)
+    | (t_array(Inner1), t_array(Inner2)) => subtype(Env, Inner1, Inner2)
+    | (t_map(K1, V1), t_map(K2, V2)) => subtype(Env, K1, K2) && subtype(Env, V1, V2)
+    | (t_optional(Inner1), t_optional(Inner2)) => subtype(Env, Inner1, Inner2)
+    | (t_chan(Inner1), t_chan(Inner2)) => subtype(Env, Inner1, Inner2)
+    | (t_fifo_link(Inner1), t_fifo_link(Inner2)) => subtype(Env, Inner1, Inner2)
+    | (t_iter(Inner1), t_iter(Inner2)) => subtype(Env, Inner1, Inner2)
+    | (t_struct(A), t_struct(B)) => A = B
+    | (t_variant(A), t_variant(B)) => A = B
+    | (t_role(A), t_role(B)) => A = B
+    | (t_refined(V1, Base1, R1), t_refined(V2, Base2, R2)) =>
+        if subtype(Env, Base1, Base2) then
+            let SmtEnv = env_to_smt(Env) in
+            let SmtR1 = to_smt_bool(R1) in
+
+            let RenamedR2 = subst_refexpr(r_var(V1), V2, R2) in
+            let SmtR2 = to_smt_bool(RenamedR2) in
+            
+            let Implication = `(SmtEnv /\ SmtR1) ==> SmtR2` in
+            
+            is_valid(Implication)
+        else
+            false
+    | (t_refined(_, Base1, _), T2) =>
+        subtype(Env, Base1, T2)
+    | _ => false
+    end
+
+@topdown
+rel synth_expr(env, global_ctx, c_type, c_expr, i32, c_type, i32)
+@topdown
+rel check_expr(env, global_ctx, c_type, c_expr, i32, c_type, i32)
+
+@topdown
+rel check_args(env, global_ctx, c_type, func_param list, c_atomic list, c_type, i32, c_type, i32)
+
+synth_expr(Env, _Ctx, _FRetTy, e_atomic(a_var(X)), Ctr, t_refined(V, Base, r_eq(r_var(V), r_var(X))), CtrOut) :-
+    env_lookup(X, Env) = some(T),
+    base_type(T) = Base,
+    (V, CtrOut) = fresh(Ctr).
+
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_int_lit(N)), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_int_lit(N))), CtrOut) :-
+    (V, CtrOut) = fresh(Ctr).
+
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_bool_lit(true)), Ctr, t_refined(V, t_bool, r_var(V)), CtrOut) :-
+    (V, CtrOut) = fresh(Ctr).
+
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_bool_lit(false)), Ctr, t_refined(V, t_bool, r_not(r_var(V))), CtrOut) :-
+    (V, CtrOut) = fresh(Ctr).
+
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_nil), Ctr, t_nil, Ctr).
+
+synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_bin_op(Op, Re1, Re2))), CtrOut) :-
+    is_arithmetic_op(Op),
+    atomic_to_refexpr(A1) = Re1,
+    atomic_to_refexpr(A2) = Re2,
+    (V, CtrOut) = fresh(Ctr).
+
+synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_bool, Pred), CtrOut) :-
+    is_comparison_op(Op),
+    atomic_to_refexpr(A1) = Re1,
+    atomic_to_refexpr(A2) = Re2,
+    (V, CtrOut) = fresh(Ctr),
+    iff_refexpr(r_var(V), r_bin_op(Op, Re1, Re2)) = Pred.
+
+synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_bool, Pred), CtrOut) :-
+    is_logical_op(Op),
+    atomic_to_refexpr(A1) = Re1,
+    atomic_to_refexpr(A2) = Re2,
+    (V, CtrOut) = fresh(Ctr),
+    iff_refexpr(r_var(V), r_bin_op(Op, Re1, Re2)) = Pred.
+
+synth_expr(_Env, _Ctx, _FRetTy, e_not(A), Ctr, t_refined(V, t_bool, Pred), CtrOut) :-
+    (V, CtrOut) = fresh(Ctr),
+    atomic_to_refexpr(A) = Re,
+    iff_refexpr(r_var(V), r_not(Re)) = Pred.
+
+synth_expr(_Env, _Ctx, _FRetTy, e_negate(A), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_bin_op(subtract, r_int_lit(0L), Re))), CtrOut) :-
+    atomic_to_refexpr(A) = Re,
+    (V, CtrOut) = fresh(Ctr).
+
+synth_expr(Env, Ctx, FRetTy, e_tuple_access(a_var(X), Idx), Ctr, t_refined(V, ElemTy, r_eq(r_var(V), r_app(AccId, [r_var(X)]))), CtrOut) :-
+    synth_expr(Env, Ctx, FRetTy, e_atomic(a_var(X)), Ctr, ReceiverTy, Ctr1),
+    base_type(ReceiverTy) = t_tuple(Tys),
+    list_nth(Tys, Idx) = some(ElemTy),
+    tuple_accessor(Idx, AccId),
+    (V, CtrOut) = fresh(Ctr1).
+
+@topdown
+rel synth_tuple(env, global_ctx, c_type, c_atomic list, i32, c_type list, i32)
+
+synth_tuple(_Env, _Ctx, _FRetTy, [], Ctr, [], Ctr).
+
+synth_tuple(Env, Ctx, FRetTy, A :: Rest, Ctr, T :: RestTys, CtrOut) :-
+    synth_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, T, Ctr1),
+    synth_tuple(Env, Ctx, FRetTy, Rest, Ctr1, RestTys, CtrOut).
+
+synth_expr(Env, Ctx, FRetTy, e_tuple_lit(Elems), Ctr, t_tuple(Tys), CtrOut) :-
+    synth_tuple(Env, Ctx, FRetTy, Elems, Ctr, Tys, CtrOut).
+
+synth_expr(Env, Ctx, FRetTy, e_func_call(F, Args), Ctr, ResultTy, CtrOut) :-
+    Ctx = gctx(Fenv, _Senv, _Eenv),
+    fenv_lookup(F, Fenv) = some(fsig(Params, RetTy)),
+    check_args(Env, Ctx, FRetTy, Params, Args, RetTy, Ctr, ResultTy, CtrOut).
+
+@topdown
+rel check_struct_fields(env, global_ctx, c_type, (name_id * c_type) list, (name_id * c_atomic) list, i32, i32)
+
+check_struct_fields(_Env, _Ctx, _FRetTy, [], _Assignments, Ctr, Ctr).
+
+check_struct_fields(Env, Ctx, FRetTy, (FieldName, FieldTy) :: RestFields, Assignments, Ctr, CtrOut) :-
+    assoc_lookup(FieldName, Assignments) = some(Val),
+    check_expr(Env, Ctx, FRetTy, e_atomic(Val), Ctr, FieldTy, Ctr1),
+    check_struct_fields(Env, Ctx, FRetTy, RestFields, Assignments, Ctr1, CtrOut).
+
+synth_expr(Env, Ctx, FRetTy, e_struct_lit(StructName, Assignments), Ctr, t_struct(StructName), CtrOut) :-
+    Ctx = gctx(_Fenv, Senv, _Eenv),
+    struct_lookup(StructName, Senv) = some(Fields),
+    check_struct_fields(Env, Ctx, FRetTy, Fields, Assignments, Ctr, CtrOut).
+
+synth_expr(Env, Ctx, FRetTy, e_field_access(a_var(X), FieldName), Ctr, t_refined(V, FieldTy, r_eq(r_var(V), r_app(FieldName, [r_var(X)]))), CtrOut) :-
+    synth_expr(Env, Ctx, FRetTy, e_atomic(a_var(X)), Ctr, ReceiverTy, Ctr1),
+    base_type(ReceiverTy) = t_struct(StructName),
+    Ctx = gctx(_Fenv, Senv, _Eenv),
+    struct_lookup(StructName, Senv) = some(Fields),
+    field_lookup(FieldName, Fields) = some(FieldTy),
+    (V, CtrOut) = fresh(Ctr1).
+
+synth_expr(_Env, Ctx, _FRetTy, e_variant_lit(EnumId, CtorId, none), Ctr, t_variant(EnumId), Ctr) :-
+    Ctx = gctx(_Fenv, _Senv, Eenv),
+    enum_lookup(EnumId, Eenv) = some(Ctors),
+    ctor_lookup(CtorId, Ctors) = some(none).
+
+synth_expr(Env, Ctx, FRetTy, e_variant_lit(EnumId, CtorId, some(Payload)), Ctr, t_variant(EnumId), CtrOut) :-
+    Ctx = gctx(_Fenv, _Senv, Eenv),
+    enum_lookup(EnumId, Eenv) = some(Ctors),
+    ctor_lookup(CtorId, Ctors) = some(some(PayloadTy)),
+    check_expr(Env, Ctx, FRetTy, e_atomic(Payload), Ctr, PayloadTy, CtrOut).
+
+synth_expr(Env, Ctx, _FRetTy, e_is_variant(a_var(X), EnumId, CtorId), Ctr, t_refined(V, t_bool, r_is_variant(X, EnumId, CtorId)), CtrOut) :-
+    env_lookup(X, Env) = some(XTy),
+    base_type(XTy) = t_variant(EnumId),
+    Ctx = gctx(_Fenv, _Senv, Eenv),
+    enum_lookup(EnumId, Eenv) = some(Ctors),
+    ctor_lookup(CtorId, Ctors) = some(_),
+    (V, CtrOut) = fresh(Ctr).
+
+synth_expr(Env, Ctx, _FRetTy, e_variant_payload(a_var(X), EnumId, CtorId), Ctr, PayloadTy, Ctr) :-
+    Ctx = gctx(_Fenv, _Senv, Eenv),
+    enum_lookup(EnumId, Eenv) = some(Ctors),
+    ctor_lookup(CtorId, Ctors) = some(some(PayloadTy)),
+    let SmtEnv = env_to_smt(Env) in
+    let Goal = to_smt_bool(r_is_variant(X, EnumId, CtorId)) in
+    is_valid(`SmtEnv ==> Goal`).
+
+check_args(_Env, _Ctx, _FRetTy, [], _, RetTy, Ctr, RetTy, Ctr).
+
+check_args(Env, Ctx, FRetTy, fparam(ParamId, ParamTy) :: RestParams, Arg :: RestArgs, RetTy, Ctr, ResultTy, CtrOut) :-
+    check_expr(Env, Ctx, FRetTy, e_atomic(Arg), Ctr, ParamTy, CtrMid),
+    atomic_to_refexpr(Arg) = ArgRef,
+    subst_params(ArgRef, ParamId, RestParams) = SubstRestParams,
+    subst_type(ArgRef, ParamId, RetTy) = SubstRetTy,
+    check_args(Env, Ctx, FRetTy, SubstRestParams, RestArgs, SubstRetTy, CtrMid, ResultTy, CtrOut).
+
+@topdown
+rel check_block(env, global_ctx, c_type, c_block, i32, c_type, i32)
+
+check_block(Env, Ctx, FRetTy, block([], some(Tail)), Ctr, T, CtrOut) :-
+    check_expr(Env, Ctx, FRetTy, e_atomic(Tail), Ctr, T, CtrOut).
+
+check_block(_Env, _Ctx, _FRetTy, block([], none), Ctr, _T, Ctr).
+
+check_block(Env, Ctx, FRetTy, block(s_return(A) :: _, _), Ctr, _T, CtrOut) :-
+    check_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, FRetTy, CtrOut).
+
+check_block(Env, Ctx, FRetTy, block(s_let(X, some(AnnTy), E) :: Rest, Tail), Ctr, T, CtrOut) :-
+    check_expr(Env, Ctx, FRetTy, E, Ctr, AnnTy, Ctr1),
+    check_block((X, AnnTy) :: Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut).
+
+check_block(Env, Ctx, FRetTy, block(s_let(X, none, E) :: Rest, Tail), Ctr, T, CtrOut) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, Tx, Ctr1),
+    check_block((X, Tx) :: Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut).
+
+check_block(Env, Ctx, FRetTy, block(s_expr(E) :: Rest, Tail), Ctr, T, CtrOut) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, _Tx, Ctr1),
+    check_block(Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut).
+
+@topdown
+rel synth_block(env, global_ctx, c_type, c_block, i32, c_type, i32)
+
+@topdown
+rel synth_stmts(env, global_ctx, c_type, c_stmt list, i32, env, i32)
+
+synth_stmts(Env, _Ctx, _FRetTy, [], Ctr, Env, Ctr).
+
+synth_stmts(Env, Ctx, FRetTy, s_let(X, some(AnnTy), E) :: Rest, Ctr, EnvOut, CtrOut) :-
+    check_expr(Env, Ctx, FRetTy, E, Ctr, AnnTy, Ctr1),
+    synth_stmts((X, AnnTy) :: Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut).
+
+synth_stmts(Env, Ctx, FRetTy, s_let(X, none, E) :: Rest, Ctr, EnvOut, CtrOut) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, Tx, Ctr1),
+    synth_stmts((X, Tx) :: Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut).
+
+synth_stmts(Env, Ctx, FRetTy, s_expr(E) :: Rest, Ctr, EnvOut, CtrOut) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, _Tx, Ctr1),
+    synth_stmts(Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut).
+
+synth_stmts(Env, Ctx, FRetTy, s_return(A) :: _, Ctr, Env, CtrOut) :-
+    check_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, FRetTy, CtrOut).
+
+synth_block(Env, Ctx, FRetTy, block(Stmts, some(Tail)), Ctr, BaseTy, CtrOut) :-
+    synth_stmts(Env, Ctx, FRetTy, Stmts, Ctr, EnvExt, Ctr1),
+    synth_expr(EnvExt, Ctx, FRetTy, e_atomic(Tail), Ctr1, T, CtrOut),
+    base_type(T) = BaseTy.
+
+synth_block(_Env, _Ctx, _FRetTy, block(_, none), Ctr, t_never, Ctr).
+
+@topdown
+rel check_cond(env, global_ctx, c_type, c_cond_branch list, c_block, i32, c_type, i32)
+
+check_cond(Env, Ctx, FRetTy, [], ElseBlock, Ctr, T, CtrOut) :-
+    check_block(Env, Ctx, FRetTy, ElseBlock, Ctr, T, CtrOut).
+
+check_cond(Env, Ctx, FRetTy, cond_branch(Cond, Body) :: Rest, ElseBlock, Ctr, T, CtrOut) :-
+    refine_env_true(Env, Cond, Ctr) = (EnvTrue, Ctr1),
+    check_block(EnvTrue, Ctx, FRetTy, Body, Ctr1, T, Ctr2),
+    refine_env_false(Env, Cond, Ctr2) = (EnvFalse, Ctr3),
+    check_cond(EnvFalse, Ctx, FRetTy, Rest, ElseBlock, Ctr3, T, CtrOut).
+
+@topdown
+rel synth_cond(env, global_ctx, c_type, c_cond_branch list, c_block, i32, c_type, i32)
+
+synth_cond(Env, Ctx, FRetTy, [], ElseBlock, Ctr, BaseTy, CtrOut) :-
+    synth_block(Env, Ctx, FRetTy, ElseBlock, Ctr, BaseTy, CtrOut).
+
+synth_cond(Env, Ctx, FRetTy, cond_branch(Cond, Body) :: Rest, ElseBlock, Ctr, BaseTy, CtrOut) :-
+    refine_env_true(Env, Cond, Ctr) = (EnvTrue, Ctr1),
+    synth_block(EnvTrue, Ctx, FRetTy, Body, Ctr1, BaseTy, Ctr2),
+    refine_env_false(Env, Cond, Ctr2) = (EnvFalse, Ctr3),
+    synth_cond(EnvFalse, Ctx, FRetTy, Rest, ElseBlock, Ctr3, BaseTy, CtrOut).
+
+synth_expr(Env, Ctx, FRetTy, e_block(B), Ctr, T, CtrOut) :-
+    synth_block(Env, Ctx, FRetTy, B, Ctr, T, CtrOut).
+
+synth_expr(Env, Ctx, FRetTy, e_cond(Branches, ElseBlock), Ctr, T, CtrOut) :-
+    synth_cond(Env, Ctx, FRetTy, Branches, ElseBlock, Ctr, T, CtrOut).
+
+check_expr(Env, Ctx, FRetTy, e_block(B), Ctr, T, CtrOut) :-
+    check_block(Env, Ctx, FRetTy, B, Ctr, T, CtrOut).
+
+check_expr(Env, Ctx, FRetTy, e_cond(Branches, ElseBlock), Ctr, T, CtrOut) :-
+    check_cond(Env, Ctx, FRetTy, Branches, ElseBlock, Ctr, T, CtrOut).
+
+check_expr(Env, Ctx, FRetTy, E, Ctr, T, CtrOut) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, Tprime, CtrOut),
+    subtype(Env, Tprime, T).
+
+fun params_to_env(Params: func_param list) : env =
+    match Params with
+    | [] => []
+    | fparam(Id, Ty) :: Rest => (Id, Ty) :: params_to_env(Rest)
+    end
+
+@topdown
+rel check_func(global_ctx, func_def, i32)
+
+check_func(Ctx, fdef(_Name, Params, RetTy, Body), Ctr) :-
+    params_to_env(Params) = Env,
+    check_block(Env, Ctx, RetTy, Body, Ctr, RetTy, _).
+
+@topdown
+rel check_program(global_ctx, func_def list, i32)
+
+check_program(_Ctx, [], _Ctr).
+
+check_program(Ctx, fdef(Name, Params, RetTy, Body) :: Rest, Ctr) :-
+    check_func(Ctx, fdef(Name, Params, RetTy, Body), Ctr),
+    check_program(Ctx, Rest, Ctr).
+
+(* Lookup helper: return Some(fdef) when `Funcs` contains a definition
+ * for the given name. Used by the new EDB-driven entry rules below. *)
+fun fdef_lookup(F: name_id, Funcs: func_def list) : func_def option =
+    match Funcs with
+    | [] => none
+    | fdef(Name, Params, RetTy, Body) :: Rest =>
+        if Name = F then some(fdef(Name, Params, RetTy, Body))
+        else fdef_lookup(F, Rest)
+    end
+
+
+@disk rel func_ok(name_id)
+@disk rel func_failed(name_id, i32)
+
+func_ok(F) :-
+    fn_to_check(F),
+    program_in(Ctx, Funcs, Ctr),
+    fdef_lookup(F, Funcs) = some(Fdef),
+    check_func(Ctx, Fdef, Ctr).
+
+func_failed(F, -1) :-
+    fn_to_check(F),
+    !func_ok(F).
+
+(* Default tuple accessor facts. *)
+tuple_accessor(0, 900).
+tuple_accessor(1, 901).
+
+(* Tests. *)
+@topdown
+rel test(i32)
+
+(* x:nat, inc: nat -> {v | v > param} |- inc(x) : nat *)
+test(1) :-
+    check_expr(
+      [(1, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
+      gctx([(2, fsig([fparam(3, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
+                t_refined(-1, t_int, r_bin_op(greater, r_var(-1), r_var(3)))))], [], []),
+      t_nil,
+      e_func_call(2, [a_var(1)]),
+      -1,
+      t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
+      _).
+
+(* let x = 5; let y = x + x; y : {v | v > 0} *)
+test(2) :-
+    check_expr([], gctx([], [], []), t_nil,
+      e_block(block(
+        [s_let(1, none, e_atomic(a_int_lit(5L))),
+         s_let(2, none, e_binop(add, a_var(1), a_var(1)))],
+        some(a_var(2)))),
+      -1,
+      t_refined(-1, t_int, r_bin_op(greater, r_var(-1), r_int_lit(0L))),
+      _).
+
+(* synth block produces t_int *)
+test(3) :-
+    synth_expr([], gctx([], [], []), t_nil,
+      e_block(block(
+        [s_let(1, none, e_atomic(a_int_lit(5L))),
+         s_let(2, none, e_binop(add, a_var(1), a_var(1)))],
+        some(a_var(2)))),
+      -1, t_int, _).
+
+(* b iff (x > 5), x: nat |- if b then x else 0 : nat *)
+test(4) :-
+    check_expr(
+      [(10, t_refined(10, t_bool,
+             r_bin_op(and_op,
+               r_bin_op(or_op, r_not(r_var(10)), r_bin_op(greater, r_var(1), r_int_lit(5L))),
+               r_bin_op(or_op, r_var(10), r_not(r_bin_op(greater, r_var(1), r_int_lit(5L))))))),
+       (1, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
+      gctx([], [], []),
+      t_nil,
+      e_cond(
+        [cond_branch(a_var(10), block([], some(a_var(1))))],
+        block([], some(a_int_lit(0L)))
+      ),
+      -2,
+      t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
+      _).
+
+(* check_func: id(x: nat) -> nat { x } *)
+test(5) :-
+    check_func(
+      gctx([], [], []),
+      fdef(100,
+        [fparam(1, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
+        t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
+        block([], some(a_var(1)))),
+      -100).
+
+(* check_func: inc(x: nat) -> nat { let r = x + 1; r } *)
+test(6) :-
+    check_func(
+      gctx([], [], []),
+      fdef(101,
+        [fparam(1, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
+        t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
+        block([s_let(2, none, e_binop(add, a_var(1), a_int_lit(1L)))], some(a_var(2)))),
+      -100).
+
+(* check_func: early_ret(x: nat) -> nat { return x; } *)
+test(7) :-
+    check_func(
+      gctx([], [], []),
+      fdef(102,
+        [fparam(1, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
+        t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
+        block([s_return(a_var(1))], none)),
+      -100).
+
+(* synth tuple: (1, true) synthesizes a tuple type *)
+test(8) :-
+    synth_expr([], gctx([], [], []), t_nil,
+      e_tuple_lit([a_int_lit(1L), a_bool_lit(true)]),
+      -1, t_tuple(_), _).
+
+(* check tuple: (5, 10) checks against t_tuple([nat, nat]) *)
+test(9) :-
+    check_expr([], gctx([], [], []), t_nil,
+      e_tuple_lit([a_int_lit(5L), a_int_lit(10L)]),
+      -1,
+      t_tuple([t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
+               t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L)))]),
+      _).
+
+(* struct literal: Point{x: 3, y: 4} : Point *)
+test(10) :-
+    synth_expr([], gctx([], [(200, [(201, t_int), (202, t_int)])], []), t_nil,
+      e_struct_lit(200, [(201, a_int_lit(3L)), (202, a_int_lit(4L))]),
+      -1, t_struct(200), _).
+
+(* field access: p: Point |- p.x : refined int *)
+test(11) :-
+    synth_expr([(1, t_struct(200))],
+      gctx([], [(200, [(201, t_int), (202, t_int)])], []), t_nil,
+      e_field_access(a_var(1), 201),
+      -1, t_refined(_, t_int, _), _).
+
+(* refined field access: s: Sized |- s.length : nat *)
+test(12) :-
+    check_expr([(1, t_struct(300))],
+      gctx([], [(300, [(301, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))])], []),
+      t_nil,
+      e_field_access(a_var(1), 301),
+      -1,
+      t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
+      _).
+
+(* struct literal with refined field: Sized{length: 5} : Sized *)
+test(13) :-
+    synth_expr([],
+      gctx([], [(300, [(301, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))])], []),
+      t_nil,
+      e_struct_lit(300, [(301, a_int_lit(5L))]),
+      -1, t_struct(300), _).
+
+(* struct subtyping is nominal *)
+test(14) :-
+    subtype([], t_struct(200), t_struct(200)).
+
+(* enum Option<int> = Some(int) | None. EnumId=400, Some=401, None=402 *)
+
+(* None literal *)
+test(15) :-
+    synth_expr([],
+      gctx([], [], [(400, [(401, some(t_int)), (402, none)])]),
+      t_nil,
+      e_variant_lit(400, 402, none),
+      -1, t_variant(400), _).
+
+(* Some(5) literal *)
+test(16) :-
+    synth_expr([],
+      gctx([], [], [(400, [(401, some(t_int)), (402, none)])]),
+      t_nil,
+      e_variant_lit(400, 401, some(a_int_lit(5L))),
+      -1, t_variant(400), _).
+
+(* is_variant synthesizes refined bool with r_is_variant *)
+test(17) :-
+    synth_expr([(1, t_variant(400))],
+      gctx([], [], [(400, [(401, some(t_int)), (402, none)])]),
+      t_nil,
+      e_is_variant(a_var(1), 400, 401),
+      -1, t_refined(_, t_bool, r_is_variant(1, 400, 401)), _).
+
+(* Nominal variants *)
+test(18) :-
+    subtype([], t_variant(400), t_variant(400)).
+
+(* Full unwrap_or_zero with payload extraction *)
+test(19) :-
+    check_func(
+      gctx([], [], [(400, [(401, some(t_int)), (402, none)])]),
+      fdef(500,
+        [fparam(1, t_variant(400))],
+        t_int,
+        block(
+          [s_let(2, none, e_is_variant(a_var(1), 400, 401)),
+           s_expr(e_cond(
+             [cond_branch(a_var(2),
+               block([s_let(3, none, e_variant_payload(a_var(1), 400, 401)),
+                      s_return(a_var(3))], none))],
+             block([s_return(a_int_lit(0L))], none)))],
+          none)),
+      -100).
+
+(* not true synthesizes a bool *)
+test(20) :-
+    synth_expr([], gctx([], [], []), t_nil,
+      e_not(a_bool_lit(true)),
+      -1, t_refined(_, t_bool, _), _).
+
+(* negate 5 is < 0 *)
+test(21) :-
+    check_expr([], gctx([], [], []), t_nil,
+      e_negate(a_int_lit(5L)),
+      -1,
+      t_refined(-1, t_int, r_bin_op(less, r_var(-1), r_int_lit(0L))),
+      _).
+
+(* tuple access: (1, true).0 synthesizes int-typed refinement *)
+test(22) :-
+    synth_expr(
+      [(1, t_tuple([t_int, t_bool]))],
+      gctx([], [], []), t_nil,
+      e_tuple_access(a_var(1), 0),
+      -1, t_refined(_, t_int, _), _).
+
+(* tuple access: (1, true).1 synthesizes bool-typed refinement *)
+test(23) :-
+    synth_expr(
+      [(1, t_tuple([t_int, t_bool]))],
+      gctx([], [], []), t_nil,
+      e_tuple_access(a_var(1), 1),
+      -1, t_refined(_, t_bool, _), _).
+
+(* len(xs) returns {v | v == len(xs)} via substitution *)
+test(24) :-
+    check_expr(
+      [(1, t_array(t_int))],
+      gctx([(50, fsig([fparam(2, t_array(t_int))],
+                  t_refined(-1, t_int, r_eq(r_var(-1), r_app(50, [r_var(2)])))))], [], []),
+      t_nil,
+      e_func_call(50, [a_var(1)]),
+      -1,
+      t_refined(-1, t_int, r_eq(r_var(-1), r_app(50, [r_var(1)]))),
+      _).
+
+(* congruence: len(xs) == len(xs) by reflexivity *)
+test(25) :-
+    check_expr(
+      [(1, t_array(t_int)),
+       (2, t_refined(-1, t_int, r_eq(r_var(-1), r_app(50, [r_var(1)]))))],
+      gctx([], [], []),
+      t_nil,
+      e_atomic(a_var(2)),
+      -1,
+      t_refined(-1, t_int, r_eq(r_var(-1), r_app(50, [r_var(1)]))),
+      _).
+
+(* multi-arg: add(x, y) with 2-arg extern *)
+test(26) :-
+    check_expr(
+      [(1, t_int), (2, t_int)],
+      gctx([(60, fsig([fparam(3, t_int), fparam(4, t_int)],
+                  t_refined(-1, t_int, r_eq(r_var(-1), r_app(60, [r_var(3), r_var(4)])))))], [], []),
+      t_nil,
+      e_func_call(60, [a_var(1), a_var(2)]),
+      -1,
+      t_refined(-1, t_int, r_eq(r_var(-1), r_app(60, [r_var(1), r_var(2)]))),
+      _).
+
+(* p.x == p.x by congruence *)
+test(27) :-
+    check_expr(
+      [(1, t_struct(200))],
+      gctx([], [(200, [(201, t_int), (202, t_int)])], []),
+      t_nil,
+      e_block(block(
+        [s_let(2, none, e_field_access(a_var(1), 201))],
+        some(a_var(2)))),
+      -1,
+      t_refined(-1, t_int, r_eq(r_var(-1), r_app(201, [r_var(1)]))),
+      _).
+
+(* Single query is enough to make every relation reachable. *)
+test(99) :- func_ok(_F).
+test(99) :- func_failed(_F, _Eid).
+test(98) :- expr_origin(_E, _Off, _Len).
+
+:- test(_X).

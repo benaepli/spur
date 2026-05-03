@@ -7,8 +7,16 @@ edition = "2024"
 name = "spur-lsp"
 path = "src/main.rs"
 
+[features]
+default = []
+# Forwarded from `spur-core::formulog`; enables refinement check
+# diagnostics for `func_failed` events. Adds the same heavyweight
+# system dependencies as `spur-liquid::formulog`.
+formulog = ["spur-core/formulog"]
+
 [dependencies]
 spur-core = { path = "../spur-core", default-features = false }
+spur-liquid = { path = "../spur-liquid" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 dashmap = "6.1.0"

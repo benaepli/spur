@@ -4,7 +4,7 @@ use super::lower::lower_program;
 use crate::analysis::resolver::NameId;
 use crate::analysis::types::Type;
 use crate::liquid::pure::ast::*;
-use crate::liquid::threaded::ast::*;
+use crate::compiler::threaded::ast::*;
 use crate::parser::{BinOp, Span};
 
 fn dummy_span() -> Span {
@@ -589,7 +589,7 @@ fn test_loop_with_break_lifts_to_free_func() {
         Type::Enum(enum_id, _) => {
             let variants = pure.enum_defs.get(enum_id).expect("enum def registered");
             assert_eq!(variants.len(), 2);
-            let names: Vec<&str> = variants.iter().map(|(n, _)| n.as_str()).collect();
+            let names: Vec<&str> = variants.iter().map(|(_, n, _)| n.as_str()).collect();
             assert!(names.contains(&"Exit"));
             assert!(names.contains(&"Return"));
         }
@@ -629,7 +629,7 @@ fn test_loop_with_break_lifts_to_free_func() {
     assert_eq!(call_count, 1);
 
     let is_variant_present = main.body.statements.iter().any(|s| match &s.kind {
-        PStatementKind::LetAtom(la) => matches!(la.value.kind, PExprKind::IsVariant(_, _)),
+        PStatementKind::LetAtom(la) => matches!(la.value.kind, PExprKind::IsVariant(_, _, _)),
         _ => false,
     });
     assert!(is_variant_present, "expected IsVariant check");
@@ -805,33 +805,39 @@ fn find_lifted_funcs(program: &PProgram) -> Vec<&PFuncDef> {
         .collect()
 }
 
-fn block_contains_variant_lit_named(block: &PBlock, target: &str) -> bool {
+fn block_contains_variant_lit_named(
+    block: &PBlock,
+    target: &str,
+    id_to_name: &HashMap<NameId, String>,
+) -> bool {
     block.statements.iter().any(|s| match &s.kind {
         PStatementKind::LetAtom(la) => match &la.value.kind {
-            PExprKind::VariantLit(_, name, _) => name == target,
+            PExprKind::VariantLit(_, variant_id, _) => {
+                id_to_name.get(variant_id).map(|n| n.as_str()) == Some(target)
+            }
             PExprKind::Conditional(c) => {
-                block_contains_variant_lit_named(&c.if_branch.body, target)
+                block_contains_variant_lit_named(&c.if_branch.body, target, id_to_name)
                     || c.elseif_branches
                         .iter()
-                        .any(|b| block_contains_variant_lit_named(&b.body, target))
+                        .any(|b| block_contains_variant_lit_named(&b.body, target, id_to_name))
                     || c.else_branch
                         .as_ref()
-                        .is_some_and(|b| block_contains_variant_lit_named(b, target))
+                        .is_some_and(|b| block_contains_variant_lit_named(b, target, id_to_name))
             }
-            PExprKind::Block(b) => block_contains_variant_lit_named(b, target),
+            PExprKind::Block(b) => block_contains_variant_lit_named(b, target, id_to_name),
             _ => false,
         },
         PStatementKind::Expr(e) => match &e.kind {
             PExprKind::Conditional(c) => {
-                block_contains_variant_lit_named(&c.if_branch.body, target)
+                block_contains_variant_lit_named(&c.if_branch.body, target, id_to_name)
                     || c.elseif_branches
                         .iter()
-                        .any(|b| block_contains_variant_lit_named(&b.body, target))
+                        .any(|b| block_contains_variant_lit_named(&b.body, target, id_to_name))
                     || c.else_branch
                         .as_ref()
-                        .is_some_and(|b| block_contains_variant_lit_named(b, target))
+                        .is_some_and(|b| block_contains_variant_lit_named(b, target, id_to_name))
             }
-            PExprKind::Block(b) => block_contains_variant_lit_named(b, target),
+            PExprKind::Block(b) => block_contains_variant_lit_named(b, target, id_to_name),
             _ => false,
         },
         _ => false,
@@ -917,7 +923,9 @@ fn test_loop_return_wraps_and_main_extracts() {
     // variant of its LoopResult enum.
     let wraps_return_7 = lifted.body.statements.iter().any(|s| match &s.kind {
         PStatementKind::LetAtom(la) => match &la.value.kind {
-            PExprKind::VariantLit(_, name, Some(PAtomic::IntLit(7))) => name == "Return",
+            PExprKind::VariantLit(_, variant_id, Some(PAtomic::IntLit(7))) => {
+                pure.id_to_name.get(variant_id).map(|n| n.as_str()) == Some("Return")
+            }
             _ => false,
         },
         _ => false,
@@ -932,7 +940,9 @@ fn test_loop_return_wraps_and_main_extracts() {
     // Main body tests IsVariant for "Return".
     let has_is_return = main.body.statements.iter().any(|s| match &s.kind {
         PStatementKind::LetAtom(la) => match &la.value.kind {
-            PExprKind::IsVariant(_, name) => name == "Return",
+            PExprKind::IsVariant(_, _, variant_id) => {
+                pure.id_to_name.get(variant_id).map(|n| n.as_str()) == Some("Return")
+            }
             _ => false,
         },
         _ => false,
@@ -1022,7 +1032,7 @@ fn test_nested_loops_inner_return_propagates() {
     // - outer wraps the payload extracted from the inner call's is_return arm
     for f in &lifted {
         assert!(
-            block_contains_variant_lit_named(&f.body, "Return"),
+            block_contains_variant_lit_named(&f.body, "Return", &pure.id_to_name),
             "lifted {:?} should wrap Return via its LoopResult enum",
             f.original_name
         );

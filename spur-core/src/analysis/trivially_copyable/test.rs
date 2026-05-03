@@ -43,8 +43,8 @@ fn test_struct_all_primitives_is_trivial() {
     program.struct_defs.insert(
         struct_id,
         vec![
-            ("x".to_string(), Type::Int),
-            ("y".to_string(), Type::String),
+            (id(100), "x".to_string(), Type::Int),
+            (id(101), "y".to_string(), Type::String),
         ],
     );
 
@@ -59,8 +59,8 @@ fn test_struct_with_chan_field_is_non_trivial() {
     program.struct_defs.insert(
         struct_id,
         vec![
-            ("x".to_string(), Type::Int),
-            ("ch".to_string(), Type::Chan(Box::new(Type::Int))),
+            (id(100), "x".to_string(), Type::Int),
+            (id(101), "ch".to_string(), Type::Chan(Box::new(Type::Int))),
         ],
     );
 
@@ -76,7 +76,7 @@ fn test_struct_containing_non_trivial_struct_is_non_trivial() {
     let inner_id = id(10);
     program.struct_defs.insert(
         inner_id,
-        vec![("ch".to_string(), Type::Chan(Box::new(Type::Int)))],
+        vec![(id(100), "ch".to_string(), Type::Chan(Box::new(Type::Int)))],
     );
 
     // Outer struct contains the inner struct.
@@ -84,6 +84,7 @@ fn test_struct_containing_non_trivial_struct_is_non_trivial() {
     program.struct_defs.insert(
         outer_id,
         vec![(
+            id(101),
             "inner".to_string(),
             Type::Struct(inner_id, "Inner".to_string()),
         )],
@@ -101,8 +102,8 @@ fn test_enum_with_chan_payload_is_non_trivial() {
     program.enum_defs.insert(
         enum_id,
         vec![
-            ("None".to_string(), None),
-            ("HasChan".to_string(), Some(Type::Chan(Box::new(Type::Int)))),
+            (id(100), "None".to_string(), None),
+            (id(101), "HasChan".to_string(), Some(Type::Chan(Box::new(Type::Int)))),
         ],
     );
 
@@ -116,7 +117,7 @@ fn test_enum_without_chan_is_trivial() {
     let enum_id = id(10);
     program.enum_defs.insert(
         enum_id,
-        vec![("A".to_string(), None), ("B".to_string(), Some(Type::Int))],
+        vec![(id(100), "A".to_string(), None), (id(101), "B".to_string(), Some(Type::Int))],
     );
 
     let map = compute_trivially_copyable(&program.struct_defs, &program.enum_defs);

@@ -49,8 +49,8 @@ pub enum TExprKind {
     Conditional(Box<TCondExpr>),
     Block(Box<TBlock>),
 
-    VariantLit(NameId, String, Option<TAtomic>),
-    IsVariant(TAtomic, String),
+    VariantLit(NameId, NameId, Option<TAtomic>),
+    IsVariant(TAtomic, NameId, NameId),
     VariantPayload(TAtomic),
 
     UnwrapOptional(TAtomic),
@@ -69,13 +69,13 @@ pub enum TExprKind {
     Index(TAtomic, TAtomic),
     Slice(TAtomic, TAtomic, TAtomic),
     TupleAccess(TAtomic, usize),
-    FieldAccess(TAtomic, String),
+    FieldAccess(TAtomic, NameId),
 
-    SafeFieldAccess(TAtomic, String),
+    SafeFieldAccess(TAtomic, NameId),
     SafeIndex(TAtomic, TAtomic),
     SafeTupleAccess(TAtomic, usize),
 
-    StructLit(NameId, Vec<(String, TAtomic)>),
+    StructLit(NameId, Vec<(NameId, TAtomic)>),
 
     WrapInOptional(TAtomic),
     PersistData(TAtomic),
@@ -198,6 +198,6 @@ pub struct TProgram {
     pub top_level_defs: Vec<TTopLevelDef>,
     pub next_name_id: usize,
     pub id_to_name: HashMap<NameId, String>,
-    pub struct_defs: HashMap<NameId, Vec<(String, Type)>>,
-    pub enum_defs: HashMap<NameId, Vec<(String, Option<Type>)>>,
+    pub struct_defs: HashMap<NameId, Vec<(NameId, String, Type)>>,
+    pub enum_defs: HashMap<NameId, Vec<(NameId, String, Option<Type>)>>,
 }

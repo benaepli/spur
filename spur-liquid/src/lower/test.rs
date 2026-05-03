@@ -1,5 +1,5 @@
 use super::*;
-use crate::parser::Span;
+use spur_ast::span::Span;
 
 fn span() -> Span {
     Span::default()
@@ -246,10 +246,10 @@ fn make_iter_returns_iter_of_elem() {
     assert_eq!(ext.return_type, CType::Iter(Box::new(CType::Int)));
 }
 
-use crate::analysis::types::{
+use spur_ast::binop::BinOp;
+use spur_ast::types::{
     RefinementBody, RefinementHandle, TypedExpr, TypedExprKind, TypedUserFuncCall,
 };
-use crate::parser::BinOp;
 
 fn typed(kind: TypedExprKind, ty: Type) -> TypedExpr {
     TypedExpr {
@@ -405,7 +405,7 @@ fn refinement_len_call_shares_extern_with_function_body_call() {
 fn refinement_user_function_call_records_validation_error() {
     // int { x | helper(x) } -- helper is a user function, not allowed.
     let user_call = TypedExprKind::FuncCall(
-        crate::analysis::types::TypedFuncCall::User(TypedUserFuncCall {
+        spur_ast::types::TypedFuncCall::User(TypedUserFuncCall {
             name: nid(99),
             original_name: "helper".to_string(),
             args: vec![typed(

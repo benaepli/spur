@@ -1,10 +1,10 @@
-use crate::analysis::resolver::NameId;
-use crate::parser::Span;
+use spur_ast::name::NameId;
+use spur_ast::span::Span;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use super::refinement::RefinementExpr;
+use crate::refinement::RefinementExpr;
 
 #[derive(Debug, Clone)]
 pub enum CType {
@@ -199,14 +199,13 @@ pub enum CExprKind {
     FuncCall(CFuncCall),
 
     TupleLit(Vec<CAtomic>),
-    MapLit(Vec<(CAtomic, CAtomic)>),
-    StructLit(NameId, Vec<(String, CAtomic)>),
-    VariantLit(NameId, String, Option<CAtomic>),
-    IsVariant(CAtomic, String),
+    StructLit(NameId, Vec<(NameId, CAtomic)>),
+    VariantLit(NameId, NameId, Option<CAtomic>),
+    IsVariant(CAtomic, NameId, NameId),
     VariantPayload(CAtomic),
 
     TupleAccess(CAtomic, usize),
-    FieldAccess(CAtomic, String),
+    FieldAccess(CAtomic, NameId),
 
     Conditional(Box<CCondExpr>),
     Block(Box<CBlock>),
@@ -317,8 +316,8 @@ pub struct CProgram {
     /// Header: every domain-specific operator that lowering desugared into a
     /// FuncCall has its monomorphic signature recorded here.
     pub extern_funcs: Vec<CExternFunc>,
-    pub struct_defs: HashMap<NameId, Vec<(String, CType)>>,
-    pub enum_defs: HashMap<NameId, Vec<(String, Option<CType>)>>,
+    pub struct_defs: HashMap<NameId, Vec<(NameId, String, CType)>>,
+    pub enum_defs: HashMap<NameId, Vec<(NameId, String, Option<CType>)>>,
     pub next_name_id: usize,
     pub id_to_name: HashMap<NameId, String>,
 }

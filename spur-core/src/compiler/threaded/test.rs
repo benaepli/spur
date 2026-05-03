@@ -2,7 +2,7 @@ use super::lower::lower_program;
 use crate::analysis::resolver::NameId;
 use crate::analysis::types::Type;
 use crate::compiler::anf::*;
-use crate::liquid::threaded::ast::*;
+use crate::compiler::threaded::ast::*;
 use crate::parser::Span;
 use std::collections::HashMap;
 
@@ -190,8 +190,8 @@ fn test_role_state_extraction() {
     };
     let fields = threaded.struct_defs.get(&state_struct_id).unwrap();
     assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0].0, "db");
-    assert_eq!(fields[1].0, "count");
+    assert_eq!(fields[0].1, "db");
+    assert_eq!(fields[1].1, "count");
 
     // Role should have no var_inits (only func_defs)
     let role = expect_role(&threaded, 1);

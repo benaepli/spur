@@ -29,8 +29,68 @@ pub fn compile_result_to_diagnostics(
     for e in &result.type_errors {
         out.push(type_error_to_diagnostic(e, line_index));
     }
+    for e in &result.refinement_errors {
+        out.push(refinement_validation_error_to_diagnostic(e, line_index));
+    }
+    #[cfg(feature = "formulog")]
+    for e in &result.refinement_check_errors {
+        out.push(refinement_check_error_to_diagnostic(e, &result, line_index));
+    }
 
     out
+}
+
+fn refinement_validation_error_to_diagnostic(
+    e: &spur_liquid::RefinementValidationError,
+    line_index: &LineIndex,
+) -> Diagnostic {
+    let span = e.span;
+    Diagnostic {
+        range: line_index.span_to_range(span.start, span.end),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("spur:refinement".into()),
+        message: format!("{}", e),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "formulog")]
+fn refinement_check_error_to_diagnostic(
+    e: &spur_liquid::RefinementCheckError,
+    result: &CompileResult,
+    line_index: &LineIndex,
+) -> Diagnostic {
+    use spur_liquid::RefinementCheckErrorKind;
+
+    // Step 6 only threads `expr_origin` symbolically; we don't have a
+    // real expression-id ↔ Span side-table yet, so for now we report
+    // the failure at the function's declaration span when we can find
+    // it, falling back to the start of the file.
+    let span = result
+        .refinement_ir
+        .as_ref()
+        .and_then(|p| p.funcs.iter().find(|f| f.name == e.function).map(|f| f.span))
+        .unwrap_or_default();
+    let name = result
+        .refinement_ir
+        .as_ref()
+        .and_then(|p| p.funcs.iter().find(|f| f.name == e.function).map(|f| f.original_name.clone()))
+        .unwrap_or_else(|| format!("#{}", e.function.0));
+    let detail = match e.kind {
+        RefinementCheckErrorKind::FunctionFailed { expr_id: Some(id) } => {
+            format!("function `{}` failed refinement check (at expr id {})", name, id)
+        }
+        RefinementCheckErrorKind::FunctionFailed { expr_id: None } => {
+            format!("function `{}` failed refinement check", name)
+        }
+    };
+    Diagnostic {
+        range: line_index.span_to_range(span.start, span.end),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("spur:refinement".into()),
+        message: detail,
+        ..Default::default()
+    }
 }
 
 fn lex_error_to_diagnostic(e: &LexError, line_index: &LineIndex) -> Diagnostic {

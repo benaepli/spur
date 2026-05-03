@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::analysis::resolver::NameId;
 use crate::analysis::types::Type;
 use crate::compiler::anf::*;
-use crate::liquid::threaded::ast::*;
+use crate::compiler::threaded::ast::*;
 use crate::parser::Span;
 
 /// Context struct for the ANF → Threaded AST transformation.
@@ -14,7 +14,7 @@ struct ThreadLowerer {
     role_var_ids: HashSet<NameId>,
     /// Full info (NameId, name, type) for the current role's variables.
     /// Ordered to match the source declaration order.
-    role_vars: Vec<(NameId, String, Type)>,
+    role_vars: Vec<(NameId, NameId, String, Type)>,
     /// NameId allocated for the `s` state parameter.
     state_name_id: NameId,
     /// The Type::Struct for the current role's state.
@@ -98,10 +98,12 @@ impl ThreadLowerer {
                 TExprKind::Conditional(Box::new(self.lower_cond_expr(*cond)))
             }
             AExprKind::Block(block) => TExprKind::Block(Box::new(self.lower_block(*block))),
-            AExprKind::VariantLit(id, name, payload) => {
-                TExprKind::VariantLit(id, name, payload.map(|a| self.lower_atomic(a)))
+            AExprKind::VariantLit(enum_id, variant_id, payload) => {
+                TExprKind::VariantLit(enum_id, variant_id, payload.map(|a| self.lower_atomic(a)))
             }
-            AExprKind::IsVariant(a, name) => TExprKind::IsVariant(self.lower_atomic(a), name),
+            AExprKind::IsVariant(a, enum_id, variant_id) => {
+                TExprKind::IsVariant(self.lower_atomic(a), enum_id, variant_id)
+            }
             AExprKind::VariantPayload(a) => TExprKind::VariantPayload(self.lower_atomic(a)),
             AExprKind::UnwrapOptional(a) => TExprKind::UnwrapOptional(self.lower_atomic(a)),
             AExprKind::MakeIter(a) => TExprKind::MakeIter(self.lower_atomic(a)),
@@ -139,9 +141,11 @@ impl ThreadLowerer {
                 self.lower_atomic(c),
             ),
             AExprKind::TupleAccess(a, idx) => TExprKind::TupleAccess(self.lower_atomic(a), idx),
-            AExprKind::FieldAccess(a, name) => TExprKind::FieldAccess(self.lower_atomic(a), name),
-            AExprKind::SafeFieldAccess(a, name) => {
-                TExprKind::SafeFieldAccess(self.lower_atomic(a), name)
+            AExprKind::FieldAccess(a, field_id) => {
+                TExprKind::FieldAccess(self.lower_atomic(a), field_id)
+            }
+            AExprKind::SafeFieldAccess(a, field_id) => {
+                TExprKind::SafeFieldAccess(self.lower_atomic(a), field_id)
             }
             AExprKind::SafeIndex(a, b) => {
                 TExprKind::SafeIndex(self.lower_atomic(a), self.lower_atomic(b))
@@ -153,7 +157,7 @@ impl ThreadLowerer {
                 id,
                 fields
                     .into_iter()
-                    .map(|(name, a)| (name, self.lower_atomic(a)))
+                    .map(|(field_id, a)| (field_id, self.lower_atomic(a)))
                     .collect(),
             ),
             AExprKind::WrapInOptional(a) => TExprKind::WrapInOptional(self.lower_atomic(a)),
@@ -737,13 +741,13 @@ impl ThreadLowerer {
         let prologue: Vec<TStatement> = self
             .role_vars
             .iter()
-            .map(|(rid, rname, rty)| TStatement {
+            .map(|(rid, field_id, rname, rty)| TStatement {
                 kind: TStatementKind::LetAtom(TLetAtom {
                     name: *rid,
                     original_name: rname.clone(),
                     ty: rty.clone(),
                     value: TExpr {
-                        kind: TExprKind::FieldAccess(self.s_atomic(), rname.clone()),
+                        kind: TExprKind::FieldAccess(self.s_atomic(), *field_id),
                         ty: rty.clone(),
                         span: func.span,
                     },
@@ -863,12 +867,15 @@ pub fn lower_program(program: AProgram) -> TProgram {
 fn lower_role(
     lowerer: &mut ThreadLowerer,
     role: ARoleDef,
-) -> (TRoleDef, NameId, Vec<(String, Type)>, TFuncDef) {
-    // 1. Extract state struct fields
-    let state_fields: Vec<(String, Type)> = role
+) -> (TRoleDef, NameId, Vec<(NameId, String, Type)>, TFuncDef) {
+    // 1. Extract state struct fields, allocating a NameId for each field
+    let state_fields: Vec<(NameId, String, Type)> = role
         .var_inits
         .iter()
-        .map(|vi| (vi.original_name.clone(), vi.type_def.clone()))
+        .map(|vi| {
+            let (field_id, _) = lowerer.fresh_name(&vi.original_name);
+            (field_id, vi.original_name.clone(), vi.type_def.clone())
+        })
         .collect();
 
     let (state_struct_id, state_struct_name) =
@@ -880,14 +887,15 @@ fn lower_role(
     lowerer.role_vars = role
         .var_inits
         .iter()
-        .map(|vi| (vi.name, vi.original_name.clone(), vi.type_def.clone()))
+        .zip(state_fields.iter())
+        .map(|(vi, (field_id, _, _))| (vi.name, *field_id, vi.original_name.clone(), vi.type_def.clone()))
         .collect();
     let (s_id, _) = lowerer.fresh_name("s");
     lowerer.state_name_id = s_id;
     lowerer.state_type = Some(state_type.clone());
 
     // 3. Generate init function
-    let init_func = generate_init_func(lowerer, &role, state_struct_id, &state_type);
+    let init_func = generate_init_func(lowerer, &role, state_struct_id, &state_type, &state_fields);
 
     // 4. Lower each function
     let func_defs: Vec<TFuncDef> = role
@@ -916,13 +924,14 @@ fn generate_init_func(
     role: &ARoleDef,
     state_struct_id: NameId,
     state_type: &Type,
+    state_fields: &[(NameId, String, Type)],
 ) -> TFuncDef {
     let (func_name_id, func_name) = lowerer.fresh_name(&format!("{}_init", role.original_name));
 
     let mut body_stmts = Vec::new();
-    let mut struct_fields: Vec<(String, TAtomic)> = Vec::new();
+    let mut struct_fields: Vec<(NameId, TAtomic)> = Vec::new();
 
-    for vi in &role.var_inits {
+    for (vi, (field_id, _, _)) in role.var_inits.iter().zip(state_fields.iter()) {
         for stmt in &vi.stmts {
             lowerer.lower_statement(stmt.clone(), &mut body_stmts);
         }
@@ -930,7 +939,7 @@ fn generate_init_func(
         let texpr = lowerer.lower_expr(vi.value.clone());
         match &texpr.kind {
             TExprKind::Atomic(a) => {
-                struct_fields.push((vi.original_name.clone(), a.clone()));
+                struct_fields.push((*field_id, a.clone()));
             }
             _ => {
                 let (tid, tname) = lowerer.fresh_name(&format!("init_{}", vi.original_name));
@@ -945,7 +954,7 @@ fn generate_init_func(
                     }),
                     span: vi.span,
                 });
-                struct_fields.push((vi.original_name.clone(), TAtomic::Var(tid, tname)));
+                struct_fields.push((*field_id, TAtomic::Var(tid, tname)));
             }
         }
     }

@@ -530,7 +530,7 @@ impl Compiler {
             | SafeFieldAccess(e, _)
             | SafeTupleAccess(e, _)
             | WrapInOptional(e)
-            | IsVariant(e, _)
+            | IsVariant(e, _, _)
             | VariantPayload(e) => {
                 self.scan_expr_slots(e);
             }
@@ -1112,8 +1112,8 @@ impl Compiler {
                 self.compile_unary(e, target, next_vertex, ctx,
                     |v| Expr::TupleAccess(v, i))
             }
-            LExprKind::FieldAccess(e, field) => {
-                let field = EcoString::from(field.as_str());
+            LExprKind::FieldAccess(e, field_id) => {
+                let field = EcoString::from(self.id_to_name[field_id].as_str());
                 self.compile_unary(e, target, next_vertex, ctx,
                     |v| Expr::Find(v, Box::new(Expr::String(field))))
             }
@@ -1124,8 +1124,8 @@ impl Compiler {
             LExprKind::WrapInOptional(e) => {
                 self.compile_unary(e, target, next_vertex, ctx, Expr::Some)
             }
-            LExprKind::SafeFieldAccess(e, field) => {
-                let field = EcoString::from(field.as_str());
+            LExprKind::SafeFieldAccess(e, field_id) => {
+                let field = EcoString::from(self.id_to_name[field_id].as_str());
                 self.compile_unary(e, target, next_vertex, ctx,
                     |v| Expr::SafeFind(v, Box::new(Expr::String(field))))
             }
@@ -1139,11 +1139,11 @@ impl Compiler {
             }
 
             LExprKind::StructLit(_, fields) => {
-                let (field_names, val_exprs): (Vec<_>, Vec<_>) = fields.iter().cloned().unzip();
+                let (field_ids, val_exprs): (Vec<_>, Vec<_>) = fields.iter().cloned().unzip();
                 let (tmps, simple_exprs) = self.compile_temp_list(val_exprs.len());
-                let final_pairs = field_names
+                let final_pairs = field_ids
                     .into_iter()
-                    .map(|s| Expr::String(EcoString::from(s.as_str())))
+                    .map(|fid| Expr::String(EcoString::from(self.id_to_name[&fid].as_str())))
                     .zip(simple_exprs)
                     .collect();
                 let final_expr = Expr::Map(final_pairs);
@@ -1152,15 +1152,15 @@ impl Compiler {
                 self.compile_expr_list_recursive(val_exprs.iter(), tmps, assign_vertex, ctx)
             }
 
-            LExprKind::VariantLit(enum_id, variant_name, Some(payload_expr)) => {
+            LExprKind::VariantLit(enum_id, variant_id, Some(payload_expr)) => {
                 let eid = enum_id.0 as u32;
-                let vname = EcoString::from(variant_name.as_str());
+                let vname = EcoString::from(self.id_to_name[variant_id].as_str());
                 self.compile_unary(payload_expr, target, next_vertex, ctx,
                     |v| Expr::Variant(eid, vname, Some(v)))
             }
 
-            LExprKind::IsVariant(e, variant_name) => {
-                let vname = EcoString::from(variant_name.as_str());
+            LExprKind::IsVariant(e, _enum_id, variant_id) => {
+                let vname = EcoString::from(self.id_to_name[variant_id].as_str());
                 self.compile_unary(e, target, next_vertex, ctx,
                     |v| Expr::IsVariant(v, vname))
             }
@@ -1519,16 +1519,16 @@ impl Compiler {
             LExprKind::TupleAccess(tuple, index) => {
                 Expr::TupleAccess(Box::new(self.try_to_expr(tuple)?), *index)
             }
-            LExprKind::FieldAccess(target, field) => Expr::Find(
+            LExprKind::FieldAccess(target, field_id) => Expr::Find(
                 Box::new(self.try_to_expr(target)?),
-                Box::new(Expr::String(EcoString::from(field.as_str()))),
+                Box::new(Expr::String(EcoString::from(self.id_to_name[field_id].as_str()))),
             ),
             LExprKind::MakeIter(_) | LExprKind::IterIsDone(_) | LExprKind::IterNext(_) => return None,
             LExprKind::UnwrapOptional(e) => Expr::Unwrap(Box::new(self.try_to_expr(e)?)),
             LExprKind::WrapInOptional(e) => Expr::Some(Box::new(self.try_to_expr(e)?)),
-            LExprKind::SafeFieldAccess(target, field) => Expr::SafeFind(
+            LExprKind::SafeFieldAccess(target, field_id) => Expr::SafeFind(
                 Box::new(self.try_to_expr(target)?),
-                Box::new(Expr::String(EcoString::from(field.as_str()))),
+                Box::new(Expr::String(EcoString::from(self.id_to_name[field_id].as_str()))),
             ),
             LExprKind::SafeIndex(target, index) => Expr::SafeFind(
                 Box::new(self.try_to_expr(target)?),
@@ -1539,22 +1539,22 @@ impl Compiler {
             }
             LExprKind::StructLit(_, fields) => {
                 let mut out = Vec::with_capacity(fields.len());
-                for (name, val) in fields {
+                for (field_id, val) in fields {
                     out.push((
-                        Expr::String(EcoString::from(name.as_str())),
+                        Expr::String(EcoString::from(self.id_to_name[field_id].as_str())),
                         self.try_to_expr(val)?,
                     ));
                 }
                 Expr::Map(out)
             }
-            LExprKind::VariantLit(enum_id, variant_name, None) => Expr::Variant(
+            LExprKind::VariantLit(enum_id, variant_id, None) => Expr::Variant(
                 enum_id.0 as u32,
-                EcoString::from(variant_name.as_str()),
+                EcoString::from(self.id_to_name[variant_id].as_str()),
                 None,
             ),
-            LExprKind::IsVariant(e, variant_name) => Expr::IsVariant(
+            LExprKind::IsVariant(e, _enum_id, variant_id) => Expr::IsVariant(
                 Box::new(self.try_to_expr(e)?),
-                EcoString::from(variant_name.as_str()),
+                EcoString::from(self.id_to_name[variant_id].as_str()),
             ),
             LExprKind::VariantPayload(e) => Expr::VariantPayload(Box::new(self.try_to_expr(e)?)),
 

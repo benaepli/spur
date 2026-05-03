@@ -350,11 +350,13 @@ fn test_check_variant_lit_no_payload() {
     // enum E { V1, V2(int) }
     let variants = vec![
         ResolvedEnumVariant {
+            id: NameId(200),
             name: "V1".to_string(),
             payload: None,
             span: dummy_span(),
         },
         ResolvedEnumVariant {
+            id: NameId(201),
             name: "V2".to_string(),
             payload: Some(ResolvedTypeDef::Named(id(0))), // int is id(0)
             span: dummy_span(),
@@ -380,11 +382,13 @@ fn test_check_variant_lit_with_payload_valid() {
 
     let variants = vec![
         ResolvedEnumVariant {
+            id: NameId(202),
             name: "V1".to_string(),
             payload: None,
             span: dummy_span(),
         },
         ResolvedEnumVariant {
+            id: NameId(203),
             name: "V2".to_string(),
             payload: Some(ResolvedTypeDef::Named(int_id)),
             span: dummy_span(),
@@ -409,6 +413,7 @@ fn test_check_variant_lit_payload_mismatch() {
     let int_id = id(0);
 
     let variants = vec![ResolvedEnumVariant {
+        id: NameId(204),
         name: "V2".to_string(),
         payload: Some(ResolvedTypeDef::Named(int_id)),
         span: dummy_span(),
@@ -438,11 +443,13 @@ fn test_check_match_expression_valid() {
     // enum E { V1, V2(int) }
     let variants = vec![
         ResolvedEnumVariant {
+            id: NameId(205),
             name: "V1".to_string(),
             payload: None,
             span: dummy_span(),
         },
         ResolvedEnumVariant {
+            id: NameId(206),
             name: "V2".to_string(),
             payload: Some(ResolvedTypeDef::Named(int_id)),
             span: dummy_span(),

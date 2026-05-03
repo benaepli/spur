@@ -11,8 +11,14 @@ use crate::analysis::{trivially_copyable, type_id};
 use crate::compiler::cfg::Compiler as CfgCompiler;
 use crate::compiler::lowered::lower_program;
 use crate::lexer::{LexError, Lexer};
-use crate::liquid::core::lower::RefinementValidationError;
-use crate::liquid::pure::ast::PProgram;
+use spur_ast::pure::PProgram;
+use spur_liquid::RefinementValidationError;
+use spur_liquid::lower_program as liquid_lower_program;
+
+#[cfg(feature = "formulog")]
+use spur_liquid::ir::CProgram;
+#[cfg(feature = "formulog")]
+use spur_liquid::{FormulogError, RefinementCheckError};
 use crate::parser::{ParseError, ValidationError, parse_program};
 use crate::{lexer, parser};
 
@@ -22,23 +28,39 @@ pub struct CompileResult {
     /// Pure / SSA IR. Populated by `compile` after a successful type check;
     /// `compile_lsp` leaves this `None`.
     pub pure: Option<PProgram>,
+    /// Post-lowering refinement IR ([`spur_liquid::ir::CProgram`]).
+    /// Populated whenever liquid lowering ran without bailing out;
+    /// the caller can hand this to [`spur_liquid::check_with_formulog`]
+    /// for full refinement checking.
+    #[cfg(feature = "formulog")]
+    pub refinement_ir: Option<CProgram>,
     pub lex_errors: Vec<LexError>,
     pub parse_errors: Vec<ParseError>,
     pub validation_errors: Vec<ValidationError>,
     pub resolution_errors: Vec<ResolutionError>,
     pub type_errors: Vec<TypeError>,
     pub refinement_errors: Vec<RefinementValidationError>,
+    /// Per-function refinement check failures from the Formulog
+    /// driver, populated only when `compile_with_refinements` ran the
+    /// SMT-backed checker. Empty otherwise.
+    #[cfg(feature = "formulog")]
+    pub refinement_check_errors: Vec<RefinementCheckError>,
 }
 
 impl CompileResult {
     /// Returns true if any errors were encountered during compilation.
     pub fn has_errors(&self) -> bool {
-        !self.lex_errors.is_empty()
+        let staged = !self.lex_errors.is_empty()
             || !self.parse_errors.is_empty()
             || !self.validation_errors.is_empty()
             || !self.resolution_errors.is_empty()
             || !self.type_errors.is_empty()
-            || !self.refinement_errors.is_empty()
+            || !self.refinement_errors.is_empty();
+
+        #[cfg(feature = "formulog")]
+        return staged || !self.refinement_check_errors.is_empty();
+        #[cfg(not(feature = "formulog"))]
+        return staged;
     }
 
     /// Converts into a Result, returning the program if no errors, or an error otherwise.
@@ -79,12 +101,16 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     let mut result = CompileResult {
         program: None,
         pure: None,
+        #[cfg(feature = "formulog")]
+        refinement_ir: None,
         lex_errors: Vec::new(),
         parse_errors: Vec::new(),
         validation_errors: Vec::new(),
         resolution_errors: Vec::new(),
         type_errors: Vec::new(),
         refinement_errors: Vec::new(),
+        #[cfg(feature = "formulog")]
+        refinement_check_errors: Vec::new(),
     };
 
     let mut lexer = Lexer::new(input);
@@ -145,7 +171,16 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     lowered::remove_for_loops(&mut lowered_copy);
     let anf = anf::lower_program(lowered_copy);
     let _threaded = threaded::lower_program(anf);
-    result.pure = Some(pure::lower_program(_threaded));
+    let pure = pure::lower_program(_threaded);
+
+    let liquid_out = liquid_lower_program(pure.clone());
+    result.refinement_errors = liquid_out.refinement_errors;
+    #[cfg(feature = "formulog")]
+    {
+        result.refinement_ir = Some(liquid_out.program);
+    }
+    let _ = liquid_out; // keep the binding alive for both cfgs
+    result.pure = Some(pure);
 
     let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(lowered, type_ids);
@@ -159,12 +194,16 @@ pub fn compile_lsp(input: &str) -> CompileResult {
     let mut result = CompileResult {
         program: None,
         pure: None,
+        #[cfg(feature = "formulog")]
+        refinement_ir: None,
         lex_errors: Vec::new(),
         parse_errors: Vec::new(),
         validation_errors: Vec::new(),
         resolution_errors: Vec::new(),
         type_errors: Vec::new(),
         refinement_errors: Vec::new(),
+        #[cfg(feature = "formulog")]
+        refinement_check_errors: Vec::new(),
     };
     let mut lexer = Lexer::new(input);
     let (lexed, lex_errors) = lexer.collect_all();
@@ -201,4 +240,32 @@ pub fn compile_lsp(input: &str) -> CompileResult {
     result.type_errors = type_errors;
 
     result
+}
+
+/// Run [`compile`] and, if no earlier-stage errors fired, hand the
+/// lowered refinement IR to the Formulog driver. Returns the same
+/// [`CompileResult`] but with `refinement_check_errors` populated.
+///
+/// The `flg_bin` argument should be the path to the Formulog-compiled
+/// driver (typically [`spur_liquid::flg_binary_path`]); set `timeout`
+/// to whatever budget you want to give the SMT-backed checker.
+#[cfg(feature = "formulog")]
+pub fn compile_with_refinements(
+    input: &str,
+    name: &str,
+    flg_bin: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<CompileResult, FormulogError> {
+    let mut result = compile(input, name);
+
+    if result.has_errors() {
+        return Ok(result);
+    }
+    let Some(cprog) = &result.refinement_ir else {
+        return Ok(result);
+    };
+    let fns: Vec<spur_ast::name::NameId> = cprog.funcs.iter().map(|f| f.name).collect();
+    let errs = spur_liquid::check_with_formulog(cprog, &fns, flg_bin, timeout)?;
+    result.refinement_check_errors = errs;
+    Ok(result)
 }

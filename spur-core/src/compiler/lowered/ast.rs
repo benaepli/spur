@@ -42,9 +42,9 @@ pub enum LExprKind {
 
     Conditional(Box<LCondExpr>),
     Block(Box<LBlock>),
-    VariantLit(NameId, String, Option<Box<LExpr>>),
+    VariantLit(NameId, NameId, Option<Box<LExpr>>),
 
-    IsVariant(Box<LExpr>, String),
+    IsVariant(Box<LExpr>, NameId, NameId),
     VariantPayload(Box<LExpr>),
 
     UnwrapOptional(Box<LExpr>),
@@ -63,13 +63,13 @@ pub enum LExprKind {
     Index(Box<LExpr>, Box<LExpr>),
     Slice(Box<LExpr>, Box<LExpr>, Box<LExpr>),
     TupleAccess(Box<LExpr>, usize),
-    FieldAccess(Box<LExpr>, String),
+    FieldAccess(Box<LExpr>, NameId),
 
-    SafeFieldAccess(Box<LExpr>, String),
+    SafeFieldAccess(Box<LExpr>, NameId),
     SafeIndex(Box<LExpr>, Box<LExpr>),
     SafeTupleAccess(Box<LExpr>, usize),
 
-    StructLit(NameId, Vec<(String, LExpr)>),
+    StructLit(NameId, Vec<(NameId, LExpr)>),
 
     WrapInOptional(Box<LExpr>),
     PersistData(Box<LExpr>),
@@ -191,8 +191,8 @@ pub struct LProgram {
     pub top_level_defs: Vec<LTopLevelDef>,
     pub next_name_id: usize,
     pub id_to_name: HashMap<NameId, String>,
-    pub struct_defs: HashMap<NameId, Vec<(String, Type)>>,
-    pub enum_defs: HashMap<NameId, Vec<(String, Option<Type>)>>,
+    pub struct_defs: HashMap<NameId, Vec<(NameId, String, Type)>>,
+    pub enum_defs: HashMap<NameId, Vec<(NameId, String, Option<Type>)>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

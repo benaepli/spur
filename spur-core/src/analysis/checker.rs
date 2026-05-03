@@ -306,17 +306,17 @@ impl TypeChecker {
         for (name_id, type_def) in collected_defs {
             match type_def {
                 TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Struct(fields)) => {
-                    let resolved_fields: Vec<(String, Type)> = fields
+                    let resolved_fields: Vec<(NameId, String, Type)> = fields
                         .iter()
                         .filter_map(|f| match self.resolve_type(&f.type_def) {
-                            Ok(ty) => Some((f.name.clone(), ty)),
+                            Ok(ty) => Some((f.id, f.name.clone(), ty)),
                             Err(_) => None,
                         })
                         .collect();
                     struct_defs.insert(name_id, resolved_fields);
                 }
                 TypeDefinition::UserDefined(ResolvedTypeDefStmtKind::Enum(variants)) => {
-                    let resolved_variants: Vec<(String, Option<Type>)> = variants
+                    let resolved_variants: Vec<(NameId, String, Option<Type>)> = variants
                         .iter()
                         .filter_map(|v| {
                             let payload_ty = match v.payload.as_ref().map(|p| self.resolve_type(p))
@@ -325,7 +325,7 @@ impl TypeChecker {
                                 Some(Err(_)) => return None,
                                 None => None,
                             };
-                            Some((v.name.clone(), payload_ty))
+                            Some((v.id, v.name.clone(), payload_ty))
                         })
                         .collect();
                     enum_defs.insert(name_id, resolved_variants);
@@ -1014,7 +1014,12 @@ impl TypeChecker {
                     };
 
                     TypedPattern {
-                        kind: TypedPatternKind::Variant(enum_id, variant_name, typed_payload),
+                        kind: TypedPatternKind::Variant(
+                            enum_id,
+                            variant_def.id,
+                            variant_name,
+                            typed_payload,
+                        ),
                         ty: expected_type.clone(),
                         span: pattern.span,
                     }
@@ -1342,7 +1347,12 @@ impl TypeChecker {
         };
 
         TypedExpr {
-            kind: TypedExprKind::VariantLit(resolved_id, variant_name, typed_payload),
+            kind: TypedExprKind::VariantLit(
+                resolved_id,
+                variant_def.id,
+                variant_name,
+                typed_payload,
+            ),
             ty: Type::Enum(resolved_id, enum_name),
             span,
         }
@@ -1777,7 +1787,7 @@ impl TypeChecker {
                         };
 
                         let field_ty = match self.get_field_type(struct_id, &field_name, span) {
-                            Ok(ty) => ty,
+                            Ok((_field_id, ty)) => ty,
                             Err(e) => {
                                 self.emit(e);
                                 let _ = self.infer_expr(*value);
@@ -2083,8 +2093,12 @@ impl TypeChecker {
                 }
                 if let Type::Struct(struct_id, _) = typed_struct.ty {
                     match self.get_field_type(struct_id, &field_name, span) {
-                        Ok(field_ty) => TypedExpr {
-                            kind: TypedExprKind::FieldAccess(Box::new(typed_struct), field_name),
+                        Ok((field_id, field_ty)) => TypedExpr {
+                            kind: TypedExprKind::FieldAccess(
+                                Box::new(typed_struct),
+                                field_id,
+                                field_name,
+                            ),
                             ty: field_ty,
                             span,
                         },
@@ -2111,9 +2125,10 @@ impl TypeChecker {
                     Type::Optional(inner) => {
                         if let Type::Struct(struct_id, _) = inner.as_ref() {
                             match self.get_field_type(*struct_id, &field_name, span) {
-                                Ok(field_ty) => TypedExpr {
+                                Ok((field_id, field_ty)) => TypedExpr {
                                     kind: TypedExprKind::SafeFieldAccess(
                                         Box::new(typed_struct),
+                                        field_id,
                                         field_name,
                                     ),
                                     ty: Type::Optional(Box::new(field_ty)),
@@ -2897,7 +2912,7 @@ impl TypeChecker {
                 Some(fd) => match self.resolve_type(&fd.type_def) {
                     Ok(expected_ty) => {
                         let typed_field_expr = self.check_expr(field_expr, &expected_ty);
-                        typed_fields.push((field_name, typed_field_expr));
+                        typed_fields.push((fd.id, field_name, typed_field_expr));
                     }
                     Err(e) => {
                         self.emit(e);
@@ -2915,7 +2930,7 @@ impl TypeChecker {
         }
 
         for field_def in field_defs {
-            if !typed_fields.iter().any(|(name, _)| name == &field_def.name) {
+            if !typed_fields.iter().any(|(_, name, _)| name == &field_def.name) {
                 self.emit(TypeError::MissingStructField {
                     field_name: field_def.name.clone(),
                     span,
@@ -2942,19 +2957,20 @@ impl TypeChecker {
         struct_id: NameId,
         field_name: &str,
         span: Span,
-    ) -> Result<Type, TypeError> {
+    ) -> Result<(NameId, Type), TypeError> {
         let (_, field_defs) = self.resolve_struct_definition(struct_id, span, field_name)?;
 
-        let field_def_type = field_defs
+        let field_def = field_defs
             .iter()
             .find(|f| f.name == field_name)
             .ok_or_else(|| TypeError::FieldNotFound {
                 field_name: field_name.to_string(),
                 span,
-            })?
-            .type_def
-            .clone();
-        self.resolve_type(&field_def_type)
+            })?;
+        let field_id = field_def.id;
+        let type_def = field_def.type_def.clone();
+        let field_type = self.resolve_type(&type_def)?;
+        Ok((field_id, field_type))
     }
 
     fn resolve_type(&mut self, type_def: &ResolvedTypeDef) -> Result<Type, TypeError> {

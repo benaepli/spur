@@ -2,12 +2,12 @@
 
 use std::collections::HashSet;
 
-use super::ast::{
+use crate::ir::{
     CBinOp, CBlock, CCondExpr, CExpr, CExprKind, CProgram, CRefinementBody, CRefinementHandle,
     CStatement, CStatementKind, CType,
 };
-use super::lower::{RefinementValidationError, RefinementValidationErrorKind};
-use super::refinement::{
+use crate::lower::{RefinementValidationError, RefinementValidationErrorKind};
+use crate::refinement::{
     RefinementCond, RefinementExpr, RefinementExprKind, is_constant_int,
 };
 
@@ -52,12 +52,12 @@ impl HandleCollector {
             self.walk_type(&ext.return_type);
         }
         for fields in p.struct_defs.values() {
-            for (_, ty) in fields {
+            for (_, _, ty) in fields {
                 self.walk_type(ty);
             }
         }
         for variants in p.enum_defs.values() {
-            for (_, payload) in variants {
+            for (_, _, payload) in variants {
                 if let Some(ty) = payload {
                     self.walk_type(ty);
                 }
@@ -131,10 +131,9 @@ impl HandleCollector {
             | CExprKind::Not(_)
             | CExprKind::Negate(_)
             | CExprKind::TupleLit(_)
-            | CExprKind::MapLit(_)
             | CExprKind::StructLit(_, _)
             | CExprKind::VariantLit(_, _, _)
-            | CExprKind::IsVariant(_, _)
+            | CExprKind::IsVariant(_, _, _)
             | CExprKind::VariantPayload(_)
             | CExprKind::TupleAccess(_, _)
             | CExprKind::FieldAccess(_, _) => {}
@@ -177,12 +176,6 @@ impl HandleCollector {
                     self.walk_refinement_expr(x);
                 }
             }
-            RefinementExprKind::MapLit(ps) => {
-                for (k, v) in ps {
-                    self.walk_refinement_expr(k);
-                    self.walk_refinement_expr(v);
-                }
-            }
             RefinementExprKind::StructLit(_, fields) => {
                 for (_, x) in fields {
                     self.walk_refinement_expr(x);
@@ -193,7 +186,7 @@ impl HandleCollector {
                     self.walk_refinement_expr(x);
                 }
             }
-            RefinementExprKind::IsVariant(e, _) | RefinementExprKind::VariantPayload(e) => {
+            RefinementExprKind::IsVariant(e, _, _) | RefinementExprKind::VariantPayload(e) => {
                 self.walk_refinement_expr(e);
             }
             RefinementExprKind::TupleAccess(e, _) | RefinementExprKind::FieldAccess(e, _) => {
@@ -255,12 +248,6 @@ fn walk_check(e: &RefinementExpr, errs: &mut Vec<RefinementValidationError>) {
                 walk_check(x, errs);
             }
         }
-        RefinementExprKind::MapLit(ps) => {
-            for (k, v) in ps {
-                walk_check(k, errs);
-                walk_check(v, errs);
-            }
-        }
         RefinementExprKind::StructLit(_, fields) => {
             for (_, x) in fields {
                 walk_check(x, errs);
@@ -271,7 +258,7 @@ fn walk_check(e: &RefinementExpr, errs: &mut Vec<RefinementValidationError>) {
                 walk_check(x, errs);
             }
         }
-        RefinementExprKind::IsVariant(e, _) | RefinementExprKind::VariantPayload(e) => {
+        RefinementExprKind::IsVariant(e, _, _) | RefinementExprKind::VariantPayload(e) => {
             walk_check(e, errs);
         }
         RefinementExprKind::TupleAccess(e, _) | RefinementExprKind::FieldAccess(e, _) => {
@@ -302,12 +289,12 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::analysis::resolver::NameId;
-    use crate::liquid::core::ast::{CBinOp, CRefinementBody, CRefinementHandle, CType};
-    use crate::liquid::core::refinement::{
+    use crate::ir::{CBinOp, CRefinementBody, CRefinementHandle, CType};
+    use crate::refinement::{
         RefinementCond, RefinementExpr, RefinementExprKind, RefinementIfBranch,
     };
-    use crate::parser::Span;
+    use spur_ast::name::NameId;
+    use spur_ast::span::Span;
 
     fn span() -> Span {
         Span::default()
@@ -367,7 +354,7 @@ mod tests {
         });
         let refined = CType::Refined(Box::new(CType::Int), handle);
         let mut struct_defs = HashMap::new();
-        struct_defs.insert(nid(2), vec![("f".to_string(), refined)]);
+        struct_defs.insert(nid(2), vec![(nid(99), "f".to_string(), refined)]);
         CProgram {
             funcs: vec![],
             extern_funcs: vec![],
@@ -510,7 +497,7 @@ mod tests {
         });
         let refined = CType::Refined(Box::new(CType::Int), handle);
 
-        use crate::liquid::core::ast::{
+        use crate::ir::{
             CBlock, CFuncDef, CFuncKind, CFuncParam,
         };
         let func = CFuncDef {
@@ -536,9 +523,9 @@ mod tests {
         };
 
         let mut struct_defs = HashMap::new();
-        struct_defs.insert(nid(20), vec![("field".to_string(), refined.clone())]);
+        struct_defs.insert(nid(20), vec![(nid(100), "field".to_string(), refined.clone())]);
         let mut enum_defs = HashMap::new();
-        enum_defs.insert(nid(21), vec![("V".to_string(), Some(refined))]);
+        enum_defs.insert(nid(21), vec![(nid(101), "V".to_string(), Some(refined))]);
 
         let prog = CProgram {
             funcs: vec![func],

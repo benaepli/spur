@@ -213,6 +213,7 @@ fn test_lower_match_variant() {
             pattern: TypedPattern {
                 kind: TypedPatternKind::Variant(
                     enum_id,
+                    id(200),
                     "A".to_string(),
                     Some(Box::new(TypedPattern {
                         kind: TypedPatternKind::Var(id(2), "v".to_string()),
@@ -236,7 +237,7 @@ fn test_lower_match_variant() {
         },
         TypedMatchArm {
             pattern: TypedPattern {
-                kind: TypedPatternKind::Variant(enum_id, "B".to_string(), None),
+                kind: TypedPatternKind::Variant(enum_id, id(201), "B".to_string(), None),
                 ty: Type::Enum(enum_id, "MyEnum".to_string()),
                 span: dummy_span(),
             },
@@ -262,21 +263,23 @@ fn test_lower_match_variant() {
             panic!("expected VarInit for scrutinee");
         }
 
-        // Tail expr: conditional chain starting with IsVariant(_, "A")
+        // Tail expr: conditional chain starting with IsVariant(_, enum_id, variant_id for "A")
         let tail = block.tail_expr.as_ref().unwrap();
         if let LExprKind::Conditional(cond) = &tail.kind {
-            if let LExprKind::IsVariant(_, variant_name) = &cond.if_branch.condition.kind {
-                assert_eq!(variant_name, "A");
+            if let LExprKind::IsVariant(_, e_id, v_id) = &cond.if_branch.condition.kind {
+                assert_eq!(*e_id, enum_id);
+                assert_eq!(*v_id, id(200));
             } else {
                 panic!("expected IsVariant condition, got {:?}", cond.if_branch.condition.kind);
             }
 
-            // The else branch should contain the second arm (IsVariant "B")
+            // The else branch should contain the second arm (IsVariant for "B")
             let else_block = cond.else_branch.as_ref().unwrap();
             let else_tail = else_block.tail_expr.as_ref().unwrap();
             if let LExprKind::Conditional(inner_cond) = &else_tail.kind {
-                if let LExprKind::IsVariant(_, variant_name) = &inner_cond.if_branch.condition.kind {
-                    assert_eq!(variant_name, "B");
+                if let LExprKind::IsVariant(_, e_id, v_id) = &inner_cond.if_branch.condition.kind {
+                    assert_eq!(*e_id, enum_id);
+                    assert_eq!(*v_id, id(201));
                 } else {
                     panic!("expected IsVariant 'B', got {:?}", inner_cond.if_branch.condition.kind);
                 }

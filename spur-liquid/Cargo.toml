@@ -1,0 +1,23 @@
+[package]
+name = "spur-liquid"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[features]
+default = []
+# Enables the Formulog-driven refinement check. Requires `java`,
+# `cmake >= 3.21`, a C++17 toolchain (GCC or clang), boost (~1.81),
+# oneTBB, OpenMP, and Souffle (>= 2.3) to be installed at build time.
+formulog = []
+
+[dependencies]
+spur-ast = { path = "../spur-ast" }
+serde = { version = "1.0", features = ["derive"] }
+ecow = { version = "0.2.6", features = ["serde"] }
+thiserror = "2.0.17"
+tempfile = "3.10"
+blake3 = "1.5"
+
+[build-dependencies]
+cmake = "0.1"

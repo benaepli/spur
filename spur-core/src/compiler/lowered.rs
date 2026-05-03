@@ -600,10 +600,10 @@ impl Lowerer {
                 ty,
                 span,
             },
-            TypedExprKind::VariantLit(id, name, payload) => LExpr {
+            TypedExprKind::VariantLit(enum_id, variant_id, _name, payload) => LExpr {
                 kind: LExprKind::VariantLit(
-                    id,
-                    name,
+                    enum_id,
+                    variant_id,
                     payload.map(|e| Box::new(self.lower_expr(*e))),
                 ),
                 ty,
@@ -664,14 +664,14 @@ impl Lowerer {
                 ty,
                 span,
             },
-            TypedExprKind::FieldAccess(e, name) => LExpr {
-                kind: LExprKind::FieldAccess(Box::new(self.lower_expr(*e)), name),
+            TypedExprKind::FieldAccess(e, field_id, _name) => LExpr {
+                kind: LExprKind::FieldAccess(Box::new(self.lower_expr(*e)), field_id),
                 ty,
                 span,
             },
 
-            TypedExprKind::SafeFieldAccess(e, name) => LExpr {
-                kind: LExprKind::SafeFieldAccess(Box::new(self.lower_expr(*e)), name),
+            TypedExprKind::SafeFieldAccess(e, field_id, _name) => LExpr {
+                kind: LExprKind::SafeFieldAccess(Box::new(self.lower_expr(*e)), field_id),
                 ty,
                 span,
             },
@@ -694,7 +694,7 @@ impl Lowerer {
                     id,
                     fields
                         .into_iter()
-                        .map(|(name, e)| (name, self.lower_expr(e)))
+                        .map(|(field_id, _name, e)| (field_id, self.lower_expr(e)))
                         .collect(),
                 ),
                 ty,
@@ -812,11 +812,12 @@ impl Lowerer {
         let remaining = &arms[1..];
 
         match &arm.pattern.kind {
-            TypedPatternKind::Variant(_enum_id, variant_name, payload_pat) => {
+            TypedPatternKind::Variant(enum_id, variant_id, _variant_name, payload_pat) => {
                 let condition = LExpr {
                     kind: LExprKind::IsVariant(
                         Box::new(scrutinee_var.clone()),
-                        variant_name.clone(),
+                        *enum_id,
+                        *variant_id,
                     ),
                     ty: Type::Bool,
                     span: arm.pattern.span,
@@ -972,7 +973,7 @@ impl Lowerer {
                 }
                 stmts
             }
-            TypedPatternKind::Variant(_, _, payload_pat) => {
+            TypedPatternKind::Variant(_, _, _, payload_pat) => {
                 if let Some(payload_pat) = payload_pat {
                     let payload_expr = LExpr {
                         kind: LExprKind::VariantPayload(Box::new(value)),

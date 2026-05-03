@@ -7,8 +7,17 @@ edition = "2024"
 name = "spur"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enables the `--refinements` flag on `spur check` and `spur compile`.
+# Requires the same heavyweight system dependencies as the underlying
+# `spur-liquid::formulog` build (java, cmake, boost, oneTBB, OpenMP,
+# souffle).
+formulog = ["spur-core/formulog"]
+
 [dependencies]
 spur-core = { path = "../spur-core", features = ["simulator"] }
+spur-liquid = { path = "../spur-liquid" }
 anyhow = "1.0.100"
 clap = { version = "4.5.49", features = ["derive"] }
 env_logger = "0.11.8"
