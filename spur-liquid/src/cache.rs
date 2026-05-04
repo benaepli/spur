@@ -1,15 +1,3 @@
-//! Tiny in-memory cache for refinement-check results.
-//!
-//! The cache is keyed by a blake3 hash of the encoded fact bundle that
-//! would be shipped to the `flg` binary, plus the sorted list of
-//! function ids being verified. This makes hits on equivalent
-//! programs cheap (and avoids running the SMT-backed checker on every
-//! debounced LSP edit).
-//!
-//! Currently the cache is a wrapped `Mutex<HashMap>` with no eviction
-//! policy. Realistic LSP sessions rarely accumulate more than a few
-//! dozen entries; if we ever want to bound it, swap in `lru` here.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -98,6 +86,7 @@ mod tests {
             program_in: "gctx([], [], [])\t[]\t-1\n".into(),
             fn_to_check: "1\n".into(),
             expr_origin: String::new(),
+            id_to_span: std::collections::HashMap::new(),
         };
         let b = a.clone();
         assert_eq!(
@@ -113,6 +102,7 @@ mod tests {
             program_in: "gctx([], [], [])\t[]\t-1\n".into(),
             fn_to_check: "1\n".into(),
             expr_origin: String::new(),
+            id_to_span: HashMap::new(),
         };
         let mut b = a.clone();
         b.program_in = "gctx([], [], [])\t[]\t-2\n".into();

@@ -2,6 +2,11 @@ use crate::analysis::checker::TypeError;
 use crate::analysis::resolver::ResolutionError;
 use ariadne::{Color, Label, Report, ReportKind, Source};
 
+#[cfg(feature = "formulog")]
+use spur_liquid::RefinementCheckError;
+#[cfg(feature = "formulog")]
+use spur_liquid::ir::CProgram;
+
 pub fn report_resolution_errors(
     source: &str,
     errors: &[ResolutionError],
@@ -692,6 +697,85 @@ pub fn report_type_errors(
                     )
                     .finish()
                     .eprint((filename, Source::from(source)))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Render Formulog-side refinement check failures as `ariadne`
+/// diagnostics (matching the `rustc`-style output the rest of this
+/// module produces).
+///
+/// Each [`RefinementCheckError`] resolves to one report:
+/// - If the encoder pinned a precise [`spur_ast::Span`] to the failing
+///   sub-expression, the caret points at it.
+/// - Otherwise (atomic-position failure, unsupported expression kind,
+///   or a synthesized e_atomic), we fall back to the function's
+///   declaration span pulled out of `refinement_ir`.
+/// - If `refinement_ir` is `None` (rare; only happens when the lowering
+///   itself bailed out), we drop the label and report just a
+///   message-level diagnostic so the user still sees something.
+#[cfg(feature = "formulog")]
+pub fn report_refinement_check_errors(
+    source: &str,
+    errors: &[RefinementCheckError],
+    filename: &str,
+    refinement_ir: Option<&CProgram>,
+) -> Result<(), std::io::Error> {
+    for error in errors {
+        let label = refinement_ir
+            .and_then(|p| p.funcs.iter().find(|f| f.name == error.function))
+            .map(|f| f.original_name.clone())
+            .unwrap_or_else(|| format!("#{}", error.function.0));
+
+        let func_span = refinement_ir
+            .and_then(|p| p.funcs.iter().find(|f| f.name == error.function))
+            .map(|f| f.span);
+
+        // Pick the most precise span we have. `error.span` is set when
+        // the encoder mapped the failing `expr_id` back to a non-default
+        // source span; otherwise we fall back to the function span.
+        let render_span = error.span.or(func_span);
+
+        match render_span {
+            Some(span) => {
+                Report::build(ReportKind::Error, filename, span.start)
+                    .with_message(format!(
+                        "refinement check failed in function `{}`",
+                        label
+                    ))
+                    .with_label(
+                        Label::new((filename, span.start..span.end))
+                            .with_message(if error.span.is_some() {
+                                "this expression's type does not satisfy its declared bound"
+                                    .to_string()
+                            } else {
+                                format!("function `{}` failed to verify", label)
+                            })
+                            .with_color(Color::Red),
+                    )
+                    .with_note(
+                        "note: the SMT-backed refinement checker could not derive \
+                         this expression's type from its precondition; tighten the \
+                         predicate or weaken the expectation",
+                    )
+                    .finish()
+                    .eprint((filename, Source::from(source)))?;
+            }
+            None => {
+                Report::<(&str, std::ops::Range<usize>)>::build(
+                    ReportKind::Error,
+                    filename,
+                    0,
+                )
+                .with_message(format!(
+                    "refinement check failed in function `{}`",
+                    label
+                ))
+                .finish()
+                .eprint((filename, Source::from(source)))?;
             }
         }
     }

@@ -14,6 +14,7 @@
 //! derived (or `func_failed` *is* derived) as a verification failure
 //! and surface it to higher layers.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -23,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use spur_ast::name::NameId;
+use spur_ast::span::Span;
 use thiserror::Error;
 
 use crate::cache::{Cache, CacheKey};
@@ -31,14 +33,22 @@ use crate::ir::CProgram;
 
 /// One refinement check failure reported back from Formulog.
 ///
-/// Currently the only kind that can arise is a function-level failure
-/// (`func_failed/2` derived, or `func_ok/1` not derived). The optional
-/// `expr_id` will be populated once the .flg rules learn to thread
-/// failing-expression ids through (`expr_origin` step 6.b).
+/// `span` is populated when the encoder was able to associate the
+/// `func_failed/2` row's `expr_id` column with a non-default source
+/// [`Span`] (see [`crate::flg::encode`]). Diagnostic renderers should
+/// prefer `span` when present and fall back to the enclosing function's
+/// declaration span otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefinementCheckError {
     pub function: NameId,
     pub kind: RefinementCheckErrorKind,
+    /// Source span of the offending sub-expression, resolved via the
+    /// encoder's `id_to_span` table. `None` means the .flg side reported
+    /// a failure but no precise expression id was available (e.g. an
+    /// atomic-position check, or a synth rule that didn't fire at all),
+    /// in which case the renderer should fall back to the function's
+    /// own span.
+    pub span: Option<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,8 +56,8 @@ pub enum RefinementCheckErrorKind {
     /// The Formulog driver could not derive `func_ok(F)` for this
     /// function, so its body did not type-check against its signature.
     /// `expr_id` is the synthetic id of the offending expression when
-    /// available; once `expr_origin` is plumbed end-to-end it will be
-    /// translatable back to a [`spur_ast::Span`].
+    /// available, populated by the `_outcome` family of rules in
+    /// `spur.flg`.
     FunctionFailed { expr_id: Option<i32> },
 }
 
@@ -95,6 +105,10 @@ pub fn check_with_formulog(
     }
 
     let result = run_flg(&facts, fns_to_check, flg_bin, timeout)?;
+    // The cache stores the fully-resolved errors (with spans baked in),
+    // since `id_to_span` is derived from the same facts that produced
+    // the cache key - re-running the encoder on a hit would just rebuild
+    // the same map.
     result_cache().insert(key, result.clone());
     Ok(result)
 }
@@ -113,48 +127,30 @@ fn run_flg(
     flg_bin: &Path,
     timeout: Duration,
 ) -> Result<Vec<RefinementCheckError>, FormulogError> {
-    let keep_tmp = std::env::var_os("SPUR_FORMULOG_KEEP_TMPDIR").is_some();
-
     let tempdir = tempfile::Builder::new()
         .prefix("spur-formulog-")
         .tempdir()?;
-    let fact_dir = tempdir.path().to_path_buf();
-    write_fact_files(&fact_dir, facts)?;
+    let fact_dir = tempdir.path();
+    write_fact_files(fact_dir, facts)?;
 
-    let out_dir = tempdir.path().to_path_buf();
-
-    if keep_tmp {
-        eprintln!("[spur-formulog] keeping tempdir: {}", fact_dir.display());
-    }
+    let out_dir = tempdir.path();
 
     let child = Command::new(flg_bin)
         .arg("--fact-dir")
-        .arg(&fact_dir)
+        .arg(fact_dir)
         .arg("--out-dir")
-        .arg(&out_dir)
+        .arg(out_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let (exit_status, stdout, stderr) = wait_with_timeout(child, timeout)?;
-
-    if keep_tmp {
-        eprintln!("[spur-formulog] flg stdout:\n{}", stdout);
-        eprintln!("[spur-formulog] flg stderr:\n{}", stderr);
-    }
-
+    let exit_status = wait_with_timeout(child, timeout)?;
     if !exit_status.success() {
         return Err(FormulogError::NonZeroExit(exit_status.code().unwrap_or(-1)));
     }
 
-    let result = parse_outputs(&out_dir, fns_to_check);
-
-    if keep_tmp {
-        let _ = tempdir.into_path();
-    }
-
-    result
+    parse_outputs(out_dir, fns_to_check, &facts.id_to_span)
 }
 
 /// Write every TSV blob in `facts` into `dir`. Empty relations still
@@ -171,24 +167,12 @@ pub(crate) fn write_fact_files(dir: &Path, facts: &EncodedFacts) -> io::Result<(
 fn wait_with_timeout(
     mut child: Child,
     timeout: Duration,
-) -> Result<(std::process::ExitStatus, String, String), FormulogError> {
+) -> Result<std::process::ExitStatus, FormulogError> {
     let start = Instant::now();
     let poll = Duration::from_millis(25);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut o) = child.stdout.take() {
-                    use std::io::Read as _;
-                    let _ = o.read_to_string(&mut stdout);
-                }
-                if let Some(mut e) = child.stderr.take() {
-                    use std::io::Read as _;
-                    let _ = e.read_to_string(&mut stderr);
-                }
-                return Ok((status, stdout, stderr));
-            }
+            Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
@@ -204,10 +188,14 @@ fn wait_with_timeout(
 
 /// Parse `func_ok.tsv` and `func_failed.tsv` out of `out_dir` and
 /// produce a list of [`RefinementCheckError`]s for every requested
-/// function that did not pass.
+/// function that did not pass. Each error's `span` is resolved through
+/// `id_to_span` (the encoder's `expr_id -> Span` table); a value of
+/// `-1` in the failure row's second column - or any id not present in
+/// the map - resolves to `None`, meaning "render at the function span".
 fn parse_outputs(
     out_dir: &Path,
     fns_to_check: &[NameId],
+    id_to_span: &HashMap<i32, Span>,
 ) -> Result<Vec<RefinementCheckError>, FormulogError> {
     let ok = read_func_ok(out_dir)?;
     let failed = read_func_failed(out_dir)?;
@@ -219,9 +207,14 @@ fn parse_outputs(
             continue;
         }
         let expr_id = failed.iter().find(|(fid, _)| *fid == id).map(|(_, eid)| *eid);
+        let span = expr_id
+            .and_then(|eid| if eid < 0 { None } else { Some(eid) })
+            .and_then(|eid| id_to_span.get(&eid).copied())
+            .filter(|s| *s != Span::default());
         errors.push(RefinementCheckError {
             function: *f,
             kind: RefinementCheckErrorKind::FunctionFailed { expr_id },
+            span,
         });
     }
     Ok(errors)
@@ -324,7 +317,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("func_ok.tsv"), "1\n").unwrap();
         fs::write(dir.path().join("func_failed.tsv"), "2\t-1\n").unwrap();
-        let errs = parse_outputs(dir.path(), &[NameId(1), NameId(2), NameId(3)]).unwrap();
+        let id_to_span = HashMap::new();
+        let errs = parse_outputs(
+            dir.path(),
+            &[NameId(1), NameId(2), NameId(3)],
+            &id_to_span,
+        )
+        .unwrap();
         // Function 1 is ok; functions 2 and 3 both lack a `func_ok`
         // tuple. Function 2 has an explicit `func_failed`, function 3
         // is implicit.
@@ -334,10 +333,35 @@ mod tests {
             errs[0].kind,
             RefinementCheckErrorKind::FunctionFailed { expr_id: Some(-1) }
         ));
+        // expr_id == -1 is a sentinel meaning "no precise span", so
+        // the resolved span stays None.
+        assert!(errs[0].span.is_none());
         assert_eq!(errs[1].function, NameId(3));
         assert!(matches!(
             errs[1].kind,
             RefinementCheckErrorKind::FunctionFailed { expr_id: None }
+        ));
+        assert!(errs[1].span.is_none());
+    }
+
+    #[test]
+    fn parse_outputs_resolves_real_span_through_id_to_span() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("func_ok.tsv"), "").unwrap();
+        // function id 4 failed, attributed to expression id 7.
+        fs::write(dir.path().join("func_failed.tsv"), "4\t7\n").unwrap();
+
+        let mut id_to_span = HashMap::new();
+        let real_span: Span = Span::from(12..20);
+        id_to_span.insert(7, real_span);
+
+        let errs = parse_outputs(dir.path(), &[NameId(4)], &id_to_span).unwrap();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].function, NameId(4));
+        assert_eq!(errs[0].span, Some(real_span));
+        assert!(matches!(
+            errs[0].kind,
+            RefinementCheckErrorKind::FunctionFailed { expr_id: Some(7) }
         ));
     }
 }

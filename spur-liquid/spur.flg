@@ -80,6 +80,8 @@ and c_expr =
   | e_variant_payload(c_atomic, name_id, name_id)
   | e_block(c_block)
   | e_cond(c_cond_branch list, c_block)
+  (* Transparent wrapper that tags a sub-expression with an id. *)
+  | e_id(i32, c_expr)
 
 type env = (name_id * c_type) list
 
@@ -92,10 +94,10 @@ type struct_env = (name_id * (name_id * c_type) list) list
 type enum_env = (name_id * (name_id * c_type option) list) list
 type global_ctx = gctx(func_env, struct_env, enum_env)
 
-@edb rel tuple_accessor(i32, name_id)
-@edb rel program_in(global_ctx, func_def list, i32)
-@edb rel fn_to_check(name_id)
-@edb rel expr_origin(i32, i32, i32)
+@disk @edb rel tuple_accessor(i32, name_id)
+@disk @edb rel program_in(global_ctx, func_def list, i32)
+@disk @edb rel fn_to_check(name_id)
+@disk @edb rel expr_origin(i32, i32, i32)
 
 fun subst_refexpr(NewExpr: refexpr, Old_id: name_id, Expr: refexpr) : refexpr =
     match Expr with
@@ -244,6 +246,23 @@ fun iff_refexpr(V: refexpr, P: refexpr) : refexpr =
 
 fun fresh(Ctr: i32) : i32 * i32 = (Ctr, Ctr - 1)
 
+
+type chk_outcome = chk_ok | chk_fail(i32)
+
+fun combine(O1: chk_outcome, O2: chk_outcome) : chk_outcome =
+    match O1 with
+    | chk_ok => O2
+    | chk_fail(_) => O1
+    end
+
+
+fun is_block_or_cond(E: c_expr) : bool =
+    match E with
+    | e_block(_) => true
+    | e_cond(_, _) => true
+    | _ => false
+    end
+
 fun refine_env_true(Env: env, Cond: c_atomic, Ctr: i32) : env * i32 =
     let (V, Ctr1) = fresh(Ctr) in
     ((V, t_refined(V, t_bool, atomic_to_refexpr(Cond))) :: Env, Ctr1)
@@ -271,6 +290,7 @@ fun subst_params(NewExpr: refexpr, Old_id: name_id, Params: func_param list) : f
 
 uninterpreted fun ast_var_bool(i32 smt) : bool smt
 uninterpreted fun ast_var_int(i32 smt)  : int smt
+uninterpreted fun ast_string_atom(string smt) : int smt
 uninterpreted fun smt_is_variant(int smt, int smt, int smt) : bool smt
 uninterpreted fun smt_apply(int smt, int smt) : int smt
 uninterpreted fun smt_to_bool(int smt) : bool smt
@@ -355,6 +375,8 @@ and to_smt_int(Expr: refexpr): int smt =
     match Expr with
     | r_int_lit(Val) =>
         `int_big_const(Val)`
+    | r_string_lit(S) =>
+        `ast_string_atom(S)`
     | r_var(Id) =>
         create_smt_int_var(Id)
     | r_bin_op(Op, Lhs, Rhs) =>
@@ -452,117 +474,129 @@ and subtype(Env: env, T1: c_type, T2: c_type) : bool =
     end
 
 @topdown
-rel synth_expr(env, global_ctx, c_type, c_expr, i32, c_type, i32)
+rel synth_expr(env, global_ctx, c_type, c_expr, i32, c_type, i32, chk_outcome)
 @topdown
-rel check_expr(env, global_ctx, c_type, c_expr, i32, c_type, i32)
-
+rel check_expr(env, global_ctx, c_type, c_expr, i32, c_type, i32, chk_outcome)
 @topdown
-rel check_args(env, global_ctx, c_type, func_param list, c_atomic list, c_type, i32, c_type, i32)
+rel synth_tuple(env, global_ctx, c_type, c_atomic list, i32, c_type list, i32, chk_outcome)
+@topdown
+rel check_args(env, global_ctx, c_type, func_param list, c_atomic list, c_type, i32, c_type, i32, chk_outcome)
+@topdown
+rel check_struct_fields(env, global_ctx, c_type, (name_id * c_type) list, (name_id * c_atomic) list, i32, i32, chk_outcome)
+@topdown
+rel synth_block(env, global_ctx, c_type, c_block, i32, c_type, i32, chk_outcome)
+@topdown
+rel check_block(env, global_ctx, c_type, c_block, i32, c_type, i32, chk_outcome)
+@topdown
+rel synth_stmts(env, global_ctx, c_type, c_stmt list, i32, env, i32, chk_outcome)
+@topdown
+rel synth_cond(env, global_ctx, c_type, c_cond_branch list, c_block, i32, c_type, i32, chk_outcome)
+@topdown
+rel check_cond(env, global_ctx, c_type, c_cond_branch list, c_block, i32, c_type, i32, chk_outcome)
 
-synth_expr(Env, _Ctx, _FRetTy, e_atomic(a_var(X)), Ctr, t_refined(V, Base, r_eq(r_var(V), r_var(X))), CtrOut) :-
+synth_expr(Env, _Ctx, _FRetTy, e_atomic(a_var(X)), Ctr, t_refined(V, Base, r_eq(r_var(V), r_var(X))), CtrOut, chk_ok) :-
     env_lookup(X, Env) = some(T),
     base_type(T) = Base,
     (V, CtrOut) = fresh(Ctr).
 
-synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_int_lit(N)), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_int_lit(N))), CtrOut) :-
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_int_lit(N)), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_int_lit(N))), CtrOut, chk_ok) :-
     (V, CtrOut) = fresh(Ctr).
 
-synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_bool_lit(true)), Ctr, t_refined(V, t_bool, r_var(V)), CtrOut) :-
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_bool_lit(true)), Ctr, t_refined(V, t_bool, r_var(V)), CtrOut, chk_ok) :-
     (V, CtrOut) = fresh(Ctr).
 
-synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_bool_lit(false)), Ctr, t_refined(V, t_bool, r_not(r_var(V))), CtrOut) :-
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_bool_lit(false)), Ctr, t_refined(V, t_bool, r_not(r_var(V))), CtrOut, chk_ok) :-
     (V, CtrOut) = fresh(Ctr).
 
-synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_nil), Ctr, t_nil, Ctr).
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_string_lit(S)), Ctr, t_refined(V, t_string, r_eq(r_var(V), r_string_lit(S))), CtrOut, chk_ok) :-
+    (V, CtrOut) = fresh(Ctr).
 
-synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_bin_op(Op, Re1, Re2))), CtrOut) :-
+synth_expr(_Env, _Ctx, _FRetTy, e_atomic(a_nil), Ctr, t_nil, Ctr, chk_ok).
+
+synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_bin_op(Op, Re1, Re2))), CtrOut, chk_ok) :-
     is_arithmetic_op(Op),
     atomic_to_refexpr(A1) = Re1,
     atomic_to_refexpr(A2) = Re2,
     (V, CtrOut) = fresh(Ctr).
 
-synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_bool, Pred), CtrOut) :-
+synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_bool, Pred), CtrOut, chk_ok) :-
     is_comparison_op(Op),
     atomic_to_refexpr(A1) = Re1,
     atomic_to_refexpr(A2) = Re2,
     (V, CtrOut) = fresh(Ctr),
     iff_refexpr(r_var(V), r_bin_op(Op, Re1, Re2)) = Pred.
 
-synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_bool, Pred), CtrOut) :-
+synth_expr(_Env, _Ctx, _FRetTy, e_binop(Op, A1, A2), Ctr, t_refined(V, t_bool, Pred), CtrOut, chk_ok) :-
     is_logical_op(Op),
     atomic_to_refexpr(A1) = Re1,
     atomic_to_refexpr(A2) = Re2,
     (V, CtrOut) = fresh(Ctr),
     iff_refexpr(r_var(V), r_bin_op(Op, Re1, Re2)) = Pred.
 
-synth_expr(_Env, _Ctx, _FRetTy, e_not(A), Ctr, t_refined(V, t_bool, Pred), CtrOut) :-
+synth_expr(_Env, _Ctx, _FRetTy, e_not(A), Ctr, t_refined(V, t_bool, Pred), CtrOut, chk_ok) :-
     (V, CtrOut) = fresh(Ctr),
     atomic_to_refexpr(A) = Re,
     iff_refexpr(r_var(V), r_not(Re)) = Pred.
 
-synth_expr(_Env, _Ctx, _FRetTy, e_negate(A), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_bin_op(subtract, r_int_lit(0L), Re))), CtrOut) :-
+synth_expr(_Env, _Ctx, _FRetTy, e_negate(A), Ctr, t_refined(V, t_int, r_eq(r_var(V), r_bin_op(subtract, r_int_lit(0L), Re))), CtrOut, chk_ok) :-
     atomic_to_refexpr(A) = Re,
     (V, CtrOut) = fresh(Ctr).
 
-synth_expr(Env, Ctx, FRetTy, e_tuple_access(a_var(X), Idx), Ctr, t_refined(V, ElemTy, r_eq(r_var(V), r_app(AccId, [r_var(X)]))), CtrOut) :-
-    synth_expr(Env, Ctx, FRetTy, e_atomic(a_var(X)), Ctr, ReceiverTy, Ctr1),
+synth_expr(Env, Ctx, FRetTy, e_tuple_access(a_var(X), Idx), Ctr, t_refined(V, ElemTy, r_eq(r_var(V), r_app(AccId, [r_var(X)]))), CtrOut, chk_ok) :-
+    synth_expr(Env, Ctx, FRetTy, e_atomic(a_var(X)), Ctr, ReceiverTy, Ctr1, chk_ok),
     base_type(ReceiverTy) = t_tuple(Tys),
     list_nth(Tys, Idx) = some(ElemTy),
     tuple_accessor(Idx, AccId),
     (V, CtrOut) = fresh(Ctr1).
 
-@topdown
-rel synth_tuple(env, global_ctx, c_type, c_atomic list, i32, c_type list, i32)
+synth_tuple(_Env, _Ctx, _FRetTy, [], Ctr, [], Ctr, chk_ok).
 
-synth_tuple(_Env, _Ctx, _FRetTy, [], Ctr, [], Ctr).
+synth_tuple(Env, Ctx, FRetTy, A :: Rest, Ctr, T :: RestTys, CtrOut, Out) :-
+    synth_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, T, Ctr1, O1),
+    synth_tuple(Env, Ctx, FRetTy, Rest, Ctr1, RestTys, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-synth_tuple(Env, Ctx, FRetTy, A :: Rest, Ctr, T :: RestTys, CtrOut) :-
-    synth_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, T, Ctr1),
-    synth_tuple(Env, Ctx, FRetTy, Rest, Ctr1, RestTys, CtrOut).
+synth_expr(Env, Ctx, FRetTy, e_tuple_lit(Elems), Ctr, t_tuple(Tys), CtrOut, Out) :-
+    synth_tuple(Env, Ctx, FRetTy, Elems, Ctr, Tys, CtrOut, Out).
 
-synth_expr(Env, Ctx, FRetTy, e_tuple_lit(Elems), Ctr, t_tuple(Tys), CtrOut) :-
-    synth_tuple(Env, Ctx, FRetTy, Elems, Ctr, Tys, CtrOut).
-
-synth_expr(Env, Ctx, FRetTy, e_func_call(F, Args), Ctr, ResultTy, CtrOut) :-
+synth_expr(Env, Ctx, FRetTy, e_func_call(F, Args), Ctr, ResultTy, CtrOut, Out) :-
     Ctx = gctx(Fenv, _Senv, _Eenv),
     fenv_lookup(F, Fenv) = some(fsig(Params, RetTy)),
-    check_args(Env, Ctx, FRetTy, Params, Args, RetTy, Ctr, ResultTy, CtrOut).
+    check_args(Env, Ctx, FRetTy, Params, Args, RetTy, Ctr, ResultTy, CtrOut, Out).
 
-@topdown
-rel check_struct_fields(env, global_ctx, c_type, (name_id * c_type) list, (name_id * c_atomic) list, i32, i32)
+check_struct_fields(_Env, _Ctx, _FRetTy, [], _Assignments, Ctr, Ctr, chk_ok).
 
-check_struct_fields(_Env, _Ctx, _FRetTy, [], _Assignments, Ctr, Ctr).
-
-check_struct_fields(Env, Ctx, FRetTy, (FieldName, FieldTy) :: RestFields, Assignments, Ctr, CtrOut) :-
+check_struct_fields(Env, Ctx, FRetTy, (FieldName, FieldTy) :: RestFields, Assignments, Ctr, CtrOut, Out) :-
     assoc_lookup(FieldName, Assignments) = some(Val),
-    check_expr(Env, Ctx, FRetTy, e_atomic(Val), Ctr, FieldTy, Ctr1),
-    check_struct_fields(Env, Ctx, FRetTy, RestFields, Assignments, Ctr1, CtrOut).
+    check_expr(Env, Ctx, FRetTy, e_atomic(Val), Ctr, FieldTy, Ctr1, O1),
+    check_struct_fields(Env, Ctx, FRetTy, RestFields, Assignments, Ctr1, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-synth_expr(Env, Ctx, FRetTy, e_struct_lit(StructName, Assignments), Ctr, t_struct(StructName), CtrOut) :-
+synth_expr(Env, Ctx, FRetTy, e_struct_lit(StructName, Assignments), Ctr, t_struct(StructName), CtrOut, Out) :-
     Ctx = gctx(_Fenv, Senv, _Eenv),
     struct_lookup(StructName, Senv) = some(Fields),
-    check_struct_fields(Env, Ctx, FRetTy, Fields, Assignments, Ctr, CtrOut).
+    check_struct_fields(Env, Ctx, FRetTy, Fields, Assignments, Ctr, CtrOut, Out).
 
-synth_expr(Env, Ctx, FRetTy, e_field_access(a_var(X), FieldName), Ctr, t_refined(V, FieldTy, r_eq(r_var(V), r_app(FieldName, [r_var(X)]))), CtrOut) :-
-    synth_expr(Env, Ctx, FRetTy, e_atomic(a_var(X)), Ctr, ReceiverTy, Ctr1),
+synth_expr(Env, Ctx, FRetTy, e_field_access(a_var(X), FieldName), Ctr, t_refined(V, FieldTy, r_eq(r_var(V), r_app(FieldName, [r_var(X)]))), CtrOut, chk_ok) :-
+    synth_expr(Env, Ctx, FRetTy, e_atomic(a_var(X)), Ctr, ReceiverTy, Ctr1, chk_ok),
     base_type(ReceiverTy) = t_struct(StructName),
     Ctx = gctx(_Fenv, Senv, _Eenv),
     struct_lookup(StructName, Senv) = some(Fields),
     field_lookup(FieldName, Fields) = some(FieldTy),
     (V, CtrOut) = fresh(Ctr1).
 
-synth_expr(_Env, Ctx, _FRetTy, e_variant_lit(EnumId, CtorId, none), Ctr, t_variant(EnumId), Ctr) :-
+synth_expr(_Env, Ctx, _FRetTy, e_variant_lit(EnumId, CtorId, none), Ctr, t_variant(EnumId), Ctr, chk_ok) :-
     Ctx = gctx(_Fenv, _Senv, Eenv),
     enum_lookup(EnumId, Eenv) = some(Ctors),
     ctor_lookup(CtorId, Ctors) = some(none).
 
-synth_expr(Env, Ctx, FRetTy, e_variant_lit(EnumId, CtorId, some(Payload)), Ctr, t_variant(EnumId), CtrOut) :-
+synth_expr(Env, Ctx, FRetTy, e_variant_lit(EnumId, CtorId, some(Payload)), Ctr, t_variant(EnumId), CtrOut, Out) :-
     Ctx = gctx(_Fenv, _Senv, Eenv),
     enum_lookup(EnumId, Eenv) = some(Ctors),
     ctor_lookup(CtorId, Ctors) = some(some(PayloadTy)),
-    check_expr(Env, Ctx, FRetTy, e_atomic(Payload), Ctr, PayloadTy, CtrOut).
+    check_expr(Env, Ctx, FRetTy, e_atomic(Payload), Ctr, PayloadTy, CtrOut, Out).
 
-synth_expr(Env, Ctx, _FRetTy, e_is_variant(a_var(X), EnumId, CtorId), Ctr, t_refined(V, t_bool, r_is_variant(X, EnumId, CtorId)), CtrOut) :-
+synth_expr(Env, Ctx, _FRetTy, e_is_variant(a_var(X), EnumId, CtorId), Ctr, t_refined(V, t_bool, r_is_variant(X, EnumId, CtorId)), CtrOut, chk_ok) :-
     env_lookup(X, Env) = some(XTy),
     base_type(XTy) = t_variant(EnumId),
     Ctx = gctx(_Fenv, _Senv, Eenv),
@@ -570,7 +604,7 @@ synth_expr(Env, Ctx, _FRetTy, e_is_variant(a_var(X), EnumId, CtorId), Ctr, t_ref
     ctor_lookup(CtorId, Ctors) = some(_),
     (V, CtrOut) = fresh(Ctr).
 
-synth_expr(Env, Ctx, _FRetTy, e_variant_payload(a_var(X), EnumId, CtorId), Ctr, PayloadTy, Ctr) :-
+synth_expr(Env, Ctx, _FRetTy, e_variant_payload(a_var(X), EnumId, CtorId), Ctr, PayloadTy, Ctr, chk_ok) :-
     Ctx = gctx(_Fenv, _Senv, Eenv),
     enum_lookup(EnumId, Eenv) = some(Ctors),
     ctor_lookup(CtorId, Ctors) = some(some(PayloadTy)),
@@ -578,107 +612,136 @@ synth_expr(Env, Ctx, _FRetTy, e_variant_payload(a_var(X), EnumId, CtorId), Ctr, 
     let Goal = to_smt_bool(r_is_variant(X, EnumId, CtorId)) in
     is_valid(`SmtEnv ==> Goal`).
 
-check_args(_Env, _Ctx, _FRetTy, [], _, RetTy, Ctr, RetTy, Ctr).
+check_args(_Env, _Ctx, _FRetTy, [], _, RetTy, Ctr, RetTy, Ctr, chk_ok).
 
-check_args(Env, Ctx, FRetTy, fparam(ParamId, ParamTy) :: RestParams, Arg :: RestArgs, RetTy, Ctr, ResultTy, CtrOut) :-
-    check_expr(Env, Ctx, FRetTy, e_atomic(Arg), Ctr, ParamTy, CtrMid),
+check_args(Env, Ctx, FRetTy, fparam(ParamId, ParamTy) :: RestParams, Arg :: RestArgs, RetTy, Ctr, ResultTy, CtrOut, Out) :-
+    check_expr(Env, Ctx, FRetTy, e_atomic(Arg), Ctr, ParamTy, CtrMid, O1),
     atomic_to_refexpr(Arg) = ArgRef,
     subst_params(ArgRef, ParamId, RestParams) = SubstRestParams,
     subst_type(ArgRef, ParamId, RetTy) = SubstRetTy,
-    check_args(Env, Ctx, FRetTy, SubstRestParams, RestArgs, SubstRetTy, CtrMid, ResultTy, CtrOut).
+    check_args(Env, Ctx, FRetTy, SubstRestParams, RestArgs, SubstRetTy, CtrMid, ResultTy, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-@topdown
-rel check_block(env, global_ctx, c_type, c_block, i32, c_type, i32)
+check_block(Env, Ctx, FRetTy, block([], some(Tail)), Ctr, T, CtrOut, Out) :-
+    check_expr(Env, Ctx, FRetTy, e_atomic(Tail), Ctr, T, CtrOut, Out).
 
-check_block(Env, Ctx, FRetTy, block([], some(Tail)), Ctr, T, CtrOut) :-
-    check_expr(Env, Ctx, FRetTy, e_atomic(Tail), Ctr, T, CtrOut).
+check_block(_Env, _Ctx, _FRetTy, block([], none), Ctr, _T, Ctr, chk_ok).
 
-check_block(_Env, _Ctx, _FRetTy, block([], none), Ctr, _T, Ctr).
+check_block(Env, Ctx, FRetTy, block(s_return(A) :: _, _), Ctr, _T, CtrOut, Out) :-
+    check_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, FRetTy, CtrOut, Out).
 
-check_block(Env, Ctx, FRetTy, block(s_return(A) :: _, _), Ctr, _T, CtrOut) :-
-    check_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, FRetTy, CtrOut).
+check_block(Env, Ctx, FRetTy, block(s_let(X, some(AnnTy), E) :: Rest, Tail), Ctr, T, CtrOut, Out) :-
+    check_expr(Env, Ctx, FRetTy, E, Ctr, AnnTy, Ctr1, O1),
+    check_block((X, AnnTy) :: Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-check_block(Env, Ctx, FRetTy, block(s_let(X, some(AnnTy), E) :: Rest, Tail), Ctr, T, CtrOut) :-
-    check_expr(Env, Ctx, FRetTy, E, Ctr, AnnTy, Ctr1),
-    check_block((X, AnnTy) :: Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut).
+check_block(Env, Ctx, FRetTy, block(s_let(X, none, E) :: Rest, Tail), Ctr, T, CtrOut, Out) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, Tx, Ctr1, O1),
+    check_block((X, Tx) :: Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-check_block(Env, Ctx, FRetTy, block(s_let(X, none, E) :: Rest, Tail), Ctr, T, CtrOut) :-
-    synth_expr(Env, Ctx, FRetTy, E, Ctr, Tx, Ctr1),
-    check_block((X, Tx) :: Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut).
+check_block(Env, Ctx, FRetTy, block(s_expr(E) :: Rest, Tail), Ctr, T, CtrOut, Out) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, _Tx, Ctr1, O1),
+    check_block(Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-check_block(Env, Ctx, FRetTy, block(s_expr(E) :: Rest, Tail), Ctr, T, CtrOut) :-
-    synth_expr(Env, Ctx, FRetTy, E, Ctr, _Tx, Ctr1),
-    check_block(Env, Ctx, FRetTy, block(Rest, Tail), Ctr1, T, CtrOut).
+synth_stmts(Env, _Ctx, _FRetTy, [], Ctr, Env, Ctr, chk_ok).
 
-@topdown
-rel synth_block(env, global_ctx, c_type, c_block, i32, c_type, i32)
+synth_stmts(Env, Ctx, FRetTy, s_let(X, some(AnnTy), E) :: Rest, Ctr, EnvOut, CtrOut, Out) :-
+    check_expr(Env, Ctx, FRetTy, E, Ctr, AnnTy, Ctr1, O1),
+    synth_stmts((X, AnnTy) :: Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-@topdown
-rel synth_stmts(env, global_ctx, c_type, c_stmt list, i32, env, i32)
+synth_stmts(Env, Ctx, FRetTy, s_let(X, none, E) :: Rest, Ctr, EnvOut, CtrOut, Out) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, Tx, Ctr1, O1),
+    synth_stmts((X, Tx) :: Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-synth_stmts(Env, _Ctx, _FRetTy, [], Ctr, Env, Ctr).
+synth_stmts(Env, Ctx, FRetTy, s_expr(E) :: Rest, Ctr, EnvOut, CtrOut, Out) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, _Tx, Ctr1, O1),
+    synth_stmts(Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-synth_stmts(Env, Ctx, FRetTy, s_let(X, some(AnnTy), E) :: Rest, Ctr, EnvOut, CtrOut) :-
-    check_expr(Env, Ctx, FRetTy, E, Ctr, AnnTy, Ctr1),
-    synth_stmts((X, AnnTy) :: Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut).
+synth_stmts(Env, Ctx, FRetTy, s_return(A) :: _, Ctr, Env, CtrOut, Out) :-
+    check_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, FRetTy, CtrOut, Out).
 
-synth_stmts(Env, Ctx, FRetTy, s_let(X, none, E) :: Rest, Ctr, EnvOut, CtrOut) :-
-    synth_expr(Env, Ctx, FRetTy, E, Ctr, Tx, Ctr1),
-    synth_stmts((X, Tx) :: Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut).
+synth_block(Env, Ctx, FRetTy, block(Stmts, some(Tail)), Ctr, BaseTy, CtrOut, Out) :-
+    synth_stmts(Env, Ctx, FRetTy, Stmts, Ctr, EnvExt, Ctr1, O1),
+    synth_expr(EnvExt, Ctx, FRetTy, e_atomic(Tail), Ctr1, T, CtrOut, O2),
+    base_type(T) = BaseTy,
+    combine(O1, O2) = Out.
 
-synth_stmts(Env, Ctx, FRetTy, s_expr(E) :: Rest, Ctr, EnvOut, CtrOut) :-
-    synth_expr(Env, Ctx, FRetTy, E, Ctr, _Tx, Ctr1),
-    synth_stmts(Env, Ctx, FRetTy, Rest, Ctr1, EnvOut, CtrOut).
+synth_block(_Env, _Ctx, _FRetTy, block(_, none), Ctr, t_never, Ctr, chk_ok).
 
-synth_stmts(Env, Ctx, FRetTy, s_return(A) :: _, Ctr, Env, CtrOut) :-
-    check_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, FRetTy, CtrOut).
+check_cond(Env, Ctx, FRetTy, [], ElseBlock, Ctr, T, CtrOut, Out) :-
+    check_block(Env, Ctx, FRetTy, ElseBlock, Ctr, T, CtrOut, Out).
 
-synth_block(Env, Ctx, FRetTy, block(Stmts, some(Tail)), Ctr, BaseTy, CtrOut) :-
-    synth_stmts(Env, Ctx, FRetTy, Stmts, Ctr, EnvExt, Ctr1),
-    synth_expr(EnvExt, Ctx, FRetTy, e_atomic(Tail), Ctr1, T, CtrOut),
-    base_type(T) = BaseTy.
-
-synth_block(_Env, _Ctx, _FRetTy, block(_, none), Ctr, t_never, Ctr).
-
-@topdown
-rel check_cond(env, global_ctx, c_type, c_cond_branch list, c_block, i32, c_type, i32)
-
-check_cond(Env, Ctx, FRetTy, [], ElseBlock, Ctr, T, CtrOut) :-
-    check_block(Env, Ctx, FRetTy, ElseBlock, Ctr, T, CtrOut).
-
-check_cond(Env, Ctx, FRetTy, cond_branch(Cond, Body) :: Rest, ElseBlock, Ctr, T, CtrOut) :-
+check_cond(Env, Ctx, FRetTy, cond_branch(Cond, Body) :: Rest, ElseBlock, Ctr, T, CtrOut, Out) :-
     refine_env_true(Env, Cond, Ctr) = (EnvTrue, Ctr1),
-    check_block(EnvTrue, Ctx, FRetTy, Body, Ctr1, T, Ctr2),
+    check_block(EnvTrue, Ctx, FRetTy, Body, Ctr1, T, Ctr2, O1),
     refine_env_false(Env, Cond, Ctr2) = (EnvFalse, Ctr3),
-    check_cond(EnvFalse, Ctx, FRetTy, Rest, ElseBlock, Ctr3, T, CtrOut).
+    check_cond(EnvFalse, Ctx, FRetTy, Rest, ElseBlock, Ctr3, T, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-@topdown
-rel synth_cond(env, global_ctx, c_type, c_cond_branch list, c_block, i32, c_type, i32)
+synth_cond(Env, Ctx, FRetTy, [], ElseBlock, Ctr, BaseTy, CtrOut, Out) :-
+    synth_block(Env, Ctx, FRetTy, ElseBlock, Ctr, BaseTy, CtrOut, Out).
 
-synth_cond(Env, Ctx, FRetTy, [], ElseBlock, Ctr, BaseTy, CtrOut) :-
-    synth_block(Env, Ctx, FRetTy, ElseBlock, Ctr, BaseTy, CtrOut).
-
-synth_cond(Env, Ctx, FRetTy, cond_branch(Cond, Body) :: Rest, ElseBlock, Ctr, BaseTy, CtrOut) :-
+synth_cond(Env, Ctx, FRetTy, cond_branch(Cond, Body) :: Rest, ElseBlock, Ctr, BaseTy, CtrOut, Out) :-
     refine_env_true(Env, Cond, Ctr) = (EnvTrue, Ctr1),
-    synth_block(EnvTrue, Ctx, FRetTy, Body, Ctr1, BaseTy, Ctr2),
+    synth_block(EnvTrue, Ctx, FRetTy, Body, Ctr1, BaseTy, Ctr2, O1),
     refine_env_false(Env, Cond, Ctr2) = (EnvFalse, Ctr3),
-    synth_cond(EnvFalse, Ctx, FRetTy, Rest, ElseBlock, Ctr3, BaseTy, CtrOut).
+    synth_cond(EnvFalse, Ctx, FRetTy, Rest, ElseBlock, Ctr3, BaseTy, CtrOut, O2),
+    combine(O1, O2) = Out.
 
-synth_expr(Env, Ctx, FRetTy, e_block(B), Ctr, T, CtrOut) :-
-    synth_block(Env, Ctx, FRetTy, B, Ctr, T, CtrOut).
+synth_expr(Env, Ctx, FRetTy, e_block(B), Ctr, T, CtrOut, Out) :-
+    synth_block(Env, Ctx, FRetTy, B, Ctr, T, CtrOut, Out).
 
-synth_expr(Env, Ctx, FRetTy, e_cond(Branches, ElseBlock), Ctr, T, CtrOut) :-
-    synth_cond(Env, Ctx, FRetTy, Branches, ElseBlock, Ctr, T, CtrOut).
+synth_expr(Env, Ctx, FRetTy, e_cond(Branches, ElseBlock), Ctr, T, CtrOut, Out) :-
+    synth_cond(Env, Ctx, FRetTy, Branches, ElseBlock, Ctr, T, CtrOut, Out).
 
-check_expr(Env, Ctx, FRetTy, e_block(B), Ctr, T, CtrOut) :-
-    check_block(Env, Ctx, FRetTy, B, Ctr, T, CtrOut).
+(* e_id wrapper is transparent for synth; when the inner expression
+   fails with the -1 sentinel (no precise location), upgrade to the
+   enclosing expr id so the diagnostic can point at it. *)
+synth_expr(Env, Ctx, FRetTy, e_id(_Id, E), Ctr, T, CtrOut, chk_ok) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, T, CtrOut, chk_ok).
 
-check_expr(Env, Ctx, FRetTy, e_cond(Branches, ElseBlock), Ctr, T, CtrOut) :-
-    check_cond(Env, Ctx, FRetTy, Branches, ElseBlock, Ctr, T, CtrOut).
+synth_expr(Env, Ctx, FRetTy, e_id(Id, E), Ctr, T, CtrOut, chk_fail(Id)) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, T, CtrOut, chk_fail(-1)).
 
-check_expr(Env, Ctx, FRetTy, E, Ctr, T, CtrOut) :-
-    synth_expr(Env, Ctx, FRetTy, E, Ctr, Tprime, CtrOut),
+synth_expr(Env, Ctx, FRetTy, e_id(_Id, E), Ctr, T, CtrOut, chk_fail(Inner)) :-
+    synth_expr(Env, Ctx, FRetTy, E, Ctr, T, CtrOut, chk_fail(Inner)),
+    Inner != -1.
+
+check_expr(Env, Ctx, FRetTy, e_id(_Id, e_block(B)), Ctr, T, CtrOut, Out) :-
+    check_block(Env, Ctx, FRetTy, B, Ctr, T, CtrOut, Out).
+
+check_expr(Env, Ctx, FRetTy, e_id(_Id, e_cond(Branches, ElseBlock)), Ctr, T, CtrOut, Out) :-
+    check_cond(Env, Ctx, FRetTy, Branches, ElseBlock, Ctr, T, CtrOut, Out).
+
+check_expr(Env, Ctx, FRetTy, e_id(Id, E), Ctr, T, CtrOut, SynthOut) :-
+    is_block_or_cond(E) = false,
+    synth_expr(Env, Ctx, FRetTy, e_id(Id, E), Ctr, Tprime, CtrOut, SynthOut),
     subtype(Env, Tprime, T).
+
+check_expr(Env, Ctx, FRetTy, e_id(Id, E), Ctr, T, CtrOut, Out) :-
+    is_block_or_cond(E) = false,
+    synth_expr(Env, Ctx, FRetTy, e_id(Id, E), Ctr, Tprime, CtrOut, SynthOut),
+    !subtype(Env, Tprime, T),
+    combine(SynthOut, chk_fail(Id)) = Out.
+
+check_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, T, CtrOut, chk_ok) :-
+    synth_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, Tprime, CtrOut, chk_ok),
+    subtype(Env, Tprime, T).
+
+check_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, T, CtrOut, chk_fail(-1)) :-
+    synth_expr(Env, Ctx, FRetTy, e_atomic(A), Ctr, Tprime, CtrOut, chk_ok),
+    !subtype(Env, Tprime, T).
+
+check_expr(Env, Ctx, FRetTy, e_block(B), Ctr, T, CtrOut, Out) :-
+    check_block(Env, Ctx, FRetTy, B, Ctr, T, CtrOut, Out).
+
+check_expr(Env, Ctx, FRetTy, e_cond(Branches, ElseBlock), Ctr, T, CtrOut, Out) :-
+    check_cond(Env, Ctx, FRetTy, Branches, ElseBlock, Ctr, T, CtrOut, Out).
 
 fun params_to_env(Params: func_param list) : env =
     match Params with
@@ -687,23 +750,22 @@ fun params_to_env(Params: func_param list) : env =
     end
 
 @topdown
-rel check_func(global_ctx, func_def, i32)
+rel check_func(global_ctx, func_def, i32, chk_outcome)
 
-check_func(Ctx, fdef(_Name, Params, RetTy, Body), Ctr) :-
+check_func(Ctx, fdef(_Name, Params, RetTy, Body), Ctr, Out) :-
     params_to_env(Params) = Env,
-    check_block(Env, Ctx, RetTy, Body, Ctr, RetTy, _).
+    check_block(Env, Ctx, RetTy, Body, Ctr, RetTy, _, Out).
 
 @topdown
-rel check_program(global_ctx, func_def list, i32)
+rel check_program(global_ctx, func_def list, i32, chk_outcome)
 
-check_program(_Ctx, [], _Ctr).
+check_program(_Ctx, [], _Ctr, chk_ok).
 
-check_program(Ctx, fdef(Name, Params, RetTy, Body) :: Rest, Ctr) :-
-    check_func(Ctx, fdef(Name, Params, RetTy, Body), Ctr),
-    check_program(Ctx, Rest, Ctr).
+check_program(Ctx, fdef(Name, Params, RetTy, Body) :: Rest, Ctr, Out) :-
+    check_func(Ctx, fdef(Name, Params, RetTy, Body), Ctr, O1),
+    check_program(Ctx, Rest, Ctr, O2),
+    combine(O1, O2) = Out.
 
-(* Lookup helper: return Some(fdef) when `Funcs` contains a definition
- * for the given name. Used by the new EDB-driven entry rules below. *)
 fun fdef_lookup(F: name_id, Funcs: func_def list) : func_def option =
     match Funcs with
     | [] => none
@@ -712,7 +774,6 @@ fun fdef_lookup(F: name_id, Funcs: func_def list) : func_def option =
         else fdef_lookup(F, Rest)
     end
 
-
 @disk rel func_ok(name_id)
 @disk rel func_failed(name_id, i32)
 
@@ -720,11 +781,26 @@ func_ok(F) :-
     fn_to_check(F),
     program_in(Ctx, Funcs, Ctr),
     fdef_lookup(F, Funcs) = some(Fdef),
-    check_func(Ctx, Fdef, Ctr).
+    check_func(Ctx, Fdef, Ctr, chk_ok).
+
+rel func_outcome_known(name_id)
+
+func_outcome_known(F) :-
+    fn_to_check(F),
+    program_in(Ctx, Funcs, Ctr),
+    fdef_lookup(F, Funcs) = some(Fdef),
+    check_func(Ctx, Fdef, Ctr, chk_fail(_)).
+
+func_failed(F, ExprId) :-
+    fn_to_check(F),
+    program_in(Ctx, Funcs, Ctr),
+    fdef_lookup(F, Funcs) = some(Fdef),
+    check_func(Ctx, Fdef, Ctr, chk_fail(ExprId)).
 
 func_failed(F, -1) :-
     fn_to_check(F),
-    !func_ok(F).
+    !func_ok(F),
+    !func_outcome_known(F).
 
 (* Default tuple accessor facts. *)
 tuple_accessor(0, 900).
@@ -744,7 +820,7 @@ test(1) :-
       e_func_call(2, [a_var(1)]),
       -1,
       t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
-      _).
+      _, chk_ok).
 
 (* let x = 5; let y = x + x; y : {v | v > 0} *)
 test(2) :-
@@ -755,7 +831,7 @@ test(2) :-
         some(a_var(2)))),
       -1,
       t_refined(-1, t_int, r_bin_op(greater, r_var(-1), r_int_lit(0L))),
-      _).
+      _, chk_ok).
 
 (* synth block produces t_int *)
 test(3) :-
@@ -764,7 +840,7 @@ test(3) :-
         [s_let(1, none, e_atomic(a_int_lit(5L))),
          s_let(2, none, e_binop(add, a_var(1), a_var(1)))],
         some(a_var(2)))),
-      -1, t_int, _).
+      -1, t_int, _, chk_ok).
 
 (* b iff (x > 5), x: nat |- if b then x else 0 : nat *)
 test(4) :-
@@ -782,7 +858,7 @@ test(4) :-
       ),
       -2,
       t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
-      _).
+      _, chk_ok).
 
 (* check_func: id(x: nat) -> nat { x } *)
 test(5) :-
@@ -792,7 +868,7 @@ test(5) :-
         [fparam(1, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
         t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
         block([], some(a_var(1)))),
-      -100).
+      -100, chk_ok).
 
 (* check_func: inc(x: nat) -> nat { let r = x + 1; r } *)
 test(6) :-
@@ -802,7 +878,7 @@ test(6) :-
         [fparam(1, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
         t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
         block([s_let(2, none, e_binop(add, a_var(1), a_int_lit(1L)))], some(a_var(2)))),
-      -100).
+      -100, chk_ok).
 
 (* check_func: early_ret(x: nat) -> nat { return x; } *)
 test(7) :-
@@ -812,13 +888,13 @@ test(7) :-
         [fparam(1, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))],
         t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
         block([s_return(a_var(1))], none)),
-      -100).
+      -100, chk_ok).
 
 (* synth tuple: (1, true) synthesizes a tuple type *)
 test(8) :-
     synth_expr([], gctx([], [], []), t_nil,
       e_tuple_lit([a_int_lit(1L), a_bool_lit(true)]),
-      -1, t_tuple(_), _).
+      -1, t_tuple(_), _, chk_ok).
 
 (* check tuple: (5, 10) checks against t_tuple([nat, nat]) *)
 test(9) :-
@@ -827,20 +903,20 @@ test(9) :-
       -1,
       t_tuple([t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
                t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L)))]),
-      _).
+      _, chk_ok).
 
 (* struct literal: Point{x: 3, y: 4} : Point *)
 test(10) :-
     synth_expr([], gctx([], [(200, [(201, t_int), (202, t_int)])], []), t_nil,
       e_struct_lit(200, [(201, a_int_lit(3L)), (202, a_int_lit(4L))]),
-      -1, t_struct(200), _).
+      -1, t_struct(200), _, chk_ok).
 
 (* field access: p: Point |- p.x : refined int *)
 test(11) :-
     synth_expr([(1, t_struct(200))],
       gctx([], [(200, [(201, t_int), (202, t_int)])], []), t_nil,
       e_field_access(a_var(1), 201),
-      -1, t_refined(_, t_int, _), _).
+      -1, t_refined(_, t_int, _), _, chk_ok).
 
 (* refined field access: s: Sized |- s.length : nat *)
 test(12) :-
@@ -850,7 +926,7 @@ test(12) :-
       e_field_access(a_var(1), 301),
       -1,
       t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))),
-      _).
+      _, chk_ok).
 
 (* struct literal with refined field: Sized{length: 5} : Sized *)
 test(13) :-
@@ -858,7 +934,7 @@ test(13) :-
       gctx([], [(300, [(301, t_refined(-1, t_int, r_bin_op(greater_equal, r_var(-1), r_int_lit(0L))))])], []),
       t_nil,
       e_struct_lit(300, [(301, a_int_lit(5L))]),
-      -1, t_struct(300), _).
+      -1, t_struct(300), _, chk_ok).
 
 (* struct subtyping is nominal *)
 test(14) :-
@@ -872,7 +948,7 @@ test(15) :-
       gctx([], [], [(400, [(401, some(t_int)), (402, none)])]),
       t_nil,
       e_variant_lit(400, 402, none),
-      -1, t_variant(400), _).
+      -1, t_variant(400), _, chk_ok).
 
 (* Some(5) literal *)
 test(16) :-
@@ -880,7 +956,7 @@ test(16) :-
       gctx([], [], [(400, [(401, some(t_int)), (402, none)])]),
       t_nil,
       e_variant_lit(400, 401, some(a_int_lit(5L))),
-      -1, t_variant(400), _).
+      -1, t_variant(400), _, chk_ok).
 
 (* is_variant synthesizes refined bool with r_is_variant *)
 test(17) :-
@@ -888,7 +964,7 @@ test(17) :-
       gctx([], [], [(400, [(401, some(t_int)), (402, none)])]),
       t_nil,
       e_is_variant(a_var(1), 400, 401),
-      -1, t_refined(_, t_bool, r_is_variant(1, 400, 401)), _).
+      -1, t_refined(_, t_bool, r_is_variant(1, 400, 401)), _, chk_ok).
 
 (* Nominal variants *)
 test(18) :-
@@ -909,13 +985,13 @@ test(19) :-
                       s_return(a_var(3))], none))],
              block([s_return(a_int_lit(0L))], none)))],
           none)),
-      -100).
+      -100, chk_ok).
 
 (* not true synthesizes a bool *)
 test(20) :-
     synth_expr([], gctx([], [], []), t_nil,
       e_not(a_bool_lit(true)),
-      -1, t_refined(_, t_bool, _), _).
+      -1, t_refined(_, t_bool, _), _, chk_ok).
 
 (* negate 5 is < 0 *)
 test(21) :-
@@ -923,7 +999,7 @@ test(21) :-
       e_negate(a_int_lit(5L)),
       -1,
       t_refined(-1, t_int, r_bin_op(less, r_var(-1), r_int_lit(0L))),
-      _).
+      _, chk_ok).
 
 (* tuple access: (1, true).0 synthesizes int-typed refinement *)
 test(22) :-
@@ -931,7 +1007,7 @@ test(22) :-
       [(1, t_tuple([t_int, t_bool]))],
       gctx([], [], []), t_nil,
       e_tuple_access(a_var(1), 0),
-      -1, t_refined(_, t_int, _), _).
+      -1, t_refined(_, t_int, _), _, chk_ok).
 
 (* tuple access: (1, true).1 synthesizes bool-typed refinement *)
 test(23) :-
@@ -939,7 +1015,7 @@ test(23) :-
       [(1, t_tuple([t_int, t_bool]))],
       gctx([], [], []), t_nil,
       e_tuple_access(a_var(1), 1),
-      -1, t_refined(_, t_bool, _), _).
+      -1, t_refined(_, t_bool, _), _, chk_ok).
 
 (* len(xs) returns {v | v == len(xs)} via substitution *)
 test(24) :-
@@ -951,7 +1027,7 @@ test(24) :-
       e_func_call(50, [a_var(1)]),
       -1,
       t_refined(-1, t_int, r_eq(r_var(-1), r_app(50, [r_var(1)]))),
-      _).
+      _, chk_ok).
 
 (* congruence: len(xs) == len(xs) by reflexivity *)
 test(25) :-
@@ -963,7 +1039,7 @@ test(25) :-
       e_atomic(a_var(2)),
       -1,
       t_refined(-1, t_int, r_eq(r_var(-1), r_app(50, [r_var(1)]))),
-      _).
+      _, chk_ok).
 
 (* multi-arg: add(x, y) with 2-arg extern *)
 test(26) :-
@@ -975,7 +1051,7 @@ test(26) :-
       e_func_call(60, [a_var(1), a_var(2)]),
       -1,
       t_refined(-1, t_int, r_eq(r_var(-1), r_app(60, [r_var(1), r_var(2)]))),
-      _).
+      _, chk_ok).
 
 (* p.x == p.x by congruence *)
 test(27) :-
@@ -988,7 +1064,13 @@ test(27) :-
         some(a_var(2)))),
       -1,
       t_refined(-1, t_int, r_eq(r_var(-1), r_app(201, [r_var(1)]))),
-      _).
+      _, chk_ok).
+
+(* string literal synthesizes refined string *)
+test(28) :-
+    synth_expr([], gctx([], [], []), t_nil,
+      e_atomic(a_string_lit("hello")),
+      -1, t_refined(_, t_string, _), _, chk_ok).
 
 (* Single query is enough to make every relation reachable. *)
 test(99) :- func_ok(_F).

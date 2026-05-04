@@ -1097,3 +1097,192 @@ fn refinement_side_empty_list_lit_uses_array_empty() {
         other => panic!("expected array_empty ExternCall, got {:?}", other),
     }
 }
+
+#[test]
+fn struct_field_store_same_field_deduplicates() {
+    // struct S { x: int }
+    // f(s: S, a: int, b: int) -> () {
+    //   _ = store(s, "x", a);
+    //   _ = store(s, "x", b);
+    // }
+    let struct_id = nid(50);
+    let field_x_id = nid(51);
+    let struct_ty = Type::Struct(struct_id, "S".to_string());
+
+    let body = block(
+        vec![
+            let_atom(
+                10,
+                struct_ty.clone(),
+                PExpr {
+                    kind: PExprKind::Store(var(1), PAtomic::StringLit("x".to_string()), var(2)),
+                    ty: struct_ty.clone(),
+                    span: span(),
+                },
+            ),
+            let_atom(
+                11,
+                struct_ty.clone(),
+                PExpr {
+                    kind: PExprKind::Store(var(1), PAtomic::StringLit("x".to_string()), var(3)),
+                    ty: struct_ty.clone(),
+                    span: span(),
+                },
+            ),
+        ],
+        None,
+        Type::Tuple(vec![]),
+    );
+
+    let f = func(
+        5,
+        vec![
+            (1, struct_ty.clone()),
+            (2, Type::Int),
+            (3, Type::Int),
+        ],
+        Type::Tuple(vec![]),
+        body,
+    );
+    let mut prog = empty_program(60);
+    prog.struct_defs.insert(
+        struct_id,
+        vec![(field_x_id, "x".to_string(), Type::Int)],
+    );
+    prog.top_level_defs.push(PTopLevelDef::FreeFunc(f));
+
+    let c = lower_program(prog).program;
+
+    let ext = find_extern(&c, "struct_store_50_51");
+    assert_eq!(ext.params.len(), 2);
+    assert_eq!(ext.params[0].ty, CType::Struct(struct_id));
+    assert_eq!(ext.params[1].ty, CType::Int);
+    // Only one extern for the two calls (deduplicated)
+    assert_eq!(
+        c.extern_funcs
+            .iter()
+            .filter(|e| e.original_name == "struct_store_50_51")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn struct_field_store_different_fields_get_distinct_externs() {
+    // struct S { x: int, y: bool }
+    // f(s: S, a: int, b: bool) -> () {
+    //   _ = store(s, "x", a);
+    //   _ = store(s, "y", b);
+    // }
+    let struct_id = nid(50);
+    let field_x_id = nid(51);
+    let field_y_id = nid(52);
+    let struct_ty = Type::Struct(struct_id, "S".to_string());
+
+    let body = block(
+        vec![
+            let_atom(
+                10,
+                struct_ty.clone(),
+                PExpr {
+                    kind: PExprKind::Store(var(1), PAtomic::StringLit("x".to_string()), var(2)),
+                    ty: struct_ty.clone(),
+                    span: span(),
+                },
+            ),
+            let_atom(
+                11,
+                struct_ty.clone(),
+                PExpr {
+                    kind: PExprKind::Store(var(1), PAtomic::StringLit("y".to_string()), var(3)),
+                    ty: struct_ty.clone(),
+                    span: span(),
+                },
+            ),
+        ],
+        None,
+        Type::Tuple(vec![]),
+    );
+
+    let f = func(
+        5,
+        vec![
+            (1, struct_ty.clone()),
+            (2, Type::Int),
+            (3, Type::Bool),
+        ],
+        Type::Tuple(vec![]),
+        body,
+    );
+    let mut prog = empty_program(60);
+    prog.struct_defs.insert(
+        struct_id,
+        vec![
+            (field_x_id, "x".to_string(), Type::Int),
+            (field_y_id, "y".to_string(), Type::Bool),
+        ],
+    );
+    prog.top_level_defs.push(PTopLevelDef::FreeFunc(f));
+
+    let c = lower_program(prog).program;
+
+    let ext_x = find_extern(&c, "struct_store_50_51");
+    let ext_y = find_extern(&c, "struct_store_50_52");
+    assert_ne!(ext_x.name, ext_y.name);
+    assert_eq!(ext_x.params[1].ty, CType::Int);
+    assert_eq!(ext_y.params[1].ty, CType::Bool);
+}
+
+#[test]
+fn struct_field_store_return_type_is_refined() {
+    // struct S { x: int }
+    // f(s: S, a: int) -> () {
+    //   _ = store(s, "x", a);
+    // }
+    let struct_id = nid(50);
+    let field_x_id = nid(51);
+    let struct_ty = Type::Struct(struct_id, "S".to_string());
+
+    let body = block(
+        vec![let_atom(
+            10,
+            struct_ty.clone(),
+            PExpr {
+                kind: PExprKind::Store(var(1), PAtomic::StringLit("x".to_string()), var(2)),
+                ty: struct_ty.clone(),
+                span: span(),
+            },
+        )],
+        None,
+        Type::Tuple(vec![]),
+    );
+
+    let f = func(5, vec![(1, struct_ty), (2, Type::Int)], Type::Tuple(vec![]), body);
+    let mut prog = empty_program(60);
+    prog.struct_defs.insert(
+        struct_id,
+        vec![(field_x_id, "x".to_string(), Type::Int)],
+    );
+    prog.top_level_defs.push(PTopLevelDef::FreeFunc(f));
+
+    let c = lower_program(prog).program;
+
+    let ext = find_extern(&c, "struct_store_50_51");
+    let CType::Refined(inner, handle) = &ext.return_type else {
+        panic!("expected refined return type, got {:?}", ext.return_type);
+    };
+    assert_eq!(**inner, CType::Struct(struct_id));
+    // The body should be a FieldAccess == val comparison (IntEq)
+    match &handle.body.kind {
+        RefinementExprKind::BinOp(op, lhs, _rhs) => {
+            assert_eq!(*op, CBinOp::IntEq);
+            match &lhs.kind {
+                RefinementExprKind::FieldAccess(_, fid) => {
+                    assert_eq!(*fid, field_x_id);
+                }
+                other => panic!("expected FieldAccess on lhs, got {:?}", other),
+            }
+        }
+        other => panic!("expected BinOp(IntEq, ...) body, got {:?}", other),
+    }
+}

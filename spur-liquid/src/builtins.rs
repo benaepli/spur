@@ -60,6 +60,9 @@ pub enum BuiltinKind {
     Eq,
     Neq,
 
+    // Struct field update (monomorphized per struct+field)
+    StructFieldStore { struct_id: NameId, field_id: NameId },
+
     // Existing resolver builtins
     Println,
     IntToString,
@@ -104,6 +107,9 @@ impl BuiltinKind {
             BuiltinKind::Retrieve => "retrieve".into(),
             BuiltinKind::Discard => "discard".into(),
             BuiltinKind::Rpc(target) => format!("rpc_to_{}", target.0),
+            BuiltinKind::StructFieldStore { struct_id, field_id } => {
+                format!("struct_store_{}_{}", struct_id.0, field_id.0)
+            }
             BuiltinKind::Eq => "eq".into(),
             BuiltinKind::Neq => "neq".into(),
             BuiltinKind::Println => "println".into(),

@@ -401,35 +401,42 @@ impl CoreLowerer {
                     return_type,
                 })
             }
-            PExprKind::Store(map, key, val) => {
-                let (k, v) = self.map_kv_of(&map);
-                let map_ty = CType::Map(Box::new(k.clone()), Box::new(v.clone()));
-                let k_for_post = k.clone();
-                let v_for_post = v.clone();
-                let target = self.intern_extern_with_dependent_params(
-                    BuiltinKind::MapStore,
-                    vec![k.clone(), v.clone()],
-                    vec![
-                        ("m".to_string(), const_param(map_ty.clone())),
-                        ("k".to_string(), const_param(k.clone())),
-                        ("v".to_string(), const_param(v.clone())),
-                    ],
-                    move |this, params| {
-                        let post = this.make_map_store_return_handle(
-                            k_for_post,
-                            v_for_post,
-                            params[1].name,
-                            params[1].original_name.clone(),
+            PExprKind::Store(receiver, key, val) => {
+                match self.atomic_p_type(&receiver) {
+                    Type::Struct(struct_id, _) => {
+                        self.lower_struct_field_store(struct_id, receiver, key, val)
+                    }
+                    _ => {
+                        let (k, v) = self.map_kv_of(&receiver);
+                        let map_ty = CType::Map(Box::new(k.clone()), Box::new(v.clone()));
+                        let k_for_post = k.clone();
+                        let v_for_post = v.clone();
+                        let target = self.intern_extern_with_dependent_params(
+                            BuiltinKind::MapStore,
+                            vec![k.clone(), v.clone()],
+                            vec![
+                                ("m".to_string(), const_param(map_ty.clone())),
+                                ("k".to_string(), const_param(k.clone())),
+                                ("v".to_string(), const_param(v.clone())),
+                            ],
+                            move |this, params| {
+                                let post = this.make_map_store_return_handle(
+                                    k_for_post,
+                                    v_for_post,
+                                    params[1].name,
+                                    params[1].original_name.clone(),
+                                );
+                                CType::Refined(Box::new(map_ty), post)
+                            },
                         );
-                        CType::Refined(Box::new(map_ty), post)
-                    },
-                );
-                let return_type = self.extern_return_type(target);
-                CExprKind::FuncCall(CFuncCall {
-                    target,
-                    args: vec![lower_atomic(map), lower_atomic(key), lower_atomic(val)],
-                    return_type,
-                })
+                        let return_type = self.extern_return_type(target);
+                        CExprKind::FuncCall(CFuncCall {
+                            target,
+                            args: vec![lower_atomic(receiver), lower_atomic(key), lower_atomic(val)],
+                            return_type,
+                        })
+                    }
+                }
             }
             PExprKind::Head(list) => {
                 let elem = self.array_elem_of(&list);
@@ -576,7 +583,8 @@ impl CoreLowerer {
                 params.extend(call_arg_types);
                 let mut args = vec![dest];
                 args.extend(call.args);
-                let ret_ty = self.lower_type(&call.return_type);
+                let inner_ty = self.lower_type(&call.return_type);
+                let ret_ty = CType::Chan(Box::new(inner_ty));
                 self.emit_extern_call(
                     BuiltinKind::Rpc(call.name),
                     vec![],
@@ -685,7 +693,7 @@ impl CoreLowerer {
                 let ret_ty = self.lower_type(result_ty);
                 self.emit_extern_call(
                     BuiltinKind::ChanSend,
-                    vec![elem.clone()],
+                    vec![state_ty.clone(), elem.clone()],
                     vec![state_ty, chan_ty, elem],
                     ret_ty,
                     vec![state, chan, value],
@@ -698,7 +706,7 @@ impl CoreLowerer {
                 let ret_ty = self.lower_type(result_ty);
                 self.emit_extern_call(
                     BuiltinKind::ChanRecv,
-                    vec![elem],
+                    vec![state_ty.clone(), elem],
                     vec![state_ty, chan_ty],
                     ret_ty,
                     vec![state, chan],
@@ -1491,6 +1499,103 @@ impl CoreLowerer {
         self.wrap_handle(bound, "ys", body)
     }
 
+    /// Resolve a struct field by name, returning `(field_id, field_ctype)`.
+    fn resolve_struct_field(&self, struct_id: NameId, field_name: &str) -> (NameId, CType) {
+        let fields = self
+            .struct_defs
+            .get(&struct_id)
+            .expect("struct must be registered in struct_defs");
+        fields
+            .iter()
+            .find(|(_, name, _)| name == field_name)
+            .map(|(fid, _, ty)| (*fid, ty.clone()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "field {:?} not found on struct {:?}",
+                    field_name, struct_id
+                )
+            })
+    }
+
+    /// Lower a struct-field store (`record.field := val`) in statement position.
+    fn lower_struct_field_store(
+        &mut self,
+        struct_id: NameId,
+        receiver: PAtomic,
+        key: PAtomic,
+        val: PAtomic,
+    ) -> CExprKind {
+        let field_name = match &key {
+            PAtomic::StringLit(s) => s.clone(),
+            _ => panic!("struct field store key must be a string literal"),
+        };
+        let (field_id, field_ty) = self.resolve_struct_field(struct_id, &field_name);
+        let struct_ty = CType::Struct(struct_id);
+        let struct_ty_for_ret = struct_ty.clone();
+        let field_ty_for_ret = field_ty.clone();
+
+        let target = self.intern_extern_with_dependent_params(
+            BuiltinKind::StructFieldStore { struct_id, field_id },
+            vec![],
+            vec![
+                ("s".to_string(), const_param(struct_ty.clone())),
+                ("v".to_string(), const_param(field_ty)),
+            ],
+            move |this, params| {
+                let post = this.make_struct_field_store_return_handle(
+                    struct_ty_for_ret,
+                    field_id,
+                    field_ty_for_ret,
+                    params[1].name,
+                    params[1].original_name.clone(),
+                );
+                CType::Refined(Box::new(CType::Struct(struct_id)), post)
+            },
+        );
+        let return_type = self.extern_return_type(target);
+        CExprKind::FuncCall(CFuncCall {
+            target,
+            args: vec![lower_atomic(receiver), lower_atomic(val)],
+            return_type,
+        })
+    }
+
+    /// `struct_store` return refinement: `{ s | s.field == val_param }`.
+    /// For field types where equality isn't expressible in the refinement
+    /// language (structs, enums), we skip the refinement and return the
+    /// bare struct type.
+    fn make_struct_field_store_return_handle(
+        &mut self,
+        struct_ty: CType,
+        field_id: NameId,
+        field_ty: CType,
+        val_param: NameId,
+        val_param_name: String,
+    ) -> CRefinementHandle {
+        let bound = self.mint_bound("s");
+        let s = self.r_var(bound, "s", struct_ty);
+        let lhs = RefinementExpr {
+            kind: RefinementExprKind::FieldAccess(Box::new(s), field_id),
+            ty: field_ty.clone(),
+            span: spur_ast::span::Span::default(),
+        };
+        let rhs = self.r_var(val_param, &val_param_name, field_ty.clone());
+        let body = match &field_ty {
+            CType::Int => self.r_binop(CBinOp::IntEq, lhs, rhs, CType::Bool),
+            CType::Bool => self.r_binop(CBinOp::BoolEq, lhs, rhs, CType::Bool),
+            _ => {
+                // For types without first-class equality in the refinement
+                // language, emit a trivially-true refinement (true).
+                RefinementExpr {
+                    kind: RefinementExprKind::BoolLit(true),
+                    ty: CType::Bool,
+                    span: spur_ast::span::Span::default(),
+                }
+            }
+        };
+        self.wrap_handle(bound, "s", body)
+    }
+
     /// `map_erase<K, V>` return refinement: `{ ys | !map_exists(ys, key_param) }`.
     fn make_map_erase_return_handle(
         &mut self,
@@ -2082,19 +2187,41 @@ impl CoreLowerer {
                     map_ty,
                 )
             }
-            TypedExprKind::Store(map, key, val) => {
-                let (k, v) = self.t_map_kv(map);
-                let map_ty = CType::Map(Box::new(k.clone()), Box::new(v.clone()));
-                let map_l = self.lower_refinement_expr(map);
-                let key_l = self.lower_refinement_expr(key);
-                let val_l = self.lower_refinement_expr(val);
-                self.r_extern_call_kind(
-                    BuiltinKind::MapStore,
-                    vec![k.clone(), v.clone()],
-                    vec![map_ty.clone(), k, v],
-                    vec![map_l, key_l, val_l],
-                    map_ty,
-                )
+            TypedExprKind::Store(receiver, key, val) => {
+                match &receiver.ty {
+                    Type::Struct(struct_id, _) => {
+                        let struct_id = *struct_id;
+                        let field_name = match &key.kind {
+                            TypedExprKind::StringLit(s) => s.clone(),
+                            _ => panic!("struct field store key must be a string literal"),
+                        };
+                        let (field_id, field_ty) = self.resolve_struct_field(struct_id, &field_name);
+                        let struct_ty = CType::Struct(struct_id);
+                        let receiver_l = self.lower_refinement_expr(receiver);
+                        let val_l = self.lower_refinement_expr(val);
+                        self.r_extern_call_kind(
+                            BuiltinKind::StructFieldStore { struct_id, field_id },
+                            vec![],
+                            vec![struct_ty.clone(), field_ty],
+                            vec![receiver_l, val_l],
+                            struct_ty,
+                        )
+                    }
+                    _ => {
+                        let (k, v) = self.t_map_kv(receiver);
+                        let map_ty = CType::Map(Box::new(k.clone()), Box::new(v.clone()));
+                        let map_l = self.lower_refinement_expr(receiver);
+                        let key_l = self.lower_refinement_expr(key);
+                        let val_l = self.lower_refinement_expr(val);
+                        self.r_extern_call_kind(
+                            BuiltinKind::MapStore,
+                            vec![k.clone(), v.clone()],
+                            vec![map_ty.clone(), k, v],
+                            vec![map_l, key_l, val_l],
+                            map_ty,
+                        )
+                    }
+                }
             }
 
             TypedExprKind::UnwrapOptional(e) => {

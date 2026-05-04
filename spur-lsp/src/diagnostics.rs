@@ -60,30 +60,33 @@ fn refinement_check_error_to_diagnostic(
     result: &CompileResult,
     line_index: &LineIndex,
 ) -> Diagnostic {
-    use spur_liquid::RefinementCheckErrorKind;
-
-    // Step 6 only threads `expr_origin` symbolically; we don't have a
-    // real expression-id ↔ Span side-table yet, so for now we report
-    // the failure at the function's declaration span when we can find
-    // it, falling back to the start of the file.
-    let span = result
+    // Prefer the precise sub-expression span the encoder resolved
+    // through `id_to_span`. Fall back to the function's declaration
+    // span when the failure was attributed to an atomic position (no
+    // precise id) or when the encoder couldn't recover the expression
+    // for some reason.
+    let func_span = result
         .refinement_ir
         .as_ref()
-        .and_then(|p| p.funcs.iter().find(|f| f.name == e.function).map(|f| f.span))
-        .unwrap_or_default();
+        .and_then(|p| p.funcs.iter().find(|f| f.name == e.function).map(|f| f.span));
+    let span = e.span.or(func_span).unwrap_or_default();
+
     let name = result
         .refinement_ir
         .as_ref()
         .and_then(|p| p.funcs.iter().find(|f| f.name == e.function).map(|f| f.original_name.clone()))
         .unwrap_or_else(|| format!("#{}", e.function.0));
-    let detail = match e.kind {
-        RefinementCheckErrorKind::FunctionFailed { expr_id: Some(id) } => {
-            format!("function `{}` failed refinement check (at expr id {})", name, id)
-        }
-        RefinementCheckErrorKind::FunctionFailed { expr_id: None } => {
-            format!("function `{}` failed refinement check", name)
-        }
+
+    let detail = if e.span.is_some() {
+        format!(
+            "refinement check failed in function `{}`: this expression's type \
+             does not satisfy its declared bound",
+            name
+        )
+    } else {
+        format!("function `{}` failed refinement check", name)
     };
+
     Diagnostic {
         range: line_index.span_to_range(span.start, span.end),
         severity: Some(DiagnosticSeverity::ERROR),

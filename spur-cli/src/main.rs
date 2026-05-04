@@ -335,6 +335,7 @@ fn run_check(spec_path: PathBuf, refinements: bool, refinements_timeout: u64) ->
 
 #[cfg(feature = "formulog")]
 fn run_refinements(source: &str, name: &str, timeout_secs: u64) -> Result<()> {
+    use spur_core::analysis::format::report_refinement_check_errors;
     use std::time::Duration;
 
     let bin = spur_liquid::flg_binary_path()
@@ -352,15 +353,13 @@ fn run_refinements(source: &str, name: &str, timeout_secs: u64) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("Refinement check failed: {}", e))?;
 
     if !result.refinement_check_errors.is_empty() {
-        for e in &result.refinement_check_errors {
-            let label = result
-                .refinement_ir
-                .as_ref()
-                .and_then(|p| p.funcs.iter().find(|f| f.name == e.function))
-                .map(|f| f.original_name.clone())
-                .unwrap_or_else(|| format!("#{}", e.function.0));
-            eprintln!("refinement error: function `{}` failed to verify", label);
-        }
+        report_refinement_check_errors(
+            source,
+            &result.refinement_check_errors,
+            name,
+            result.refinement_ir.as_ref(),
+        )
+        .ok();
         return Err(anyhow::anyhow!(
             "refinement check failed for {} function(s)",
             result.refinement_check_errors.len()
