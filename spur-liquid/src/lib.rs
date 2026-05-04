@@ -19,6 +19,9 @@ pub use formulog::{
     FormulogError, RefinementCheckError, RefinementCheckErrorKind, check_with_formulog,
 };
 
+#[cfg(all(feature = "formulog", feature = "bench-support"))]
+pub use formulog::clear_result_cache;
+
 #[cfg(feature = "native-checker")]
 pub use native::{NativeCheckError, check_native};
 

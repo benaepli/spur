@@ -445,6 +445,7 @@ and subtype(Env: env, T1: c_type, T2: c_type) : bool =
     | (t_bool, t_bool)     => true
     | (t_string, t_string) => true
     | (t_nil, t_nil)       => true
+    | (t_nil, t_optional(_)) => true
     | (t_tuple(Ts1), t_tuple(Ts2)) => subtype_list(Env, Ts1, Ts2)
     | (t_array(Inner1), t_array(Inner2)) => subtype(Env, Inner1, Inner2)
     | (t_map(K1, V1), t_map(K2, V2)) => subtype(Env, K1, K2) && subtype(Env, V1, V2)

@@ -121,6 +121,11 @@ fn result_cache() -> &'static Cache<Vec<RefinementCheckError>> {
     CACHE.get_or_init(Cache::new)
 }
 
+#[cfg(feature = "bench-support")]
+pub fn clear_result_cache() {
+    result_cache().clear();
+}
+
 fn run_flg(
     facts: &EncodedFacts,
     fns_to_check: &[NameId],

@@ -122,14 +122,6 @@ impl ExplorerConfig {
         self.num_rmw_ops_range
             .validate()
             .map_err(|e| format!("num_rmw_ops range error: {}", e))?;
-        // Soft warning: RMW correctness is checked only via subsequent reads.
-        // A run with RMWs but no reads exercises zero of the kv_rmw checking logic.
-        if self.num_rmw_ops_range.max > 0 && self.num_read_ops_range.max == 0 {
-            warn!(
-                "num_rmw_ops > 0 but num_read_ops == 0: RMW prev_uid chains are validated only \
-                 through Read responses, so this configuration will not catch RMW bugs."
-            );
-        }
         self.num_keys_range
             .validate()
             .map_err(|e| format!("num_keys range error: {}", e))?;

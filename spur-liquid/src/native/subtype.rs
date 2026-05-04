@@ -63,6 +63,7 @@ fn subtype_inner(env: &Env, solver: &mut SmtSolver, t1: &CType, t2: &CType) -> b
         (CType::Bool, CType::Bool) => true,
         (CType::String, CType::String) => true,
         (CType::Nil, CType::Nil) => true,
+        (CType::Nil, CType::Optional(_)) => true,
         (CType::Tuple(ts1), CType::Tuple(ts2)) => {
             ts1.len() == ts2.len()
                 && ts1

@@ -267,6 +267,96 @@ impl CoreLowerer {
                         )
                     }
                 }
+                BinOp::Coalesce => {
+                    let span = spur_ast::span::Span::default();
+
+                    let inner = self.optional_inner_of(&a);
+                    let opt_ty = CType::Optional(Box::new(inner.clone()));
+
+                    // neq<Optional<T>>(a, nil) -> Bool
+                    let neq_kind = self.emit_extern_call(
+                        BuiltinKind::Neq,
+                        vec![opt_ty.clone()],
+                        vec![opt_ty.clone(), opt_ty.clone()],
+                        CType::Bool,
+                        vec![a.clone(), PAtomic::NilLit],
+                    );
+                    let neq_expr = CExpr {
+                        kind: neq_kind,
+                        ty: CType::Bool,
+                        span,
+                    };
+
+                    let cond_id = NameId(self.next_name_id);
+                    self.next_name_id += 1;
+                    let cond_name = format!("_coalesce_cond{}", cond_id.0);
+                    self.id_to_name.insert(cond_id, cond_name.clone());
+                    self.pending_stmts.push(CStatement {
+                        kind: CStatementKind::LetAtom(CLetAtom {
+                            name: cond_id,
+                            original_name: cond_name.clone(),
+                            ty: CType::Bool,
+                            value: neq_expr,
+                            user_annotated: false,
+                            span,
+                        }),
+                        span,
+                    });
+
+                    // if-branch: unwrap(a)
+                    let unwrap_kind = self.emit_extern_call(
+                        BuiltinKind::OptionalUnwrap,
+                        vec![inner.clone()],
+                        vec![opt_ty],
+                        inner.clone(),
+                        vec![a],
+                    );
+                    let unwrap_expr = CExpr {
+                        kind: unwrap_kind,
+                        ty: inner.clone(),
+                        span,
+                    };
+                    let unwrap_id = NameId(self.next_name_id);
+                    self.next_name_id += 1;
+                    let unwrap_name = format!("_coalesce_unwrap{}", unwrap_id.0);
+                    self.id_to_name.insert(unwrap_id, unwrap_name.clone());
+
+                    let if_body = CBlock {
+                        statements: vec![CStatement {
+                            kind: CStatementKind::LetAtom(CLetAtom {
+                                name: unwrap_id,
+                                original_name: unwrap_name.clone(),
+                                ty: inner.clone(),
+                                value: unwrap_expr,
+                                user_annotated: false,
+                                span,
+                            }),
+                            span,
+                        }],
+                        tail_expr: Some(CAtomic::Var(unwrap_id, unwrap_name)),
+                        ty: inner.clone(),
+                        span,
+                    };
+
+                    // else-branch: b
+                    let else_body = CBlock {
+                        statements: vec![],
+                        tail_expr: Some(lower_atomic(b)),
+                        ty: inner,
+                        span,
+                    };
+
+                    CExprKind::Conditional(Box::new(CCondExpr {
+                        if_branch: CIfBranch {
+                            condition: CAtomic::Var(cond_id, cond_name),
+                            body: if_body,
+                            span,
+                        },
+                        elseif_branches: vec![],
+                        else_branch: Some(else_body),
+                        span,
+                    }))
+                }
                 _ => CExprKind::BinOp(to_cbinop(&op), lower_atomic(a), lower_atomic(b)),
             },
             PExprKind::Not(a) => CExprKind::Not(lower_atomic(a)),

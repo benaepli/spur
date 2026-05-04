@@ -12,6 +12,8 @@ default = []
 formulog = []
 # Native Rust refinement type checker (shells out to z3 for SMT).
 native-checker = []
+# Exposes cache-clearing for benchmarks.
+bench-support = []
 
 [dependencies]
 spur-ast = { path = "../spur-ast" }

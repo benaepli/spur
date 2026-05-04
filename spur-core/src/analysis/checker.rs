@@ -1155,12 +1155,10 @@ impl TypeChecker {
             ResolvedAssignItem::Existing(id, name) => {
                 // Look up the existing variable's type and check it matches
                 let var_ty = self.get_var_type(id, span).unwrap_or(Type::Error);
-                if var_ty != Type::Error && *expected_ty != Type::Error && var_ty != *expected_ty {
-                    self.emit(TypeError::Mismatch {
-                        expected: var_ty.clone(),
-                        found: expected_ty.clone(),
-                        span,
-                    });
+                if var_ty != Type::Error && *expected_ty != Type::Error {
+                    if let Err(e) = self.check_type_compatibility(&var_ty, expected_ty, span) {
+                        self.emit(e);
+                    }
                 }
                 TypedAssignItem::Existing(id, name, var_ty)
             }
@@ -2494,36 +2492,40 @@ impl TypeChecker {
     ) -> TypedExpr {
         match op {
             BinOp::Add => {
-                // Infer types of both operands
                 let typed_left = self.infer_expr(left);
                 let typed_right = self.infer_expr(right);
 
-                // Both must be the same type (either Int or String)
-                match (&typed_left.ty, &typed_right.ty) {
-                    (Type::Int, Type::Int) => TypedExpr {
-                        kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
-                        ty: Type::Int,
-                        span,
-                    },
-                    (Type::String, Type::String) => TypedExpr {
-                        kind: TypedExprKind::BinOp(op, Box::new(typed_left), Box::new(typed_right)),
-                        ty: Type::String,
-                        span,
-                    },
-                    _ if matches!(typed_left.ty, Type::Error)
-                        || matches!(typed_right.ty, Type::Error) =>
-                    {
-                        self.error_expr(span)
-                    }
-                    _ => {
-                        self.emit(TypeError::InvalidBinOp {
-                            op: op.clone(),
-                            left: typed_left.ty.clone(),
-                            right: typed_right.ty.clone(),
+                // Try Int + Int (check_types_match strips refined wrappers)
+                if let Ok(coerced_left) = self.check_types_match(typed_left.clone(), &Type::Int) {
+                    if let Ok(coerced_right) = self.check_types_match(typed_right.clone(), &Type::Int) {
+                        return TypedExpr {
+                            kind: TypedExprKind::BinOp(op, Box::new(coerced_left), Box::new(coerced_right)),
+                            ty: Type::Int,
                             span,
-                        });
-                        self.error_expr(span)
+                        };
                     }
+                }
+                // Try String + String
+                if let Ok(coerced_left) = self.check_types_match(typed_left.clone(), &Type::String) {
+                    if let Ok(coerced_right) = self.check_types_match(typed_right.clone(), &Type::String) {
+                        return TypedExpr {
+                            kind: TypedExprKind::BinOp(op, Box::new(coerced_left), Box::new(coerced_right)),
+                            ty: Type::String,
+                            span,
+                        };
+                    }
+                }
+                // Error cases
+                if matches!(typed_left.ty, Type::Error) || matches!(typed_right.ty, Type::Error) {
+                    self.error_expr(span)
+                } else {
+                    self.emit(TypeError::InvalidBinOp {
+                        op: op.clone(),
+                        left: typed_left.ty.clone(),
+                        right: typed_right.ty.clone(),
+                        span,
+                    });
+                    self.error_expr(span)
                 }
             }
             BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {

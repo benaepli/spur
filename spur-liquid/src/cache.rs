@@ -62,6 +62,10 @@ impl<V: Clone> Cache<V> {
         g.insert(key, value);
     }
 
+    pub fn clear(&self) {
+        self.inner.lock().expect("cache mutex poisoned").clear();
+    }
+
     pub fn get_or_insert_with<F>(&self, key: CacheKey, f: F) -> V
     where
         F: FnOnce() -> V,
