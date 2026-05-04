@@ -14,6 +14,7 @@ default = []
 # `spur-liquid::formulog` build (java, cmake, boost, oneTBB, OpenMP,
 # souffle).
 formulog = ["spur-core/formulog"]
+native-checker = ["spur-core/native-checker"]
 
 [dependencies]
 spur-core = { path = "../spur-core", features = ["simulator"] }

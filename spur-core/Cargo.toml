@@ -8,6 +8,7 @@ default = ["simulator"]
 # Forwards `spur-liquid`'s Formulog driver. Same heavyweight system
 # dependencies (java, cmake, boost, oneTBB, OpenMP, souffle).
 formulog = ["spur-liquid/formulog"]
+native-checker = ["spur-liquid/native-checker"]
 simulator = [
     "dep:parquet",
     "dep:arrow",

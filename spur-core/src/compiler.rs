@@ -269,3 +269,34 @@ pub fn compile_with_refinements(
     result.refinement_check_errors = errs;
     Ok(result)
 }
+
+/// Run [`compile`] and, if no earlier-stage errors fired, hand the
+/// lowered refinement IR to the native Rust refinement checker.
+#[cfg(feature = "native-checker")]
+pub fn compile_with_native_refinements(
+    input: &str,
+    name: &str,
+) -> Result<NativeRefinementResult, spur_liquid::NativeCheckError> {
+    let result = compile(input, name);
+    if result.has_errors() {
+        return Ok(NativeRefinementResult {
+            compile_result: result,
+            refinement_check_errors: Vec::new(),
+        });
+    }
+
+    let liquid_out = liquid_lower_program(result.pure.as_ref().unwrap().clone());
+    let fns: Vec<spur_ast::name::NameId> =
+        liquid_out.program.funcs.iter().map(|f| f.name).collect();
+    let errs = spur_liquid::check_native(&liquid_out.program, &fns)?;
+    Ok(NativeRefinementResult {
+        compile_result: result,
+        refinement_check_errors: errs,
+    })
+}
+
+#[cfg(feature = "native-checker")]
+pub struct NativeRefinementResult {
+    pub compile_result: CompileResult,
+    pub refinement_check_errors: Vec<spur_liquid::native::RefinementCheckError>,
+}

@@ -10,6 +10,8 @@ default = []
 # `cmake >= 3.21`, a C++17 toolchain (GCC or clang), boost (~1.81),
 # oneTBB, OpenMP, and Souffle (>= 2.3) to be installed at build time.
 formulog = []
+# Native Rust refinement type checker (shells out to z3 for SMT).
+native-checker = []
 
 [dependencies]
 spur-ast = { path = "../spur-ast" }

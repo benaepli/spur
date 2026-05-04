@@ -368,14 +368,40 @@ fn run_refinements(source: &str, name: &str, timeout_secs: u64) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "formulog"))]
+#[cfg(all(not(feature = "formulog"), not(feature = "native-checker")))]
 fn run_refinements(_source: &str, _name: &str, _timeout_secs: u64) -> Result<()> {
     anyhow::bail!(
         "refinement checking is unavailable because the CLI was not built with \
-         `--features formulog`. Rebuild with\n\n  \
-         cargo build --release --features formulog -p spur-cli\n\n\
+         `--features formulog` or `--features native-checker`. Rebuild with\n\n  \
+         cargo build --release --features native-checker -p spur-cli\n\n\
          and retry."
     );
+}
+
+#[cfg(all(not(feature = "formulog"), feature = "native-checker"))]
+fn run_refinements(source: &str, name: &str, _timeout_secs: u64) -> Result<()> {
+    let result = compiler::compile_with_native_refinements(source, name)
+        .map_err(|e| anyhow::anyhow!("Native refinement check failed: {}", e))?;
+
+    if !result.refinement_check_errors.is_empty() {
+        for e in &result.refinement_check_errors {
+            let label = result
+                .compile_result
+                .pure
+                .as_ref()
+                .and_then(|_| {
+                    // TODO: resolve function name from NameId
+                    None::<String>
+                })
+                .unwrap_or_else(|| format!("#{}", e.function.0));
+            eprintln!("refinement error: function `{}` failed to verify", label);
+        }
+        return Err(anyhow::anyhow!(
+            "refinement check failed for {} function(s)",
+            result.refinement_check_errors.len()
+        ));
+    }
+    Ok(())
 }
 
 fn run_graph(spec_path: PathBuf, output_path: PathBuf) -> Result<()> {
