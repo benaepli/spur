@@ -162,3 +162,12 @@ fn test_role_is_trivially_copyable() {
         &map
     ));
 }
+
+#[test]
+fn test_fifo_link_is_trivially_copyable() {
+    let map = TriviallyCopyableMap::new();
+    assert!(is_trivially_copyable(
+        &Type::FifoLink(Box::new(Type::Int)),
+        &map
+    ));
+}

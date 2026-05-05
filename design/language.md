@@ -336,17 +336,22 @@ receiver in send order. Direct `peer->Handler(...)` calls remain unordered.
 Multiple `fifo(peer)` calls to the same peer create independent links with
 no ordering relationship between them.
 
-`FifoLink<T>` values are ordinary in-memory state — they live in a node's
-env and are lost on crash. The simulator owns the per-link sequence state,
-so:
+`FifoLink<T>` values live in a node's env and are lost on crash unless
+explicitly persisted. The simulator owns the per-link sequence state, so:
 
 - **Receiver crash**: messages already enqueued through a link are buffered
   across the crash and delivered in original send order once the receiver
   recovers (same as non-FIFO messages, just with ordering preserved).
-- **Sender crash**: the link value is lost (normal env cleanup). Messages
-  sent before the crash retain their sequence tags and still drain in
-  order. After recovery, a fresh `fifo(peer)` returns a new link with its
-  own independent sequence — pre- and post-crash sends are not ordered.
+- **Sender crash (link not persisted)**: the link value is lost (normal env
+  cleanup). Messages sent before the crash retain their sequence tags and
+  still drain in order. After recovery, a fresh `fifo(peer)` returns a new
+  link with its own independent sequence — pre- and post-crash sends are
+  not ordered.
+- **Sender crash (link persisted)**: if the `FifoLink` was saved via
+  `persist_data` and recovered with `retrieve_data`, the same link ID
+  resumes with its existing sequence counter. Post-recovery sends are
+  guaranteed to arrive after any pre-crash in-flight messages — cross-crash
+  FIFO ordering is preserved.
 
 FIFO ordering applies to the request direction only; responses come back
 on per-RPC `chan<T>` and carry no cross-response ordering. Handlers at the

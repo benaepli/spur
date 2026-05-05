@@ -667,7 +667,7 @@ pub fn report_type_errors(
                             .with_message(format!("type `{}` cannot be persisted or retrieved", ty))
                             .with_color(Color::Red),
                     )
-                    .with_note(["help: only trivially copyable types (int, string, bool, lists/maps/structs of these) can be used with persist_data and retrieve_data",
+                    .with_note(["help: only trivially copyable types (int, string, bool, FifoLink, lists/maps/structs of these) can be used with persist_data and retrieve_data",
                         "note: channels and types containing channels are not trivially copyable"].join("\n"))
                     .finish()
                     .eprint((filename, Source::from(source)))?;
