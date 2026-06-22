@@ -192,6 +192,12 @@ fn schedule_client_op<H: HashPolicy>(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunOutcome {
+    Completed,
+    Deadlock { step: i32, pending_ops: usize },
+}
+
 pub fn exec_plan<H: HashPolicy>(
     path_state: &mut PathState<H>,
     program: Program,
@@ -207,7 +213,7 @@ pub fn exec_plan<H: HashPolicy>(
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
-) -> Result<(), RuntimeError> {
+) -> Result<RunOutcome, RuntimeError> {
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
@@ -286,7 +292,7 @@ pub fn exec_plan<H: HashPolicy>(
     for step in 0..max_iterations {
         if engine.is_complete() {
             info!("Plan {} completed in {} steps", run_id, step);
-            return Ok(());
+            return Ok(RunOutcome::Completed);
         }
 
         path_state.state.crash_info.current_step = step;
@@ -300,6 +306,20 @@ pub fn exec_plan<H: HashPolicy>(
             .into_iter()
             .map(|(idx, e)| (idx, e.clone()))
             .collect();
+
+        if ready_events.is_empty()
+            && path_state.state.all_queues_empty()
+            && !in_progress.is_empty()
+        {
+            warn!(
+                "Plan {} deadlocked at step {}: {} client op(s) will never complete",
+                run_id, step, in_progress.len()
+            );
+            return Ok(RunOutcome::Deadlock {
+                step,
+                pending_ops: in_progress.len(),
+            });
+        }
 
         for (node_idx, event) in ready_events {
             match &event.action {
@@ -602,5 +622,5 @@ pub fn exec_plan<H: HashPolicy>(
         "Hit max iterations ({}) before plan {} completion",
         max_iterations, run_id
     );
-    Ok(())
+    Ok(RunOutcome::Completed)
 }

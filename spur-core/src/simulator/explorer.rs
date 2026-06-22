@@ -9,7 +9,7 @@ use crate::simulator::history::{
 };
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::plan::ExecutionPlan;
-use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
+use crate::simulator::path::{PathState, RunOutcome, Topology, TopologyInfo, exec_plan};
 use crossbeam::channel;
 use log::{debug, error, info, warn};
 use nauty_pet::graph::CanonGraph;
@@ -532,7 +532,7 @@ pub fn run_single_simulation(
         &config.purgatory,
     )?;
 
-    exec_plan(
+    let outcome = exec_plan(
         &mut path_state,
         program.clone(),
         plan,
@@ -548,6 +548,10 @@ pub fn run_single_simulation(
         config.quick_fire_multiplier,
         &config.purgatory,
     )?;
+
+    if let RunOutcome::Deadlock { step, pending_ops } = &outcome {
+        warn!("Run {} deadlocked at step {} ({} pending ops)", run_id, step, pending_ops);
+    }
 
     let plan_score = path_state.coverage.plan_score();
 
@@ -783,7 +787,7 @@ fn run_single_plan(
         purgatory_config,
     )?;
 
-    exec_plan(
+    let outcome = exec_plan(
         &mut path_state,
         program.clone(),
         plan.clone(),
@@ -799,6 +803,10 @@ fn run_single_plan(
         quick_fire_multiplier,
         purgatory_config,
     )?;
+
+    if let RunOutcome::Deadlock { step, pending_ops } = &outcome {
+        warn!("Run {} deadlocked at step {} ({} pending ops)", run_id, step, pending_ops);
+    }
 
     let plan_score = path_state.coverage.plan_score();
     global_state.coverage.merge(&path_state.coverage);

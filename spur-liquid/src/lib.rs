@@ -1,5 +1,6 @@
 pub mod builtins;
 pub mod cache;
+pub mod desugar;
 pub mod flg;
 #[cfg(feature = "formulog")]
 pub mod formulog;
