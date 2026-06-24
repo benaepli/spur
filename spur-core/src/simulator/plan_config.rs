@@ -11,6 +11,7 @@ use crate::analysis::resolver::NameId;
 use crate::simulator::core::{
     PurgatoryConfig, QueuePolicyConfig, SchedulePolicy, WithinQueueSelector,
 };
+use crate::simulator::feedback::FeedbackConfig;
 use crate::simulator::path::plan::{ClientOpSpec, DeliverSpec, EventAction, PlannedEvent};
 
 #[derive(Debug, Error)]
@@ -31,6 +32,8 @@ pub enum PlanConfigError {
     InvalidNumServers(i32),
     #[error("num_runs must be >= 1, got {0}")]
     InvalidNumRuns(i32),
+    #[error("invalid feedback config: {0}")]
+    InvalidFeedback(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize)]
@@ -205,6 +208,9 @@ pub struct PlanFileConfig {
 
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
+
+    #[serde(default)]
+    pub feedback: FeedbackConfig,
 }
 
 impl PlanFileConfig {
@@ -215,6 +221,9 @@ impl PlanFileConfig {
         if self.num_runs < 1 {
             return Err(PlanConfigError::InvalidNumRuns(self.num_runs));
         }
+        self.feedback
+            .validate()
+            .map_err(PlanConfigError::InvalidFeedback)?;
 
         // Validate node indices
         for (id, spec) in &self.events {

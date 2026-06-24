@@ -11,7 +11,8 @@ use crate::simulator::core::state::{
     SchedulePolicy, ScheduleResult, State,
 };
 use crate::simulator::core::values::{Env, Value};
-use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
+use crate::simulator::coverage::GlobalState;
+use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
@@ -61,13 +62,14 @@ fn is_fifo_blocked<H: HashPolicy>(
 /// Score a runnable in [0, 1] by combining novelty and priority. For Recover
 /// events targeting a currently-crashed node, `quick_fire_multiplier` increases
 /// the weight of priority relative to novelty while keeping the result in [0, 1].
-fn score_runnable<H: HashPolicy>(
+fn score_runnable<H: HashPolicy, F: Feedback>(
     r: &Runnable<H>,
-    global_snapshot: Option<&VertexMap>,
+    feedback: &F::Local,
+    snapshot: &F::Snapshot,
     currently_crashed: &OrdSet<NodeId>,
     quick_fire_multiplier: f64,
 ) -> f64 {
-    let novelty = global_snapshot.map_or(1.0, |s| s.novelty_score(r.pc()));
+    let novelty = F::runnable_novelty(feedback, r, snapshot);
     let priority = r.priority();
     let is_quick_fire =
         matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
@@ -85,10 +87,11 @@ fn score_runnable<H: HashPolicy>(
 /// (near-greedy for typical k). `Proportional` uses Efraimidis-Spirakis weighted
 /// reservoir sampling with weight `score^exponent`, giving exact proportional
 /// selection in a single O(eligible) pass.
-fn select_within_queue<H: HashPolicy>(
+fn select_within_queue<H: HashPolicy, F: Feedback>(
     queue: &Vector<Runnable<H>>,
     eligible: &[usize],
-    global_snapshot: Option<&VertexMap>,
+    feedback: &F::Local,
+    snapshot: &F::Snapshot,
     currently_crashed: &OrdSet<NodeId>,
     quick_fire_multiplier: f64,
     selector: &WithinQueueSelector,
@@ -102,17 +105,19 @@ fn select_within_queue<H: HashPolicy>(
         WithinQueueSelector::Tournament { k } => {
             let k = (*k).max(1);
             let mut best_idx = eligible[rng.random_range(0..eligible.len())];
-            let mut best_score = score_runnable(
+            let mut best_score = score_runnable::<H, F>(
                 &queue[best_idx],
-                global_snapshot,
+                feedback,
+                snapshot,
                 currently_crashed,
                 quick_fire_multiplier,
             );
             for _ in 1..k.min(eligible.len()) {
                 let i = eligible[rng.random_range(0..eligible.len())];
-                let s = score_runnable(
+                let s = score_runnable::<H, F>(
                     &queue[i],
-                    global_snapshot,
+                    feedback,
+                    snapshot,
                     currently_crashed,
                     quick_fire_multiplier,
                 );
@@ -134,9 +139,10 @@ fn select_within_queue<H: HashPolicy>(
             let mut best_idx = eligible[0];
             let mut best_key = f64::NEG_INFINITY;
             for &i in eligible {
-                let s = score_runnable(
+                let s = score_runnable::<H, F>(
                     &queue[i],
-                    global_snapshot,
+                    feedback,
+                    snapshot,
                     currently_crashed,
                     quick_fire_multiplier,
                 );
@@ -155,15 +161,15 @@ fn select_within_queue<H: HashPolicy>(
     }
 }
 
-pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
+pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
     randomly_drop_msgs: bool,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     topology: &TopologyInfo,
-    global_state: &GlobalState,
+    global_state: &GlobalState<F>,
     policy: &SchedulePolicy,
     strict_timers: bool,
     selector: &mut Q,
@@ -234,10 +240,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = select_within_queue(
+            let idx = select_within_queue::<H, F>(
                 queue,
                 &eligible,
-                global_snapshot,
+                feedback,
+                snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
                 within_queue,
@@ -253,10 +260,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = select_within_queue(
+            let idx = select_within_queue::<H, F>(
                 queue,
                 &eligible,
-                global_snapshot,
+                feedback,
+                snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
                 within_queue,
@@ -289,10 +297,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             if eligible.is_empty() {
                 return Ok(ScheduleResult::None);
             }
-            let idx = select_within_queue(
+            let idx = select_within_queue::<H, F>(
                 queue,
                 &eligible,
-                global_snapshot,
+                feedback,
+                snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
                 within_queue,
@@ -308,15 +317,15 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
             Ok(ScheduleResult::Crash { node_id })
         }
         Runnable::Recover { node_id, .. } => {
-            recover_crashed_node(
+            recover_crashed_node::<H, L, F>(
                 state,
                 logger,
                 program,
                 topology,
                 node_id,
                 global_state,
-                global_snapshot,
-                local_coverage,
+                snapshot,
+                feedback,
                 policy,
                 purgatory_config,
             )?;
@@ -431,13 +440,13 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector>(
                     if let Some((link_id, seq)) = r.link_seq {
                         state.link_deliver_seq.insert(link_id, seq + 1);
                     }
-                    let result = exec(
+                    let result = exec::<H, L, F>(
                         state,
                         logger,
                         program,
                         r,
-                        global_snapshot,
-                        local_coverage,
+                        snapshot,
+                        feedback,
                         policy,
                         purgatory_config,
                     )?;
@@ -530,15 +539,15 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     }
 }
 
-fn recover_crashed_node<H: HashPolicy, L: Logger>(
+fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
     topology: &TopologyInfo,
     node_id: NodeId,
-    global_state: &GlobalState,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    global_state: &GlobalState<F>,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
@@ -549,15 +558,15 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
     state.crash_info.currently_crashed.remove(&node_id);
 
     state.nodes[node_id.index] = Env::<H>::default();
-    reinit_node(
+    reinit_node::<H, L, F>(
         topology,
         state,
         logger,
         program,
         node_id,
         global_state,
-        global_snapshot,
-        local_coverage,
+        snapshot,
+        feedback,
         policy,
         purgatory_config,
     )?;
@@ -573,15 +582,15 @@ fn recover_crashed_node<H: HashPolicy, L: Logger>(
     Ok(())
 }
 
-fn reinit_node<H: HashPolicy, L: Logger>(
+fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
     topology: &TopologyInfo,
     state: &mut State<H>,
     logger: &mut L,
     prog: &Program,
     node_id: NodeId,
-    global_state: &GlobalState,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    global_state: &GlobalState<F>,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
@@ -604,42 +613,42 @@ fn reinit_node<H: HashPolicy, L: Logger>(
         &prog.id_to_name,
     );
 
-    exec_sync_on_node(
+    exec_sync_on_node::<H, L, F>(
         state,
         logger,
         prog,
         &mut env,
         node_id,
         init_fn.entry,
-        global_snapshot,
-        local_coverage,
+        snapshot,
+        feedback,
         policy,
         purgatory_config,
     )?;
 
-    recover_node(
+    recover_node::<H, L, F>(
         topology,
         state,
         logger,
         prog,
         node_id,
         global_state,
-        global_snapshot,
-        local_coverage,
+        snapshot,
+        feedback,
         policy,
         purgatory_config,
     )
 }
 
-fn recover_node<H: HashPolicy, L: Logger>(
+fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
     topology: &TopologyInfo,
     state: &mut State<H>,
     logger: &mut L,
     prog: &Program,
     node_id: NodeId,
-    _global_state: &GlobalState,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    _global_state: &GlobalState<F>,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
@@ -687,13 +696,13 @@ fn recover_node<H: HashPolicy, L: Logger>(
         link_seq: None,
     };
 
-    exec(
+    exec::<H, L, F>(
         state,
         logger,
         prog,
         record,
-        global_snapshot,
-        local_coverage,
+        snapshot,
+        feedback,
         policy,
         purgatory_config,
     )?;
@@ -703,6 +712,7 @@ fn recover_node<H: HashPolicy, L: Logger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulator::feedback::NoFeedback;
     use crate::simulator::hash_utils::NoHashing;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -733,10 +743,11 @@ mod tests {
         let trials = 50_000usize;
         let mut counts = [0usize; 3];
         for _ in 0..trials {
-            let idx = select_within_queue(
+            let idx = select_within_queue::<NoHashing, NoFeedback>(
                 &queue,
                 &eligible,
-                None,
+                &(),
+                &(),
                 &crashed,
                 1.0,
                 &selector,
@@ -775,10 +786,11 @@ mod tests {
         let trials = 30_000usize;
         let mut counts = [0usize; 3];
         for _ in 0..trials {
-            let idx = select_within_queue(
+            let idx = select_within_queue::<NoHashing, NoFeedback>(
                 &queue,
                 &eligible,
-                None,
+                &(),
+                &(),
                 &crashed,
                 1.0,
                 &selector,
@@ -810,10 +822,11 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let mut counts = [0usize; 2];
         for _ in 0..4_000 {
-            let idx = select_within_queue(
+            let idx = select_within_queue::<NoHashing, NoFeedback>(
                 &queue,
                 &eligible,
-                None,
+                &(),
+                &(),
                 &crashed,
                 1.0,
                 &selector,
@@ -840,10 +853,11 @@ mod tests {
         let proportional = WithinQueueSelector::Proportional { exponent: 1.0 };
 
         for selector in [&tournament, &proportional] {
-            let idx = select_within_queue(
+            let idx = select_within_queue::<NoHashing, NoFeedback>(
                 &queue,
                 &eligible,
-                None,
+                &(),
+                &(),
                 &crashed,
                 1.0,
                 selector,

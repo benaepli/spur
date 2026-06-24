@@ -5,7 +5,8 @@ use crate::simulator::core::state::{
     Continuation, LogEntry, Logger, NodeId, Record, SchedulePolicy, State,
 };
 use crate::simulator::core::values::{Env, Value};
-use crate::simulator::coverage::LocalCoverage;
+use crate::simulator::coverage::{LocalCoverage, VertexMap};
+use crate::simulator::feedback::CfgFeedback;
 use crate::simulator::hash_utils::WithHashing;
 use std::collections::HashMap;
 
@@ -111,12 +112,12 @@ fn test_assign_then_cond_true() {
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -141,12 +142,12 @@ fn test_assign_then_cond_false() {
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -172,12 +173,12 @@ fn test_arithmetic_assignment() {
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -207,12 +208,12 @@ fn test_multiple_assigns() {
     let record = make_record(assign1, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -235,12 +236,12 @@ fn test_node_slot_assignment() {
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -268,12 +269,12 @@ fn test_copy_instruction() {
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -293,12 +294,12 @@ fn test_print_instruction() {
     let record = make_record(print, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -338,12 +339,12 @@ fn test_for_loop_in_list() {
     let record = make_record(init, 4);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -363,12 +364,12 @@ fn test_pause_yields() {
     let record = make_record(pause, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -401,12 +402,12 @@ fn test_coverage_records_transitions() {
     let record = make_record(assign1, 2);
     let mut coverage = LocalCoverage::new();
 
-    let _ = exec::<WithHashing, TestLogger>(
+    let _ = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -436,12 +437,12 @@ fn test_channel_send_recv() {
     );
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -464,12 +465,12 @@ fn test_recv_blocks_on_empty() {
     let record = make_record(make, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -552,12 +553,12 @@ fn test_for_loop_map_destructuring() {
     );
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -616,12 +617,12 @@ fn test_tuple_assignment() {
     );
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
@@ -650,12 +651,12 @@ fn test_runtime_type_error() {
     let record = make_record(assign, 2);
     let mut coverage = LocalCoverage::new();
 
-    let result = exec::<WithHashing, TestLogger>(
+    let result = exec::<WithHashing, TestLogger, CfgFeedback>(
         &mut state,
         &mut logger,
         &program,
         record,
-        None,
+        &VertexMap::new(),
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),

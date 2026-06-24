@@ -1,4 +1,5 @@
 use crate::compiler::cfg::Vertex;
+use crate::simulator::feedback::Feedback;
 use crate::simulator::path::plan::PlannedEvent;
 use dashmap::DashMap;
 use imbl::HashMap as ImMap;
@@ -13,10 +14,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct VertexMap {
     vertices: ImMap<Vertex, u64>,
     total: u64,
+}
+
+impl Default for VertexMap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VertexMap {
@@ -59,12 +66,18 @@ impl IntoIterator for VertexMap {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct LocalCoverage {
     edges: HashMap<(Vertex, Vertex), u64>,
     vertices: HashMap<Vertex, u64>,
     total: u64,
     novelty_score: f64,
+}
+
+impl Default for LocalCoverage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LocalCoverage {
@@ -128,11 +141,17 @@ impl LocalCoverage {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct GlobalCoverage {
     edges: DashMap<(usize, usize), u64>,
     vertices: RwLock<VertexMap>,
     total: AtomicU64,
+}
+
+impl Default for GlobalCoverage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GlobalCoverage {
@@ -197,16 +216,25 @@ type Canonical = CanonGraph<PlannedEvent, ()>;
 type CuckooFilter = ScalableCuckooFilter<Canonical, CuckooHasher, SmallRng>;
 
 /// Global state shared across all simulation runs.
-#[derive(Debug)]
-pub struct GlobalState {
-    pub coverage: GlobalCoverage,
+///
+/// Generic over the feedback strategy `F`: the per-session feedback store lives
+/// in `feedback`, while `seen_states` (canonical-plan dedup) is independent of
+/// feedback and present for every strategy.
+pub struct GlobalState<F: Feedback> {
+    pub feedback: F::Global,
     seen_states: Mutex<CuckooFilter>,
 }
 
-impl GlobalState {
+impl<F: Feedback> std::fmt::Debug for GlobalState<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobalState").finish_non_exhaustive()
+    }
+}
+
+impl<F: Feedback> GlobalState<F> {
     pub fn new(expected_runs: usize) -> Self {
         Self {
-            coverage: GlobalCoverage::new(),
+            feedback: F::Global::default(),
             seen_states: Mutex::new(
                 ScalableCuckooFilterBuilder::new()
                     .rng(SmallRng::from_os_rng())

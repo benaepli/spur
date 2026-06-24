@@ -3,7 +3,11 @@ use crate::simulator::core::{
     Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
     Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
 };
-use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
+use crate::simulator::coverage::GlobalState;
+use crate::simulator::feedback::{
+    CfgFeedback, CoverageConfig, Feedback, FeedbackConfig, FeedbackMode, FullFeedback, NoFeedback,
+    TimelineFeedback,
+};
 use crate::simulator::history::{
     HistoryWriter, LogBackend, create_writer, serialize_history, serialize_logs, serialize_traces,
 };
@@ -20,9 +24,52 @@ use serde::Deserialize;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::collections::HashMap;
 use std::{fs, thread};
 
 const CANON_LIMIT: usize = 8;
+
+/// Non-generic result of an exploration session. The feedback type parameter is
+/// fully contained inside the dispatch, so callers (the CLI) never see it.
+pub struct ExploreSummary {
+    /// Per-vertex CFG hit counts for the heatmap, present only when the chosen
+    /// feedback strategy tracks CFG coverage.
+    pub vertex_coverage: Option<HashMap<usize, u64>>,
+}
+
+/// Resolves a runtime `FeedbackConfig` to a monomorphized call. Each arm binds
+/// the chosen `Feedback` strategy to the caller's type identifier and evaluates
+/// `$body`, so the generic type never escapes this match.
+macro_rules! dispatch_feedback {
+    ($cfg:expr, $f:ident => $body:expr) => {{
+        match ($cfg.mode, $cfg.steer) {
+            (FeedbackMode::None, _) => {
+                type $f = NoFeedback;
+                $body
+            }
+            (FeedbackMode::Cfg, _) => {
+                type $f = CfgFeedback;
+                $body
+            }
+            (FeedbackMode::Timeline, false) => {
+                type $f = TimelineFeedback<false>;
+                $body
+            }
+            (FeedbackMode::Timeline, true) => {
+                type $f = TimelineFeedback<true>;
+                $body
+            }
+            (FeedbackMode::Both, false) => {
+                type $f = FullFeedback<false>;
+                $body
+            }
+            (FeedbackMode::Both, true) => {
+                type $f = FullFeedback<true>;
+                $body
+            }
+        }
+    }};
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Range {
@@ -106,10 +153,16 @@ pub struct ExplorerConfig {
 
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
+
+    #[serde(default)]
+    pub feedback: FeedbackConfig,
 }
 
 impl ExplorerConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.feedback
+            .validate()
+            .map_err(|e| format!("feedback config error: {}", e))?;
         self.num_servers_range
             .validate()
             .map_err(|e| format!("num_servers range error: {}", e))?;
@@ -338,12 +391,12 @@ impl SingleRunConfig {
     }
 }
 
-fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
+fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feedback>(
     program: &Program,
     logger: &mut L,
     num_servers: usize,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<State<H>, RuntimeError> {
     // Look up role NameIds from the program
@@ -371,15 +424,15 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
                 node_env,
                 &program.id_to_name,
             );
-            exec_sync_on_node(
+            exec_sync_on_node::<H, _, F>(
                 &mut state,
                 logger,
                 program,
                 &mut env,
                 node_id,
                 init_fn.entry,
-                global_snapshot,
-                local_coverage,
+                snapshot,
+                feedback,
                 &SchedulePolicy::Fixed,
                 purgatory_config,
             )?;
@@ -389,13 +442,13 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
     Ok(state)
 }
 
-fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
+fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
     num_servers: usize,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<(), RuntimeError> {
     let init_fn_name = "Node.Init";
@@ -437,15 +490,15 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
             &program.id_to_name,
         );
 
-        exec_sync_on_node(
+        exec_sync_on_node::<H, _, F>(
             state,
             logger,
             program,
             &mut env,
             node_id,
             init_fn.entry,
-            global_snapshot,
-            local_coverage,
+            snapshot,
+            feedback,
             &SchedulePolicy::Fixed,
             purgatory_config,
         )?;
@@ -454,14 +507,15 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger>(
 }
 
 /// Runs a single simulation configuration and returns the plan score.
-pub fn run_single_simulation(
+pub fn run_single_simulation<F: Feedback>(
     program: &Program,
     writer: &Arc<dyn HistoryWriter>,
-    global_state: &GlobalState,
+    global_state: &GlobalState<F>,
     run_id: i64,
     config: &SingleRunConfig,
+    weights: &CoverageConfig,
 ) -> Result<f64, Box<dyn Error>> {
-    let global_snapshot = global_state.coverage.snapshot();
+    let snapshot = F::snapshot(&global_state.feedback);
     let gen_config = GeneratorConfig {
         num_servers: config.num_servers,
         num_write_ops: config.num_write_ops,
@@ -501,19 +555,19 @@ pub fn run_single_simulation(
         .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
 
     let role_node_counts = vec![(server_role, num_servers)];
-    let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing>::new(
+    let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing, F>::new(
         &role_node_counts,
         program.max_node_slots as usize,
         client_role,
     );
 
     // Initialize state
-    path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _>(
+    path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _, F>(
         program,
         &mut path_state.logs,
         num_servers,
-        Some(&global_snapshot),
-        &mut path_state.coverage,
+        &snapshot,
+        &mut path_state.feedback,
         &config.purgatory,
     )?;
 
@@ -522,24 +576,24 @@ pub fn run_single_simulation(
         num_servers: config.num_servers,
     };
 
-    init_topology::<crate::simulator::hash_utils::NoHashing, _>(
+    init_topology::<crate::simulator::hash_utils::NoHashing, _, F>(
         &mut path_state.state,
         &mut path_state.logs,
         program,
         num_servers,
-        Some(&global_snapshot),
-        &mut path_state.coverage,
+        &snapshot,
+        &mut path_state.feedback,
         &config.purgatory,
     )?;
 
-    let outcome = exec_plan(
+    let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
         program.clone(),
         plan,
         config.max_iterations,
         topology_info,
         global_state,
-        Some(&global_snapshot),
+        &snapshot,
         run_id,
         &config.schedule_policy,
         false,
@@ -553,9 +607,9 @@ pub fn run_single_simulation(
         warn!("Run {} deadlocked at step {} ({} pending ops)", run_id, step, pending_ops);
     }
 
-    let plan_score = path_state.coverage.plan_score();
+    let plan_score = F::plan_score(&path_state.feedback, &snapshot, weights);
 
-    global_state.coverage.merge(&path_state.coverage);
+    F::merge(&global_state.feedback, &path_state.feedback);
     if let Some(x) = canonical.as_ref() {
         global_state.insert(x)
     }
@@ -575,7 +629,7 @@ pub fn run_explorer(
     output_path: &str,
     backend: LogBackend,
     cancelled: &Arc<AtomicBool>,
-) -> Result<Arc<GlobalState>, Box<dyn Error>> {
+) -> Result<ExploreSummary, Box<dyn Error>> {
     info!("Starting Execution Explorer...");
     info!("Config: {}", config_json_path);
 
@@ -587,6 +641,17 @@ pub fn run_explorer(
         .validate()
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
+    dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
+}
+
+fn run_explorer_impl<F: Feedback>(
+    program: &Program,
+    config: ExplorerConfig,
+    output_path: &str,
+    backend: LogBackend,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<ExploreSummary, Box<dyn Error>> {
+    let weights = config.feedback.weights;
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
 
     let (sender, receiver) = channel::bounded::<(i64, SingleRunConfig)>(100);
@@ -698,14 +763,21 @@ pub fn run_explorer(
 
     info!("Starting parallel simulation...");
 
-    let global_state = Arc::new(GlobalState::new(1_000_000));
+    let global_state = Arc::new(GlobalState::<F>::new(1_000_000));
 
     receiver
         .into_iter()
         .par_bridge()
         .for_each(|(run_id, run_config)| {
             let start = std::time::Instant::now();
-            match run_single_simulation(program, &writer, &global_state, run_id, &run_config) {
+            match run_single_simulation::<F>(
+                program,
+                &writer,
+                &global_state,
+                run_id,
+                &run_config,
+                &weights,
+            ) {
                 Ok(_) => {
                     debug!(
                         "Run {} Success ({:.4}s)",
@@ -721,14 +793,17 @@ pub fn run_explorer(
     writer.shutdown();
 
     info!("Execution explorer finished.");
-    Ok(global_state)
+    Ok(ExploreSummary {
+        vertex_coverage: F::vertex_coverage(&global_state.feedback),
+    })
 }
 
 /// Runs a single simulation with a pre-built execution plan.
-fn run_single_plan(
+#[allow(clippy::too_many_arguments)]
+fn run_single_plan<F: Feedback>(
     program: &Program,
     writer: &Arc<dyn HistoryWriter>,
-    global_state: &GlobalState,
+    global_state: &GlobalState<F>,
     run_id: i64,
     plan: &ExecutionPlan,
     num_servers: i32,
@@ -739,8 +814,9 @@ fn run_single_plan(
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
+    weights: &CoverageConfig,
 ) -> Result<f64, Box<dyn Error>> {
-    let global_snapshot = global_state.coverage.snapshot();
+    let snapshot = F::snapshot(&global_state.feedback);
     let num_servers_usize = num_servers as usize;
 
     let server_role = program
@@ -757,18 +833,18 @@ fn run_single_plan(
         .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
 
     let role_node_counts = vec![(server_role, num_servers_usize)];
-    let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing>::new(
+    let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing, F>::new(
         &role_node_counts,
         program.max_node_slots as usize,
         client_role,
     );
 
-    path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _>(
+    path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _, F>(
         program,
         &mut path_state.logs,
         num_servers_usize,
-        Some(&global_snapshot),
-        &mut path_state.coverage,
+        &snapshot,
+        &mut path_state.feedback,
         purgatory_config,
     )?;
 
@@ -777,24 +853,24 @@ fn run_single_plan(
         num_servers,
     };
 
-    init_topology::<crate::simulator::hash_utils::NoHashing, _>(
+    init_topology::<crate::simulator::hash_utils::NoHashing, _, F>(
         &mut path_state.state,
         &mut path_state.logs,
         program,
         num_servers_usize,
-        Some(&global_snapshot),
-        &mut path_state.coverage,
+        &snapshot,
+        &mut path_state.feedback,
         purgatory_config,
     )?;
 
-    let outcome = exec_plan(
+    let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
         program.clone(),
         plan.clone(),
         max_iterations,
         topology_info,
         global_state,
-        Some(&global_snapshot),
+        &snapshot,
         run_id,
         policy,
         strict_timers,
@@ -808,8 +884,8 @@ fn run_single_plan(
         warn!("Run {} deadlocked at step {} ({} pending ops)", run_id, step, pending_ops);
     }
 
-    let plan_score = path_state.coverage.plan_score();
-    global_state.coverage.merge(&path_state.coverage);
+    let plan_score = F::plan_score(&path_state.feedback, &snapshot, weights);
+    F::merge(&global_state.feedback, &path_state.feedback);
 
     let serialized = serialize_history(&path_state.history);
     let serialized_logs = serialize_logs(&path_state.logs.entries);
@@ -826,7 +902,7 @@ pub fn run_plan(
     output_path: &str,
     backend: LogBackend,
     cancelled: &Arc<AtomicBool>,
-) -> Result<Arc<GlobalState>, Box<dyn Error>> {
+) -> Result<ExploreSummary, Box<dyn Error>> {
     use crate::simulator::plan_config::PlanFileConfig;
 
     info!("Starting Plan Runner...");
@@ -838,6 +914,16 @@ pub fn run_plan(
         .validate()
         .map_err(|e| format!("Plan validation failed: {}", e))?;
 
+    dispatch_feedback!(config.feedback, F => run_plan_impl::<F>(program, config, output_path, backend, cancelled))
+}
+
+fn run_plan_impl<F: Feedback>(
+    program: &Program,
+    config: crate::simulator::plan_config::PlanFileConfig,
+    output_path: &str,
+    backend: LogBackend,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<ExploreSummary, Box<dyn Error>> {
     let plan = config
         .to_execution_plan()
         .map_err(|e| format!("Failed to build execution plan: {}", e))?;
@@ -852,8 +938,9 @@ pub fn run_plan(
         config.num_runs, config.num_servers
     );
 
+    let weights = config.feedback.weights;
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
-    let global_state = Arc::new(GlobalState::new(1_000_000));
+    let global_state = Arc::new(GlobalState::<F>::new(1_000_000));
 
     let runs: Vec<i64> = (1..=config.num_runs as i64).collect();
 
@@ -862,7 +949,7 @@ pub fn run_plan(
             return;
         }
         let start = std::time::Instant::now();
-        match run_single_plan(
+        match run_single_plan::<F>(
             program,
             &writer,
             &global_state,
@@ -876,6 +963,7 @@ pub fn run_plan(
             &config.within_queue_selector,
             config.quick_fire_multiplier,
             &config.purgatory,
+            &weights,
         ) {
             Ok(_) => {
                 debug!(
@@ -890,18 +978,20 @@ pub fn run_plan(
 
     writer.shutdown();
     info!("Plan runner finished.");
-    Ok(global_state)
+    Ok(ExploreSummary {
+        vertex_coverage: F::vertex_coverage(&global_state.feedback),
+    })
 }
 
 /// Runs the genetic algorithm-based explorer.
-/// Returns the GlobalState containing accumulated coverage data.
+/// Returns the coverage summary for the heatmap.
 pub fn run_explorer_genetic(
     program: &Program,
     config_json_path: &str,
     output_path: &str,
     backend: LogBackend,
     cancelled: &Arc<AtomicBool>,
-) -> Result<Arc<GlobalState>, Box<dyn Error>> {
+) -> Result<ExploreSummary, Box<dyn Error>> {
     info!("Starting Genetic Execution Explorer...");
     info!("Config: {}", config_json_path);
 
@@ -913,8 +1003,19 @@ pub fn run_explorer_genetic(
         .validate()
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
+    dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
+}
+
+fn run_explorer_genetic_impl<F: Feedback>(
+    program: &Program,
+    config: ExplorerConfig,
+    output_path: &str,
+    backend: LogBackend,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<ExploreSummary, Box<dyn Error>> {
+    let weights = config.feedback.weights;
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
-    let global_state = Arc::new(GlobalState::new(1_000_000));
+    let global_state = Arc::new(GlobalState::<F>::new(1_000_000));
     let run_counter = Arc::new(AtomicI64::new(0));
 
     let mut population: Vec<SingleRunConfig> = (0..config.population_size)
@@ -939,8 +1040,14 @@ pub fn run_explorer_genetic(
             .par_iter()
             .map(|run_config| {
                 let run_id = run_counter.fetch_add(1, Ordering::Relaxed);
-                let result =
-                    run_single_simulation(program, &writer, &global_state, run_id, run_config);
+                let result = run_single_simulation::<F>(
+                    program,
+                    &writer,
+                    &global_state,
+                    run_id,
+                    run_config,
+                    &weights,
+                );
                 match result {
                     Ok(score) => (run_config.clone(), score),
                     Err(e) => {
@@ -985,5 +1092,7 @@ pub fn run_explorer_genetic(
     writer.shutdown();
 
     info!("Genetic explorer finished.");
-    Ok(global_state)
+    Ok(ExploreSummary {
+        vertex_coverage: F::vertex_coverage(&global_state.feedback),
+    })
 }

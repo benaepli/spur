@@ -8,23 +8,23 @@ use crate::simulator::core::state::{
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
 use imbl::Vector;
 use rand::Rng;
-use crate::simulator::coverage::{LocalCoverage, VertexMap};
+use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 
-pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
+pub fn exec_sync_on_node<H: HashPolicy, L: Logger, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
     local_env: &mut Env<H>,
     node_id: NodeId,
     start_pc: usize,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<Value<H>, RuntimeError> {
     let mut node_env = state.nodes[node_id.index].clone();
-    let result = exec_sync_inner(
+    let result = exec_sync_inner::<H, L, F>(
         state,
         logger,
         program,
@@ -32,8 +32,8 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger>(
         &mut node_env,
         start_pc,
         node_id,
-        global_snapshot,
-        local_coverage,
+        snapshot,
+        feedback,
         policy,
         purgatory_config,
         None, // top-level sync calls have no causal client op
@@ -47,7 +47,7 @@ enum StepOutcome<H: HashPolicy> {
     Return(Value<H>),
 }
 
-fn execute_common_label<H: HashPolicy, L: Logger>(
+fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
     label: &Label,
     state: &mut State<H>,
     logger: &mut L,
@@ -55,8 +55,8 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     local_env: &mut Env<H>,
     node_env: &mut Env<H>,
     node_id: NodeId,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
@@ -96,7 +96,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     &program.id_to_name,
                 );
 
-                let val = exec_sync_inner(
+                let val = exec_sync_inner::<H, L, F>(
                     state,
                     logger,
                     program,
@@ -104,8 +104,8 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
                     node_env,
                     func_info.entry,
                     node_id,
-                    global_snapshot,
-                    local_coverage,
+                    snapshot,
+                    feedback,
                     policy,
                     purgatory_config,
                     causal_operation_id,
@@ -400,7 +400,7 @@ fn execute_common_label<H: HashPolicy, L: Logger>(
     }
 }
 
-fn exec_sync_inner<H: HashPolicy, L: Logger>(
+fn exec_sync_inner<H: HashPolicy, L: Logger, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
@@ -408,8 +408,8 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
     node_env: &mut Env<H>,
     start_pc: usize,
     node_id: NodeId,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
@@ -419,13 +419,12 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
     let mut pending_trace_id = None;
     loop {
         if pc != prev_pc {
-            let rarity = global_snapshot.map_or(1.0, |s| s.novelty_score(pc));
-            local_coverage.record_with_rarity(prev_pc, pc, rarity);
+            F::record_transition(feedback, prev_pc, pc, snapshot);
             prev_pc = pc;
         }
 
         let label = program.cfg.get_label(pc);
-        if let Some(outcome) = execute_common_label(
+        if let Some(outcome) = execute_common_label::<H, L, F>(
             label,
             state,
             logger,
@@ -433,8 +432,8 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
             local_env,
             node_env,
             node_id,
-            global_snapshot,
-            local_coverage,
+            snapshot,
+            feedback,
             policy,
             purgatory_config,
             causal_operation_id,
@@ -456,13 +455,13 @@ fn exec_sync_inner<H: HashPolicy, L: Logger>(
     }
 }
 
-pub fn exec<H: HashPolicy, L: Logger>(
+pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
     mut record: Record<H>,
-    global_snapshot: Option<&VertexMap>,
-    local_coverage: &mut LocalCoverage,
+    snapshot: &F::Snapshot,
+    feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
@@ -473,17 +472,31 @@ pub fn exec<H: HashPolicy, L: Logger>(
 
     let mut prev_pc = record.pc;
 
+    // Capture the first-entry handler delivery for timeline coverage. The whole
+    // block is const-folded away for strategies that do not track timelines.
+    // `record.pc == record.entry_pc` is true only on the first exec entry of a
+    // delivery; Recv/Pause re-push with pc advanced past entry.
+    if F::CAPTURES_TIMELINE && record.pc == record.entry_pc {
+        let server_role = program
+            .roles
+            .iter()
+            .find(|(_, n)| n == "Node")
+            .map(|(id, _)| *id);
+        if server_role == Some(record.node.role) {
+            F::note_delivery(feedback, record.node, record.entry_pc);
+        }
+    }
+
     loop {
         let current_pc = record.pc;
         if current_pc != prev_pc {
-            let rarity = global_snapshot.map_or(1.0, |s| s.novelty_score(current_pc));
-            local_coverage.record_with_rarity(prev_pc, current_pc, rarity);
+            F::record_transition(feedback, prev_pc, current_pc, snapshot);
             prev_pc = current_pc;
         }
 
         let label = program.cfg.get_label(record.pc);
 
-        if let Some(outcome) = execute_common_label(
+        if let Some(outcome) = execute_common_label::<H, L, F>(
             label,
             state,
             logger,
@@ -491,8 +504,8 @@ pub fn exec<H: HashPolicy, L: Logger>(
             &mut local_env,
             &mut node_env,
             record.node,
-            global_snapshot,
-            local_coverage,
+            snapshot,
+            feedback,
             policy,
             purgatory_config,
             causal_operation_id,

@@ -6,7 +6,8 @@ use crate::simulator::core::{
     RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, WithinQueueSelector,
     make_local_env, schedule_runnable,
 };
-use crate::simulator::coverage::{GlobalState, LocalCoverage, VertexMap};
+use crate::simulator::coverage::GlobalState;
+use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
@@ -81,15 +82,15 @@ impl ClientPool {
 
 /// Wrapper around State that adds path-execution tracking fields.
 #[derive(Debug)]
-pub struct PathState<H: HashPolicy> {
+pub struct PathState<H: HashPolicy, F: Feedback> {
     pub state: State<H>,
-    pub coverage: LocalCoverage,
+    pub feedback: F::Local,
     pub logs: Logs,
     pub history: Vec<Operation<H>>,
     pub client_pool: ClientPool,
 }
 
-impl<H: HashPolicy> PathState<H> {
+impl<H: HashPolicy, F: Feedback> PathState<H, F> {
     pub fn new(
         role_node_counts: &[(NameId, usize)],
         node_slot_count: usize,
@@ -97,7 +98,7 @@ impl<H: HashPolicy> PathState<H> {
     ) -> Self {
         Self {
             state: State::<H>::new(role_node_counts, node_slot_count),
-            coverage: LocalCoverage::new(),
+            feedback: F::Local::default(),
             logs: Logs::default(),
             history: Vec::new(),
             client_pool: ClientPool::new(client_role, node_slot_count),
@@ -198,14 +199,14 @@ pub enum RunOutcome {
     Deadlock { step: i32, pending_ops: usize },
 }
 
-pub fn exec_plan<H: HashPolicy>(
-    path_state: &mut PathState<H>,
+pub fn exec_plan<H: HashPolicy, F: Feedback>(
+    path_state: &mut PathState<H, F>,
     program: Program,
     plan: ExecutionPlan,
     max_iterations: i32,
     topology: TopologyInfo,
-    global_state: &GlobalState,
-    global_snapshot: Option<&VertexMap>,
+    global_state: &GlobalState<F>,
+    snapshot: &F::Snapshot,
     run_id: i64,
     policy: &SchedulePolicy,
     strict_timers: bool,
@@ -342,15 +343,15 @@ pub fn exec_plan<H: HashPolicy>(
                                 &path_state.state.nodes[client_node_id.index],
                                 &program.id_to_name,
                             );
-                            if let Err(e) = crate::simulator::core::exec_sync_on_node(
+                            if let Err(e) = crate::simulator::core::exec_sync_on_node::<H, _, F>(
                                 &mut path_state.state,
                                 &mut path_state.logs,
                                 &program,
                                 &mut env,
                                 client_node_id,
                                 init_fn.entry,
-                                global_snapshot,
-                                &mut path_state.coverage,
+                                snapshot,
+                                &mut path_state.feedback,
                                 policy,
                                 purgatory_config,
                             ) {
@@ -450,13 +451,13 @@ pub fn exec_plan<H: HashPolicy>(
         let history_start_len = path_state.history.len();
 
         if !path_state.state.all_queues_empty() {
-            let result = schedule_runnable(
+            let result = schedule_runnable::<H, _, _, F>(
                 &mut path_state.state,
                 &mut path_state.logs,
                 &program,
                 false,
-                global_snapshot,
-                &mut path_state.coverage,
+                snapshot,
+                &mut path_state.feedback,
                 &topology,
                 global_state,
                 policy,

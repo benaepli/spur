@@ -3,10 +3,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use spur_core::compiler;
 use spur_core::compiler::pure::print_program as print_pure;
 use spur_core::debug::SimulatorDebugger;
-use spur_core::simulator::explorer::{run_explorer, run_explorer_genetic, run_plan};
+use spur_core::simulator::explorer::{
+    ExploreSummary, run_explorer, run_explorer_genetic, run_plan,
+};
 use spur_core::simulator::history::LogBackend;
 use spur_core::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -462,7 +463,7 @@ fn run_explore(
         .to_str()
         .context("Config path contains invalid UTF-8")?;
 
-    let global_state = match explorer_type {
+    let summary = match explorer_type {
         ExplorerType::Standard => run_explorer(
             &program,
             config_path_str,
@@ -483,23 +484,8 @@ fn run_explore(
 
     let elapsed = start.elapsed();
 
-    // Generate coverage heatmap
-    let vertex_coverage: HashMap<usize, u64> = global_state
-        .coverage
-        .vertices_snapshot()
-        .into_iter()
-        .collect();
-
-    let byte_hits = vertex_coverage_to_byte_coverage(
-        &vertex_coverage,
-        &program.vertex_to_span,
-        source_code.len(),
-    );
-
-    let html = render_html_heatmap(&source_code, &byte_hits);
-    let heatmap_path = output_dir.join("coverage.html");
-
-    fs::write(&heatmap_path, html).context("Failed to write coverage heatmap")?;
+    // Generate coverage heatmap (only when the chosen feedback tracks CFG coverage)
+    let heatmap_path = write_coverage_heatmap(&summary, &program, &source_code, &output_dir)?;
 
     // Generate CFG SVG
     let cfg_path = output_dir.join("cfg.svg");
@@ -511,10 +497,34 @@ fn run_explore(
         elapsed,
         output_dir.display()
     );
-    println!("  - Coverage heatmap: {}", heatmap_path.display());
+    match &heatmap_path {
+        Some(p) => println!("  - Coverage heatmap: {}", p.display()),
+        None => println!("  - Coverage heatmap: skipped (no CFG feedback)"),
+    }
     println!("  - CFG: {}", cfg_path.display());
 
     Ok(())
+}
+
+/// Renders the CFG coverage heatmap if the summary carries vertex coverage.
+/// Returns the path written, or `None` when the feedback mode tracks no CFG.
+fn write_coverage_heatmap(
+    summary: &ExploreSummary,
+    program: &compiler::cfg::Program,
+    source_code: &str,
+    output_dir: &std::path::Path,
+) -> Result<Option<PathBuf>> {
+    let Some(vertex_coverage) = &summary.vertex_coverage else {
+        return Ok(None);
+    };
+
+    let byte_hits =
+        vertex_coverage_to_byte_coverage(vertex_coverage, &program.vertex_to_span, source_code.len());
+
+    let html = render_html_heatmap(source_code, &byte_hits);
+    let heatmap_path = output_dir.join("coverage.html");
+    fs::write(&heatmap_path, html).context("Failed to write coverage heatmap")?;
+    Ok(Some(heatmap_path))
 }
 
 fn run_run_plan(
@@ -555,7 +565,7 @@ fn run_run_plan(
         .to_str()
         .context("Plan path contains invalid UTF-8")?;
 
-    let global_state = run_plan(
+    let summary = run_plan(
         &program,
         plan_path_str,
         &output_path_str,
@@ -566,23 +576,8 @@ fn run_run_plan(
 
     let elapsed = start.elapsed();
 
-    // Generate coverage heatmap
-    let vertex_coverage: HashMap<usize, u64> = global_state
-        .coverage
-        .vertices_snapshot()
-        .into_iter()
-        .collect();
-
-    let byte_hits = vertex_coverage_to_byte_coverage(
-        &vertex_coverage,
-        &program.vertex_to_span,
-        source_code.len(),
-    );
-
-    let html = render_html_heatmap(&source_code, &byte_hits);
-    let heatmap_path = output_dir.join("coverage.html");
-
-    fs::write(&heatmap_path, html).context("Failed to write coverage heatmap")?;
+    // Generate coverage heatmap (only when the chosen feedback tracks CFG coverage)
+    let heatmap_path = write_coverage_heatmap(&summary, &program, &source_code, &output_dir)?;
 
     let cfg_path = output_dir.join("cfg.svg");
     let svg = render_svg(&program).map_err(|e| anyhow::anyhow!("Failed to render SVG: {}", e))?;
@@ -593,7 +588,10 @@ fn run_run_plan(
         elapsed,
         output_dir.display()
     );
-    println!("  - Coverage heatmap: {}", heatmap_path.display());
+    match &heatmap_path {
+        Some(p) => println!("  - Coverage heatmap: {}", p.display()),
+        None => println!("  - Coverage heatmap: skipped (no CFG feedback)"),
+    }
     println!("  - CFG: {}", cfg_path.display());
 
     Ok(())
