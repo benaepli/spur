@@ -15,7 +15,8 @@ use crate::simulator::path::plan::{
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
-use std::collections::{HashMap, HashSet};
+use rand::Rng;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub mod generator;
 pub mod plan;
@@ -64,7 +65,7 @@ impl ClientPool {
         }
     }
 
-    /// Get a client node — reuses a free one or creates a new one.
+    /// Get a client node: reuses a free one or creates a new one.
     /// Returns (NodeId, bool) where the boolean is true if the node was newly created.
     pub fn get<H: HashPolicy>(&mut self, state: &mut State<H>) -> (NodeId, bool) {
         if let Some(node_id) = self.free_clients.pop() {
@@ -115,6 +116,7 @@ fn schedule_client_op<H: HashPolicy>(
     client_node_id: NodeId,
     server_role: NameId,
     policy: &SchedulePolicy,
+    rng: &mut impl Rng,
 ) -> Result<(), RuntimeError> {
     let client_id = client_node_id.index as i32;
     let (op_name, actuals) = match op_spec {
@@ -172,7 +174,6 @@ fn schedule_client_op<H: HashPolicy>(
         step: state.crash_info.current_step,
     });
 
-    let mut rng = rand::rng();
     state.push_runnable(Runnable::Record(Record {
         pc: op_func.entry,
         node: client_node_id,
@@ -185,7 +186,7 @@ fn schedule_client_op<H: HashPolicy>(
         entry_pc: op_func.entry,
         initial_env: env.clone(),
         env,
-        priority: policy.sample(&mut rng, RunnableCategory::Record),
+        priority: policy.sample(rng, RunnableCategory::Record),
         causal_operation_id: Some(op_id),
         trace_id: None,
         link_seq: None,
@@ -214,6 +215,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
+    rng: &mut impl Rng,
 ) -> Result<RunOutcome, RuntimeError> {
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
@@ -250,8 +252,10 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         })
         .collect();
 
-    // Track deliver states: ready (unlocked) vs completed
-    let mut ready_delivers: HashSet<NodeIndex> = HashSet::new();
+    // Track deliver states: ready (unlocked) vs completed. `ready_delivers` is a
+    // BTreeSet so the `.iter().find(...)` match at the deliver site is
+    // deterministic across runs (required for replay).
+    let mut ready_delivers: BTreeSet<NodeIndex> = BTreeSet::new();
     let mut completed_delivers: HashSet<NodeIndex> = HashSet::new();
 
     let mut engine = PlanEngine::new(plan);
@@ -354,6 +358,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                                 &mut path_state.feedback,
                                 policy,
                                 purgatory_config,
+                                rng,
                             ) {
                                 log::warn!(
                                     "Failed to initialize dynamic client node {}: {}",
@@ -380,25 +385,24 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         client_node_id,
                         server_role,
                         policy,
+                        rng,
                     )?;
                 }
                 EventAction::CrashNode(node_id) => {
                     let nid =
                         validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
-                    let mut rng = rand::rng();
                     path_state.state.push_runnable(Runnable::Crash {
                         node_id: nid,
-                        priority: policy.sample(&mut rng, RunnableCategory::Crash),
+                        priority: policy.sample(rng, RunnableCategory::Crash),
                     });
                     pending_crash_recover.insert(nid.index, node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
                     let nid =
                         validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
-                    let mut rng = rand::rng();
                     path_state.state.push_runnable(Runnable::Recover {
                         node_id: nid,
-                        priority: policy.sample(&mut rng, RunnableCategory::Recover),
+                        priority: policy.sample(rng, RunnableCategory::Recover),
                     });
                     pending_crash_recover.insert(nid.index, node_idx);
                 }
@@ -412,17 +416,15 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         server_role,
                         topology.num_servers,
                     );
-                    let mut rng = rand::rng();
                     path_state.state.push_runnable(Runnable::Partition {
                         partition_type,
-                        priority: policy.sample(&mut rng, RunnableCategory::Partition),
+                        priority: policy.sample(rng, RunnableCategory::Partition),
                     });
                     pending_partition = Some(node_idx);
                 }
                 EventAction::Heal => {
-                    let mut rng = rand::rng();
                     path_state.state.push_runnable(Runnable::Heal {
-                        priority: policy.sample(&mut rng, RunnableCategory::Heal),
+                        priority: policy.sample(rng, RunnableCategory::Heal),
                     });
                     pending_heal = Some(node_idx);
                 }
@@ -467,6 +469,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 quick_fire_multiplier,
                 purgatory_config,
                 &reservations,
+                rng,
             )?;
 
             match result {

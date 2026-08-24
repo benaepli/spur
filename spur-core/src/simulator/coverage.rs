@@ -1,18 +1,11 @@
 use crate::compiler::cfg::Vertex;
 use crate::simulator::feedback::Feedback;
-use crate::simulator::path::plan::PlannedEvent;
 use dashmap::DashMap;
 use imbl::HashMap as ImMap;
 use imbl::shared_ptr::ArcK;
-use nauty_pet::prelude::CanonGraph;
-use rand::SeedableRng;
-use rand::prelude::SmallRng;
-use scalable_cuckoo_filter::{
-    DefaultHasher as CuckooHasher, ScalableCuckooFilter, ScalableCuckooFilterBuilder,
-};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct VertexMap {
@@ -54,6 +47,25 @@ impl VertexMap {
                 .or_insert(*count);
             self.total += count;
         }
+    }
+
+    /// Scale every count by `factor` (clamped to `[0, 1]`), dropping entries
+    /// that round to zero, and recompute `total`. Used by the continuous
+    /// explorer to bound memory and let saturated vertices regain novelty
+    /// over a long session.
+    pub fn decay(&mut self, factor: f64) {
+        let factor = factor.clamp(0.0, 1.0);
+        let mut scaled = ImMap::new();
+        let mut total = 0u64;
+        for (v, count) in self.vertices.iter() {
+            let s = ((*count as f64) * factor).floor() as u64;
+            if s > 0 {
+                scaled.insert(*v, s);
+                total += s;
+            }
+        }
+        self.vertices = scaled;
+        self.total = total;
     }
 }
 
@@ -188,6 +200,22 @@ impl GlobalCoverage {
         self.total.load(Ordering::Relaxed)
     }
 
+    /// Scale all edge/vertex counts by factor.
+    pub fn decay(&self, factor: f64) {
+        let factor = factor.clamp(0.0, 1.0);
+        self.edges.retain(|_, c| {
+            *c = ((*c as f64) * factor).floor() as u64;
+            *c > 0
+        });
+        let mut vertices = self
+            .vertices
+            .write()
+            .expect("RwLock poisoned - this indicates a panic occurred while holding the lock");
+        vertices.decay(factor);
+        // Keep the cheap `== 0` guard's denominator in step with the vertices.
+        self.total.store(vertices.total, Ordering::Relaxed);
+    }
+
     /// Calculates the novelty score for a vertex using global stats.
     /// Returns 1.0 if never seen, otherwise 1.0 - (count/total).
     pub fn novelty_score(&self, vertex: Vertex) -> f64 {
@@ -210,19 +238,18 @@ impl GlobalCoverage {
     }
 }
 
-const FALSE_POSITIVE_PROBABILITY: f64 = 0.001;
-
-type Canonical = CanonGraph<PlannedEvent, ()>;
-type CuckooFilter = ScalableCuckooFilter<Canonical, CuckooHasher, SmallRng>;
-
-/// Global state shared across all simulation runs.
+/// Global feedback state shared across all simulation runs.
 ///
 /// Generic over the feedback strategy `F`: the per-session feedback store lives
-/// in `feedback`, while `seen_states` (canonical-plan dedup) is independent of
-/// feedback and present for every strategy.
+/// in `feedback`.
 pub struct GlobalState<F: Feedback> {
     pub feedback: F::Global,
-    seen_states: Mutex<CuckooFilter>,
+}
+
+impl<F: Feedback> Default for GlobalState<F> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<F: Feedback> std::fmt::Debug for GlobalState<F> {
@@ -232,37 +259,48 @@ impl<F: Feedback> std::fmt::Debug for GlobalState<F> {
 }
 
 impl<F: Feedback> GlobalState<F> {
-    pub fn new(expected_runs: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             feedback: F::Global::default(),
-            seen_states: Mutex::new(
-                ScalableCuckooFilterBuilder::new()
-                    .rng(SmallRng::from_os_rng())
-                    .initial_capacity(expected_runs)
-                    .false_positive_probability(FALSE_POSITIVE_PROBABILITY)
-                    .finish(),
-            ),
         }
-    }
-
-    pub fn insert(&self, item: &Canonical) {
-        self.seen_states
-            .lock()
-            .expect("Mutex poisoned - this indicates a panic occurred while holding the lock")
-            .insert(item)
-    }
-
-    pub fn contains(&self, item: &Canonical) -> bool {
-        self.seen_states
-            .lock()
-            .expect("Mutex poisoned - this indicates a panic occurred while holding the lock")
-            .contains(item)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_map_decay_scales_drops_zeros_and_stays_in_range() {
+        let mut m = VertexMap::new();
+        let mut src: HashMap<Vertex, u64> = HashMap::new();
+        src.insert(1, 4);
+        src.insert(2, 1);
+        m.merge_from(&src);
+        assert_eq!(m.total, 5);
+
+        m.decay(0.5);
+        assert_eq!(m.get(&1), Some(2)); // 4 -> 2
+        assert_eq!(m.get(&2), None); // 1 -> 0, dropped
+        assert_eq!(m.total, 2); // total recomputed
+        assert!((0.0..=1.0).contains(&m.novelty_score(1)));
+        assert!((0.0..=1.0).contains(&m.novelty_score(99)));
+    }
+
+    #[test]
+    fn global_coverage_decay_keeps_total_consistent() {
+        let g = GlobalCoverage::new();
+        let mut local = LocalCoverage::new();
+        for _ in 0..4 {
+            local.record(0, 1);
+        }
+        local.record(2, 3);
+        g.merge(&local);
+        g.decay(0.5);
+        // Vertex `1` was hit 4x -> 2; vertex `3` once -> dropped. Total tracks it.
+        assert_eq!(g.total(), 2);
+        assert!((0.0..=1.0).contains(&g.novelty_score(1)));
+    }
 
     #[test]
     fn test_plan_score_empty_coverage() {

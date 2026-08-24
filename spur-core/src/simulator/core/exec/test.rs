@@ -8,6 +8,8 @@ use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
 use crate::simulator::feedback::CfgFeedback;
 use crate::simulator::hash_utils::WithHashing;
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
 use std::collections::HashMap;
 
 fn slot(idx: u32) -> VarSlot {
@@ -121,6 +123,7 @@ fn test_assign_then_cond_true() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
 }
@@ -151,6 +154,7 @@ fn test_assign_then_cond_false() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
 }
@@ -182,6 +186,7 @@ fn test_arithmetic_assignment() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
 }
@@ -217,6 +222,7 @@ fn test_multiple_assigns() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
 }
@@ -245,6 +251,7 @@ fn test_node_slot_assignment() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
     assert_eq!(state.nodes[0].get(1), &Value::<WithHashing>::int(42));
@@ -278,6 +285,7 @@ fn test_copy_instruction() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
 }
@@ -303,6 +311,7 @@ fn test_print_instruction() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
     assert_eq!(logger.entries.len(), 1);
@@ -348,6 +357,7 @@ fn test_for_loop_in_list() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
 }
@@ -373,6 +383,7 @@ fn test_pause_yields() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
@@ -411,6 +422,7 @@ fn test_coverage_records_transitions() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
     assert!(coverage.unique_edges() >= 2);
 }
@@ -446,6 +458,7 @@ fn test_channel_send_recv() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -474,6 +487,7 @@ fn test_recv_blocks_on_empty() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
 
     assert!(result.is_ok());
@@ -562,6 +576,7 @@ fn test_for_loop_map_destructuring() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -626,6 +641,7 @@ fn test_tuple_assignment() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
 
     let op = result.expect("exec failed").expect("should complete");
@@ -660,6 +676,7 @@ fn test_runtime_type_error() {
         &mut coverage,
         &SchedulePolicy::Fixed,
         &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
     );
 
     assert!(result.is_err());

@@ -1,8 +1,10 @@
 mod core;
 mod coverage;
+mod curriculum;
 pub mod explorer;
 mod feedback;
 mod hash_utils;
 pub mod history;
 mod path;
 pub mod plan_config;
+pub mod rng;

@@ -22,6 +22,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
+    rng: &mut impl Rng,
 ) -> Result<Value<H>, RuntimeError> {
     let mut node_env = state.nodes[node_id.index].clone();
     let result = exec_sync_inner::<H, L, F>(
@@ -37,6 +38,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger, F: Feedback>(
         policy,
         purgatory_config,
         None, // top-level sync calls have no causal client op
+        rng,
     );
     state.nodes[node_id.index] = node_env;
     result
@@ -61,6 +63,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
     purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
     pending_trace_id: &mut Option<i64>,
+    rng: &mut impl Rng,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
     match label {
         Label::Instr(instr, next) => match instr {
@@ -109,6 +112,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     policy,
                     purgatory_config,
                     causal_operation_id,
+                    rng,
                 )?;
 
                 store(lhs, val, local_env, node_env)?;
@@ -155,7 +159,6 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     (lid, next)
                 });
 
-                let mut rng = rand::rng();
                 let new_record = Record {
                     pc: func_info.entry,
                     node: target_node,
@@ -164,7 +167,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     entry_pc: func_info.entry,
                     initial_env: callee_locals.clone(),
                     env: callee_locals,
-                    priority: policy.sample(&mut rng, RunnableCategory::Record),
+                    priority: policy.sample(rng, RunnableCategory::Record),
                     causal_operation_id,
                     trace_id: pending_trace_id.take(),
                     link_seq,
@@ -216,12 +219,11 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             store(lhs, Value::channel(cid), local_env, node_env)?;
 
             // Create a timer that will fire when scheduled
-            let mut rng = rand::rng();
             let timer = Timer {
                 pc: *next,
                 node: node_id,
                 channel: cid,
-                priority: policy.sample(&mut rng, RunnableCategory::Timer),
+                priority: policy.sample(rng, RunnableCategory::Timer),
                 label: label.clone(),
             };
             state.push_runnable(Runnable::Timer(timer));
@@ -413,6 +415,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger, F: Feedback>(
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
+    rng: &mut impl Rng,
 ) -> Result<Value<H>, RuntimeError> {
     let mut pc = start_pc;
     let mut prev_pc = pc;
@@ -438,6 +441,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger, F: Feedback>(
             purgatory_config,
             causal_operation_id,
             &mut pending_trace_id,
+            rng,
         )? {
             match outcome {
                 StepOutcome::Continue(next) => {
@@ -464,6 +468,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
+    rng: &mut impl Rng,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let causal_operation_id = record.causal_operation_id;
     let mut pending_trace_id = record.trace_id;
@@ -510,6 +515,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
             purgatory_config,
             causal_operation_id,
             &mut pending_trace_id,
+            rng,
         )? {
             match outcome {
                 StepOutcome::Continue(next) => {
@@ -531,14 +537,13 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                     eval(&local_env, &node_env, chan_expr, &program.id_to_name)?.as_channel()?;
                 let val = eval(&local_env, &node_env, val_expr, &program.id_to_name)?;
                 if cid.node != record.node {
-                    let mut rng = rand::rng();
                     let cs = Runnable::ChannelSend {
                         target: cid.node,
                         channel: cid,
                         message: val,
                         origin_node: record.node,
                         pc: *next,
-                        priority: policy.sample(&mut rng, RunnableCategory::ChannelSend),
+                        priority: policy.sample(rng, RunnableCategory::ChannelSend),
                     };
                     if purgatory_config.delay_probability > 0.0
                         && rng.random::<f64>() < purgatory_config.delay_probability

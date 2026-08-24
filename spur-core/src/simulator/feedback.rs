@@ -112,9 +112,9 @@ impl LocalTimeline {
     /// Records that `handler` was delivered to `dest`, forming a happens-before
     /// tuple against every distinct prior handler on that node.
     ///
-    /// Pairing against the *distinct* prior set (rather than the full ordered
-    /// sequence) yields the identical tuple set to all-pairs `ToTimeline` (the
-    /// `HashSet` collapses duplicate-prior tuples) at O(#handlers)/delivery.
+    /// Pairing against the distinct prior set (rather than the full ordered
+    /// sequence) gives the same tuple set, since the `HashSet` already
+    /// collapses duplicates, but scales with the number of distinct handlers.
     pub fn note_delivery(&mut self, dest: NodeId, handler: Vertex) {
         if let Some(priors) = self.per_dest_seen.get(&dest) {
             for &prior in priors {
@@ -164,11 +164,8 @@ pub struct GlobalTimeline {
 
 impl GlobalTimeline {
     pub fn snapshot(&self) -> TimelineSnap {
-        let counts: HashMap<TimelineTuple, u64> = self
-            .counts
-            .iter()
-            .map(|e| (*e.key(), *e.value()))
-            .collect();
+        let counts: HashMap<TimelineTuple, u64> =
+            self.counts.iter().map(|e| (*e.key(), *e.value())).collect();
         TimelineSnap {
             counts,
             total: self.total.load(Ordering::Relaxed),
@@ -182,6 +179,17 @@ impl GlobalTimeline {
         let _ = self
             .total
             .fetch_add(local.tuples.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Scale all tuple counts by factor.
+    pub fn decay(&self, factor: f64) {
+        let factor = factor.clamp(0.0, 1.0);
+        self.counts.retain(|_, c| {
+            *c = ((*c as f64) * factor).floor() as u64;
+            *c > 0
+        });
+        let new_total: u64 = self.counts.iter().map(|e| *e.value()).sum();
+        self.total.store(new_total, Ordering::Relaxed);
     }
 }
 
@@ -273,9 +281,18 @@ pub trait Feedback: 'static + Send + Sync + std::fmt::Debug {
         0.0
     }
 
+    fn decay(_global: &Self::Global, _factor: f64) {}
+
     /// Per-vertex CFG hit counts for the CLI heatmap, if this strategy tracks
     /// CFG coverage.
     fn vertex_coverage(_global: &Self::Global) -> Option<HashMap<usize, u64>> {
+        None
+    }
+
+    /// The run's timeline happens-before tuples, if this strategy tracks them.
+    /// Used by the AOS controller to compute within-scenario credit. Defaults
+    /// to `None` for non-timeline strategies.
+    fn timeline_tuples(_local: &Self::Local) -> Option<&HashSet<TimelineTuple>> {
         None
     }
 }
@@ -331,6 +348,10 @@ impl Feedback for CfgFeedback {
         local.plan_score()
     }
 
+    fn decay(global: &GlobalCoverage, factor: f64) {
+        global.decay(factor);
+    }
+
     fn vertex_coverage(global: &GlobalCoverage) -> Option<HashMap<usize, u64>> {
         Some(global.vertices_snapshot().into_iter().collect())
     }
@@ -377,6 +398,14 @@ impl<const STEER: bool> Feedback for TimelineFeedback<STEER> {
     fn plan_score(local: &LocalTimeline, snap: &TimelineSnap, w: &CoverageConfig) -> f64 {
         timeline_plan_score(local, snap, w)
     }
+
+    fn decay(global: &GlobalTimeline, factor: f64) {
+        global.decay(factor);
+    }
+
+    fn timeline_tuples(local: &LocalTimeline) -> Option<&HashSet<TimelineTuple>> {
+        Some(&local.tuples)
+    }
 }
 
 /// CFG + timeline coverage, blended. `STEER` toggles within-run steering.
@@ -399,12 +428,7 @@ impl<const STEER: bool> Feedback for FullFeedback<STEER> {
     }
 
     #[inline]
-    fn record_transition(
-        local: &mut Self::Local,
-        prev: Vertex,
-        pc: Vertex,
-        snap: &Self::Snapshot,
-    ) {
+    fn record_transition(local: &mut Self::Local, prev: Vertex, pc: Vertex, snap: &Self::Snapshot) {
         let rarity = snap.0.novelty_score(pc);
         local.0.record_with_rarity(prev, pc, rarity);
     }
@@ -439,8 +463,17 @@ impl<const STEER: bool> Feedback for FullFeedback<STEER> {
         (w.timeline_weight * tl_score + w.cfg_weight * cfg_score) / denom
     }
 
+    fn decay(global: &Self::Global, factor: f64) {
+        global.0.decay(factor);
+        global.1.decay(factor);
+    }
+
     fn vertex_coverage(global: &Self::Global) -> Option<HashMap<usize, u64>> {
         Some(global.0.vertices_snapshot().into_iter().collect())
+    }
+
+    fn timeline_tuples(local: &Self::Local) -> Option<&HashSet<TimelineTuple>> {
+        Some(&local.1.tuples)
     }
 }
 
@@ -498,6 +531,36 @@ mod tests {
         let snap1 = g.snapshot();
         assert_eq!(snap1.counts.len(), 1);
         assert_eq!(tl.novel_count(&snap1), 0);
+    }
+
+    #[test]
+    fn timeline_decay_scales_counts_and_drops_zeros() {
+        let g = GlobalTimeline::default();
+        let d = node(0);
+        // Tuple (d,1,2) accumulates a count of 4; (d,3,4) a count of 1.
+        for _ in 0..4 {
+            let mut tl = LocalTimeline::default();
+            tl.note_delivery(d, 1);
+            tl.note_delivery(d, 2);
+            g.merge(&tl);
+        }
+        let mut tl = LocalTimeline::default();
+        tl.note_delivery(d, 3);
+        tl.note_delivery(d, 4);
+        g.merge(&tl);
+        assert_eq!(g.snapshot().total, 5);
+
+        g.decay(0.5);
+        let after = g.snapshot();
+        assert_eq!(after.counts.len(), 1, "the count-1 tuple should be dropped");
+        assert_eq!(after.total, 2, "total recomputed from surviving counts");
+        let surviving = TimelineTuple {
+            dest: d,
+            a: 1,
+            b: 2,
+        };
+        assert_eq!(after.counts.get(&surviving), Some(&2));
+        assert!((0.0..=1.0).contains(&after.novelty_score(&surviving)));
     }
 
     #[test]

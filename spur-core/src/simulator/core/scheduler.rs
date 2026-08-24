@@ -149,7 +149,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                 let weight = s.powf(*exponent).max(1e-9);
                 let u: f64 = rng.random();
                 // u is in (0, 1); ln(u) is negative; key = ln(u) / weight is negative.
-                // Higher weight → key closer to 0 (larger), so argmax is correct.
+                // Higher weight means a key closer to 0 (larger), so argmax is correct.
                 let key = u.ln() / weight;
                 if key > best_key {
                     best_key = key;
@@ -177,12 +177,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
     reservations: &[Reservation],
+    rng: &mut impl Rng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     if state.all_queues_empty() {
         return Ok(ScheduleResult::None);
     }
-
-    let mut rng = rand::rng();
 
     // Helper: check if a runnable is reserved OR FIFO-blocked. Both exclude the
     // item from scheduling via the same plumbing, so combine them here.
@@ -226,7 +225,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         step: state.crash_info.current_step,
     };
 
-    let selection = match selector.select(&info, &mut rng) {
+    let selection = match selector.select(&info, rng) {
         Some(s) => s,
         None => return Ok(ScheduleResult::None),
     };
@@ -248,7 +247,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
                 within_queue,
-                &mut rng,
+                rng,
             );
             state.local_queues[node_idx].remove(idx)
         }
@@ -268,7 +267,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
                 within_queue,
-                &mut rng,
+                rng,
             );
             state.network_queue.remove(idx)
         }
@@ -305,7 +304,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
                 within_queue,
-                &mut rng,
+                rng,
             );
             state.timer_queue.remove(idx)
         }
@@ -328,6 +327,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 feedback,
                 policy,
                 purgatory_config,
+                rng,
             )?;
             Ok(ScheduleResult::Recover { node_id })
         }
@@ -449,6 +449,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         feedback,
                         policy,
                         purgatory_config,
+                        rng,
                     )?;
                     match result {
                         Some(client_op) => Ok(ScheduleResult::ClientOp(client_op)),
@@ -550,6 +551,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
+    rng: &mut impl Rng,
 ) -> Result<(), RuntimeError> {
     if !state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is not crashed", node_id);
@@ -569,6 +571,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
         feedback,
         policy,
         purgatory_config,
+        rng,
     )?;
 
     let queued = std::mem::take(&mut state.crash_info.queued_messages);
@@ -593,6 +596,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
+    rng: &mut impl Rng,
 ) -> Result<(), RuntimeError> {
     use crate::compiler::cfg::{SELF_SLOT, VarSlot};
 
@@ -624,6 +628,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
         feedback,
         policy,
         purgatory_config,
+        rng,
     )?;
 
     recover_node::<H, L, F>(
@@ -637,6 +642,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
         feedback,
         policy,
         purgatory_config,
+        rng,
     )
 }
 
@@ -651,6 +657,7 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
+    rng: &mut impl Rng,
 ) -> Result<(), RuntimeError> {
     let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
         return Ok(());
@@ -681,7 +688,6 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         &prog.id_to_name,
     );
 
-    let mut rng = rand::rng();
     let record = Record {
         pc: recover_fn.entry,
         node: node_id,
@@ -690,7 +696,7 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         entry_pc: recover_fn.entry,
         initial_env: env.clone(),
         env,
-        priority: policy.sample(&mut rng, RunnableCategory::Record),
+        priority: policy.sample(rng, RunnableCategory::Record),
         causal_operation_id: None,
         trace_id: None,
         link_seq: None,
@@ -705,6 +711,7 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         feedback,
         policy,
         purgatory_config,
+        rng,
     )?;
     Ok(())
 }

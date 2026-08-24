@@ -1,7 +1,6 @@
 use petgraph::algo::has_path_connecting;
 use petgraph::graph::{DiGraph, NodeIndex};
 use rand::prelude::*;
-use rand::rng;
 use std::collections::HashMap;
 
 use crate::simulator::path::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlannedEvent};
@@ -46,30 +45,34 @@ pub struct GeneratorConfig {
 }
 
 /// Generates a bag of action stubs based on the config.
-fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
+fn generate_base_actions(config: &GeneratorConfig, rng: &mut impl Rng) -> Vec<ActionStub> {
     let mut actions = Vec::new();
 
-    let rand_server = || rng().random_range(0..config.num_servers);
     let num_keys = config.num_keys.max(1);
-    let rand_key = || format!("key{}", rng().random_range(1..=num_keys));
 
     for _ in 0..config.num_write_ops {
-        let action = ClientOpSpec::Write(rand_server(), ecow::EcoString::from(rand_key()));
+        let server = rng.random_range(0..config.num_servers);
+        let key = format!("key{}", rng.random_range(1..=num_keys));
+        let action = ClientOpSpec::Write(server, ecow::EcoString::from(key));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
     for _ in 0..config.num_read_ops {
-        let action = ClientOpSpec::Read(rand_server(), ecow::EcoString::from(rand_key()));
+        let server = rng.random_range(0..config.num_servers);
+        let key = format!("key{}", rng.random_range(1..=num_keys));
+        let action = ClientOpSpec::Read(server, ecow::EcoString::from(key));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
     for _ in 0..config.num_rmw_ops {
-        let action = ClientOpSpec::Rmw(rand_server(), ecow::EcoString::from(rand_key()));
+        let server = rng.random_range(0..config.num_servers);
+        let key = format!("key{}", rng.random_range(1..=num_keys));
+        let action = ClientOpSpec::Rmw(server, ecow::EcoString::from(key));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
     for _ in 0..config.num_crashes {
-        let s = rand_server();
+        let s = rng.random_range(0..config.num_servers);
         actions.push(ActionStub::Paired(
             EventAction::CrashNode(s),
             EventAction::RecoverNode(s),
@@ -77,7 +80,7 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
     }
 
     for _ in 0..config.num_partitions {
-        let spec = random_partition_spec(config.num_servers);
+        let spec = random_partition_spec(config.num_servers, rng);
         actions.push(ActionStub::Paired(
             EventAction::Partition(spec),
             EventAction::Heal,
@@ -88,8 +91,7 @@ fn generate_base_actions(config: &GeneratorConfig) -> Vec<ActionStub> {
 }
 
 /// Generate a random PartitionSpec given the number of servers.
-fn random_partition_spec(num_servers: i32) -> PartitionSpec {
-    let mut rng = rng();
+fn random_partition_spec(num_servers: i32, rng: &mut impl Rng) -> PartitionSpec {
     match rng.random_range(0..4) {
         0 => PartitionSpec::IsolateOne {
             node: rng.random_range(0..num_servers),
@@ -114,16 +116,15 @@ fn random_partition_spec(num_servers: i32) -> PartitionSpec {
 }
 
 /// Main entry point: Generates a single, randomized execution plan as a DiGraph.
-pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
+pub fn generate_plan(config: GeneratorConfig, rng: &mut impl Rng) -> ExecutionPlan {
     let mut graph: DiGraph<PlannedEvent, ()> = DiGraph::new();
-    let mut rng = rng();
 
     // Track crash/recover pairs and serialization
     let mut last_recovery: HashMap<i32, NodeIndex> = HashMap::new(); // server_id -> last recover node
     // Track partition/heal serialization (only one partition active at a time)
     let mut last_heal: Option<NodeIndex> = None;
 
-    let stubs = generate_base_actions(&config);
+    let stubs = generate_base_actions(&config, rng);
 
     // First pass: add all nodes and mandatory edges
     let mut nodes: Vec<(NodeIndex, Option<(i32, PairPos)>)> = Vec::new();
@@ -199,10 +200,10 @@ pub fn generate_plan(config: GeneratorConfig) -> ExecutionPlan {
     }
 
     // Shuffle node order for dependency generation
-    nodes.shuffle(&mut rng);
+    nodes.shuffle(rng);
 
     // Second pass: add probabilistic dependencies. Skip any candidate edge
-    // whose target already has a path back to the source — this guards
+    // whose target already has a path back to the source. This guards
     // against cycles with every mandatory edge (write-chain, crash/recover
     // serialization, partition/heal serialization).
     let mut seen: Vec<(NodeIndex, Option<(i32, PairPos)>)> = Vec::new();

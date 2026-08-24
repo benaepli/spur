@@ -4,7 +4,8 @@ use spur_core::compiler;
 use spur_core::compiler::pure::print_program as print_pure;
 use spur_core::debug::SimulatorDebugger;
 use spur_core::simulator::explorer::{
-    ExploreSummary, run_explorer, run_explorer_genetic, run_plan,
+    ExploreSummary, run_explorer, run_explorer_aos, run_explorer_continuous, run_explorer_genetic,
+    run_plan,
 };
 use spur_core::simulator::history::LogBackend;
 use spur_core::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
@@ -113,6 +114,12 @@ pub enum ExplorerType {
     Standard,
     /// Genetic algorithm-based explorer
     Genetic,
+    /// Adaptive operator selection: record-and-replay controller (requires
+    /// timeline/both feedback)
+    Aos,
+    /// Continuous adaptive explorer: conductor rotating over curriculum / RnR /
+    /// AOS modes
+    Continuous,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -473,6 +480,22 @@ fn run_explore(
         )
         .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
         ExplorerType::Genetic => run_explorer_genetic(
+            &program,
+            config_path_str,
+            &output_path_str,
+            backend,
+            &cancelled,
+        )
+        .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
+        ExplorerType::Aos => run_explorer_aos(
+            &program,
+            config_path_str,
+            &output_path_str,
+            backend,
+            &cancelled,
+        )
+        .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
+        ExplorerType::Continuous => run_explorer_continuous(
             &program,
             config_path_str,
             &output_path_str,
