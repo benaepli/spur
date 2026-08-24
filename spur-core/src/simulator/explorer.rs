@@ -173,6 +173,84 @@ pub struct ExplorerConfig {
     /// Observation-only; off by default.
     #[serde(default)]
     pub stats: bool,
+
+    /// Opt-in strict config parsing: when true, a top-level key that no
+    /// explorer config field claims is a hard error instead of being silently
+    /// ignored. Off by default (today's serde behaviour), so existing configs
+    /// keep loading unchanged; harness-generated configs turn it on so a
+    /// misspelled or not-yet-implemented knob fails the session immediately
+    /// instead of producing a full run that quietly measures the old code.
+    #[serde(default)]
+    pub strict_config_keys: bool,
+}
+
+/// Top-level JSON keys claimed by `ExplorerConfig` (serde names, i.e. after
+/// `#[serde(rename)]`). Kept next to the struct: adding a field without
+/// listing it here makes strict mode reject configs that use it, which the
+/// `strict_config_keys_*` tests below catch.
+pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
+    "num_servers",
+    "num_write_ops",
+    "num_read_ops",
+    "num_rmw_ops",
+    "num_keys",
+    "num_crashes",
+    "num_partitions",
+    "max_concurrent_writes",
+    "dependency_density",
+    "use_coverage_scheduling",
+    "num_runs_per_config",
+    "max_iterations",
+    "population_size",
+    "num_generations",
+    "session_seed",
+    "schedule_policy",
+    "queue_policy",
+    "within_queue_selector",
+    "quick_fire_multiplier",
+    "purgatory",
+    "feedback",
+    "stats",
+    "strict_config_keys",
+];
+
+/// Top-level keys added by `ContinuousConfig` on top of the envelope.
+pub const CONTINUOUS_CONFIG_KEYS: &[&str] = &[
+    "batch_size",
+    "decay_half_life_runs",
+    "rotation",
+    "total_runs",
+];
+
+/// Reject top-level keys that no config field claims.
+///
+/// Only called when `strict_config_keys` is set. A silently ignored key is the
+/// worst failure mode a config knob has: the session runs to completion and
+/// reports metrics for a mechanism that was never enabled, so the result reads
+/// as "mechanism does not help" rather than "mechanism was never on".
+pub fn check_top_level_keys(config_json: &str, allowed: &[&[&str]]) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_json::from_str(config_json)
+        .map_err(|e| format!("config is not valid JSON: {}", e))?;
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => return Err("config must be a JSON object".to_string()),
+    };
+    let mut unknown: Vec<&str> = obj
+        .keys()
+        .map(|k| k.as_str())
+        .filter(|k| !allowed.iter().any(|set| set.contains(k)))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let mut known: Vec<&str> = allowed.iter().flat_map(|set| set.iter().copied()).collect();
+    known.sort_unstable();
+    Err(format!(
+        "unknown top-level config key(s): {} (strict_config_keys is on; known keys: {})",
+        unknown.join(", "),
+        known.join(", ")
+    ))
 }
 
 impl ExplorerConfig {
@@ -685,6 +763,9 @@ pub fn run_explorer(
 
     let config_json = fs::read_to_string(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+    if config.strict_config_keys {
+        check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
+    }
 
     // Validate configuration before proceeding
     config
@@ -1064,6 +1145,9 @@ pub fn run_explorer_genetic(
 
     let config_json = fs::read_to_string(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+    if config.strict_config_keys {
+        check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
+    }
 
     // Validate configuration before proceeding
     config
@@ -1472,6 +1556,9 @@ pub fn run_explorer_aos(
 
     let config_json = fs::read_to_string(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+    if config.strict_config_keys {
+        check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
+    }
     config
         .validate()
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
@@ -2101,6 +2188,9 @@ pub fn run_explorer_continuous(
 
     let config_json = fs::read_to_string(config_json_path)?;
     let config: ContinuousConfig = serde_json::from_str(&config_json)?;
+    if config.envelope.strict_config_keys {
+        check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS, CONTINUOUS_CONFIG_KEYS])?;
+    }
     config
         .validate()
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
@@ -2198,4 +2288,76 @@ fn run_explorer_continuous_impl<F: Feedback>(
     writer.shutdown();
     info!("Continuous explorer finished after {} runs.", total_runs);
     Ok(ExploreSummary { vertex_coverage })
+}
+
+#[cfg(test)]
+mod strict_config_keys_tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"{
+        "num_servers": {"min": 3, "max": 3},
+        "num_write_ops": {"min": 2, "max": 2},
+        "num_read_ops": {"min": 2, "max": 2},
+        "num_crashes": {"min": 0, "max": 0},
+        "dependency_density": [0.0],
+        "num_runs_per_config": 1,
+        "max_iterations": 100
+    }"#;
+
+    /// Every key an existing config may legitimately carry is accepted.
+    #[test]
+    fn strict_config_keys_accepts_known_keys() {
+        assert!(check_top_level_keys(MINIMAL, &[EXPLORER_CONFIG_KEYS]).is_ok());
+        let all_known = format!(
+            "{{{}}}",
+            EXPLORER_CONFIG_KEYS
+                .iter()
+                .chain(CONTINUOUS_CONFIG_KEYS.iter())
+                .map(|k| format!("\"{}\": null", k))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(
+            check_top_level_keys(&all_known, &[EXPLORER_CONFIG_KEYS, CONTINUOUS_CONFIG_KEYS])
+                .is_ok()
+        );
+    }
+
+    /// A key no field claims — a typo, or a knob a hypothesis forgot to
+    /// implement — is reported by name instead of silently ignored.
+    #[test]
+    fn strict_config_keys_rejects_unknown_key() {
+        let cfg = MINIMAL.replace(
+            "\"max_iterations\": 100",
+            "\"max_iterations\": 100, \"randomly_delay_msgs\": true",
+        );
+        let err = check_top_level_keys(&cfg, &[EXPLORER_CONFIG_KEYS]).unwrap_err();
+        assert!(err.contains("randomly_delay_msgs"), "{}", err);
+        // Continuous-only keys are unknown to a non-continuous session.
+        let cont = MINIMAL.replace(
+            "\"max_iterations\": 100",
+            "\"max_iterations\": 100, \"total_runs\": 10",
+        );
+        assert!(check_top_level_keys(&cont, &[EXPLORER_CONFIG_KEYS]).is_err());
+        assert!(
+            check_top_level_keys(&cont, &[EXPLORER_CONFIG_KEYS, CONTINUOUS_CONFIG_KEYS]).is_ok()
+        );
+    }
+
+    /// Default is today's behaviour: unknown keys are ignored unless the
+    /// config opts in.
+    #[test]
+    fn strict_config_keys_defaults_off() {
+        let cfg = MINIMAL.replace(
+            "\"max_iterations\": 100",
+            "\"max_iterations\": 100, \"nonsense_knob\": 3",
+        );
+        let parsed: ExplorerConfig = serde_json::from_str(&cfg).expect("parses");
+        assert!(!parsed.strict_config_keys);
+        let strict: ExplorerConfig = serde_json::from_str(
+            &cfg.replace("\"nonsense_knob\": 3", "\"strict_config_keys\": true"),
+        )
+        .expect("parses");
+        assert!(strict.strict_config_keys);
+    }
 }
