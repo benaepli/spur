@@ -16,6 +16,7 @@ use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
+use crate::simulator::util_stats;
 use imbl::{OrdSet, Vector};
 use log::warn;
 use rand::Rng;
@@ -81,6 +82,24 @@ fn score_runnable<H: HashPolicy, F: Feedback>(
     }
 }
 
+/// The priority-only share of `score_runnable` (novelty zeroed out, same
+/// quick-fire weighting). Only used by the opt-in utilization probe below.
+fn priority_component<H: HashPolicy>(
+    r: &Runnable<H>,
+    currently_crashed: &OrdSet<NodeId>,
+    quick_fire_multiplier: f64,
+) -> f64 {
+    let priority = r.priority();
+    let is_quick_fire =
+        matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
+    if is_quick_fire {
+        let w = 0.75 * quick_fire_multiplier;
+        (w * priority) / (0.25 + w)
+    } else {
+        0.75 * priority
+    }
+}
+
 /// Select an eligible item from a single queue.
 ///
 /// `Tournament` samples `k` indices uniformly and takes the highest-scoring
@@ -99,6 +118,36 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
 ) -> usize {
     if eligible.len() <= 1 {
         return eligible[0];
+    }
+
+    // Observation-only utilization probe: would the greedy pick change if the
+    // novelty/steer term were dropped? Compares the blended-score argmax with
+    // the priority-only argmax (first index wins ties). Consumes no RNG and
+    // does not influence the selection below.
+    if util_stats::enabled() {
+        let mut best_blend = f64::NEG_INFINITY;
+        let mut best_blend_idx = eligible[0];
+        let mut best_prio = f64::NEG_INFINITY;
+        let mut best_prio_idx = eligible[0];
+        for &i in eligible {
+            let blend = score_runnable::<H, F>(
+                &queue[i],
+                feedback,
+                snapshot,
+                currently_crashed,
+                quick_fire_multiplier,
+            );
+            let prio = priority_component(&queue[i], currently_crashed, quick_fire_multiplier);
+            if blend > best_blend {
+                best_blend = blend;
+                best_blend_idx = i;
+            }
+            if prio > best_prio {
+                best_prio = prio;
+                best_prio_idx = i;
+            }
+        }
+        util_stats::record_steer_evaluation(best_blend_idx != best_prio_idx);
     }
 
     match selector {

@@ -11,6 +11,7 @@ use crate::compiler::cfg::Vertex;
 use crate::simulator::core::{NodeId, Runnable};
 use crate::simulator::coverage::{GlobalCoverage, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
+use crate::simulator::util_stats;
 use dashmap::DashMap;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -345,7 +346,9 @@ impl Feedback for CfgFeedback {
 
     #[inline]
     fn plan_score(local: &LocalCoverage, _snap: &VertexMap, _w: &CoverageConfig) -> f64 {
-        local.plan_score()
+        let cfg_score = local.plan_score();
+        util_stats::record_feedback_scores(None, Some(cfg_score));
+        cfg_score
     }
 
     fn decay(global: &GlobalCoverage, factor: f64) {
@@ -396,7 +399,9 @@ impl<const STEER: bool> Feedback for TimelineFeedback<STEER> {
 
     #[inline]
     fn plan_score(local: &LocalTimeline, snap: &TimelineSnap, w: &CoverageConfig) -> f64 {
-        timeline_plan_score(local, snap, w)
+        let tl_score = timeline_plan_score(local, snap, w);
+        util_stats::record_feedback_scores(Some(tl_score), None);
+        tl_score
     }
 
     fn decay(global: &GlobalTimeline, factor: f64) {
@@ -456,6 +461,7 @@ impl<const STEER: bool> Feedback for FullFeedback<STEER> {
     fn plan_score(local: &Self::Local, snap: &Self::Snapshot, w: &CoverageConfig) -> f64 {
         let cfg_score = local.0.plan_score();
         let tl_score = timeline_plan_score(&local.1, &snap.1, w);
+        util_stats::record_feedback_scores(Some(tl_score), Some(cfg_score));
         let denom = w.timeline_weight + w.cfg_weight;
         if denom <= 0.0 {
             return cfg_score;

@@ -10,6 +10,7 @@ use imbl::Vector;
 use rand::Rng;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
+use crate::simulator::util_stats;
 
 pub fn exec_sync_on_node<H: HashPolicy, L: Logger, F: Feedback>(
     state: &mut State<H>,
@@ -185,6 +186,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                         rng.random_range(ln_min..=ln_max).exp().round() as i32
                     };
                     let release_step = state.crash_info.current_step + duration;
+                    util_stats::record_purgatory_delay();
                     state.delay_runnable(release_step, Runnable::Record(new_record));
                 } else {
                     state.push_runnable(Runnable::Record(new_record));
@@ -557,6 +559,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                             rng.random_range(ln_min..=ln_max).exp().round() as i32
                         };
                         let release_step = state.crash_info.current_step + duration;
+                        util_stats::record_purgatory_delay();
                         state.delay_runnable(release_step, cs);
                     } else {
                         state.push_runnable(cs);

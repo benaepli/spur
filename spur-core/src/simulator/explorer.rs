@@ -20,6 +20,7 @@ use crate::simulator::rng::{
     LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, WORKLOAD_SALT,
     derive_seed, mutate_tape,
 };
+use crate::simulator::util_stats;
 use crossbeam::channel;
 use log::{debug, error, info, warn};
 use rand::prelude::*;
@@ -166,6 +167,12 @@ pub struct ExplorerConfig {
 
     #[serde(default)]
     pub feedback: FeedbackConfig,
+
+    /// Opt-in utilization counters (see `util_stats`), dumped to
+    /// `<output_dir>/utilization.json` at the end of the session.
+    /// Observation-only; off by default.
+    #[serde(default)]
+    pub stats: bool,
 }
 
 impl ExplorerConfig {
@@ -685,6 +692,7 @@ pub fn run_explorer(
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     info!("session_seed = {}", config.session_seed);
+    util_stats::set_enabled(config.stats);
     dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1063,6 +1071,7 @@ pub fn run_explorer_genetic(
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     info!("session_seed = {}", config.session_seed);
+    util_stats::set_enabled(config.stats);
     dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1203,11 +1212,13 @@ impl Bandit {
         }
     }
     fn pick(&self, rng: &mut impl Rng) -> Operator {
-        if rng.random::<f64>() < self.p[0] {
+        let op = if rng.random::<f64>() < self.p[0] {
             Operator::TapeMutate
         } else {
             Operator::ConfigMutate
-        }
+        };
+        util_stats::record_aos_pick(matches!(op, Operator::TapeMutate));
+        op
     }
     fn credit(&mut self, op: Operator, reward: f64) {
         let i = op as usize;
@@ -1264,7 +1275,9 @@ impl Population {
     /// workload_seed of a scenario whose last member was evicted, if any.
     fn insert(&mut self, ind: Individual) -> Option<u64> {
         let key = (ind.workload_seed, ind.timeline_hash);
-        if self.seen.contains(&key) {
+        let duplicate = self.seen.contains(&key);
+        util_stats::record_dedup_check(duplicate);
+        if duplicate {
             return None; // redundant timeline within this scenario
         }
         let count = self
@@ -1475,6 +1488,7 @@ pub fn run_explorer_aos(
     }
 
     info!("AOS session_seed = {}", config.session_seed);
+    util_stats::set_enabled(config.stats);
     dispatch_feedback!(config.feedback, F => run_explorer_aos_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -2092,6 +2106,7 @@ pub fn run_explorer_continuous(
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     info!("Continuous session_seed = {}", config.envelope.session_seed);
+    util_stats::set_enabled(config.envelope.stats);
     dispatch_feedback!(config.envelope.feedback, F => run_explorer_continuous_impl::<F>(program, config, output_path, backend, cancelled))
 }
 

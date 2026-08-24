@@ -8,6 +8,7 @@ use spur_core::simulator::explorer::{
     run_plan,
 };
 use spur_core::simulator::history::LogBackend;
+use spur_core::simulator::util_stats;
 use spur_core::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
 use std::fs;
 use std::io::{self, Write};
@@ -515,6 +516,17 @@ fn run_explore(
     let svg = render_svg(&program).map_err(|e| anyhow::anyhow!("Failed to render SVG: {}", e))?;
     fs::write(&cfg_path, svg).context("Failed to write CFG SVG")?;
 
+    // Dump opt-in utilization counters (enabled via `"stats": true` in the config)
+    let util_path = if util_stats::enabled() {
+        let path = output_dir.join("utilization.json");
+        let json = serde_json::to_string_pretty(&util_stats::snapshot())
+            .context("Failed to serialize utilization counters")?;
+        fs::write(&path, json).context("Failed to write utilization.json")?;
+        Some(path)
+    } else {
+        None
+    };
+
     println!(
         "Explorer finished in {:.2?}. Results saved to {}",
         elapsed,
@@ -525,6 +537,9 @@ fn run_explore(
         None => println!("  - Coverage heatmap: skipped (no CFG feedback)"),
     }
     println!("  - CFG: {}", cfg_path.display());
+    if let Some(p) = &util_path {
+        println!("  - Utilization counters: {}", p.display());
+    }
 
     Ok(())
 }

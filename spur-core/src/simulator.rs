@@ -8,3 +8,4 @@ pub mod history;
 mod path;
 pub mod plan_config;
 pub mod rng;
+pub mod util_stats;
