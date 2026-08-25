@@ -13,6 +13,8 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static STEER_EVALUATIONS: AtomicU64 = AtomicU64::new(0);
 static STEER_DIVERGENT_PICKS: AtomicU64 = AtomicU64::new(0);
 static PURGATORY_DELAYED_SENDS: AtomicU64 = AtomicU64::new(0);
+static CRASH_ANCHORS_ARMED: AtomicU64 = AtomicU64::new(0);
+static CRASH_ANCHORS_TAKEN: AtomicU64 = AtomicU64::new(0);
 static AOS_TAPE_WINS: AtomicU64 = AtomicU64::new(0);
 static AOS_CONFIG_WINS: AtomicU64 = AtomicU64::new(0);
 static DEDUP_CHECKS: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +35,8 @@ pub fn set_enabled(on: bool) {
             &STEER_EVALUATIONS,
             &STEER_DIVERGENT_PICKS,
             &PURGATORY_DELAYED_SENDS,
+            &CRASH_ANCHORS_ARMED,
+            &CRASH_ANCHORS_TAKEN,
             &AOS_TAPE_WINS,
             &AOS_CONFIG_WINS,
             &DEDUP_CHECKS,
@@ -89,6 +93,24 @@ pub fn record_purgatory_delay() {
     PURGATORY_DELAYED_SENDS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// A crash was anchored to a node with an outbound message in flight.
+#[inline]
+pub fn record_crash_anchor_armed() {
+    if !enabled() {
+        return;
+    }
+    CRASH_ANCHORS_ARMED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// An anchored crash came due and was taken ahead of queue routing.
+#[inline]
+pub fn record_crash_anchor_taken() {
+    if !enabled() {
+        return;
+    }
+    CRASH_ANCHORS_TAKEN.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The AOS bandit chose an arm (`tape` = TapeMutate, else ConfigMutate).
 #[inline]
 pub fn record_aos_pick(tape: bool) {
@@ -143,6 +165,12 @@ pub struct PurgatoryStats {
 }
 
 #[derive(Serialize)]
+pub struct CrashAfterSendStats {
+    pub anchors_armed: u64,
+    pub anchors_taken: u64,
+}
+
+#[derive(Serialize)]
 pub struct AosStats {
     pub tape_wins: u64,
     pub config_wins: u64,
@@ -167,6 +195,7 @@ pub struct FeedbackStats {
 pub struct UtilizationSnapshot {
     pub steer: SteerStats,
     pub purgatory: PurgatoryStats,
+    pub crash_after_send: CrashAfterSendStats,
     pub aos: AosStats,
     pub dedup: DedupStats,
     pub feedback: FeedbackStats,
@@ -180,6 +209,10 @@ pub fn snapshot() -> UtilizationSnapshot {
         },
         purgatory: PurgatoryStats {
             delayed_sends: PURGATORY_DELAYED_SENDS.load(Ordering::Relaxed),
+        },
+        crash_after_send: CrashAfterSendStats {
+            anchors_armed: CRASH_ANCHORS_ARMED.load(Ordering::Relaxed),
+            anchors_taken: CRASH_ANCHORS_TAKEN.load(Ordering::Relaxed),
         },
         aos: AosStats {
             tape_wins: AOS_TAPE_WINS.load(Ordering::Relaxed),

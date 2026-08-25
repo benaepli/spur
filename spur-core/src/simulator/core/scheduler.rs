@@ -7,8 +7,8 @@ use crate::simulator::core::queue_selector::{
     QueueInfo, QueueSelection, QueueSelector, WithinQueueSelector,
 };
 use crate::simulator::core::state::{
-    Continuation, Logger, NodeId, PurgatoryConfig, Record, Runnable, RunnableCategory,
-    SchedulePolicy, ScheduleResult, State,
+    Continuation, CrashAfterSendConfig, Logger, NodeId, PurgatoryConfig, Record, Runnable,
+    RunnableCategory, SchedulePolicy, ScheduleResult, State,
 };
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::GlobalState;
@@ -210,6 +210,128 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     }
 }
 
+/// Per-run bookkeeping for send-anchored crashing. At most one anchor is armed
+/// at a time; `taken` counts anchored crashes against the per-run cap.
+#[derive(Debug, Default)]
+pub struct CrashAfterSendState {
+    armed: Option<(NodeId, i32)>,
+    taken: u32,
+}
+
+impl CrashAfterSendState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// True when `node` has a message it sent sitting on the network or in
+/// purgatory, i.e. crashing it now leaves that message in flight.
+fn has_outbound_in_flight<H: HashPolicy>(state: &State<H>, node: NodeId) -> bool {
+    let sent_by_node = |r: &Runnable<H>| match r {
+        Runnable::Record(rec) => rec.origin_node == node && rec.node != node,
+        Runnable::ChannelSend {
+            origin_node,
+            target,
+            ..
+        } => *origin_node == node && *target != node,
+        _ => false,
+    };
+    state.network_queue.iter().any(sent_by_node)
+        || state.purgatory.iter().any(|(_, r)| sent_by_node(r))
+}
+
+fn pending_crash_index<H: HashPolicy>(queue: &[Runnable<H>]) -> Option<usize> {
+    queue
+        .iter()
+        .position(|r| matches!(r, Runnable::Crash { .. }))
+}
+
+/// Arm and, when it comes due, take a crash anchored to an in-flight send,
+/// bypassing queue routing. Returns the crashed node, or `None` when nothing is
+/// anchored this step.
+fn take_send_anchored_crash<H: HashPolicy, F: Feedback>(
+    state: &mut State<H>,
+    config: &CrashAfterSendConfig,
+    anchor: &mut CrashAfterSendState,
+    feedback: &F::Local,
+    snapshot: &F::Snapshot,
+    quick_fire_multiplier: f64,
+    rng: &mut impl Rng,
+) -> Option<NodeId> {
+    if config.probability <= 0.0 {
+        return None;
+    }
+    let step = state.crash_info.current_step;
+
+    if anchor.armed.is_none() && anchor.taken < config.per_run_cap {
+        let pending: Vec<NodeId> = state
+            .local_queues
+            .iter()
+            .filter_map(|queue| {
+                let idx = pending_crash_index(queue)?;
+                match &queue[idx] {
+                    Runnable::Crash { node_id, .. } => Some(*node_id),
+                    _ => None,
+                }
+            })
+            .collect();
+        let candidate = pending
+            .into_iter()
+            .find(|node| has_outbound_in_flight(state, *node));
+        if let Some(node) = candidate
+            && rng.random::<f64>() < config.probability
+        {
+            let delay = if config.delay_max > 0 {
+                rng.random_range(0..=config.delay_max)
+            } else {
+                0
+            };
+            anchor.armed = Some((node, step + delay));
+            util_stats::record_crash_anchor_armed();
+        }
+    }
+
+    let (node, due_step) = anchor.armed?;
+    if step < due_step {
+        return None;
+    }
+    let Some(idx) = pending_crash_index(&state.local_queues[node.index]) else {
+        anchor.armed = None;
+        return None;
+    };
+
+    let take = if config.boost <= 0.0 {
+        true
+    } else {
+        let score = score_runnable::<H, F>(
+            &state.local_queues[node.index][idx],
+            feedback,
+            snapshot,
+            &state.crash_info.currently_crashed,
+            quick_fire_multiplier,
+        );
+        let odds = config.boost * score;
+        let denominator = odds + (1.0 - score);
+        let probability = if denominator > 0.0 {
+            odds / denominator
+        } else {
+            0.0
+        };
+        rng.random::<f64>() < probability
+    };
+    anchor.armed = None;
+    if !take {
+        return None;
+    }
+
+    state.local_queues[node.index].remove(idx);
+    crash_node(state, node);
+    anchor.taken += 1;
+    util_stats::record_crash_anchor_taken();
+    Some(node)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
@@ -224,11 +346,25 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
+    crash_after_send: &CrashAfterSendConfig,
+    crash_anchor: &mut CrashAfterSendState,
     reservations: &[Reservation],
     rng: &mut impl Rng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     if state.all_queues_empty() {
         return Ok(ScheduleResult::None);
+    }
+
+    if let Some(node_id) = take_send_anchored_crash::<H, F>(
+        state,
+        crash_after_send,
+        crash_anchor,
+        feedback,
+        snapshot,
+        quick_fire_multiplier,
+        rng,
+    ) {
+        return Ok(ScheduleResult::Crash { node_id });
     }
 
     // Helper: check if a runnable is reserved OR FIFO-blocked. Both exclude the

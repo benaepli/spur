@@ -1,7 +1,7 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::core::{
-    Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
-    Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
+    CrashAfterSendConfig, Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError,
+    SchedulePolicy, State, Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
 };
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::curriculum::{Curriculum, lower};
@@ -166,6 +166,9 @@ pub struct ExplorerConfig {
     pub purgatory: PurgatoryConfig,
 
     #[serde(default)]
+    pub crash_after_send: CrashAfterSendConfig,
+
+    #[serde(default)]
     pub feedback: FeedbackConfig,
 
     /// Opt-in utilization counters (see `util_stats`), dumped to
@@ -209,6 +212,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "within_queue_selector",
     "quick_fire_multiplier",
     "purgatory",
+    "crash_after_send",
     "feedback",
     "stats",
     "strict_config_keys",
@@ -360,6 +364,7 @@ pub struct SingleRunConfig {
     pub within_queue_selector: WithinQueueSelector,
     pub quick_fire_multiplier: f64,
     pub purgatory: PurgatoryConfig,
+    pub crash_after_send: CrashAfterSendConfig,
     pub timeline_key_granularity: TimelineKeyGranularity,
 }
 
@@ -421,6 +426,7 @@ impl SingleRunConfig {
             within_queue_selector: constraints.within_queue_selector.clone(),
             quick_fire_multiplier: constraints.quick_fire_multiplier,
             purgatory: constraints.purgatory.clone(),
+            crash_after_send: constraints.crash_after_send.clone(),
             timeline_key_granularity: constraints.feedback.timeline_key_granularity,
         }
     }
@@ -722,6 +728,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &config.within_queue_selector,
         config.quick_fire_multiplier,
         &config.purgatory,
+        &config.crash_after_send,
         &mut rec,
     )?;
 
@@ -860,6 +867,7 @@ fn run_explorer_impl<F: Feedback>(
                                                     .clone(),
                                                 quick_fire_multiplier: config.quick_fire_multiplier,
                                                 purgatory: config.purgatory.clone(),
+                                                crash_after_send: config.crash_after_send.clone(),
                                                 timeline_key_granularity: config
                                                     .feedback
                                                     .timeline_key_granularity,
@@ -960,6 +968,7 @@ fn run_single_plan<F: Feedback>(
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
+    crash_after_send: &CrashAfterSendConfig,
     weights: &CoverageConfig,
     key_granularity: TimelineKeyGranularity,
 ) -> Result<f64, Box<dyn Error>> {
@@ -1030,6 +1039,7 @@ fn run_single_plan<F: Feedback>(
         within_queue,
         quick_fire_multiplier,
         purgatory_config,
+        crash_after_send,
         &mut rng,
     )?;
 
@@ -1119,6 +1129,7 @@ fn run_plan_impl<F: Feedback>(
             &config.within_queue_selector,
             config.quick_fire_multiplier,
             &config.purgatory,
+            &config.crash_after_send,
             &weights,
             config.feedback.timeline_key_granularity,
         ) {

@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::analysis::resolver::NameId;
 use crate::simulator::core::{
-    PurgatoryConfig, QueuePolicyConfig, SchedulePolicy, WithinQueueSelector,
+    CrashAfterSendConfig, PurgatoryConfig, QueuePolicyConfig, SchedulePolicy, WithinQueueSelector,
 };
 use crate::simulator::feedback::FeedbackConfig;
 use crate::simulator::path::plan::{ClientOpSpec, DeliverSpec, EventAction, PlannedEvent};
@@ -208,6 +208,9 @@ pub struct PlanFileConfig {
 
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
+
+    #[serde(default)]
+    pub crash_after_send: CrashAfterSendConfig,
 
     #[serde(default)]
     pub feedback: FeedbackConfig,

@@ -137,6 +137,48 @@ fn default_delay_range() -> (i32, i32) {
     (5, 50)
 }
 
+/// Configures send-anchored crashing: taking a node's pending crash while one
+/// of its messages is still on the network, so the message outlives the sender.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CrashAfterSendConfig {
+    /// Probability of anchoring a pending crash to a node that currently has an
+    /// outbound message in flight. 0.0 disables the mechanism entirely: no
+    /// anchor is armed, no random number is drawn and selection is unchanged.
+    #[serde(default)]
+    pub probability: f64,
+    /// Odds multiplier applied to the anchored crash's score when it comes due;
+    /// 1.0 takes the crash with probability equal to its score. Values <= 0.0
+    /// take it unconditionally, bypassing queue routing and scoring.
+    #[serde(default = "default_crash_boost")]
+    pub boost: f64,
+    /// Upper bound on the number of scheduler steps between arming an anchor
+    /// and the crash coming due; the delay is uniform on 0..=delay_max.
+    #[serde(default)]
+    pub delay_max: i32,
+    /// Maximum number of anchored crashes taken in one run.
+    #[serde(default = "default_crash_per_run_cap")]
+    pub per_run_cap: u32,
+}
+
+impl Default for CrashAfterSendConfig {
+    fn default() -> Self {
+        Self {
+            probability: 0.0,
+            boost: default_crash_boost(),
+            delay_max: 0,
+            per_run_cap: default_crash_per_run_cap(),
+        }
+    }
+}
+
+fn default_crash_boost() -> f64 {
+    1.0
+}
+
+fn default_crash_per_run_cap() -> u32 {
+    1
+}
+
 impl SchedulePolicy {
     /// Sample a priority value for the given runnable category.
     pub fn sample(&self, rng: &mut impl Rng, cat: RunnableCategory) -> f64 {

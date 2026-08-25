@@ -1,8 +1,8 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, Vertex};
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, PurgatoryConfig,
-    QueuePolicyConfig, Record, Reservation, Runnable, RunnableCategory,
+    Continuation, CrashAfterSendConfig, CrashAfterSendState, Env, LogEntry, Logger, NodeId, OpKind,
+    Operation, PurgatoryConfig, QueuePolicyConfig, Record, Reservation, Runnable, RunnableCategory,
     RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, WithinQueueSelector,
     make_local_env, schedule_runnable,
 };
@@ -215,9 +215,11 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
+    crash_after_send: &CrashAfterSendConfig,
     rng: &mut impl Rng,
 ) -> Result<RunOutcome, RuntimeError> {
     let mut selector = queue_policy.to_selector();
+    let mut crash_anchor = CrashAfterSendState::new();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
     // Map from node_id index to the plan engine NodeIndex for pending crash/recover events
@@ -467,6 +469,8 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 within_queue,
                 quick_fire_multiplier,
                 purgatory_config,
+                crash_after_send,
+                &mut crash_anchor,
                 &reservations,
                 rng,
             )?;
