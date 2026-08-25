@@ -474,10 +474,15 @@ pub enum ScheduleResult<H: HashPolicy> {
 
 #[derive(Debug, Clone)]
 pub struct State<H: HashPolicy> {
-    pub nodes: Vector<Env<H>>, // Index is node_id.index
-    pub local_queues: Vec<Vector<Runnable<H>>>,
-    pub network_queue: Vector<Runnable<H>>,
-    pub timer_queue: Vector<Runnable<H>>,
+    // `nodes` and the three run queues are owned exclusively by the run that
+    // created them — a `State` is never cloned or snapshotted — so they use
+    // plain `Vec`s. The persistent `imbl::Vector` they replaced paid a chunk
+    // allocation on first growth and an `Arc::make_mut` chunk memmove on every
+    // in-place write, for structural sharing nothing ever used.
+    pub nodes: Vec<Env<H>>, // Index is node_id.index
+    pub local_queues: Vec<Vec<Runnable<H>>>,
+    pub network_queue: Vec<Runnable<H>>,
+    pub timer_queue: Vec<Runnable<H>>,
     /// Delayed runnables not yet schedulable. (release_step, runnable)
     pub purgatory: Vec<(i32, Runnable<H>)>,
     pub channels: ImHashMap<ChannelId, ChannelState<H>>,
@@ -505,7 +510,7 @@ impl<H: HashPolicy> State<H> {
     /// Create a new state. `role_node_counts` is a list of (role NameId, count) pairs.
     /// Nodes are laid out sequentially: all nodes of the first role, then all of the second, etc.
     pub fn new(role_node_counts: &[(NameId, usize)], node_slot_count: usize) -> Self {
-        let mut nodes = Vector::new();
+        let mut nodes = Vec::new();
         let mut global_index = 0usize;
         for &(role, count) in role_node_counts {
             for _ in 0..count {
@@ -515,16 +520,16 @@ impl<H: HashPolicy> State<H> {
                 };
                 let mut env = Env::<H>::with_slots(node_slot_count);
                 env.set(0, Value::<H>::node(node_id)); // Slot 0 = self
-                nodes.push_back(env);
+                nodes.push(env);
                 global_index += 1;
             }
         }
         let num_nodes = nodes.len();
         Self {
             nodes,
-            local_queues: (0..num_nodes).map(|_| Vector::new()).collect(),
-            network_queue: Vector::new(),
-            timer_queue: Vector::new(),
+            local_queues: (0..num_nodes).map(|_| Vec::new()).collect(),
+            network_queue: Vec::new(),
+            timer_queue: Vec::new(),
             purgatory: Vec::new(),
             channels: ImHashMap::new(),
             crash_info: CrashInfo {
@@ -557,8 +562,8 @@ impl<H: HashPolicy> State<H> {
         let node_id = NodeId { role, index };
         let mut env = Env::<H>::with_slots(node_slot_count);
         env.set(0, Value::<H>::node(node_id)); // Slot 0 = self
-        self.nodes.push_back(env);
-        self.local_queues.push(Vector::new());
+        self.nodes.push(env);
+        self.local_queues.push(Vec::new());
         node_id
     }
 
@@ -580,20 +585,20 @@ impl<H: HashPolicy> State<H> {
     /// is already delivered and being re-enqueued.
     pub fn push_runnable(&mut self, runnable: Runnable<H>) {
         match &runnable {
-            Runnable::Timer(_) => self.timer_queue.push_back(runnable),
-            Runnable::ChannelSend { .. } => self.network_queue.push_back(runnable),
+            Runnable::Timer(_) => self.timer_queue.push(runnable),
+            Runnable::ChannelSend { .. } => self.network_queue.push(runnable),
             Runnable::Partition { .. } | Runnable::Heal { .. } => {
-                self.network_queue.push_back(runnable)
+                self.network_queue.push(runnable)
             }
             Runnable::Crash { node_id, .. } | Runnable::Recover { node_id, .. } => {
                 let idx = node_id.index;
-                self.local_queues[idx].push_back(runnable);
+                self.local_queues[idx].push(runnable);
             }
             Runnable::Record(r) => {
                 if r.origin_node == r.node {
-                    self.local_queues[r.node.index].push_back(runnable);
+                    self.local_queues[r.node.index].push(runnable);
                 } else {
-                    self.network_queue.push_back(runnable);
+                    self.network_queue.push(runnable);
                 }
             }
         }
@@ -601,7 +606,7 @@ impl<H: HashPolicy> State<H> {
 
     /// Force a runnable into a specific node's local queue.
     pub fn push_to_local(&mut self, node_index: usize, runnable: Runnable<H>) {
-        self.local_queues[node_index].push_back(runnable);
+        self.local_queues[node_index].push(runnable);
     }
 
     /// True when all queue groups and purgatory are empty.

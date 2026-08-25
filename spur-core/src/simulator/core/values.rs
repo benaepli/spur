@@ -1,7 +1,7 @@
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::state::NodeId;
 use crate::simulator::hash_utils::{HashPolicy, mix};
-use ecow::EcoString;
+use ecow::{EcoString, EcoVec};
 use imbl::{HashMap as ImHashMap, Vector};
 use std::cmp::Ordering;
 use rustc_hash::FxHasher;
@@ -514,9 +514,20 @@ impl<H: HashPolicy> PartialEq for Env<H> {
 
 impl<H: HashPolicy> Eq for Env<H> {}
 
+/// Slot storage for an environment.
+///
+/// `EcoVec` is a copy-on-write vector behind a single allocation whose length is
+/// exactly the slot count. Cloning an `Env` (which happens on every record
+/// enqueue, node-env read-modify-write and crash re-delivery) is a refcount
+/// bump, and the first write after a clone copies only `len` slots. The former
+/// `imbl::Vector` representation had the same O(1) clone but paid a full
+/// 64-slot RRB chunk memmove on every `Arc::make_mut` triggered by a write to a
+/// shared env, which dominated the profile.
+type Slots<H> = EcoVec<Value<H>>;
+
 #[derive(Clone, Debug)]
 pub struct Env<H: HashPolicy> {
-    pub slots: Vector<Value<H>>,
+    pub slots: Slots<H>,
     pub sig: u64,
     _marker: PhantomData<H>,
 }
@@ -530,7 +541,7 @@ impl<H: HashPolicy> Hash for Env<H> {
 impl<H: HashPolicy> Default for Env<H> {
     fn default() -> Self {
         Self {
-            slots: Vector::new(),
+            slots: Slots::new(),
             sig: 0,
             _marker: PhantomData,
         }
@@ -540,7 +551,8 @@ impl<H: HashPolicy> Default for Env<H> {
 impl<H: HashPolicy> Env<H> {
     /// Create an environment with `n` slots, all initialized to Unit
     pub fn with_slots(n: usize) -> Self {
-        let slots: Vector<Value<H>> = (0..n).map(|_| Value::<H>::unit()).collect();
+        // Single exact-size allocation; no per-element push/grow.
+        let slots: Slots<H> = EcoVec::from_elem(Value::<H>::unit(), n);
 
         let mut sig = 0u64;
         if H::EAGER {
@@ -568,8 +580,9 @@ impl<H: HashPolicy> Env<H> {
         if idx >= self.slots.len() {
             // Extending requires recomputing signature
             let old_len = self.slots.len();
-            while self.slots.len() < idx + 1 {
-                self.slots.push_back(Value::<H>::unit());
+            self.slots.reserve(idx + 1 - old_len);
+            while self.slots.len() < idx {
+                self.slots.push(Value::<H>::unit());
             }
             if H::EAGER {
                 let unit_sig = Value::<H>::unit().sig;
@@ -578,13 +591,14 @@ impl<H: HashPolicy> Env<H> {
                 }
                 self.sig ^= H::mix(value.sig, slot);
             }
-            self.slots[idx] = value;
+            self.slots.push(value);
         } else {
             if H::EAGER {
                 let old_sig = self.slots[idx].sig;
                 self.sig = H::update_env_sig(self.sig, old_sig, value.sig, slot);
             }
-            self.slots[idx] = value;
+            // Copy-on-write: clones exactly `len` slots iff this env is shared.
+            self.slots.make_mut()[idx] = value;
         }
     }
 
@@ -599,8 +613,9 @@ impl<H: HashPolicy> Env<H> {
     pub fn ensure_slots(&mut self, n: usize) {
         if self.slots.len() < n {
             let old_len = self.slots.len();
+            self.slots.reserve(n - old_len);
             while self.slots.len() < n {
-                self.slots.push_back(Value::<H>::unit());
+                self.slots.push(Value::<H>::unit());
             }
             if H::EAGER {
                 let unit_sig = Value::<H>::unit().sig;

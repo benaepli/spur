@@ -259,7 +259,7 @@ pub fn activate_partition<H: HashPolicy>(
                     *priority,
                 );
             }
-            _ => state.network_queue.push_back(task),
+            _ => state.network_queue.push(task),
         }
     }
 }

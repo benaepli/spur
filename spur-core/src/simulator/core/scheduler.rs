@@ -17,7 +17,7 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
 use crate::simulator::util_stats;
-use imbl::{OrdSet, Vector};
+use imbl::OrdSet;
 use log::warn;
 use rand::Rng;
 
@@ -107,7 +107,7 @@ fn priority_component<H: HashPolicy>(
 /// reservoir sampling with weight `score^exponent`, giving exact proportional
 /// selection in a single O(eligible) pass.
 fn select_within_queue<H: HashPolicy, F: Feedback>(
-    queue: &Vector<Runnable<H>>,
+    queue: &[Runnable<H>],
     eligible: &[usize],
     feedback: &F::Local,
     snapshot: &F::Snapshot,
@@ -574,7 +574,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
             Runnable::ChannelSend { target, .. } if *target == node_id => {}
             Runnable::Crash { node_id: nid, .. } | Runnable::Recover { node_id: nid, .. }
                 if *nid == node_id => {}
-            _ => state.network_queue.push_back(task),
+            _ => state.network_queue.push(task),
         }
     }
 
@@ -585,7 +585,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
             && t.node == node_id {
                 continue;
             }
-        state.timer_queue.push_back(task);
+        state.timer_queue.push(task);
     }
 }
 
@@ -785,12 +785,11 @@ mod tests {
 
     #[test]
     fn proportional_selection_matches_expected_distribution() {
-        let queue: Vector<Runnable<NoHashing>> = vec![
+        let queue: Vec<Runnable<NoHashing>> = vec![
             heal(0.0), // score 0.25
             heal(0.5), // score 0.625
             heal(1.0), // score 1.00
-        ]
-        .into();
+        ];
         let eligible: Vec<usize> = (0..queue.len()).collect();
         let crashed = OrdSet::new();
         let selector = WithinQueueSelector::Proportional { exponent: 1.0 };
@@ -833,7 +832,7 @@ mod tests {
 
     #[test]
     fn proportional_with_zero_exponent_is_uniform() {
-        let queue: Vector<Runnable<NoHashing>> = vec![heal(0.0), heal(0.5), heal(1.0)].into();
+        let queue: Vec<Runnable<NoHashing>> = vec![heal(0.0), heal(0.5), heal(1.0)];
         let eligible: Vec<usize> = (0..queue.len()).collect();
         let crashed = OrdSet::new();
         let selector = WithinQueueSelector::Proportional { exponent: 0.0 };
@@ -869,7 +868,7 @@ mod tests {
     fn tournament_default_preserves_existing_behavior() {
         // Default selector is Tournament { k: 10 }. With sampling-with-replacement,
         // the top-scoring item should dominate but not deterministically.
-        let queue: Vector<Runnable<NoHashing>> = vec![heal(0.1), heal(0.9)].into();
+        let queue: Vec<Runnable<NoHashing>> = vec![heal(0.1), heal(0.9)];
         let eligible: Vec<usize> = (0..queue.len()).collect();
         let crashed = OrdSet::new();
         let selector = WithinQueueSelector::default();
@@ -900,7 +899,7 @@ mod tests {
 
     #[test]
     fn select_within_queue_handles_singleton() {
-        let queue: Vector<Runnable<NoHashing>> = vec![heal(0.5)].into();
+        let queue: Vec<Runnable<NoHashing>> = vec![heal(0.5)];
         let eligible = vec![0];
         let crashed = OrdSet::new();
         let mut rng = StdRng::seed_from_u64(1);
