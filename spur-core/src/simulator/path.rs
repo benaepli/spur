@@ -457,7 +457,6 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 &mut path_state.state,
                 &mut path_state.logs,
                 &program,
-                false,
                 snapshot,
                 &mut path_state.feedback,
                 &topology,

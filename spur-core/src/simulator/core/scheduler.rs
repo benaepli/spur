@@ -214,7 +214,6 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
-    randomly_drop_msgs: bool,
     snapshot: &F::Snapshot,
     feedback: &mut F::Local,
     topology: &TopologyInfo,
@@ -471,11 +470,6 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     }
                     _ => unreachable!(),
                 }
-                return Ok(ScheduleResult::None);
-            }
-
-            let is_remote = src_node != dest_node;
-            if is_remote && randomly_drop_msgs && rng.random::<f64>() < 0.3 {
                 return Ok(ScheduleResult::None);
             }
 
