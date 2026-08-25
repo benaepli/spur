@@ -519,10 +519,7 @@ impl<H: HashPolicy> Eq for Env<H> {}
 /// `EcoVec` is a copy-on-write vector behind a single allocation whose length is
 /// exactly the slot count. Cloning an `Env` (which happens on every record
 /// enqueue, node-env read-modify-write and crash re-delivery) is a refcount
-/// bump, and the first write after a clone copies only `len` slots. The former
-/// `imbl::Vector` representation had the same O(1) clone but paid a full
-/// 64-slot RRB chunk memmove on every `Arc::make_mut` triggered by a write to a
-/// shared env, which dominated the profile.
+/// bump, and the first write after a clone copies only `len` slots.
 type Slots<H> = EcoVec<Value<H>>;
 
 #[derive(Clone, Debug)]

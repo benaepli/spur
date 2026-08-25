@@ -475,10 +475,8 @@ pub enum ScheduleResult<H: HashPolicy> {
 #[derive(Debug, Clone)]
 pub struct State<H: HashPolicy> {
     // `nodes` and the three run queues are owned exclusively by the run that
-    // created them — a `State` is never cloned or snapshotted — so they use
-    // plain `Vec`s. The persistent `imbl::Vector` they replaced paid a chunk
-    // allocation on first growth and an `Arc::make_mut` chunk memmove on every
-    // in-place write, for structural sharing nothing ever used.
+    // created them; a `State` is never cloned or snapshotted, so plain `Vec`s
+    // are the right representation.
     pub nodes: Vec<Env<H>>, // Index is node_id.index
     pub local_queues: Vec<Vec<Runnable<H>>>,
     pub network_queue: Vec<Runnable<H>>,
