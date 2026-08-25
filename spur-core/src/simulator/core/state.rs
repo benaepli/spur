@@ -430,6 +430,19 @@ impl<H: HashPolicy> Runnable<H> {
         }
     }
 
+    /// Get the category this runnable belongs to.
+    pub fn category(&self) -> RunnableCategory {
+        match self {
+            Runnable::Record(_) => RunnableCategory::Record,
+            Runnable::Timer(_) => RunnableCategory::Timer,
+            Runnable::ChannelSend { .. } => RunnableCategory::ChannelSend,
+            Runnable::Crash { .. } => RunnableCategory::Crash,
+            Runnable::Recover { .. } => RunnableCategory::Recover,
+            Runnable::Partition { .. } => RunnableCategory::Partition,
+            Runnable::Heal { .. } => RunnableCategory::Heal,
+        }
+    }
+
     /// Get the scheduling priority for this runnable.
     pub fn priority(&self) -> f64 {
         match self {

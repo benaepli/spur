@@ -3,6 +3,7 @@ use crate::simulator::core::{
     Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
     Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
 };
+use crate::simulator::census;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::curriculum::{Curriculum, lower};
 use crate::simulator::feedback::{
@@ -707,6 +708,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &mut rec,
     )?;
 
+    census::begin_run(run_id);
     let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
         program.clone(),
@@ -724,6 +726,11 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &config.purgatory,
         &mut rec,
     )?;
+
+    census::finish_run(match &outcome {
+        RunOutcome::Completed => "completed",
+        RunOutcome::Deadlock { .. } => "deadlock",
+    });
 
     if let RunOutcome::Deadlock { step, pending_ops } = &outcome {
         warn!(

@@ -11,6 +11,7 @@ use crate::simulator::core::state::{
     SchedulePolicy, ScheduleResult, State,
 };
 use crate::simulator::core::values::{Env, Value};
+use crate::simulator::census;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
@@ -273,6 +274,36 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         step: state.crash_info.current_step,
     };
 
+    // The eligible classes at this step, sampled before anything is removed.
+    let offered_classes = if census::enabled() {
+        let mut classes = census::ClassSet::default();
+        for r in state
+            .local_queues
+            .iter()
+            .flatten()
+            .chain(state.network_queue.iter())
+            .filter(|r| !is_ineligible(r))
+        {
+            classes.insert(r.category());
+        }
+        for r in state.timer_queue.iter() {
+            if is_ineligible(r) {
+                continue;
+            }
+            if strict_timers
+                && let Runnable::Timer(t) = r
+                && let Some(label) = t.label.as_ref()
+                && !state.allowed_timers.contains(&(t.node.index, label.clone()))
+            {
+                continue;
+            }
+            classes.insert(r.category());
+        }
+        Some(classes)
+    } else {
+        None
+    };
+
     let selection = match selector.select(&info, rng) {
         Some(s) => s,
         None => return Ok(ScheduleResult::None),
@@ -357,6 +388,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             state.timer_queue.remove(idx)
         }
     };
+
+    if let Some(classes) = offered_classes {
+        census::record_step(runnable.category(), classes);
+    }
 
     match runnable {
         Runnable::Crash { node_id, .. } => {

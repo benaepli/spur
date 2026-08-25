@@ -621,6 +621,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         }
     }
 
+    crate::simulator::census::note_iteration_cap();
     warn!(
         "Hit max iterations ({}) before plan {} completion",
         max_iterations, run_id

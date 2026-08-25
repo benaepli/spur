@@ -1,3 +1,4 @@
+pub mod census;
 mod core;
 mod coverage;
 mod curriculum;

@@ -7,6 +7,7 @@ use spur_core::simulator::explorer::{
     ExploreSummary, run_explorer, run_explorer_aos, run_explorer_continuous, run_explorer_genetic,
     run_plan,
 };
+use spur_core::simulator::census;
 use spur_core::simulator::history::LogBackend;
 use spur_core::simulator::util_stats;
 use spur_core::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
@@ -84,6 +85,11 @@ enum Commands {
         /// Logging backend for simulation history
         #[arg(long, value_enum, default_value_t = LogBackendArg::Parquet)]
         log_backend: LogBackendArg,
+        /// Record, per run, which event class each scheduling step took and
+        /// which classes were eligible but not taken; written to
+        /// `<output_dir>/depth_census.json`
+        #[arg(long)]
+        depth_census: bool,
         /// Skip confirmation prompt for directory deletion
         #[arg(short = 'y', long)]
         yes: bool,
@@ -205,8 +211,17 @@ fn main() {
             output_dir,
             explorer,
             log_backend,
+            depth_census,
             yes,
-        } => run_explore(spec, config, output_dir, explorer, log_backend.into(), yes),
+        } => run_explore(
+            spec,
+            config,
+            output_dir,
+            explorer,
+            log_backend.into(),
+            depth_census,
+            yes,
+        ),
         Commands::RunPlan {
             spec,
             plan,
@@ -436,6 +451,7 @@ fn run_explore(
     output_dir: PathBuf,
     explorer_type: ExplorerType,
     backend: LogBackend,
+    depth_census: bool,
     yes: bool,
 ) -> Result<()> {
     let source_code = fs::read_to_string(&spec_path)
@@ -456,6 +472,8 @@ fn run_explore(
             .context("Output dir contains invalid UTF-8")?
             .to_string(),
     };
+    census::set_enabled(depth_census);
+
     let start = Instant::now();
 
     // Install Ctrl+C handler for graceful shutdown
@@ -527,6 +545,16 @@ fn run_explore(
         None
     };
 
+    let census_path = if depth_census {
+        let path = output_dir.join("depth_census.json");
+        let json = serde_json::to_string(&census::snapshot())
+            .context("Failed to serialize scheduling census")?;
+        fs::write(&path, json).context("Failed to write depth_census.json")?;
+        Some(path)
+    } else {
+        None
+    };
+
     println!(
         "Explorer finished in {:.2?}. Results saved to {}",
         elapsed,
@@ -539,6 +567,9 @@ fn run_explore(
     println!("  - CFG: {}", cfg_path.display());
     if let Some(p) = &util_path {
         println!("  - Utilization counters: {}", p.display());
+    }
+    if let Some(p) = &census_path {
+        println!("  - Scheduling census: {}", p.display());
     }
 
     Ok(())
