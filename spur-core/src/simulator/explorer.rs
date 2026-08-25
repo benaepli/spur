@@ -733,6 +733,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     }
 
     let plan_score = F::plan_score(&path_state.feedback, &snapshot, weights);
+    util_stats::record_plan_score(plan_score);
     let tuples = F::timeline_tuples(&path_state.feedback)
         .cloned()
         .unwrap_or_default();
@@ -777,6 +778,7 @@ pub fn run_explorer(
 
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    util_stats::set_audit_enabled(config.feedback.audit_stats);
     dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1041,6 +1043,7 @@ fn run_single_plan<F: Feedback>(
     }
 
     let plan_score = F::plan_score(&path_state.feedback, &snapshot, weights);
+    util_stats::record_plan_score(plan_score);
     F::merge(&global_state.feedback, &path_state.feedback);
 
     let serialized = serialize_history(&path_state.history);
@@ -1165,6 +1168,7 @@ pub fn run_explorer_genetic(
 
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    util_stats::set_audit_enabled(config.feedback.audit_stats);
     dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1585,6 +1589,7 @@ pub fn run_explorer_aos(
 
     info!("AOS session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    util_stats::set_audit_enabled(config.feedback.audit_stats);
     dispatch_feedback!(config.feedback, F => run_explorer_aos_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -2206,6 +2211,7 @@ pub fn run_explorer_continuous(
 
     info!("Continuous session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
+    util_stats::set_audit_enabled(config.envelope.feedback.audit_stats);
     dispatch_feedback!(config.envelope.feedback, F => run_explorer_continuous_impl::<F>(program, config, output_path, backend, cancelled))
 }
 

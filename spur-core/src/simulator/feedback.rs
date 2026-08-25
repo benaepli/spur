@@ -127,6 +127,13 @@ pub struct FeedbackConfig {
     /// Only meaningful for `Timeline`/`Both`.
     #[serde(default)]
     pub timeline_key_granularity: TimelineKeyGranularity,
+    /// Record observation-only counters measuring how much authority the
+    /// scoring layer has over scheduling: how often the score changes the
+    /// greedy pick, how much it spreads across candidates, and how much the
+    /// per-run fitness spreads across runs. Adds a pass over the eligible set
+    /// at every scheduling decision, so it stays off unless asked for.
+    #[serde(default)]
+    pub audit_stats: bool,
 }
 
 impl FeedbackConfig {

@@ -517,7 +517,7 @@ fn run_explore(
     fs::write(&cfg_path, svg).context("Failed to write CFG SVG")?;
 
     // Dump opt-in utilization counters (enabled via `"stats": true` in the config)
-    let util_path = if util_stats::enabled() {
+    let util_path = if util_stats::any_enabled() {
         let path = output_dir.join("utilization.json");
         let json = serde_json::to_string_pretty(&util_stats::snapshot())
             .context("Failed to serialize utilization counters")?;

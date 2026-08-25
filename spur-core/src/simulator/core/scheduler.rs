@@ -82,6 +82,10 @@ fn score_runnable<H: HashPolicy, F: Feedback>(
     }
 }
 
+/// Two scores this close apart are treated as equal when the observation
+/// probes decide whether candidates were tied.
+const SCORE_TIE_EPSILON: f64 = 1e-12;
+
 /// The priority-only share of `score_runnable` (novelty zeroed out, same
 /// quick-fire weighting). Only used by the opt-in utilization probe below.
 fn priority_component<H: HashPolicy>(
@@ -124,11 +128,20 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     // novelty/steer term were dropped? Compares the blended-score argmax with
     // the priority-only argmax (first index wins ties). Consumes no RNG and
     // does not influence the selection below.
-    if util_stats::enabled() {
+    let stats_on = util_stats::enabled();
+    let audit_on = util_stats::audit_enabled();
+    if stats_on || audit_on {
         let mut best_blend = f64::NEG_INFINITY;
         let mut best_blend_idx = eligible[0];
         let mut best_prio = f64::NEG_INFINITY;
         let mut best_prio_idx = eligible[0];
+        let mut prio_at_max = 0usize;
+        let mut score_sum = 0.0;
+        let mut score_sq_sum = 0.0;
+        let mut novelty_sum = 0.0;
+        let mut novelty_sq_sum = 0.0;
+        let mut novelty_min = f64::INFINITY;
+        let mut novelty_max = f64::NEG_INFINITY;
         for &i in eligible {
             let blend = score_runnable::<H, F>(
                 &queue[i],
@@ -142,12 +155,41 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                 best_blend = blend;
                 best_blend_idx = i;
             }
-            if prio > best_prio {
+            if prio > best_prio + SCORE_TIE_EPSILON {
                 best_prio = prio;
                 best_prio_idx = i;
+                prio_at_max = 1;
+            } else if (prio - best_prio).abs() <= SCORE_TIE_EPSILON {
+                prio_at_max += 1;
+            }
+            if audit_on {
+                let novelty = F::runnable_novelty(feedback, &queue[i], snapshot);
+                novelty_sum += novelty;
+                novelty_sq_sum += novelty * novelty;
+                novelty_min = novelty_min.min(novelty);
+                novelty_max = novelty_max.max(novelty);
+                score_sum += blend;
+                score_sq_sum += blend * blend;
             }
         }
-        util_stats::record_steer_evaluation(best_blend_idx != best_prio_idx);
+        let divergent = best_blend_idx != best_prio_idx;
+        if stats_on {
+            util_stats::record_steer_evaluation(divergent);
+        }
+        if audit_on {
+            let n = eligible.len() as f64;
+            let variance = |sum: f64, sq_sum: f64| {
+                let mean = sum / n;
+                (sq_sum / n - mean * mean).max(0.0)
+            };
+            util_stats::record_decision_audit(
+                divergent,
+                prio_at_max > 1 && divergent,
+                novelty_max - novelty_min <= SCORE_TIE_EPSILON,
+                variance(score_sum, score_sq_sum),
+                variance(novelty_sum, novelty_sq_sum),
+            );
+        }
     }
 
     match selector {
