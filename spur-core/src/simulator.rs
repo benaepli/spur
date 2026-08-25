@@ -8,4 +8,5 @@ pub mod history;
 mod path;
 pub mod plan_config;
 pub mod rng;
+pub mod score_scale;
 pub mod util_stats;

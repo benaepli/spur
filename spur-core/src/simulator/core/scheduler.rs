@@ -16,6 +16,7 @@ use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
+use crate::simulator::score_scale;
 use crate::simulator::util_stats;
 use imbl::OrdSet;
 use log::warn;
@@ -63,21 +64,35 @@ fn is_fifo_blocked<H: HashPolicy>(
 /// Score a runnable in [0, 1] by combining novelty and priority. For Recover
 /// events targeting a currently-crashed node, `quick_fire_multiplier` increases
 /// the weight of priority relative to novelty while keeping the result in [0, 1].
+///
+/// `observe` feeds the raw terms into the running scale estimate used by
+/// standardized scoring; callers that only inspect a score without acting on it
+/// pass false so the estimate reflects real scheduling decisions alone.
 fn score_runnable<H: HashPolicy, F: Feedback>(
     r: &Runnable<H>,
     feedback: &F::Local,
     snapshot: &F::Snapshot,
     currently_crashed: &OrdSet<NodeId>,
     quick_fire_multiplier: f64,
+    observe: bool,
 ) -> f64 {
     let novelty = F::runnable_novelty(feedback, r, snapshot);
     let priority = r.priority();
     let is_quick_fire =
         matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
+    if observe {
+        score_scale::observe(novelty, priority);
+    }
     if is_quick_fire {
         let w = 0.75 * quick_fire_multiplier;
+        if let Some(s) = score_scale::standardized_blend(novelty, priority, quick_fire_multiplier) {
+            return s;
+        }
         (0.25 * novelty + w * priority) / (0.25 + w)
     } else {
+        if let Some(s) = score_scale::standardized_blend(novelty, priority, 1.0) {
+            return s;
+        }
         0.25 * novelty + 0.75 * priority
     }
 }
@@ -136,6 +151,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                 snapshot,
                 currently_crashed,
                 quick_fire_multiplier,
+                false,
             );
             let prio = priority_component(&queue[i], currently_crashed, quick_fire_multiplier);
             if blend > best_blend {
@@ -160,6 +176,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                 snapshot,
                 currently_crashed,
                 quick_fire_multiplier,
+                true,
             );
             for _ in 1..k.min(eligible.len()) {
                 let i = eligible[rng.random_range(0..eligible.len())];
@@ -169,6 +186,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                     snapshot,
                     currently_crashed,
                     quick_fire_multiplier,
+                    true,
                 );
                 if s > best_score {
                     best_idx = i;
@@ -194,6 +212,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                     snapshot,
                     currently_crashed,
                     quick_fire_multiplier,
+                    true,
                 );
                 let weight = s.powf(*exponent).max(1e-9);
                 let u: f64 = rng.random();

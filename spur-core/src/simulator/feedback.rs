@@ -127,6 +127,12 @@ pub struct FeedbackConfig {
     /// Only meaningful for `Timeline`/`Both`.
     #[serde(default)]
     pub timeline_key_granularity: TimelineKeyGranularity,
+    /// Standardize the novelty and priority terms by their own running mean and
+    /// standard deviation before blending them, so a term with a narrow spread
+    /// still influences the pick. Only meaningful when a feedback mode supplies
+    /// a novelty signal.
+    #[serde(default)]
+    pub novelty_normalization: bool,
 }
 
 impl FeedbackConfig {
