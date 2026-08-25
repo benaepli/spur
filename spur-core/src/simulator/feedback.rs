@@ -64,6 +64,54 @@ pub enum FeedbackMode {
     Both,
 }
 
+/// How many fields distinguish one timeline coverage key from another.
+/// Lower resolution collapses more orderings into the same key, so a run has
+/// fewer ways to look novel; higher resolution splits them further apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TimelineKeyGranularity {
+    /// Handler pair only: the same ordering on two different nodes is one key.
+    Coarse,
+    /// Handler pair per destination node.
+    #[default]
+    Default,
+    /// Handler pair per destination node per restart generation of that node,
+    /// so an ordering seen before a crash is distinct from the same ordering
+    /// seen after recovery.
+    Fine,
+}
+
+impl TimelineKeyGranularity {
+    /// Builds the coverage key for "handler `a` ran before handler `b` on
+    /// `dest`, while `dest` was on its `generation`-th incarnation".
+    pub fn key(self, dest: NodeId, a: Vertex, b: Vertex, generation: u32) -> TimelineTuple {
+        match self {
+            Self::Coarse => TimelineTuple {
+                dest: None,
+                a,
+                b,
+                generation: 0,
+            },
+            Self::Default => TimelineTuple {
+                dest: Some(dest),
+                a,
+                b,
+                generation: 0,
+            },
+            Self::Fine => TimelineTuple {
+                dest: Some(dest),
+                a,
+                b,
+                generation,
+            },
+        }
+    }
+
+    fn tracks_generation(self) -> bool {
+        matches!(self, Self::Fine)
+    }
+}
+
 /// Session-level feedback selection, deserialized from the explorer config.
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
 pub struct FeedbackConfig {
@@ -75,6 +123,10 @@ pub struct FeedbackConfig {
     pub steer: bool,
     #[serde(default)]
     pub weights: CoverageConfig,
+    /// Resolution of the timeline coverage key.
+    /// Only meaningful for `Timeline`/`Both`.
+    #[serde(default)]
+    pub timeline_key_granularity: TimelineKeyGranularity,
 }
 
 impl FeedbackConfig {
@@ -94,12 +146,15 @@ impl FeedbackConfig {
 }
 
 /// A direction-aware happens-before tuple: on `dest`, handler `a` ran before
-/// handler `b`. `(dest, a, b)` is distinct from `(dest, b, a)`.
+/// handler `b`. `(dest, a, b)` is distinct from `(dest, b, a)`. Which fields
+/// are populated is decided by `TimelineKeyGranularity`; build keys with
+/// `TimelineKeyGranularity::key` rather than constructing them directly.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub struct TimelineTuple {
-    pub dest: NodeId,
+    pub dest: Option<NodeId>,
     pub a: Vertex,
     pub b: Vertex,
+    pub generation: u32,
 }
 
 /// Per-run timeline accumulator.
@@ -107,9 +162,19 @@ pub struct TimelineTuple {
 pub struct LocalTimeline {
     pub tuples: HashSet<TimelineTuple>,
     pub per_dest_seen: HashMap<NodeId, HashSet<Vertex>>,
+    granularity: TimelineKeyGranularity,
+    generations: HashMap<NodeId, u32>,
 }
 
 impl LocalTimeline {
+    pub fn set_granularity(&mut self, granularity: TimelineKeyGranularity) {
+        self.granularity = granularity;
+    }
+
+    fn generation(&self, dest: NodeId) -> u32 {
+        self.generations.get(&dest).copied().unwrap_or(0)
+    }
+
     /// Records that `handler` was delivered to `dest`, forming a happens-before
     /// tuple against every distinct prior handler on that node.
     ///
@@ -117,16 +182,21 @@ impl LocalTimeline {
     /// sequence) gives the same tuple set, since the `HashSet` already
     /// collapses duplicates, but scales with the number of distinct handlers.
     pub fn note_delivery(&mut self, dest: NodeId, handler: Vertex) {
+        let generation = self.generation(dest);
+        let granularity = self.granularity;
         if let Some(priors) = self.per_dest_seen.get(&dest) {
             for &prior in priors {
-                self.tuples.insert(TimelineTuple {
-                    dest,
-                    a: prior,
-                    b: handler,
-                });
+                self.tuples
+                    .insert(granularity.key(dest, prior, handler, generation));
             }
         }
         self.per_dest_seen.entry(dest).or_default().insert(handler);
+    }
+
+    /// Records that `node` came back up, starting a new incarnation. Prior
+    /// handlers stay in the pairing set so orderings still span the restart.
+    pub fn note_recovery(&mut self, node: NodeId) {
+        *self.generations.entry(node).or_default() += 1;
     }
 
     /// Number of this run's tuples not present in the global snapshot.
@@ -208,16 +278,18 @@ fn timeline_steer_bias<H: HashPolicy>(
     if rec.pc != rec.entry_pc {
         return 1.0;
     }
+    let generation = tl.generation(rec.node);
     match tl.per_dest_seen.get(&rec.node) {
         Some(priors) if !priors.is_empty() => {
             let sum: f64 = priors
                 .iter()
                 .map(|&a| {
-                    snap.novelty_score(&TimelineTuple {
-                        dest: rec.node,
+                    snap.novelty_score(&tl.granularity.key(
+                        rec.node,
                         a,
-                        b: rec.entry_pc,
-                    })
+                        rec.entry_pc,
+                        generation,
+                    ))
                 })
                 .sum();
             sum / priors.len() as f64
@@ -264,6 +336,14 @@ pub trait Feedback: 'static + Send + Sync + std::fmt::Debug {
     /// Capture a first-entry handler delivery on a server node.
     #[inline]
     fn note_delivery(_local: &mut Self::Local, _dest: NodeId, _handler: Vertex) {}
+
+    /// Capture a node coming back up after a crash.
+    #[inline]
+    fn note_recovery(_local: &mut Self::Local, _node: NodeId) {}
+
+    /// Apply the session's timeline key resolution to a fresh run accumulator.
+    #[inline]
+    fn set_key_granularity(_local: &mut Self::Local, _granularity: TimelineKeyGranularity) {}
 
     /// Novelty term in [0, 1] used by the within-queue selector. Defaults to
     /// 1.0 (uniform), which reproduces the "no global snapshot" behavior.
@@ -385,6 +465,18 @@ impl<const STEER: bool> Feedback for TimelineFeedback<STEER> {
     }
 
     #[inline]
+    fn note_recovery(local: &mut LocalTimeline, node: NodeId) {
+        if local.granularity.tracks_generation() {
+            local.note_recovery(node);
+        }
+    }
+
+    #[inline]
+    fn set_key_granularity(local: &mut LocalTimeline, granularity: TimelineKeyGranularity) {
+        local.set_granularity(granularity);
+    }
+
+    #[inline]
     fn runnable_novelty<H: HashPolicy>(
         local: &LocalTimeline,
         r: &Runnable<H>,
@@ -441,6 +533,18 @@ impl<const STEER: bool> Feedback for FullFeedback<STEER> {
     #[inline]
     fn note_delivery(local: &mut Self::Local, dest: NodeId, handler: Vertex) {
         local.1.note_delivery(dest, handler);
+    }
+
+    #[inline]
+    fn note_recovery(local: &mut Self::Local, node: NodeId) {
+        if local.1.granularity.tracks_generation() {
+            local.1.note_recovery(node);
+        }
+    }
+
+    #[inline]
+    fn set_key_granularity(local: &mut Self::Local, granularity: TimelineKeyGranularity) {
+        local.1.set_granularity(granularity);
     }
 
     #[inline]
@@ -510,11 +614,7 @@ mod tests {
         let mut expected: HashSet<TimelineTuple> = HashSet::new();
         for i in 0..seq.len() {
             for j in (i + 1)..seq.len() {
-                expected.insert(TimelineTuple {
-                    dest: d,
-                    a: seq[i],
-                    b: seq[j],
-                });
+                expected.insert(TimelineKeyGranularity::Default.key(d, seq[i], seq[j], 0));
             }
         }
 
@@ -560,11 +660,7 @@ mod tests {
         let after = g.snapshot();
         assert_eq!(after.counts.len(), 1, "the count-1 tuple should be dropped");
         assert_eq!(after.total, 2, "total recomputed from surviving counts");
-        let surviving = TimelineTuple {
-            dest: d,
-            a: 1,
-            b: 2,
-        };
+        let surviving = TimelineKeyGranularity::Default.key(d, 1, 2, 0);
         assert_eq!(after.counts.get(&surviving), Some(&2));
         assert!((0.0..=1.0).contains(&after.novelty_score(&surviving)));
     }
@@ -600,30 +696,73 @@ mod tests {
         let d = node(0);
         let mut snap = TimelineSnap::default();
         snap.total = 10;
-        snap.counts.insert(
-            TimelineTuple {
-                dest: d,
-                a: 1,
-                b: 2,
-            },
-            10,
-        );
+        snap.counts
+            .insert(TimelineKeyGranularity::Default.key(d, 1, 2, 0), 10);
 
         let mut tl = LocalTimeline::default();
         tl.per_dest_seen.entry(d).or_default().insert(1);
 
         // Candidate handler 2 forms the common tuple (d,1,2): low novelty.
-        let common = snap.novelty_score(&TimelineTuple {
-            dest: d,
-            a: 1,
-            b: 2,
-        });
+        let common = snap.novelty_score(&TimelineKeyGranularity::Default.key(d, 1, 2, 0));
         // Candidate handler 3 forms an unseen tuple: novelty 1.0.
-        let novel = snap.novelty_score(&TimelineTuple {
-            dest: d,
-            a: 1,
-            b: 3,
-        });
+        let novel = snap.novelty_score(&TimelineKeyGranularity::Default.key(d, 1, 3, 0));
         assert!(novel > common);
+    }
+
+    #[test]
+    fn granularity_parses_from_config_json() {
+        let cfg: FeedbackConfig = serde_json::from_str(
+            r#"{"mode": "timeline", "steer": true, "timeline_key_granularity": "fine"}"#,
+        )
+        .expect("config should parse");
+        assert_eq!(cfg.timeline_key_granularity, TimelineKeyGranularity::Fine);
+
+        let defaulted: FeedbackConfig = serde_json::from_str(r#"{"mode": "timeline"}"#).unwrap();
+        assert_eq!(
+            defaulted.timeline_key_granularity,
+            TimelineKeyGranularity::Default
+        );
+    }
+
+    #[test]
+    fn granularity_changes_key_resolution() {
+        let (d0, d1) = (node(0), node(1));
+        assert_eq!(
+            TimelineKeyGranularity::Coarse.key(d0, 1, 2, 0),
+            TimelineKeyGranularity::Coarse.key(d1, 1, 2, 3),
+            "coarse keys forget the destination node and its generation"
+        );
+        assert_ne!(
+            TimelineKeyGranularity::Default.key(d0, 1, 2, 0),
+            TimelineKeyGranularity::Default.key(d1, 1, 2, 0)
+        );
+        assert_eq!(
+            TimelineKeyGranularity::Default.key(d0, 1, 2, 0),
+            TimelineKeyGranularity::Default.key(d0, 1, 2, 7),
+            "default keys ignore the restart generation"
+        );
+        assert_ne!(
+            TimelineKeyGranularity::Fine.key(d0, 1, 2, 0),
+            TimelineKeyGranularity::Fine.key(d0, 1, 2, 1)
+        );
+    }
+
+    #[test]
+    fn fine_granularity_separates_orderings_across_a_restart() {
+        let d = node(0);
+        let mut fine = LocalTimeline::default();
+        fine.set_granularity(TimelineKeyGranularity::Fine);
+        fine.note_delivery(d, 1);
+        fine.note_delivery(d, 2);
+        fine.note_recovery(d);
+        fine.note_delivery(d, 2);
+        assert_eq!(fine.tuples.len(), 3, "(d,1,2) counted once per incarnation");
+
+        let mut default = LocalTimeline::default();
+        default.note_delivery(d, 1);
+        default.note_delivery(d, 2);
+        default.note_recovery(d);
+        default.note_delivery(d, 2);
+        assert_eq!(default.tuples.len(), 2);
     }
 }

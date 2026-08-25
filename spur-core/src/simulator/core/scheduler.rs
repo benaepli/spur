@@ -607,6 +607,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
         return Ok(());
     }
     state.crash_info.currently_crashed.remove(&node_id);
+    F::note_recovery(feedback, node_id);
 
     state.nodes[node_id.index] = Env::<H>::default();
     reinit_node::<H, L, F>(
