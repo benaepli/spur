@@ -134,4 +134,12 @@ impl PlanEngine {
     pub fn is_complete(&self) -> bool {
         self.statuses.values().all(|s| *s == EventStatus::Completed)
     }
+
+    /// Planned events that have not reached Completed.
+    pub fn outstanding_count(&self) -> usize {
+        self.statuses
+            .values()
+            .filter(|s| **s != EventStatus::Completed)
+            .count()
+    }
 }
