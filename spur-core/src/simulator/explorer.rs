@@ -7,7 +7,7 @@ use crate::simulator::coverage::GlobalState;
 use crate::simulator::curriculum::{Curriculum, lower};
 use crate::simulator::feedback::{
     CfgFeedback, CoverageConfig, Feedback, FeedbackConfig, FeedbackMode, FullFeedback, NoFeedback,
-    TimelineFeedback, TimelineTuple,
+    TimelineFeedback, TimelineKeyGranularity, TimelineTuple,
 };
 use crate::simulator::hash_utils::compute_hash;
 use crate::simulator::history::{
@@ -360,6 +360,7 @@ pub struct SingleRunConfig {
     pub within_queue_selector: WithinQueueSelector,
     pub quick_fire_multiplier: f64,
     pub purgatory: PurgatoryConfig,
+    pub timeline_key_granularity: TimelineKeyGranularity,
 }
 
 impl SingleRunConfig {
@@ -420,6 +421,7 @@ impl SingleRunConfig {
             within_queue_selector: constraints.within_queue_selector.clone(),
             quick_fire_multiplier: constraints.quick_fire_multiplier,
             purgatory: constraints.purgatory.clone(),
+            timeline_key_granularity: constraints.feedback.timeline_key_granularity,
         }
     }
 
@@ -666,6 +668,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         program.max_node_slots as usize,
         client_role,
     );
+    F::set_key_granularity(&mut path_state.feedback, config.timeline_key_granularity);
 
     // One scheduling RNG per run, threaded through init + execution so all
     // schedule-shaping draws land on a single stream. `RecRng<S>` records or
@@ -857,6 +860,9 @@ fn run_explorer_impl<F: Feedback>(
                                                     .clone(),
                                                 quick_fire_multiplier: config.quick_fire_multiplier,
                                                 purgatory: config.purgatory.clone(),
+                                                timeline_key_granularity: config
+                                                    .feedback
+                                                    .timeline_key_granularity,
                                             };
 
                                             info!("{}", "=".repeat(70));
@@ -955,6 +961,7 @@ fn run_single_plan<F: Feedback>(
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
     weights: &CoverageConfig,
+    key_granularity: TimelineKeyGranularity,
 ) -> Result<f64, Box<dyn Error>> {
     let snapshot = F::snapshot(&global_state.feedback);
     let num_servers_usize = num_servers as usize;
@@ -978,6 +985,7 @@ fn run_single_plan<F: Feedback>(
         program.max_node_slots as usize,
         client_role,
     );
+    F::set_key_granularity(&mut path_state.feedback, key_granularity);
 
     let mut rng = SmallRng::seed_from_u64(run_id as u64);
 
@@ -1112,6 +1120,7 @@ fn run_plan_impl<F: Feedback>(
             config.quick_fire_multiplier,
             &config.purgatory,
             &weights,
+            config.feedback.timeline_key_granularity,
         ) {
             Ok(_) => {
                 debug!(
