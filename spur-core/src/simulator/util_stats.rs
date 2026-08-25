@@ -6,6 +6,8 @@
 //! probe is a single relaxed atomic load.
 
 use serde::Serialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -28,6 +30,13 @@ static FEEDBACK_SCORED_RUNS: AtomicU64 = AtomicU64::new(0);
 static CURRICULUM_LOWERED_RUNS: AtomicU64 = AtomicU64::new(0);
 static CURRICULUM_CRASHES_SUM: AtomicU64 = AtomicU64::new(0);
 static CURRICULUM_SERVERS_SUM: AtomicU64 = AtomicU64::new(0);
+static CR_RUNS: AtomicU64 = AtomicU64::new(0);
+static CR_CRASHES: AtomicU64 = AtomicU64::new(0);
+static CR_RECOVERS: AtomicU64 = AtomicU64::new(0);
+static CR_HELD_AT_CRASH: AtomicU64 = AtomicU64::new(0);
+static CR_DROPPED_AT_CRASH: AtomicU64 = AtomicU64::new(0);
+static CR_CROSSING_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+static CR_RUNS_WITH_CROSSING: AtomicU64 = AtomicU64::new(0);
 
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
 
@@ -50,6 +59,13 @@ pub fn set_enabled(on: bool) {
             &CURRICULUM_LOWERED_RUNS,
             &CURRICULUM_CRASHES_SUM,
             &CURRICULUM_SERVERS_SUM,
+            &CR_RUNS,
+            &CR_CRASHES,
+            &CR_RECOVERS,
+            &CR_HELD_AT_CRASH,
+            &CR_DROPPED_AT_CRASH,
+            &CR_CROSSING_DELIVERIES,
+            &CR_RUNS_WITH_CROSSING,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -140,6 +156,79 @@ pub fn record_feedback_scores(timeline: Option<f64>, cfg: Option<f64>) {
     }
     if let Some(c) = cfg {
         add_f64(&FEEDBACK_CFG_SCORE_SUM, c);
+    }
+}
+
+/// Per-run bookkeeping for crash/recover crossings. Runs execute one at a time
+/// per thread, so this lives in thread-local storage and needs no locking.
+#[derive(Default)]
+struct RunCrossingState {
+    /// Node index -> records addressed to that node before it crashed that are
+    /// being held for redelivery when it comes back.
+    held: HashMap<usize, u64>,
+    counted_in_runs_with_crossing: bool,
+}
+
+thread_local! {
+    static RUN_CROSSING: RefCell<RunCrossingState> = RefCell::new(RunCrossingState::default());
+}
+
+/// One plan execution is starting on this thread. Held-message bookkeeping is
+/// per-run, so anything left over from a run that ended while a node was still
+/// down is discarded here rather than leaking into the next run.
+pub fn begin_run() {
+    if !enabled() {
+        return;
+    }
+    CR_RUNS.fetch_add(1, Ordering::Relaxed);
+    RUN_CROSSING.with(|c| {
+        let mut c = c.borrow_mut();
+        c.held.clear();
+        c.counted_in_runs_with_crossing = false;
+    });
+}
+
+/// A node crashed: `held` messages addressed to it were kept for redelivery
+/// after it recovers, `dropped` were discarded.
+pub fn record_crash(node_index: usize, held: u64, dropped: u64) {
+    if !enabled() {
+        return;
+    }
+    CR_CRASHES.fetch_add(1, Ordering::Relaxed);
+    CR_HELD_AT_CRASH.fetch_add(held, Ordering::Relaxed);
+    CR_DROPPED_AT_CRASH.fetch_add(dropped, Ordering::Relaxed);
+    if held > 0 {
+        RUN_CROSSING.with(|c| {
+            *c.borrow_mut().held.entry(node_index).or_insert(0) += held;
+        });
+    }
+}
+
+/// A node recovered. Every message held from before its crash is requeued to
+/// it at this point, so each one is a delivery that crosses the node's own
+/// crash/recover boundary. Messages that arrived while the node was down are
+/// requeued too but are not counted: they were sent to an already-dead node.
+pub fn record_recover(node_index: usize) {
+    if !enabled() {
+        return;
+    }
+    CR_RECOVERS.fetch_add(1, Ordering::Relaxed);
+    let first_crossing_of_run = RUN_CROSSING.with(|c| {
+        let mut c = c.borrow_mut();
+        let crossings = c.held.remove(&node_index).unwrap_or(0);
+        if crossings == 0 {
+            return None;
+        }
+        let first = !c.counted_in_runs_with_crossing;
+        c.counted_in_runs_with_crossing = true;
+        Some((crossings, first))
+    });
+    let Some((crossings, first)) = first_crossing_of_run else {
+        return;
+    };
+    CR_CROSSING_DELIVERIES.fetch_add(crossings, Ordering::Relaxed);
+    if first {
+        CR_RUNS_WITH_CROSSING.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -300,6 +389,27 @@ pub struct FeedbackStats {
     pub scored_runs: u64,
 }
 
+/// How dense crash/recover activity is, and how often a message actually
+/// survives a receiver's crash to be delivered after it comes back.
+#[derive(Serialize)]
+pub struct CrashRecoveryStats {
+    /// Plan executions observed, i.e. the denominator for `runs_with_crossing`.
+    pub runs: u64,
+    pub crashes: u64,
+    pub recovers: u64,
+    /// Messages from another node that were queued to a node when it crashed
+    /// and were kept for redelivery.
+    pub messages_held_at_crash: u64,
+    /// Work queued to a node at crash time that was thrown away instead:
+    /// the node's own in-progress continuations and channel sends to it.
+    pub messages_dropped_at_crash: u64,
+    /// Held messages that were requeued to their target when it recovered,
+    /// so they were sent to a live node, survived its downtime, and are
+    /// handled by a different incarnation than the one they were sent to.
+    pub crossing_deliveries: u64,
+    pub runs_with_crossing: u64,
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
@@ -309,6 +419,7 @@ pub struct UtilizationSnapshot {
     pub dedup: DedupStats,
     pub feedback: FeedbackStats,
     pub curriculum: CurriculumStats,
+    pub crash_recovery: CrashRecoveryStats,
     pub termination: TerminationStats,
 }
 
@@ -339,6 +450,15 @@ pub fn snapshot() -> UtilizationSnapshot {
             lowered_runs: CURRICULUM_LOWERED_RUNS.load(Ordering::Relaxed),
             crashes_sum: CURRICULUM_CRASHES_SUM.load(Ordering::Relaxed),
             servers_sum: CURRICULUM_SERVERS_SUM.load(Ordering::Relaxed),
+        },
+        crash_recovery: CrashRecoveryStats {
+            runs: CR_RUNS.load(Ordering::Relaxed),
+            crashes: CR_CRASHES.load(Ordering::Relaxed),
+            recovers: CR_RECOVERS.load(Ordering::Relaxed),
+            messages_held_at_crash: CR_HELD_AT_CRASH.load(Ordering::Relaxed),
+            messages_dropped_at_crash: CR_DROPPED_AT_CRASH.load(Ordering::Relaxed),
+            crossing_deliveries: CR_CROSSING_DELIVERIES.load(Ordering::Relaxed),
+            runs_with_crossing: CR_RUNS_WITH_CROSSING.load(Ordering::Relaxed),
         },
         termination: TERMINATION
             .lock()
