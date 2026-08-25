@@ -6,6 +6,7 @@
 //! probe is a single relaxed atomic load.
 
 use serde::Serialize;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -24,6 +25,11 @@ static DEDUP_SKIPPED_LARGE: AtomicU64 = AtomicU64::new(0);
 static FEEDBACK_TIMELINE_SCORE_SUM: AtomicU64 = AtomicU64::new(0);
 static FEEDBACK_CFG_SCORE_SUM: AtomicU64 = AtomicU64::new(0);
 static FEEDBACK_SCORED_RUNS: AtomicU64 = AtomicU64::new(0);
+static CURRICULUM_LOWERED_RUNS: AtomicU64 = AtomicU64::new(0);
+static CURRICULUM_CRASHES_SUM: AtomicU64 = AtomicU64::new(0);
+static CURRICULUM_SERVERS_SUM: AtomicU64 = AtomicU64::new(0);
+
+static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
 
 /// Enable or disable recording for this explorer session. Enabling resets all
 /// counters so repeated sessions in one process don't bleed into each other.
@@ -41,8 +47,14 @@ pub fn set_enabled(on: bool) {
             &FEEDBACK_TIMELINE_SCORE_SUM,
             &FEEDBACK_CFG_SCORE_SUM,
             &FEEDBACK_SCORED_RUNS,
+            &CURRICULUM_LOWERED_RUNS,
+            &CURRICULUM_CRASHES_SUM,
+            &CURRICULUM_SERVERS_SUM,
         ] {
             c.store(0, Ordering::Relaxed);
+        }
+        if let Ok(mut t) = TERMINATION.lock() {
+            *t = TerminationStats::new();
         }
     }
     ENABLED.store(on, Ordering::Relaxed);
@@ -131,6 +143,132 @@ pub fn record_feedback_scores(timeline: Option<f64>, cfg: Option<f64>) {
     }
 }
 
+/// Why a single plan execution stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// Every planned event reached Completed.
+    PlanComplete,
+    /// The per-run step budget ran out while planned events were outstanding.
+    IterationsExhausted,
+    /// No runnable work and no planned event able to become ready.
+    Deadlock,
+}
+
+/// Termination counts and running sums over one bucket of runs. `steps_used`
+/// and the queue depths are summed rather than averaged so buckets can be
+/// merged; divide by `runs` to read a mean.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TerminationTally {
+    pub runs: u64,
+    pub plan_complete: u64,
+    /// Plan finished while messages, timers or delayed sends were still
+    /// queued, so the remaining protocol traffic never ran.
+    pub plan_complete_with_pending_work: u64,
+    pub iterations_exhausted: u64,
+    pub deadlock: u64,
+    pub steps_used_sum: u64,
+    pub step_budget_sum: u64,
+    pub pending_work_at_exit_sum: u64,
+    pub planned_events_outstanding_sum: u64,
+}
+
+impl TerminationTally {
+    const fn new() -> Self {
+        Self {
+            runs: 0,
+            plan_complete: 0,
+            plan_complete_with_pending_work: 0,
+            iterations_exhausted: 0,
+            deadlock: 0,
+            steps_used_sum: 0,
+            step_budget_sum: 0,
+            pending_work_at_exit_sum: 0,
+            planned_events_outstanding_sum: 0,
+        }
+    }
+
+    fn add(&mut self, end: RunEnd, s: &RunTermination) {
+        self.runs += 1;
+        match end {
+            RunEnd::PlanComplete => {
+                self.plan_complete += 1;
+                if s.pending_work_at_exit > 0 {
+                    self.plan_complete_with_pending_work += 1;
+                }
+            }
+            RunEnd::IterationsExhausted => self.iterations_exhausted += 1,
+            RunEnd::Deadlock => self.deadlock += 1,
+        }
+        self.steps_used_sum += s.steps_used;
+        self.step_budget_sum += s.step_budget;
+        self.pending_work_at_exit_sum += s.pending_work_at_exit;
+        self.planned_events_outstanding_sum += s.planned_events_outstanding;
+    }
+}
+
+/// One run's termination facts.
+pub struct RunTermination {
+    pub end: RunEnd,
+    pub steps_used: u64,
+    pub step_budget: u64,
+    /// Runnables still queued (including delayed sends) when the run stopped.
+    pub pending_work_at_exit: u64,
+    pub planned_events_outstanding: u64,
+    /// Distinct nodes that both crashed and recovered during the run. Deep
+    /// fault interleavings need at least two; the bucketed tallies show
+    /// whether those runs stop for a different reason than shallow ones.
+    pub recovered_nodes: usize,
+}
+
+/// Termination tallies over all runs and split by how many distinct nodes
+/// completed a crash-and-recover cycle (index 0, 1, and 2-or-more).
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TerminationStats {
+    pub all: TerminationTally,
+    pub by_recovered_nodes: [TerminationTally; 3],
+}
+
+impl TerminationStats {
+    const fn new() -> Self {
+        Self {
+            all: TerminationTally::new(),
+            by_recovered_nodes: [TerminationTally::new(); 3],
+        }
+    }
+}
+
+/// One plan execution finished. Called once per run, off the scheduling hot
+/// path.
+pub fn record_run_termination(s: &RunTermination) {
+    if !enabled() {
+        return;
+    }
+    let bucket = s.recovered_nodes.min(2);
+    if let Ok(mut t) = TERMINATION.lock() {
+        t.all.add(s.end, s);
+        t.by_recovered_nodes[bucket].add(s.end, s);
+    }
+}
+
+/// The curriculum lowered its knobs into one concrete run config. Zero here
+/// means the curriculum was not on the path that produced these runs.
+#[inline]
+pub fn record_curriculum_lowering(num_crashes: i32, num_servers: i32) {
+    if !enabled() {
+        return;
+    }
+    CURRICULUM_LOWERED_RUNS.fetch_add(1, Ordering::Relaxed);
+    CURRICULUM_CRASHES_SUM.fetch_add(num_crashes.max(0) as u64, Ordering::Relaxed);
+    CURRICULUM_SERVERS_SUM.fetch_add(num_servers.max(0) as u64, Ordering::Relaxed);
+}
+
+#[derive(Serialize)]
+pub struct CurriculumStats {
+    pub lowered_runs: u64,
+    pub crashes_sum: u64,
+    pub servers_sum: u64,
+}
+
 #[derive(Serialize)]
 pub struct SteerStats {
     pub evaluations: u64,
@@ -170,6 +308,8 @@ pub struct UtilizationSnapshot {
     pub aos: AosStats,
     pub dedup: DedupStats,
     pub feedback: FeedbackStats,
+    pub curriculum: CurriculumStats,
+    pub termination: TerminationStats,
 }
 
 pub fn snapshot() -> UtilizationSnapshot {
@@ -195,5 +335,14 @@ pub fn snapshot() -> UtilizationSnapshot {
             cfg_score_sum: f64::from_bits(FEEDBACK_CFG_SCORE_SUM.load(Ordering::Relaxed)),
             scored_runs: FEEDBACK_SCORED_RUNS.load(Ordering::Relaxed),
         },
+        curriculum: CurriculumStats {
+            lowered_runs: CURRICULUM_LOWERED_RUNS.load(Ordering::Relaxed),
+            crashes_sum: CURRICULUM_CRASHES_SUM.load(Ordering::Relaxed),
+            servers_sum: CURRICULUM_SERVERS_SUM.load(Ordering::Relaxed),
+        },
+        termination: TERMINATION
+            .lock()
+            .map(|t| *t)
+            .unwrap_or_else(|p| *p.into_inner()),
     }
 }

@@ -12,6 +12,7 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
+use crate::simulator::util_stats::{self, RunEnd, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
@@ -198,6 +199,32 @@ fn schedule_client_op<H: HashPolicy>(
 pub enum RunOutcome {
     Completed,
     Deadlock { step: i32, pending_ops: usize },
+    /// The step budget ran out with planned events still outstanding.
+    IterationsExhausted { outstanding_events: usize },
+}
+
+/// Record why one plan execution stopped, together with the work that was
+/// still queued at that moment. Observation only.
+fn record_termination<H: HashPolicy>(
+    end: RunEnd,
+    state: &State<H>,
+    engine: &PlanEngine,
+    steps_used: i32,
+    step_budget: i32,
+    recovered_nodes: usize,
+) {
+    if !util_stats::enabled() {
+        return;
+    }
+    let pending = state.total_runnable_count() + state.purgatory.len();
+    util_stats::record_run_termination(&RunTermination {
+        end,
+        steps_used: steps_used.max(0) as u64,
+        step_budget: step_budget.max(0) as u64,
+        pending_work_at_exit: pending as u64,
+        planned_events_outstanding: engine.outstanding_count() as u64,
+        recovered_nodes,
+    });
 }
 
 pub fn exec_plan<H: HashPolicy, F: Feedback>(
@@ -260,6 +287,10 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 
     let mut engine = PlanEngine::new(plan);
 
+    // Nodes observed crashing, and the subset that later recovered.
+    let mut crashed_nodes: HashSet<usize> = HashSet::new();
+    let mut recovered_nodes: HashSet<usize> = HashSet::new();
+
     // Starvation detection: track consecutive no-progress iterations
     let mut no_progress_count: i32 = 0;
     const STARVATION_WARN_THRESHOLD: i32 = 500;
@@ -297,6 +328,14 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     for step in 0..max_iterations {
         if engine.is_complete() {
             info!("Plan {} completed in {} steps", run_id, step);
+            record_termination(
+                RunEnd::PlanComplete,
+                &path_state.state,
+                &engine,
+                step,
+                max_iterations,
+                recovered_nodes.len(),
+            );
             return Ok(RunOutcome::Completed);
         }
 
@@ -319,6 +358,14 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             warn!(
                 "Plan {} deadlocked at step {}: {} client op(s) will never complete",
                 run_id, step, in_progress.len()
+            );
+            record_termination(
+                RunEnd::Deadlock,
+                &path_state.state,
+                &engine,
+                step,
+                max_iterations,
+                recovered_nodes.len(),
             );
             return Ok(RunOutcome::Deadlock {
                 step,
@@ -496,6 +543,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         unique_id: -1,
                         step: path_state.state.crash_info.current_step,
                     });
+                    crashed_nodes.insert(node_id.index);
                     if let Some(plan_node) = pending_crash_recover.remove(&node_id.index) {
                         engine.mark_event_completed(plan_node);
                     }
@@ -509,6 +557,9 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         unique_id: -1,
                         step: path_state.state.crash_info.current_step,
                     });
+                    if crashed_nodes.contains(&node_id.index) {
+                        recovered_nodes.insert(node_id.index);
+                    }
                     if let Some(plan_node) = pending_crash_recover.remove(&node_id.index) {
                         engine.mark_event_completed(plan_node);
                     }
@@ -625,5 +676,15 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         "Hit max iterations ({}) before plan {} completion",
         max_iterations, run_id
     );
-    Ok(RunOutcome::Completed)
+    record_termination(
+        RunEnd::IterationsExhausted,
+        &path_state.state,
+        &engine,
+        max_iterations,
+        max_iterations,
+        recovered_nodes.len(),
+    );
+    Ok(RunOutcome::IterationsExhausted {
+        outstanding_events: engine.outstanding_count(),
+    })
 }

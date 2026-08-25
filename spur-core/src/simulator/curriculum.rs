@@ -199,6 +199,8 @@ pub fn lower(knobs: &Knobs, constraints: &ExplorerConfig, _rng: &mut impl Rng) -
         constraints.within_queue_selector.clone()
     };
 
+    crate::simulator::util_stats::record_curriculum_lowering(num_crashes, num_servers);
+
     SingleRunConfig {
         num_servers,
         num_write_ops,
