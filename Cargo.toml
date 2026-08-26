@@ -3,4 +3,4 @@ members = ["spur-ast", "spur-core", "spur-liquid", "spur-cli", "spur-lsp", "xtas
 resolver = "3"
 
 [profile.release]
-debug = true
+debug = 1
