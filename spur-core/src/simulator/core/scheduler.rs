@@ -61,6 +61,34 @@ fn is_fifo_blocked<H: HashPolicy>(
     false
 }
 
+/// Per-node flag: the node originated a remote message that has not been
+/// delivered yet, counting sends still waiting out a purgatory delay. Indexed
+/// by node index; nodes added after the queues were sized read as false.
+fn nodes_with_in_flight_send<H: HashPolicy>(state: &State<H>) -> Vec<bool> {
+    let mut senders = vec![false; state.local_queues.len()];
+    let mut mark = |r: &Runnable<H>| {
+        let origin = match r {
+            Runnable::Record(rec) if rec.origin_node != rec.node => rec.origin_node.index,
+            Runnable::ChannelSend {
+                origin_node,
+                target,
+                ..
+            } if origin_node != target => origin_node.index,
+            _ => return,
+        };
+        if let Some(slot) = senders.get_mut(origin) {
+            *slot = true;
+        }
+    };
+    for r in &state.network_queue {
+        mark(r);
+    }
+    for (_, r) in &state.purgatory {
+        mark(r);
+    }
+    senders
+}
+
 /// Score a runnable in [0, 1] by combining novelty and priority. For Recover
 /// events targeting a currently-crashed node, `quick_fire_multiplier` increases
 /// the weight of priority relative to novelty while keeping the result in [0, 1].
@@ -239,6 +267,36 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         reservations.iter().any(|res| res.matches(r)) || is_fifo_blocked(r, &link_deliver_seq)
     };
 
+    // Observation-only crash-anchor probe: is there a schedulable crash for a
+    // node whose own message is still in flight, and does the step take it?
+    // The senders vector is kept for the crash arm below so both sides of the
+    // ratio are measured against the same queue contents.
+    let in_flight_senders: Option<Vec<bool>> = if util_stats::enabled() {
+        let crash_nodes: Vec<usize> = state
+            .local_queues
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| {
+                q.iter()
+                    .any(|r| matches!(r, Runnable::Crash { .. }) && !is_ineligible(r))
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        if crash_nodes.is_empty() {
+            util_stats::record_crash_anchor_offer(false, false);
+            None
+        } else {
+            let senders = nodes_with_in_flight_send(state);
+            let anchored = crash_nodes
+                .iter()
+                .any(|&idx| senders.get(idx).copied().unwrap_or(false));
+            util_stats::record_crash_anchor_offer(true, anchored);
+            Some(senders)
+        }
+    } else {
+        None
+    };
+
     // Build QueueInfo, accounting for strict_timers eligibility AND reservations.
     // Subtract reserved items so the QueueSelector doesn't route to queues
     // where all items are reserved (wastes iterations in fully-constrained plans).
@@ -361,6 +419,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
 
     match runnable {
         Runnable::Crash { node_id, .. } => {
+            if let Some(senders) = &in_flight_senders {
+                util_stats::record_crash_anchor_apply(
+                    senders.get(node_id.index).copied().unwrap_or(false),
+                );
+            }
             crash_node(state, node_id);
             Ok(ScheduleResult::Crash { node_id })
         }
