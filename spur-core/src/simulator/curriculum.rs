@@ -186,6 +186,7 @@ pub fn lower(knobs: &Knobs, constraints: &ExplorerConfig, _rng: &mut impl Rng) -
     let queue_policy = QueuePolicyConfig::Probabilistic {
         p_local,
         p_timer: 0.03,
+        timer_weight: constraints.queue_policy.timer_weight(),
     };
 
     // recover band rises with tightness; quick-fire weight rises with tightness.

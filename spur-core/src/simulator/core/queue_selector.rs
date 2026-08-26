@@ -177,8 +177,26 @@ impl QueueSelector for AnySelector {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum QueuePolicyConfig {
-    Probabilistic { p_local: f64, p_timer: f64 },
-    Preemptive { p_timer: f64, preempt_interval: i32 },
+    Probabilistic {
+        p_local: f64,
+        p_timer: f64,
+        /// Multiplier applied to `p_timer`, letting the eagerness of timer
+        /// firing be tuned without restating the rest of the policy. A weight
+        /// of 1.0 uses `p_timer` as written; 0.0 never prefers the timer queue,
+        /// so timers only fire when every other queue is empty.
+        #[serde(default = "default_timer_weight")]
+        timer_weight: f64,
+    },
+    Preemptive {
+        p_timer: f64,
+        preempt_interval: i32,
+        #[serde(default = "default_timer_weight")]
+        timer_weight: f64,
+    },
+}
+
+fn default_timer_weight() -> f64 {
+    1.0
 }
 
 impl Default for QueuePolicyConfig {
@@ -186,30 +204,45 @@ impl Default for QueuePolicyConfig {
         QueuePolicyConfig::Probabilistic {
             p_local: 0.80,
             p_timer: 0.03,
+            timer_weight: default_timer_weight(),
         }
     }
 }
 
 impl QueuePolicyConfig {
+    pub fn timer_weight(&self) -> f64 {
+        match self {
+            QueuePolicyConfig::Probabilistic { timer_weight, .. }
+            | QueuePolicyConfig::Preemptive { timer_weight, .. } => *timer_weight,
+        }
+    }
+
     pub fn to_selector(&self) -> AnySelector {
         match self {
-            QueuePolicyConfig::Probabilistic { p_local, p_timer } => {
-                AnySelector::Probabilistic(ProbabilisticSelector {
-                    p_local: *p_local,
-                    p_timer: *p_timer,
-                })
-            }
+            QueuePolicyConfig::Probabilistic {
+                p_local,
+                p_timer,
+                timer_weight,
+            } => AnySelector::Probabilistic(ProbabilisticSelector {
+                p_local: *p_local,
+                p_timer: weighted_p_timer(*p_timer, *timer_weight),
+            }),
             QueuePolicyConfig::Preemptive {
                 p_timer,
                 preempt_interval,
+                timer_weight,
             } => AnySelector::Preemptive(PreemptiveSelector {
-                p_timer: *p_timer,
+                p_timer: weighted_p_timer(*p_timer, *timer_weight),
                 preempt_interval: *preempt_interval,
                 active_node: None,
                 steps_since_network_pull: 0,
             }),
         }
     }
+}
+
+fn weighted_p_timer(p_timer: f64, timer_weight: f64) -> f64 {
+    (p_timer * timer_weight.max(0.0)).clamp(0.0, 1.0)
 }
 
 /// Within-queue selection method. Decides which runnable, among the eligible
@@ -246,5 +279,73 @@ impl Default for WithinQueueSelector {
         WithinQueueSelector::Tournament {
             k: default_tournament_k(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    fn p_timer_of(selector: &AnySelector) -> f64 {
+        match selector {
+            AnySelector::Probabilistic(s) => s.p_timer,
+            AnySelector::Preemptive(s) => s.p_timer,
+        }
+    }
+
+    #[test]
+    fn omitted_timer_weight_leaves_p_timer_untouched() {
+        let policy: QueuePolicyConfig =
+            serde_json::from_str(r#"{"type":"Probabilistic","p_local":0.8,"p_timer":0.03}"#)
+                .unwrap();
+        assert_eq!(policy.timer_weight(), 1.0);
+        assert!((p_timer_of(&policy.to_selector()) - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn timer_weight_scales_p_timer_and_clamps() {
+        let scaled = QueuePolicyConfig::Probabilistic {
+            p_local: 0.8,
+            p_timer: 0.03,
+            timer_weight: 4.0,
+        };
+        assert!((p_timer_of(&scaled.to_selector()) - 0.12).abs() < 1e-12);
+
+        let zero = QueuePolicyConfig::Preemptive {
+            p_timer: 0.03,
+            preempt_interval: 50,
+            timer_weight: 0.0,
+        };
+        assert_eq!(p_timer_of(&zero.to_selector()), 0.0);
+
+        let over = QueuePolicyConfig::Probabilistic {
+            p_local: 0.8,
+            p_timer: 0.5,
+            timer_weight: 100.0,
+        };
+        assert_eq!(p_timer_of(&over.to_selector()), 1.0);
+    }
+
+    #[test]
+    fn zero_timer_weight_still_fires_a_lone_timer() {
+        let mut selector = QueuePolicyConfig::Probabilistic {
+            p_local: 0.8,
+            p_timer: 0.03,
+            timer_weight: 0.0,
+        }
+        .to_selector();
+        let info = QueueInfo {
+            local_queue_sizes: vec![0, 0, 0],
+            network_queue_size: 0,
+            timer_queue_size: 1,
+            step: 0,
+        };
+        let mut rng = SmallRng::seed_from_u64(7);
+        assert!(matches!(
+            selector.select(&info, &mut rng),
+            Some(QueueSelection::Timer)
+        ));
     }
 }

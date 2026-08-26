@@ -375,6 +375,7 @@ impl SingleRunConfig {
             QueuePolicyConfig::Preemptive {
                 p_timer,
                 preempt_interval,
+                timer_weight: constraints.queue_policy.timer_weight(),
             }
         } else {
             let p_local: f64 = rng.random_range(0.6..=0.95);
@@ -383,7 +384,11 @@ impl SingleRunConfig {
             } else {
                 rng.random_range(0.05..=0.2)
             };
-            QueuePolicyConfig::Probabilistic { p_local, p_timer }
+            QueuePolicyConfig::Probabilistic {
+                p_local,
+                p_timer,
+                timer_weight: constraints.queue_policy.timer_weight(),
+            }
         };
         SingleRunConfig {
             num_servers: rng.random_range(
@@ -465,6 +470,7 @@ impl SingleRunConfig {
                 QueuePolicyConfig::Probabilistic {
                     ref mut p_local,
                     ref mut p_timer,
+                    ..
                 } => {
                     let delta: f64 = rng.random_range(-0.1..=0.1);
                     *p_local = (*p_local + delta).clamp(0.6, 0.95);
@@ -474,6 +480,7 @@ impl SingleRunConfig {
                 QueuePolicyConfig::Preemptive {
                     ref mut p_timer,
                     ref mut preempt_interval,
+                    ..
                 } => {
                     let delta: f64 = rng.random_range(-0.05..=0.05);
                     *p_timer = (*p_timer + delta).clamp(0.005, 0.3);
