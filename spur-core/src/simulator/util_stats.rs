@@ -38,6 +38,10 @@ static CR_HELD_AT_CRASH: AtomicU64 = AtomicU64::new(0);
 static CR_DROPPED_AT_CRASH: AtomicU64 = AtomicU64::new(0);
 static CR_CROSSING_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 static CR_RUNS_WITH_CROSSING: AtomicU64 = AtomicU64::new(0);
+static CA_STEPS_WITH_CRASH_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+static CA_OFFERED: AtomicU64 = AtomicU64::new(0);
+static CA_CRASHES_TAKEN: AtomicU64 = AtomicU64::new(0);
+static CA_APPLIED: AtomicU64 = AtomicU64::new(0);
 
 /// Delivery-effect counters, laid out as (total, acted) pairs. Index 0 is every
 /// delivery, index 1 every delivery that carried at least one bias, and the
@@ -83,6 +87,10 @@ pub fn set_enabled(on: bool) {
             &CR_DROPPED_AT_CRASH,
             &CR_CROSSING_DELIVERIES,
             &CR_RUNS_WITH_CROSSING,
+            &CA_STEPS_WITH_CRASH_ELIGIBLE,
+            &CA_OFFERED,
+            &CA_CRASHES_TAKEN,
+            &CA_APPLIED,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -336,6 +344,36 @@ pub fn record_recover(node_index: usize) {
     }
 }
 
+/// One scheduling step was examined for the crash-after-send condition:
+/// `crash_eligible` means some node had a schedulable crash waiting, and
+/// `anchored` means at least one such node also had a message it sent still
+/// undelivered, so crashing it there would leave that message orphaned.
+#[inline]
+pub fn record_crash_anchor_offer(crash_eligible: bool, anchored: bool) {
+    if !enabled() {
+        return;
+    }
+    if crash_eligible {
+        CA_STEPS_WITH_CRASH_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
+    }
+    if anchored {
+        CA_OFFERED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A crash was executed; `anchored` means the crashing node had a message it
+/// sent still undelivered at that moment.
+#[inline]
+pub fn record_crash_anchor_apply(anchored: bool) {
+    if !enabled() {
+        return;
+    }
+    CA_CRASHES_TAKEN.fetch_add(1, Ordering::Relaxed);
+    if anchored {
+        CA_APPLIED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Why a single plan execution stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunEnd {
@@ -552,6 +590,19 @@ pub struct DeliveryEffectStats {
     pub receiver_restarted: DeliveryEffect,
 }
 
+/// How often a crash could be, and actually was, scheduled at the moment its
+/// node had an undelivered message in the network. `offered` over
+/// `steps_with_crash_eligible` says how often the situation arises at all;
+/// `applied` over `crashes_taken` says how often the scheduler lands on it
+/// without being pushed.
+#[derive(Serialize)]
+pub struct CrashAnchorStats {
+    pub steps_with_crash_eligible: u64,
+    pub offered: u64,
+    pub crashes_taken: u64,
+    pub applied: u64,
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
@@ -563,6 +614,7 @@ pub struct UtilizationSnapshot {
     pub curriculum: CurriculumStats,
     pub crash_recovery: CrashRecoveryStats,
     pub delivery_effects: DeliveryEffectStats,
+    pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
 }
 
@@ -609,6 +661,12 @@ pub fn snapshot() -> UtilizationSnapshot {
             delayed: DeliveryEffect::read(DELIVERY_DELAYED),
             sender_restarted: DeliveryEffect::read(DELIVERY_SENDER_RESTARTED),
             receiver_restarted: DeliveryEffect::read(DELIVERY_RECEIVER_RESTARTED),
+        },
+        crash_anchor: CrashAnchorStats {
+            steps_with_crash_eligible: CA_STEPS_WITH_CRASH_ELIGIBLE.load(Ordering::Relaxed),
+            offered: CA_OFFERED.load(Ordering::Relaxed),
+            crashes_taken: CA_CRASHES_TAKEN.load(Ordering::Relaxed),
+            applied: CA_APPLIED.load(Ordering::Relaxed),
         },
         termination: TERMINATION
             .lock()
