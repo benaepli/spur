@@ -540,6 +540,9 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     }
     state.crash_info.currently_crashed.insert(node_id);
 
+    let mut held: u64 = 0;
+    let mut dropped: u64 = 0;
+
     // 1. Process local queue for crashed node: save external records, drop the rest
     let local = std::mem::take(&mut state.local_queues[node_id.index]);
     for task in local {
@@ -547,10 +550,13 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
             && record.origin_node != record.node {
                 let mut record = record;
                 record.reset();
+                held += 1;
                 state
                     .crash_info
                     .queued_messages
                     .push_back((node_id, record));
+            } else {
+                dropped += 1;
             }
     }
 
@@ -562,15 +568,20 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
                 if r.origin_node != r.node {
                     let mut r = r.clone();
                     r.reset();
+                    held += 1;
                     state.crash_info.queued_messages.push_back((node_id, r));
+                } else {
+                    dropped += 1;
                 }
             }
-            Runnable::ChannelSend { target, .. } if *target == node_id => {}
+            Runnable::ChannelSend { target, .. } if *target == node_id => dropped += 1,
             Runnable::Crash { node_id: nid, .. } | Runnable::Recover { node_id: nid, .. }
                 if *nid == node_id => {}
             _ => state.network_queue.push(task),
         }
     }
+
+    util_stats::record_crash(node_id.index, held, dropped);
 
     // 3. Filter timer queue: remove timers for the crashed node
     let timers = std::mem::take(&mut state.timer_queue);
@@ -601,6 +612,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
         return Ok(());
     }
     state.crash_info.currently_crashed.remove(&node_id);
+    util_stats::record_recover(node_id.index);
     F::note_recovery(feedback, node_id);
 
     state.nodes[node_id.index] = Env::<H>::default();
