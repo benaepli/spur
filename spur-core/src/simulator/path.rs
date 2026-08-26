@@ -12,7 +12,7 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
-use crate::simulator::util_stats::{self, RunEnd, RunTermination};
+use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
@@ -191,6 +191,8 @@ fn schedule_client_op<H: HashPolicy>(
         causal_operation_id: Some(op_id),
         trace_id: None,
         link_seq: None,
+        origin_incarnation: state.incarnation(client_node_id),
+        bias: DeliveryBias::NONE,
     }));
     Ok(())
 }

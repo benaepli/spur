@@ -174,6 +174,14 @@ pub struct ExplorerConfig {
     #[serde(default)]
     pub stats: bool,
 
+    /// Count, per delivered message, whether the receiving handler changed the
+    /// node's state or fell through a guard, split by which perturbation the
+    /// message carried. Reported under `delivery_effects` and only recorded
+    /// when `stats` is on. On by default: it is a pair of counters on a path
+    /// that already clones an environment.
+    #[serde(default = "default_emit_acted_fraction")]
+    pub emit_acted_fraction: bool,
+
     /// Opt-in strict config parsing: when true, a top-level key that no
     /// explorer config field claims is a hard error instead of being silently
     /// ignored. Off by default (today's serde behaviour), so existing configs
@@ -211,6 +219,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "purgatory",
     "feedback",
     "stats",
+    "emit_acted_fraction",
     "strict_config_keys",
 ];
 
@@ -340,6 +349,10 @@ fn default_use_coverage_scheduling() -> bool {
 
 fn default_quick_fire_multiplier() -> f64 {
     5.0
+}
+
+fn default_emit_acted_fraction() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -777,6 +790,7 @@ pub fn run_explorer(
 
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1165,6 +1179,7 @@ pub fn run_explorer_genetic(
 
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1585,6 +1600,7 @@ pub fn run_explorer_aos(
 
     info!("AOS session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     dispatch_feedback!(config.feedback, F => run_explorer_aos_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -2206,6 +2222,7 @@ pub fn run_explorer_continuous(
 
     info!("Continuous session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
+    util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     dispatch_feedback!(config.envelope.feedback, F => run_explorer_continuous_impl::<F>(program, config, output_path, backend, cancelled))
 }
 

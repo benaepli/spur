@@ -5,6 +5,7 @@ use crate::simulator::core::eval::store;
 use crate::simulator::core::partition::{PartitionInfo, PartitionType};
 use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
+use crate::simulator::util_stats::DeliveryBias;
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use rand::Rng;
 use rand_distr::{Beta, Distribution};
@@ -239,6 +240,14 @@ pub struct Record<H: HashPolicy> {
     /// FIFO link tag: `Some((link_id, seq))` if this RPC was sent through a
     /// FIFO link. Delivery is gated on `seq == link_deliver_seq[link_id]`.
     pub link_seq: Option<(LinkId, u32)>,
+    /// Incarnation of `origin_node` at send time. Comparing it against the
+    /// origin's incarnation at delivery says whether the sender restarted in
+    /// between. Observation only.
+    pub origin_incarnation: u32,
+    /// Perturbations this message accumulated on its way to the receiver.
+    /// Observation only, and deliberately excluded from `Hash` so state
+    /// deduplication is unaffected.
+    pub bias: DeliveryBias,
 }
 
 impl<H: HashPolicy> Record<H> {
@@ -478,6 +487,10 @@ pub struct State<H: HashPolicy> {
     // created them; a `State` is never cloned or snapshotted, so plain `Vec`s
     // are the right representation.
     pub nodes: Vec<Env<H>>, // Index is node_id.index
+    /// How many times each node has come back from a crash, indexed like
+    /// `nodes`. Observation only: excluded from `signature()` so it cannot
+    /// change deduplication or scheduling.
+    pub incarnations: Vec<u32>,
     pub local_queues: Vec<Vec<Runnable<H>>>,
     pub network_queue: Vec<Runnable<H>>,
     pub timer_queue: Vec<Runnable<H>>,
@@ -525,6 +538,7 @@ impl<H: HashPolicy> State<H> {
         let num_nodes = nodes.len();
         Self {
             nodes,
+            incarnations: vec![0; num_nodes],
             local_queues: (0..num_nodes).map(|_| Vec::new()).collect(),
             network_queue: Vec::new(),
             timer_queue: Vec::new(),
@@ -561,8 +575,23 @@ impl<H: HashPolicy> State<H> {
         let mut env = Env::<H>::with_slots(node_slot_count);
         env.set(0, Value::<H>::node(node_id)); // Slot 0 = self
         self.nodes.push(env);
+        self.incarnations.push(0);
         self.local_queues.push(Vec::new());
         node_id
+    }
+
+    /// How many times `node` has recovered from a crash so far.
+    #[inline]
+    pub fn incarnation(&self, node: NodeId) -> u32 {
+        self.incarnations.get(node.index).copied().unwrap_or(0)
+    }
+
+    /// A value that changes whenever `node`'s persistent state is written.
+    /// Slot storage is copy-on-write and the caller's copy is shared with this
+    /// one, so the first write after a read moves the allocation.
+    #[inline]
+    pub fn node_state_token(&self, node: NodeId) -> *const Value<H> {
+        self.nodes[node.index].slots.as_ptr()
     }
 
     pub fn alloc_channel_id(&mut self) -> usize {

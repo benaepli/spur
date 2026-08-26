@@ -94,6 +94,8 @@ fn make_record_with_cont(
         causal_operation_id: None,
         trace_id: None,
         link_seq: None,
+        origin_incarnation: 0,
+        bias: crate::simulator::util_stats::DeliveryBias::NONE,
     }
 }
 

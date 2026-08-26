@@ -11,6 +11,7 @@ use rand::Rng;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::util_stats;
+use crate::simulator::util_stats::DeliveryBias;
 
 pub fn exec_sync_on_node<H: HashPolicy, L: Logger, F: Feedback>(
     state: &mut State<H>,
@@ -160,7 +161,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     (lid, next)
                 });
 
-                let new_record = Record {
+                let mut new_record = Record {
                     pc: func_info.entry,
                     node: target_node,
                     origin_node: node_id,
@@ -172,6 +173,8 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     causal_operation_id,
                     trace_id: pending_trace_id.take(),
                     link_seq,
+                    origin_incarnation: state.incarnation(node_id),
+                    bias: DeliveryBias::NONE,
                 };
 
                 if purgatory_config.delay_probability > 0.0
@@ -187,6 +190,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     };
                     let release_step = state.crash_info.current_step + duration;
                     util_stats::record_purgatory_delay();
+                    new_record.bias.insert(DeliveryBias::DELAYED);
                     state.delay_runnable(release_step, Runnable::Record(new_record));
                 } else {
                     state.push_runnable(Runnable::Record(new_record));
