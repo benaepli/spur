@@ -127,6 +127,11 @@ pub struct FeedbackConfig {
     /// Only meaningful for `Timeline`/`Both`.
     #[serde(default)]
     pub timeline_key_granularity: TimelineKeyGranularity,
+    /// Standardize the novelty term and the priority term against their running
+    /// session scale before combining them in the within-queue score, instead of
+    /// combining the raw values with fixed coefficients.
+    #[serde(default)]
+    pub normalize_scores: bool,
 }
 
 impl FeedbackConfig {

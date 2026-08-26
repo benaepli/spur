@@ -20,6 +20,7 @@ use crate::simulator::rng::{
     LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, WORKLOAD_SALT,
     derive_seed, mutate_tape,
 };
+use crate::simulator::score_norm::ScoreNorm;
 use crate::simulator::util_stats;
 use crossbeam::channel;
 use log::{debug, error, info, warn};
@@ -361,6 +362,7 @@ pub struct SingleRunConfig {
     pub quick_fire_multiplier: f64,
     pub purgatory: PurgatoryConfig,
     pub timeline_key_granularity: TimelineKeyGranularity,
+    pub normalize_scores: bool,
 }
 
 impl SingleRunConfig {
@@ -422,6 +424,7 @@ impl SingleRunConfig {
             quick_fire_multiplier: constraints.quick_fire_multiplier,
             purgatory: constraints.purgatory.clone(),
             timeline_key_granularity: constraints.feedback.timeline_key_granularity,
+            normalize_scores: constraints.feedback.normalize_scores,
         }
     }
 
@@ -630,6 +633,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     seed_tape: Option<Recording>,
 ) -> Result<RunResult, Box<dyn Error>> {
     let snapshot = F::snapshot(&global_state.feedback);
+    let score_norm = ScoreNorm::new(config.normalize_scores, &global_state.score_norm);
     let gen_config = GeneratorConfig {
         num_servers: config.num_servers,
         num_write_ops: config.num_write_ops,
@@ -721,6 +725,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &config.queue_policy,
         &config.within_queue_selector,
         config.quick_fire_multiplier,
+        &score_norm,
         &config.purgatory,
         &mut rec,
     )?;
@@ -740,6 +745,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     let recording = S::into_recording(tape);
 
     F::merge(&global_state.feedback, &path_state.feedback);
+    score_norm.merge_into(&global_state.score_norm);
 
     let serialized = serialize_history(&path_state.history);
     let serialized_logs = serialize_logs(&path_state.logs.entries);
@@ -863,6 +869,7 @@ fn run_explorer_impl<F: Feedback>(
                                                 timeline_key_granularity: config
                                                     .feedback
                                                     .timeline_key_granularity,
+                                                normalize_scores: config.feedback.normalize_scores,
                                             };
 
                                             info!("{}", "=".repeat(70));
@@ -962,8 +969,10 @@ fn run_single_plan<F: Feedback>(
     purgatory_config: &PurgatoryConfig,
     weights: &CoverageConfig,
     key_granularity: TimelineKeyGranularity,
+    normalize_scores: bool,
 ) -> Result<f64, Box<dyn Error>> {
     let snapshot = F::snapshot(&global_state.feedback);
+    let score_norm = ScoreNorm::new(normalize_scores, &global_state.score_norm);
     let num_servers_usize = num_servers as usize;
 
     let server_role = program
@@ -1029,6 +1038,7 @@ fn run_single_plan<F: Feedback>(
         queue_policy,
         within_queue,
         quick_fire_multiplier,
+        &score_norm,
         purgatory_config,
         &mut rng,
     )?;
@@ -1042,6 +1052,7 @@ fn run_single_plan<F: Feedback>(
 
     let plan_score = F::plan_score(&path_state.feedback, &snapshot, weights);
     F::merge(&global_state.feedback, &path_state.feedback);
+    score_norm.merge_into(&global_state.score_norm);
 
     let serialized = serialize_history(&path_state.history);
     let serialized_logs = serialize_logs(&path_state.logs.entries);
@@ -1121,6 +1132,7 @@ fn run_plan_impl<F: Feedback>(
             &config.purgatory,
             &weights,
             config.feedback.timeline_key_granularity,
+            config.feedback.normalize_scores,
         ) {
             Ok(_) => {
                 debug!(

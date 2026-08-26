@@ -1,5 +1,6 @@
 use crate::compiler::cfg::Vertex;
 use crate::simulator::feedback::Feedback;
+use crate::simulator::score_norm::GlobalScoreNorm;
 use dashmap::DashMap;
 use imbl::HashMap as ImMap;
 use imbl::shared_ptr::ArcK;
@@ -241,9 +242,11 @@ impl GlobalCoverage {
 /// Global feedback state shared across all simulation runs.
 ///
 /// Generic over the feedback strategy `F`: the per-session feedback store lives
-/// in `feedback`.
+/// in `feedback`. `score_norm` carries the session-wide scale of the scheduler's
+/// scoring terms and is independent of the feedback strategy.
 pub struct GlobalState<F: Feedback> {
     pub feedback: F::Global,
+    pub score_norm: GlobalScoreNorm,
 }
 
 impl<F: Feedback> Default for GlobalState<F> {
@@ -262,6 +265,7 @@ impl<F: Feedback> GlobalState<F> {
     pub fn new() -> Self {
         Self {
             feedback: F::Global::default(),
+            score_norm: GlobalScoreNorm::default(),
         }
     }
 }

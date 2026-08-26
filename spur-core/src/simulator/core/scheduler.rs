@@ -16,6 +16,7 @@ use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
+use crate::simulator::score_norm::ScoreNorm;
 use crate::simulator::util_stats;
 use imbl::OrdSet;
 use log::warn;
@@ -63,17 +64,36 @@ fn is_fifo_blocked<H: HashPolicy>(
 /// Score a runnable in [0, 1] by combining novelty and priority. For Recover
 /// events targeting a currently-crashed node, `quick_fire_multiplier` increases
 /// the weight of priority relative to novelty while keeping the result in [0, 1].
+///
+/// When `score_norm` is enabled, the two terms are standardized against their
+/// running session scale before being combined, and `observe` decides whether
+/// this call also feeds that scale. Callers that only inspect a score (rather
+/// than acting on it) must pass `observe = false` so the estimate does not
+/// depend on whether the inspection is compiled in.
 fn score_runnable<H: HashPolicy, F: Feedback>(
     r: &Runnable<H>,
     feedback: &F::Local,
     snapshot: &F::Snapshot,
     currently_crashed: &OrdSet<NodeId>,
     quick_fire_multiplier: f64,
+    score_norm: &ScoreNorm,
+    observe: bool,
 ) -> f64 {
     let novelty = F::runnable_novelty(feedback, r, snapshot);
     let priority = r.priority();
     let is_quick_fire =
         matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
+    if score_norm.enabled() {
+        if observe {
+            score_norm.observe(novelty, priority);
+        }
+        let priority_weight = if is_quick_fire {
+            quick_fire_multiplier.max(1.0)
+        } else {
+            1.0
+        };
+        return score_norm.combine(novelty, priority, priority_weight);
+    }
     if is_quick_fire {
         let w = 0.75 * quick_fire_multiplier;
         (0.25 * novelty + w * priority) / (0.25 + w)
@@ -106,6 +126,7 @@ fn priority_component<H: HashPolicy>(
 /// (near-greedy for typical k). `Proportional` uses Efraimidis-Spirakis weighted
 /// reservoir sampling with weight `score^exponent`, giving exact proportional
 /// selection in a single O(eligible) pass.
+#[allow(clippy::too_many_arguments)]
 fn select_within_queue<H: HashPolicy, F: Feedback>(
     queue: &[Runnable<H>],
     eligible: &[usize],
@@ -113,6 +134,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     snapshot: &F::Snapshot,
     currently_crashed: &OrdSet<NodeId>,
     quick_fire_multiplier: f64,
+    score_norm: &ScoreNorm,
     selector: &WithinQueueSelector,
     rng: &mut impl Rng,
 ) -> usize {
@@ -136,6 +158,8 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                 snapshot,
                 currently_crashed,
                 quick_fire_multiplier,
+                score_norm,
+                false,
             );
             let prio = priority_component(&queue[i], currently_crashed, quick_fire_multiplier);
             if blend > best_blend {
@@ -160,6 +184,8 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                 snapshot,
                 currently_crashed,
                 quick_fire_multiplier,
+                score_norm,
+                true,
             );
             for _ in 1..k.min(eligible.len()) {
                 let i = eligible[rng.random_range(0..eligible.len())];
@@ -169,6 +195,8 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                     snapshot,
                     currently_crashed,
                     quick_fire_multiplier,
+                    score_norm,
+                    true,
                 );
                 if s > best_score {
                     best_idx = i;
@@ -194,6 +222,8 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                     snapshot,
                     currently_crashed,
                     quick_fire_multiplier,
+                    score_norm,
+                    true,
                 );
                 let weight = s.powf(*exponent).max(1e-9);
                 let u: f64 = rng.random();
@@ -223,6 +253,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     selector: &mut Q,
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
+    score_norm: &ScoreNorm,
     purgatory_config: &PurgatoryConfig,
     reservations: &[Reservation],
     rng: &mut impl Rng,
@@ -294,6 +325,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
+                score_norm,
                 within_queue,
                 rng,
             );
@@ -314,6 +346,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
+                score_norm,
                 within_queue,
                 rng,
             );
@@ -351,6 +384,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 snapshot,
                 &state.crash_info.currently_crashed,
                 quick_fire_multiplier,
+                score_norm,
                 within_queue,
                 rng,
             );
@@ -800,6 +834,7 @@ mod tests {
                 &(),
                 &crashed,
                 1.0,
+                &ScoreNorm::disabled(),
                 &selector,
                 &mut rng,
             );
@@ -843,6 +878,7 @@ mod tests {
                 &(),
                 &crashed,
                 1.0,
+                &ScoreNorm::disabled(),
                 &selector,
                 &mut rng,
             );
@@ -879,6 +915,7 @@ mod tests {
                 &(),
                 &crashed,
                 1.0,
+                &ScoreNorm::disabled(),
                 &selector,
                 &mut rng,
             );
@@ -910,6 +947,7 @@ mod tests {
                 &(),
                 &crashed,
                 1.0,
+                &ScoreNorm::disabled(),
                 selector,
                 &mut rng,
             );

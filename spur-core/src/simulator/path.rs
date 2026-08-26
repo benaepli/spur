@@ -12,6 +12,7 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
+use crate::simulator::score_norm::ScoreNorm;
 use crate::simulator::util_stats::{self, RunEnd, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
@@ -241,6 +242,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     queue_policy: &QueuePolicyConfig,
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
+    score_norm: &ScoreNorm,
     purgatory_config: &PurgatoryConfig,
     rng: &mut impl Rng,
 ) -> Result<RunOutcome, RuntimeError> {
@@ -513,6 +515,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 &mut selector,
                 within_queue,
                 quick_fire_multiplier,
+                score_norm,
                 purgatory_config,
                 &reservations,
                 rng,
