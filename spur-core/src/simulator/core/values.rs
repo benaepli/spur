@@ -526,6 +526,12 @@ type Slots<H> = EcoVec<Value<H>>;
 pub struct Env<H: HashPolicy> {
     pub slots: Slots<H>,
     pub sig: u64,
+    /// Counts calls to `set`, so a caller can tell whether this env was
+    /// written between two observations. Monotone and never reset, so wrap
+    /// is the only way two observations can collide. Observation only:
+    /// excluded from `Hash` and from `sig`, so deduplication and scheduling
+    /// cannot see it.
+    pub writes: u64,
     _marker: PhantomData<H>,
 }
 
@@ -540,6 +546,7 @@ impl<H: HashPolicy> Default for Env<H> {
         Self {
             slots: Slots::new(),
             sig: 0,
+            writes: 0,
             _marker: PhantomData,
         }
     }
@@ -562,6 +569,7 @@ impl<H: HashPolicy> Env<H> {
         Self {
             slots,
             sig,
+            writes: 0,
             _marker: PhantomData,
         }
     }
@@ -573,6 +581,7 @@ impl<H: HashPolicy> Env<H> {
 
     #[inline(always)]
     pub fn set(&mut self, slot: u32, value: Value<H>) {
+        self.writes = self.writes.wrapping_add(1);
         let idx = slot as usize;
         if idx >= self.slots.len() {
             // Extending requires recomputing signature
@@ -738,5 +747,45 @@ mod tests {
                  prop_assert_ne!(env1.sig, env2.sig);
              }
         }
+    }
+}
+
+#[cfg(test)]
+mod acted_token_tests {
+    use super::*;
+    use crate::simulator::hash_utils::WithHashing;
+
+    #[test]
+    fn write_counter_moves_only_on_write() {
+        let mut env = Env::<WithHashing>::with_slots(4);
+        let before = env.writes;
+        let _ = env.get(0);
+        assert_eq!(env.writes, before, "reads must not count as writes");
+        env.set(1, Value::<WithHashing>::unit());
+        assert_ne!(env.writes, before, "a write must move the token");
+    }
+
+    #[test]
+    fn write_counter_catches_what_a_slots_pointer_misses() {
+        // An unshared env mutates in place, so the slots pointer is unchanged
+        // across a real write. Anything comparing pointers to decide whether a
+        // node was written reports "not written" for this case.
+        let mut env = Env::<WithHashing>::with_slots(4);
+        let ptr_before = env.slots.as_ptr();
+        let writes_before = env.writes;
+        env.set(2, Value::<WithHashing>::unit());
+        assert_eq!(env.slots.as_ptr(), ptr_before, "in-place write, same buffer");
+        assert_ne!(env.writes, writes_before, "the counter must still move");
+    }
+
+    #[test]
+    fn same_value_rewrite_still_counts() {
+        // The counter reports that a write happened, not that the value
+        // differs; callers that need value equality must compare values.
+        let mut env = Env::<WithHashing>::with_slots(2);
+        env.set(0, Value::<WithHashing>::unit());
+        let after_first = env.writes;
+        env.set(0, Value::<WithHashing>::unit());
+        assert_eq!(env.writes, after_first + 1);
     }
 }

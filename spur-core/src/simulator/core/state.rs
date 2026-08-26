@@ -590,8 +590,12 @@ impl<H: HashPolicy> State<H> {
     /// Slot storage is copy-on-write and the caller's copy is shared with this
     /// one, so the first write after a read moves the allocation.
     #[inline]
-    pub fn node_state_token(&self, node: NodeId) -> *const Value<H> {
-        self.nodes[node.index].slots.as_ptr()
+    /// Observation handle for "was this node written". Compare two values
+    /// taken around a step: unequal means the node's env was written. A raw
+    /// slots pointer cannot answer this, since `EcoVec` shares its buffer
+    /// across clones and reallocates only when copy-on-write fires.
+    pub fn node_state_token(&self, node: NodeId) -> u64 {
+        self.nodes[node.index].writes
     }
 
     pub fn alloc_channel_id(&mut self) -> usize {
