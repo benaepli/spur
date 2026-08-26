@@ -16,6 +16,7 @@ use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
+use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats;
 use crate::simulator::util_stats::DeliveryBias;
 use imbl::OrdSet;
@@ -143,11 +144,12 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     currently_crashed: &OrdSet<NodeId>,
     quick_fire_multiplier: f64,
     selector: &WithinQueueSelector,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> usize {
     if eligible.len() <= 1 {
         return eligible[0];
     }
+    rng.use_stream(Stream::WithinQueue);
 
     // Observation-only utilization probe: would the greedy pick change if the
     // novelty/steer term were dropped? Compares the blended-score argmax with
@@ -254,7 +256,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
     reservations: &[Reservation],
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     if state.all_queues_empty() {
         return Ok(ScheduleResult::None);
@@ -332,6 +334,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         step: state.crash_info.current_step,
     };
 
+    rng.use_stream(Stream::QueueChoice);
     let selection = match selector.select(&info, rng) {
         Some(s) => s,
         None => return Ok(ScheduleResult::None),
@@ -686,7 +689,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
     if !state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is not crashed", node_id);
@@ -738,7 +741,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
     use crate::compiler::cfg::{SELF_SLOT, VarSlot};
 
@@ -799,7 +802,7 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
     let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
         return Ok(());

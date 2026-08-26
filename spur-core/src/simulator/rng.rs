@@ -11,13 +11,132 @@
 //! schedule, and mutating a few entries (`mutate_tape`) yields a
 //! similar-but-distinct, always-feasible schedule, since the scheduler still
 //! ranges each draw over the live enabled set.
+//!
+//! `StreamSet` supplies the raw values behind that tape. It can hold one
+//! generator for all decisions, or one per `Stream`, in which case a decision
+//! kind that consumes a different number of draws leaves the values every
+//! other kind sees untouched at a fixed seed.
 
 use rand::RngCore;
+use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use std::sync::Arc;
 
 /// A schedule recording: the sequence of `u64` draws consumed by the scheduler.
 pub type Recording = Arc<[u64]>;
+
+/// The kind of decision a scheduler draw belongs to.
+///
+/// When `StreamSet` is built with isolation on, each kind draws from its own
+/// generator, so adding or removing a draw in one kind cannot shift the values
+/// any other kind sees at a fixed seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// Which queue the next step is taken from.
+    QueueChoice,
+    /// Which item inside the chosen queue runs.
+    WithinQueue,
+    /// Base priority of a newly created message or continuation.
+    MessagePriority,
+    /// Base priority of a newly armed timer.
+    TimerPriority,
+    /// Base priority of a crash or recover event.
+    FaultPriority,
+    /// Base priority of a partition or heal event.
+    PartitionPriority,
+    /// Whether a remote send is held back, and for how long.
+    SendDelay,
+}
+
+impl Stream {
+    pub const COUNT: usize = 7;
+
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            Stream::QueueChoice => 0,
+            Stream::WithinQueue => 1,
+            Stream::MessagePriority => 2,
+            Stream::TimerPriority => 3,
+            Stream::FaultPriority => 4,
+            Stream::PartitionPriority => 5,
+            Stream::SendDelay => 6,
+        }
+    }
+}
+
+/// The raw generators behind one run's scheduling draws.
+///
+/// With isolation off there is a single generator and stream selection is
+/// ignored, which is the shared-stream draw order. With isolation on there is
+/// one generator per `Stream`, each seeded from the run seed through a distinct
+/// salt, and `use_stream` decides which one the next draw comes from.
+pub struct StreamSet {
+    gens: Box<[SmallRng]>,
+    active: usize,
+    isolated: bool,
+}
+
+impl StreamSet {
+    pub fn new(seed: u64, isolated: bool) -> Self {
+        let gens: Box<[SmallRng]> = if isolated {
+            (0..Stream::COUNT)
+                .map(|i| SmallRng::seed_from_u64(derive_seed(seed, i as i64, STREAM_SALT)))
+                .collect()
+        } else {
+            Box::new([SmallRng::seed_from_u64(seed)])
+        };
+        Self {
+            gens,
+            active: 0,
+            isolated,
+        }
+    }
+
+    #[inline]
+    fn select(&mut self, stream: Stream) {
+        if self.isolated {
+            self.active = stream.index();
+        }
+    }
+
+    #[inline]
+    fn current(&mut self) -> &mut SmallRng {
+        &mut self.gens[self.active]
+    }
+}
+
+impl RngCore for StreamSet {
+    #[inline]
+    fn next_u32(&mut self) -> u32 {
+        self.current().next_u32()
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        self.current().next_u64()
+    }
+    #[inline]
+    fn fill_bytes(&mut self, dst: &mut [u8]) {
+        self.current().fill_bytes(dst)
+    }
+}
+
+/// A random source that can route draws to a named substream. Sources without
+/// substreams accept the routing and ignore it, so the same scheduling code
+/// runs against a plain generator in tests.
+pub trait StreamRng: RngCore {
+    #[inline]
+    fn use_stream(&mut self, _stream: Stream) {}
+}
+
+impl StreamRng for SmallRng {}
+impl StreamRng for rand::rngs::StdRng {}
+impl StreamRng for StreamSet {
+    #[inline]
+    fn use_stream(&mut self, stream: Stream) {
+        self.select(stream);
+    }
+}
 
 /// Compile-time RNG strategy. Default `into_recording` returns `None` so that
 /// `LiveRng` collapses to nothing.
@@ -30,7 +149,7 @@ pub trait RngSource: 'static + Send {
     /// Build a fresh tape, optionally seeded from a recording to replay.
     fn new_tape(seed: Option<Recording>) -> Self::Tape;
     /// Draw the next `u64`.
-    fn next_u64(tape: &mut Self::Tape, inner: &mut SmallRng) -> u64;
+    fn next_u64(tape: &mut Self::Tape, inner: &mut StreamSet) -> u64;
     /// Extract the complete recording, if this strategy produces one.
     fn into_recording(_tape: Self::Tape) -> Option<Recording> {
         None
@@ -41,7 +160,14 @@ pub trait RngSource: 'static + Send {
 /// call site is unchanged. Borrows the tape and inner RNG for one run.
 pub struct RecRng<'a, S: RngSource> {
     pub tape: &'a mut S::Tape,
-    pub inner: &'a mut SmallRng,
+    pub inner: &'a mut StreamSet,
+}
+
+impl<S: RngSource> StreamRng for RecRng<'_, S> {
+    #[inline]
+    fn use_stream(&mut self, stream: Stream) {
+        self.inner.select(stream);
+    }
 }
 
 impl<S: RngSource> RngCore for RecRng<'_, S> {
@@ -73,7 +199,7 @@ impl RngSource for LiveRng {
     #[inline]
     fn new_tape(_seed: Option<Recording>) -> Self::Tape {}
     #[inline]
-    fn next_u64(_tape: &mut (), inner: &mut SmallRng) -> u64 {
+    fn next_u64(_tape: &mut (), inner: &mut StreamSet) -> u64 {
         inner.next_u64()
     }
 }
@@ -90,7 +216,7 @@ impl RngSource for RecordRng {
         Vec::new()
     }
     #[inline]
-    fn next_u64(tape: &mut Vec<u64>, inner: &mut SmallRng) -> u64 {
+    fn next_u64(tape: &mut Vec<u64>, inner: &mut StreamSet) -> u64 {
         let v = inner.next_u64();
         tape.push(v);
         v
@@ -126,7 +252,7 @@ impl RngSource for ReplayRng {
         }
     }
     #[inline]
-    fn next_u64(tape: &mut ReplayTape, inner: &mut SmallRng) -> u64 {
+    fn next_u64(tape: &mut ReplayTape, inner: &mut StreamSet) -> u64 {
         let v = if tape.pos < tape.src.len() {
             let v = tape.src[tape.pos];
             tape.pos += 1;
@@ -176,6 +302,8 @@ pub fn derive_seed(session_seed: u64, run_id: i64, salt: u64) -> u64 {
 /// Domain salts for `derive_seed`.
 pub const WORKLOAD_SALT: u64 = 0x_5742_4C4F_4144_5345; // "WBLOADSE"
 pub const SCHEDULE_SALT: u64 = 0x_5343_4845_4453_4C45; // "SCHEDSLE"
+/// Salt separating the per-decision substreams of one run's schedule seed.
+pub const STREAM_SALT: u64 = 0x_5354_5245_414D_5342; // "STREAMSB"
 
 #[cfg(test)]
 mod tests {
@@ -185,7 +313,7 @@ mod tests {
     #[test]
     fn record_then_replay_reproduces_stream() {
         // Record a stream of draws.
-        let mut inner = SmallRng::seed_from_u64(7);
+        let mut inner = StreamSet::new(7, false);
         let mut tape = RecordRng::new_tape(None);
         let recorded: Vec<u64> = {
             let mut rec = RecRng::<RecordRng> {
@@ -197,7 +325,7 @@ mod tests {
         let recording = RecordRng::into_recording(tape).unwrap();
 
         // Replay it; the source seed is irrelevant while the tape covers draws.
-        let mut inner2 = SmallRng::seed_from_u64(999);
+        let mut inner2 = StreamSet::new(999, false);
         let mut rtape = ReplayRng::new_tape(Some(recording.clone()));
         let replayed: Vec<u64> = {
             let mut rep = RecRng::<ReplayRng> {
@@ -216,7 +344,7 @@ mod tests {
         // A 4-entry source, but we draw 10 times: the tail comes from `inner`
         // and must be captured so the produced recording is self-contained.
         let src: Recording = vec![1, 2, 3, 4].into();
-        let mut inner = SmallRng::seed_from_u64(3);
+        let mut inner = StreamSet::new(3, false);
         let mut rtape = ReplayRng::new_tape(Some(src));
         let first: Vec<u64> = {
             let mut rep = RecRng::<ReplayRng> {
@@ -231,7 +359,7 @@ mod tests {
 
         // Re-replaying the complete tape reproduces the full stream with no
         // dependence on the fallback seed.
-        let mut inner2 = SmallRng::seed_from_u64(123);
+        let mut inner2 = StreamSet::new(123, false);
         let mut rtape2 = ReplayRng::new_tape(Some(complete));
         let second: Vec<u64> = {
             let mut rep = RecRng::<ReplayRng> {
@@ -251,6 +379,73 @@ mod tests {
         assert_eq!(m.len(), r.len());
         let diffs = r.iter().zip(m.iter()).filter(|(a, b)| a != b).count();
         assert!(diffs <= 1, "k=1 mutation changed {} positions", diffs);
+    }
+
+    /// Draw `queue_draws` values from `QueueChoice`, having first consumed
+    /// `filler` values from `WithinQueue`.
+    fn queue_values(seed: u64, isolated: bool, filler: usize, queue_draws: usize) -> Vec<u64> {
+        let mut set = StreamSet::new(seed, isolated);
+        set.use_stream(Stream::WithinQueue);
+        for _ in 0..filler {
+            set.next_u64();
+        }
+        set.use_stream(Stream::QueueChoice);
+        (0..queue_draws).map(|_| set.next_u64()).collect()
+    }
+
+    #[test]
+    fn isolated_streams_are_immune_to_draws_elsewhere() {
+        // The exact-equality oracle: a change that only alters how many values
+        // one decision kind consumes must leave the others bit-identical.
+        assert_eq!(
+            queue_values(11, true, 0, 8),
+            queue_values(11, true, 5, 8),
+            "isolated QueueChoice shifted when WithinQueue consumed more"
+        );
+    }
+
+    #[test]
+    fn shared_stream_is_perturbed_by_draws_elsewhere() {
+        assert_ne!(
+            queue_values(11, false, 0, 8),
+            queue_values(11, false, 5, 8),
+            "shared stream must stay sensitive to draw counts"
+        );
+    }
+
+    #[test]
+    fn isolation_off_ignores_stream_selection() {
+        let mut selected = StreamSet::new(4, false);
+        let plain = {
+            let mut set = StreamSet::new(4, false);
+            (0..8).map(|_| set.next_u64()).collect::<Vec<_>>()
+        };
+        let streams = [
+            Stream::QueueChoice,
+            Stream::WithinQueue,
+            Stream::MessagePriority,
+            Stream::TimerPriority,
+            Stream::FaultPriority,
+            Stream::PartitionPriority,
+            Stream::SendDelay,
+        ];
+        let mixed: Vec<u64> = (0..8)
+            .map(|i| {
+                selected.use_stream(streams[i % streams.len()]);
+                selected.next_u64()
+            })
+            .collect();
+        assert_eq!(plain, mixed);
+    }
+
+    #[test]
+    fn distinct_streams_do_not_share_values() {
+        let mut set = StreamSet::new(2, true);
+        set.use_stream(Stream::QueueChoice);
+        let a = set.next_u64();
+        set.use_stream(Stream::SendDelay);
+        let b = set.next_u64();
+        assert_ne!(a, b);
     }
 
     #[test]

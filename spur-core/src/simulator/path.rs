@@ -12,11 +12,11 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
+use crate::simulator::rng::StreamRng;
 use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
-use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub mod generator;
@@ -117,7 +117,7 @@ fn schedule_client_op<H: HashPolicy>(
     client_node_id: NodeId,
     server_role: NameId,
     policy: &SchedulePolicy,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
     let client_id = client_node_id.index as i32;
     let (op_name, actuals) = match op_spec {
@@ -244,7 +244,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     within_queue: &WithinQueueSelector,
     quick_fire_multiplier: f64,
     purgatory_config: &PurgatoryConfig,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
     let mut selector = queue_policy.to_selector();
