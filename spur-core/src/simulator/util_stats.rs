@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static ACTED_ENABLED: AtomicBool = AtomicBool::new(true);
 
 static STEER_EVALUATIONS: AtomicU64 = AtomicU64::new(0);
 static STEER_DIVERGENT_PICKS: AtomicU64 = AtomicU64::new(0);
@@ -37,6 +38,22 @@ static CR_HELD_AT_CRASH: AtomicU64 = AtomicU64::new(0);
 static CR_DROPPED_AT_CRASH: AtomicU64 = AtomicU64::new(0);
 static CR_CROSSING_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 static CR_RUNS_WITH_CROSSING: AtomicU64 = AtomicU64::new(0);
+
+/// Delivery-effect counters, laid out as (total, acted) pairs. Index 0 is every
+/// delivery, index 1 every delivery that carried at least one bias, and the
+/// remaining indices split that by which bias the message carried (a message
+/// can carry more than one, so those three do not sum to index 1).
+const DELIVERY_ALL: usize = 0;
+const DELIVERY_BIASED: usize = 1;
+const DELIVERY_DELAYED: usize = 2;
+const DELIVERY_SENDER_RESTARTED: usize = 3;
+const DELIVERY_RECEIVER_RESTARTED: usize = 4;
+const DELIVERY_BUCKETS: usize = 5;
+
+static DELIVERIES: [AtomicU64; DELIVERY_BUCKETS] =
+    [const { AtomicU64::new(0) }; DELIVERY_BUCKETS];
+static DELIVERIES_ACTED: [AtomicU64; DELIVERY_BUCKETS] =
+    [const { AtomicU64::new(0) }; DELIVERY_BUCKETS];
 
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
 
@@ -69,6 +86,9 @@ pub fn set_enabled(on: bool) {
         ] {
             c.store(0, Ordering::Relaxed);
         }
+        for c in DELIVERIES.iter().chain(DELIVERIES_ACTED.iter()) {
+            c.store(0, Ordering::Relaxed);
+        }
         if let Ok(mut t) = TERMINATION.lock() {
             *t = TerminationStats::new();
         }
@@ -81,6 +101,90 @@ pub fn set_enabled(on: bool) {
 #[inline]
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the delivery-effect counters for this session. They also
+/// require `set_enabled(true)`; this switch exists so the per-delivery probe
+/// can be turned off on its own.
+pub fn set_acted_fraction_enabled(on: bool) {
+    ACTED_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a delivery's effect should be measured. Callers must check this
+/// before doing the before/after comparison the measurement needs.
+#[inline]
+pub fn acted_fraction_enabled() -> bool {
+    enabled() && ACTED_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Which scheduler perturbations a message was carrying when it was delivered.
+/// A message can carry several at once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryBias(u8);
+
+impl DeliveryBias {
+    /// Delivered as sent: no delay, and neither end restarted in between.
+    pub const NONE: Self = Self(0);
+    /// Held back by the message-delay mechanism before being made schedulable.
+    pub const DELAYED: Self = Self(1);
+    /// The sending node crashed and recovered between the send and this
+    /// delivery, so the message comes from an incarnation that no longer exists.
+    pub const SENDER_RESTARTED: Self = Self(2);
+    /// The message was kept across the receiver's own crash and handed to a
+    /// later incarnation of it.
+    pub const RECEIVER_RESTARTED: Self = Self(4);
+
+    #[inline]
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    #[inline]
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// A message reached a handler entry on another node. `acted` means the
+/// handler changed that node's persistent state rather than falling through a
+/// guard, which is the difference between a hazard the protocol saw and one it
+/// ignored. Only the handler's first execution segment is observed: a write
+/// that happens after the handler blocks on a channel is attributed to nothing.
+#[inline]
+pub fn record_delivery(bias: DeliveryBias, acted: bool) {
+    if !acted_fraction_enabled() {
+        return;
+    }
+    let mut buckets = [DELIVERY_ALL; DELIVERY_BUCKETS];
+    let mut len = 1;
+    if !bias.is_empty() {
+        buckets[len] = DELIVERY_BIASED;
+        len += 1;
+    }
+    for (bit, bucket) in [
+        (DeliveryBias::DELAYED, DELIVERY_DELAYED),
+        (DeliveryBias::SENDER_RESTARTED, DELIVERY_SENDER_RESTARTED),
+        (
+            DeliveryBias::RECEIVER_RESTARTED,
+            DELIVERY_RECEIVER_RESTARTED,
+        ),
+    ] {
+        if bias.contains(bit) {
+            buckets[len] = bucket;
+            len += 1;
+        }
+    }
+    for &b in &buckets[..len] {
+        DELIVERIES[b].fetch_add(1, Ordering::Relaxed);
+        if acted {
+            DELIVERIES_ACTED[b].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn add_f64(cell: &AtomicU64, v: f64) {
@@ -410,6 +514,44 @@ pub struct CrashRecoveryStats {
     pub runs_with_crossing: u64,
 }
 
+/// Deliveries and the share of them that changed the receiving node's state,
+/// for one bias bucket.
+#[derive(Serialize)]
+pub struct DeliveryEffect {
+    pub deliveries: u64,
+    pub acted: u64,
+    pub acted_fraction: f64,
+}
+
+impl DeliveryEffect {
+    fn read(bucket: usize) -> Self {
+        let deliveries = DELIVERIES[bucket].load(Ordering::Relaxed);
+        let acted = DELIVERIES_ACTED[bucket].load(Ordering::Relaxed);
+        Self {
+            deliveries,
+            acted,
+            acted_fraction: if deliveries == 0 {
+                0.0
+            } else {
+                acted as f64 / deliveries as f64
+            },
+        }
+    }
+}
+
+/// How often a message that reached a handler actually changed the receiver's
+/// state, split by which perturbation the message was carrying. A bias whose
+/// `acted_fraction` is near zero is being delivered but ignored, which is a
+/// different failure than one whose `deliveries` is near zero.
+#[derive(Serialize)]
+pub struct DeliveryEffectStats {
+    pub all: DeliveryEffect,
+    pub biased: DeliveryEffect,
+    pub delayed: DeliveryEffect,
+    pub sender_restarted: DeliveryEffect,
+    pub receiver_restarted: DeliveryEffect,
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
@@ -420,6 +562,7 @@ pub struct UtilizationSnapshot {
     pub feedback: FeedbackStats,
     pub curriculum: CurriculumStats,
     pub crash_recovery: CrashRecoveryStats,
+    pub delivery_effects: DeliveryEffectStats,
     pub termination: TerminationStats,
 }
 
@@ -460,9 +603,47 @@ pub fn snapshot() -> UtilizationSnapshot {
             crossing_deliveries: CR_CROSSING_DELIVERIES.load(Ordering::Relaxed),
             runs_with_crossing: CR_RUNS_WITH_CROSSING.load(Ordering::Relaxed),
         },
+        delivery_effects: DeliveryEffectStats {
+            all: DeliveryEffect::read(DELIVERY_ALL),
+            biased: DeliveryEffect::read(DELIVERY_BIASED),
+            delayed: DeliveryEffect::read(DELIVERY_DELAYED),
+            sender_restarted: DeliveryEffect::read(DELIVERY_SENDER_RESTARTED),
+            receiver_restarted: DeliveryEffect::read(DELIVERY_RECEIVER_RESTARTED),
+        },
         termination: TERMINATION
             .lock()
             .map(|t| *t)
             .unwrap_or_else(|p| *p.into_inner()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_effects_split_by_bias() {
+        set_enabled(true);
+        set_acted_fraction_enabled(true);
+
+        record_delivery(DeliveryBias::NONE, true);
+        record_delivery(DeliveryBias::DELAYED, false);
+        let mut both = DeliveryBias::DELAYED;
+        both.insert(DeliveryBias::SENDER_RESTARTED);
+        record_delivery(both, true);
+
+        let s = snapshot().delivery_effects;
+        set_enabled(false);
+
+        assert_eq!(s.all.deliveries, 3);
+        assert_eq!(s.all.acted, 2);
+        assert_eq!(s.biased.deliveries, 2);
+        assert_eq!(s.biased.acted, 1);
+        assert_eq!(s.delayed.deliveries, 2);
+        assert_eq!(s.delayed.acted, 1);
+        assert_eq!(s.sender_restarted.deliveries, 1);
+        assert_eq!(s.receiver_restarted.deliveries, 0);
+        assert_eq!(s.receiver_restarted.acted_fraction, 0.0);
+        assert!((s.all.acted_fraction - 2.0 / 3.0).abs() < 1e-9);
     }
 }

@@ -17,6 +17,7 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
 use crate::simulator::util_stats;
+use crate::simulator::util_stats::DeliveryBias;
 use imbl::OrdSet;
 use log::warn;
 use rand::Rng;
@@ -483,6 +484,19 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     if let Some((link_id, seq)) = r.link_seq {
                         state.link_deliver_seq.insert(link_id, seq + 1);
                     }
+                    // Measure the effect of a message on its receiver: only a
+                    // first entry into a handler for a message from another
+                    // node counts, not the continuations it is re-queued as.
+                    let probe = (util_stats::acted_fraction_enabled()
+                        && record_origin != record_dest
+                        && r.pc == record_entry_pc)
+                        .then(|| {
+                            let mut bias = r.bias;
+                            if r.origin_incarnation != state.incarnation(record_origin) {
+                                bias.insert(DeliveryBias::SENDER_RESTARTED);
+                            }
+                            (bias, state.node_state_token(record_dest))
+                        });
                     let result = exec::<H, L, F>(
                         state,
                         logger,
@@ -494,6 +508,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         purgatory_config,
                         rng,
                     )?;
+                    if let Some((bias, before)) = probe {
+                        let acted = state.node_state_token(record_dest) != before;
+                        util_stats::record_delivery(bias, acted);
+                    }
                     match result {
                         Some(client_op) => Ok(ScheduleResult::ClientOp(client_op)),
                         None => Ok(ScheduleResult::RecordExecuted {
@@ -612,6 +630,9 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
         return Ok(());
     }
     state.crash_info.currently_crashed.remove(&node_id);
+    if let Some(inc) = state.incarnations.get_mut(node_id.index) {
+        *inc = inc.saturating_add(1);
+    }
     util_stats::record_recover(node_id.index);
     F::note_recovery(feedback, node_id);
 
@@ -633,6 +654,8 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
     let queued = std::mem::take(&mut state.crash_info.queued_messages);
     for (dest, record) in queued {
         if dest == node_id {
+            let mut record = record;
+            record.bias.insert(DeliveryBias::RECEIVER_RESTARTED);
             state.push_runnable(Runnable::Record(record));
         } else {
             state.crash_info.queued_messages.push_back((dest, record));
@@ -756,6 +779,8 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         causal_operation_id: None,
         trace_id: None,
         link_seq: None,
+        origin_incarnation: state.incarnation(node_id),
+        bias: DeliveryBias::NONE,
     };
 
     exec::<H, L, F>(
