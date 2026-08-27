@@ -62,6 +62,9 @@ static RW_UNCLOSED: AtomicU64 = AtomicU64::new(0);
 static OH3_RUNS: AtomicU64 = AtomicU64::new(0);
 static OH3_WITH_H3: AtomicU64 = AtomicU64::new(0);
 static OH3_WITH_OVERLAP: AtomicU64 = AtomicU64::new(0);
+static PFO_PAIRS_SEEN: AtomicU64 = AtomicU64::new(0);
+static PFO_EDGES_ADDED: AtomicU64 = AtomicU64::new(0);
+static PFO_OPS_AFTER_LAST_RECOVER: AtomicU64 = AtomicU64::new(0);
 
 /// Recovery-window widths are tallied into a histogram so percentiles can be
 /// read without keeping every sample. Widths at or above the cap fold into the
@@ -149,6 +152,9 @@ pub fn set_enabled(on: bool) {
             &OH3_RUNS,
             &OH3_WITH_H3,
             &OH3_WITH_OVERLAP,
+            &PFO_PAIRS_SEEN,
+            &PFO_EDGES_ADDED,
+            &PFO_OPS_AFTER_LAST_RECOVER,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -437,6 +443,11 @@ struct RunCrossingState {
     fault_events: u32,
     /// Some node crashed while another node's recovery window was open.
     crash_inside_recovery_window: bool,
+    /// Client operations invoked since the most recent recover, or 0 while no
+    /// node has recovered yet. Whatever is left here when the run ends is the
+    /// client work that outlived every fault.
+    client_ops_since_last_recover: u64,
+    any_recover: bool,
     finalized: bool,
 }
 
@@ -449,6 +460,8 @@ impl Default for RunCrossingState {
             recovered: HashSet::new(),
             fault_events: 0,
             crash_inside_recovery_window: false,
+            client_ops_since_last_recover: 0,
+            any_recover: false,
             // Nothing has been recorded yet, so there is no run to flush.
             finalized: true,
         }
@@ -463,7 +476,7 @@ thread_local! {
 /// can be called both from the normal end-of-run hook and from the start of the
 /// next run for runs that ended without reaching it.
 fn finish_run() {
-    let Some((unclosed, h3, ordered, bucket)) = RUN_CROSSING.with(|c| {
+    let Some((unclosed, h3, ordered, bucket, post_recover_ops)) = RUN_CROSSING.with(|c| {
         let mut c = c.borrow_mut();
         if c.finalized {
             return None;
@@ -477,10 +490,12 @@ fn finish_run() {
             h3,
             h3 && c.crash_inside_recovery_window,
             (c.fault_events as usize).min(FAULT_EVENT_BUCKETS - 1),
+            c.client_ops_since_last_recover,
         ))
     }) else {
         return;
     };
+    PFO_OPS_AFTER_LAST_RECOVER.fetch_add(post_recover_ops, Ordering::Relaxed);
     RW_UNCLOSED.fetch_add(unclosed, Ordering::Relaxed);
     OH3_RUNS.fetch_add(1, Ordering::Relaxed);
     if h3 {
@@ -517,7 +532,36 @@ pub fn begin_run() {
         c.recovered.clear();
         c.fault_events = 0;
         c.crash_inside_recovery_window = false;
+        c.client_ops_since_last_recover = 0;
+        c.any_recover = false;
         c.finalized = false;
+    });
+}
+
+/// The plan generator examined one crash-and-recover pair for post-fault client
+/// work and added `edges_added` mandatory recover-before-request edges for it.
+#[inline]
+pub fn record_post_fault_ops(pairs_seen: u64, edges_added: u64) {
+    if !enabled() {
+        return;
+    }
+    PFO_PAIRS_SEEN.fetch_add(pairs_seen, Ordering::Relaxed);
+    PFO_EDGES_ADDED.fetch_add(edges_added, Ordering::Relaxed);
+}
+
+/// A planned client operation was handed to a client node. Only invocations
+/// that follow every recover in the run are reported, so this is the execution
+/// side of the same question the generator edges are meant to force.
+#[inline]
+pub fn record_client_op_invoked() {
+    if !enabled() {
+        return;
+    }
+    RUN_CROSSING.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.any_recover {
+            c.client_ops_since_last_recover += 1;
+        }
     });
 }
 
@@ -582,6 +626,8 @@ pub fn record_recover(node_index: usize, step: i32) {
         c.fault_events += 1;
         c.recovered.insert(node_index);
         c.recovery_open.insert(node_index, step);
+        c.any_recover = true;
+        c.client_ops_since_last_recover = 0;
         let crossings = c.held.remove(&node_index).unwrap_or(0);
         if crossings == 0 {
             return None;
@@ -1121,6 +1167,18 @@ impl OrderedH3Stats {
     }
 }
 
+/// Whether the generator managed to reserve client work for after a fault, and
+/// whether the reservation survived into execution. `edges_added` well below
+/// `pairs_seen` times the configured count means the graph had no client
+/// request left that could be ordered after a recover without closing a cycle;
+/// `ops_invoked_after_last_recover` at zero means no run ever got there.
+#[derive(Serialize)]
+pub struct PostFaultOpsStats {
+    pub pairs_seen: u64,
+    pub edges_added: u64,
+    pub ops_invoked_after_last_recover: u64,
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
@@ -1135,6 +1193,7 @@ pub struct UtilizationSnapshot {
     pub crash_recovery: CrashRecoveryStats,
     pub recovery_window: RecoveryWindowStats,
     pub ordered_h3: OrderedH3Stats,
+    pub post_fault_ops: PostFaultOpsStats,
     pub delivery_effects: DeliveryEffectStats,
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
@@ -1196,6 +1255,11 @@ pub fn snapshot() -> UtilizationSnapshot {
         },
         recovery_window: RecoveryWindowStats::read(),
         ordered_h3: OrderedH3Stats::read(),
+        post_fault_ops: PostFaultOpsStats {
+            pairs_seen: PFO_PAIRS_SEEN.load(Ordering::Relaxed),
+            edges_added: PFO_EDGES_ADDED.load(Ordering::Relaxed),
+            ops_invoked_after_last_recover: PFO_OPS_AFTER_LAST_RECOVER.load(Ordering::Relaxed),
+        },
         delivery_effects: DeliveryEffectStats {
             all: DeliveryEffect::read(DELIVERY_ALL),
             biased: DeliveryEffect::read(DELIVERY_BIASED),

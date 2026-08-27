@@ -42,6 +42,12 @@ pub struct GeneratorConfig {
     /// simultaneously. `None` disables the cap. The simulator rejects
     /// `Some(0)` during config validation.
     pub max_concurrent_writes: Option<i32>,
+    /// Client requests reserved for after each node restart. When set to K >= 1,
+    /// every crash/recover pair gets mandatory edges from its recover to K
+    /// client requests that were not already ordered after it, so client work
+    /// survives the fault instead of all of it becoming eligible up front.
+    /// 0 reserves nothing.
+    pub post_fault_client_ops: i32,
 }
 
 /// Generates a bag of action stubs based on the config.
@@ -199,6 +205,48 @@ pub fn generate_plan(config: GeneratorConfig, rng: &mut impl Rng) -> ExecutionPl
         }
     }
 
+    // Post-fault pass: order a few client requests after each recover, so a run
+    // still has client work to issue once the faults have happened.
+    if config.post_fault_client_ops >= 1 {
+        let client_indices: Vec<NodeIndex> = nodes
+            .iter()
+            .filter(|(idx, _)| {
+                matches!(graph[*idx].action, EventAction::ClientRequest(_))
+            })
+            .map(|(idx, _)| *idx)
+            .collect();
+        let recover_indices: Vec<NodeIndex> = nodes
+            .iter()
+            .filter(|(idx, _)| matches!(graph[*idx].action, EventAction::RecoverNode(_)))
+            .map(|(idx, _)| *idx)
+            .collect();
+        let wanted = config.post_fault_client_ops as usize;
+        let mut edges_added = 0u64;
+        for recover in &recover_indices {
+            let mut candidates = client_indices.clone();
+            candidates.shuffle(rng);
+            let mut added = 0;
+            for client in candidates {
+                if added >= wanted {
+                    break;
+                }
+                if has_path_connecting(&graph, *recover, client, None) {
+                    continue;
+                }
+                if has_path_connecting(&graph, client, *recover, None) {
+                    continue;
+                }
+                graph.add_edge(*recover, client, ());
+                added += 1;
+            }
+            edges_added += added as u64;
+        }
+        crate::simulator::util_stats::record_post_fault_ops(
+            recover_indices.len() as u64,
+            edges_added,
+        );
+    }
+
     // Shuffle node order for dependency generation
     nodes.shuffle(rng);
 
@@ -221,4 +269,71 @@ pub fn generate_plan(config: GeneratorConfig, rng: &mut impl Rng) -> ExecutionPl
     }
 
     graph
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use petgraph::Direction;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    fn config(post_fault_client_ops: i32) -> GeneratorConfig {
+        GeneratorConfig {
+            num_servers: 3,
+            num_write_ops: 3,
+            num_read_ops: 4,
+            num_rmw_ops: 0,
+            num_keys: 1,
+            num_crashes: 2,
+            num_partitions: 0,
+            dependency_density: 0.0,
+            max_concurrent_writes: Some(2),
+            post_fault_client_ops,
+        }
+    }
+
+    fn recovers_with_a_client_successor(plan: &ExecutionPlan) -> (usize, usize) {
+        let mut recovers = 0;
+        let mut with_client = 0;
+        for idx in plan.node_indices() {
+            if !matches!(plan[idx].action, EventAction::RecoverNode(_)) {
+                continue;
+            }
+            recovers += 1;
+            if plan
+                .neighbors_directed(idx, Direction::Outgoing)
+                .any(|n| matches!(plan[n].action, EventAction::ClientRequest(_)))
+            {
+                with_client += 1;
+            }
+        }
+        (recovers, with_client)
+    }
+
+    #[test]
+    fn zero_reserves_no_client_work_after_a_restart() {
+        for seed in 0..32u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let plan = generate_plan(config(0), &mut rng);
+            let (recovers, with_client) = recovers_with_a_client_successor(&plan);
+            assert_eq!(recovers, 2);
+            assert_eq!(with_client, 0, "seed {}", seed);
+        }
+    }
+
+    #[test]
+    fn every_restart_gets_a_client_request_ordered_after_it() {
+        for seed in 0..32u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let plan = generate_plan(config(1), &mut rng);
+            let (recovers, with_client) = recovers_with_a_client_successor(&plan);
+            assert_eq!(recovers, with_client, "seed {}", seed);
+            assert!(
+                !petgraph::algo::is_cyclic_directed(&plan),
+                "seed {} produced a cyclic plan",
+                seed
+            );
+        }
+    }
 }

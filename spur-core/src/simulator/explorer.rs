@@ -134,6 +134,11 @@ pub struct ExplorerConfig {
     #[serde(rename = "dependency_density")]
     pub dependency_density_values: Vec<f64>,
 
+    /// Client requests the generator reserves for after each node restart.
+    /// 0 reserves none, which is a plan shaped only by the other knobs.
+    #[serde(default)]
+    pub post_fault_client_ops: i32,
+
     #[serde(default = "default_use_coverage_scheduling")]
     pub use_coverage_scheduling: bool,
     pub num_runs_per_config: i32,
@@ -218,6 +223,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "num_partitions",
     "max_concurrent_writes",
     "dependency_density",
+    "post_fault_client_ops",
     "use_coverage_scheduling",
     "num_runs_per_config",
     "max_iterations",
@@ -379,6 +385,7 @@ pub struct SingleRunConfig {
     pub num_partitions: i32,
     pub max_concurrent_writes: Option<i32>,
     pub dependency_density: f64,
+    pub post_fault_client_ops: i32,
     pub use_coverage_scheduling: bool,
     pub max_iterations: i32,
     pub schedule_policy: SchedulePolicy,
@@ -441,6 +448,7 @@ impl SingleRunConfig {
                 .dependency_density_values
                 .choose(rng)
                 .unwrap_or(&0.5),
+            post_fault_client_ops: constraints.post_fault_client_ops,
             use_coverage_scheduling: constraints.use_coverage_scheduling,
             max_iterations: constraints.max_iterations,
             schedule_policy: constraints.schedule_policy.clone(),
@@ -668,6 +676,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         num_partitions: config.num_partitions,
         dependency_density: config.dependency_density,
         max_concurrent_writes: config.max_concurrent_writes,
+        post_fault_client_ops: config.post_fault_client_ops,
     };
     // Workload RNG: seeded separately from the scheduling RNG so the plan is
     // reproducible from its own seed and uncorrelated with schedule draws.
@@ -882,6 +891,8 @@ fn run_explorer_impl<F: Feedback>(
                                                 num_partitions,
                                                 max_concurrent_writes: max_concurrent,
                                                 dependency_density: density,
+                                                post_fault_client_ops: config
+                                                    .post_fault_client_ops,
                                                 use_coverage_scheduling: config
                                                     .use_coverage_scheduling,
                                                 max_iterations: config.max_iterations,
