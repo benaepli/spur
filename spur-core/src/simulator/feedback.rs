@@ -13,7 +13,7 @@ use crate::simulator::coverage::{GlobalCoverage, LocalCoverage, VertexMap};
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::util_stats;
 use dashmap::DashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,7 +31,7 @@ fn default_novelty_enabled() -> bool {
 }
 
 /// Weights for the blended genetic fitness and the timeline saturation curve.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct CoverageConfig {
     #[serde(default = "default_timeline_weight")]
     pub timeline_weight: f64,
@@ -52,7 +52,7 @@ impl Default for CoverageConfig {
 }
 
 /// Which feedback strategy to monomorphize for an exploration session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FeedbackMode {
     /// No feedback: zero cost, genetic loop degenerates to random search.
@@ -70,7 +70,7 @@ pub enum FeedbackMode {
 /// How many fields distinguish one timeline coverage key from another.
 /// Lower resolution collapses more orderings into the same key, so a run has
 /// fewer ways to look novel; higher resolution splits them further apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TimelineKeyGranularity {
     /// Handler pair only: the same ordering on two different nodes is one key.
@@ -131,7 +131,7 @@ impl TimelineKeyGranularity {
 }
 
 /// Session-level feedback selection, deserialized from the explorer config.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct FeedbackConfig {
     #[serde(default)]
     pub mode: FeedbackMode,

@@ -27,7 +27,7 @@ use log::{debug, error, info, warn};
 use rand::prelude::*;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rayon::prelude::ParallelBridge;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
@@ -77,7 +77,7 @@ macro_rules! dispatch_feedback {
     }};
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Range {
     pub min: i32,
     pub max: i32,
@@ -106,7 +106,7 @@ impl Range {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExplorerConfig {
     #[serde(rename = "num_servers")]
     pub num_servers_range: Range,
@@ -808,6 +808,7 @@ pub fn run_explorer(
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
+        config_override::check_override_paths(&config, &config_override::active_overrides())?;
     }
 
     // Validate configuration before proceeding
@@ -1201,6 +1202,7 @@ pub fn run_explorer_genetic(
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
+        config_override::check_override_paths(&config, &config_override::active_overrides())?;
     }
 
     // Validate configuration before proceeding
@@ -1614,6 +1616,7 @@ pub fn run_explorer_aos(
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
+        config_override::check_override_paths(&config, &config_override::active_overrides())?;
     }
     config
         .validate()
@@ -1742,7 +1745,7 @@ fn default_rotation() -> Vec<RotationSlice> {
 }
 
 /// Which exploration strategy a rotation slice runs.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ModeId {
     /// Curriculum over fresh samples (Mode A).
@@ -1754,7 +1757,7 @@ pub enum ModeId {
 }
 
 /// A budget for one rotation slice. `Seconds` sacrifices reproducibility.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Budget {
     Runs { runs: u64 },
@@ -1762,7 +1765,7 @@ pub enum Budget {
 }
 
 /// One entry in the manual rotation: a mode and how long to dwell on it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RotationSlice {
     pub mode: ModeId,
     pub budget: Budget,
@@ -1771,7 +1774,7 @@ pub struct RotationSlice {
 /// Continuous-explorer config: the `ExplorerConfig` range envelope plus the
 /// continuous-session fields. Reproducible under `Runs` budgets from
 /// `session_seed`.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ContinuousConfig {
     #[serde(flatten)]
     pub envelope: ExplorerConfig,
@@ -2248,6 +2251,7 @@ pub fn run_explorer_continuous(
     let config: ContinuousConfig = serde_json::from_str(&config_json)?;
     if config.envelope.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS, CONTINUOUS_CONFIG_KEYS])?;
+        config_override::check_override_paths(&config, &config_override::active_overrides())?;
     }
     config
         .validate()

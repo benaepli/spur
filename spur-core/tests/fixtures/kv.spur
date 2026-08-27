@@ -1,0 +1,29 @@
+// A key-value store with no replication: the smallest spec the explorer can
+// drive, used by tests that care about the scheduler rather than a protocol.
+// The role and client-interface names are the ones the explorer looks up.
+
+role Node {
+    var db: map<string, int> = {};
+
+    async fn Write(key: string, uid: int): bool {
+        db = db[key] := uid;
+        return true;
+    }
+
+    async fn Read(key: string): int {
+        if (exists(db, key)) {
+            return db[key];
+        }
+        return 0;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        <-dest->Write(key, uid);
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

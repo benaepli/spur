@@ -1,5 +1,5 @@
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy)]
 pub enum QueueSelection {
@@ -174,7 +174,7 @@ impl QueueSelector for AnySelector {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum QueuePolicyConfig {
     Probabilistic { p_local: f64, p_timer: f64 },
@@ -215,7 +215,7 @@ impl QueuePolicyConfig {
 /// Within-queue selection method. Decides which runnable, among the eligible
 /// items in a single queue, gets executed next. Orthogonal to `QueuePolicyConfig`,
 /// which decides *which* queue to draw from.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum WithinQueueSelector {
     /// K-tournament: sample `k` indices uniformly, take the highest score.

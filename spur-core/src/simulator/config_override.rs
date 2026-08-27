@@ -17,8 +17,10 @@
 //! parsed as JSON when it parses and taken as a string otherwise, so
 //! `true`, `12`, `[1,2]` and `parquet` all mean what they look like. Overrides
 //! are applied before strict key checking, so a misspelled top-level knob is
-//! rejected by the same rule that rejects it in a file.
+//! rejected by the same rule that rejects it in a file, and
+//! `check_override_paths` extends that rejection to paths at any depth.
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::sync::Mutex;
 
@@ -98,6 +100,49 @@ fn parse_assignment(assignment: &str) -> Result<(Vec<String>, Value), String> {
     let value = serde_json::from_str::<Value>(raw_value)
         .unwrap_or_else(|_| Value::String(raw_value.to_string()));
     Ok((path, value))
+}
+
+/// Rejects assignments whose path names no field of the parsed config.
+///
+/// An assignment is written into the config text before it is parsed, so a
+/// misspelled path becomes a key deserialization discards: the session runs to
+/// completion measuring the value the override meant to change. Reading the
+/// paths back out of the parsed config catches that at any depth, and needs no
+/// list of field names kept in step with the structs.
+pub fn check_override_paths<T: Serialize>(
+    config: &T,
+    assignments: &[String],
+) -> Result<(), String> {
+    if assignments.is_empty() {
+        return Ok(());
+    }
+    let parsed = serde_json::to_value(config)
+        .map_err(|e| format!("config could not be re-encoded to check overrides: {}", e))?;
+    let mut discarded: Vec<&str> = Vec::new();
+    for assignment in assignments {
+        let (path, _) = parse_assignment(assignment)?;
+        if !path_exists(&parsed, &path) {
+            discarded.push(assignment);
+        }
+    }
+    if discarded.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "override(s) reached no config field and were dropped when the config was parsed: {}",
+        discarded.join(", ")
+    ))
+}
+
+fn path_exists(root: &Value, path: &[String]) -> bool {
+    let mut cursor = root;
+    for segment in path {
+        match cursor.get(segment) {
+            Some(child) => cursor = child,
+            None => return false,
+        }
+    }
+    true
 }
 
 fn set_path(root: &mut Value, path: &[String], value: Value) -> Result<(), String> {
@@ -209,6 +254,79 @@ mod tests {
         assert_eq!(config.num_crashes_range.max, 3);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The config a misspelled override is checked against: fields the
+    /// assignments below name, and nothing else.
+    #[derive(Serialize)]
+    struct Fixture {
+        num_runs_per_config: i32,
+        purgatory: Purgatory,
+    }
+
+    #[derive(Serialize)]
+    struct Purgatory {
+        delay_probability: f64,
+    }
+
+    fn fixture() -> Fixture {
+        Fixture {
+            num_runs_per_config: 3,
+            purgatory: Purgatory {
+                delay_probability: 0.4,
+            },
+        }
+    }
+
+    fn check(assignments: &[&str]) -> Result<(), String> {
+        let owned: Vec<String> = assignments.iter().map(|s| s.to_string()).collect();
+        check_override_paths(&fixture(), &owned)
+    }
+
+    #[test]
+    fn accepts_paths_the_config_has() {
+        check(&["num_runs_per_config=9", "purgatory.delay_probability=0.5"]).expect("accepted");
+        check(&[]).expect("nothing to check");
+    }
+
+    #[test]
+    fn rejects_a_misspelled_nested_path() {
+        let err = check(&["purgatory.delayed_probability=0.5"]).expect_err("rejected");
+        assert!(err.contains("purgatory.delayed_probability"), "{}", err);
+    }
+
+    #[test]
+    fn rejects_a_misspelled_top_level_path() {
+        let err = check(&["num_runs=9"]).expect_err("rejected");
+        assert!(err.contains("num_runs=9"), "{}", err);
+    }
+
+    #[test]
+    fn rejects_a_path_that_descends_past_a_leaf() {
+        let err = check(&["purgatory.delay_probability.min=1"]).expect_err("rejected");
+        assert!(err.contains("purgatory.delay_probability.min"), "{}", err);
+    }
+
+    #[test]
+    fn a_misspelled_override_survives_application_and_is_caught_after_parsing() {
+        use crate::simulator::explorer::ExplorerConfig;
+
+        let base = r#"{
+             "num_servers": {"min": 3, "max": 3, "step": 1},
+             "num_write_ops": {"min": 1, "max": 1, "step": 1},
+             "num_read_ops": {"min": 1, "max": 1, "step": 1},
+             "num_crashes": {"min": 0, "max": 0, "step": 1},
+             "dependency_density": [0.0],
+             "purgatory": {"delay_probability": 0.15},
+             "num_runs_per_config": 1,
+             "max_iterations": 100
+           }"#;
+        let assignments = vec!["purgatory.delayed_probability=0.9".to_string()];
+
+        let text = apply_assignments(base, &assignments).expect("applies");
+        let config: ExplorerConfig = serde_json::from_str(&text).expect("parses");
+        assert!((config.purgatory.delay_probability - 0.15).abs() < 1e-9);
+        assert!(check_override_paths(&config, &assignments).is_err());
     }
 
     #[test]
