@@ -1293,14 +1293,11 @@ pub fn snapshot() -> UtilizationSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `set_enabled` resets every counter process-wide, so tests that record
-    /// anything must not overlap.
-    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+    use crate::simulator::config_override;
 
     #[test]
     fn delivery_effects_split_by_bias() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = config_override::exclusive_session();
         set_enabled(true);
         set_acted_fraction_enabled(true);
 
@@ -1327,7 +1324,7 @@ mod tests {
 
     #[test]
     fn steer_authority_outcomes_partition_the_steps() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = config_override::exclusive_session();
         set_enabled(true);
         set_steer_audit_enabled(true);
 
@@ -1359,7 +1356,7 @@ mod tests {
 
     #[test]
     fn steer_authority_records_nothing_when_the_audit_is_off() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = config_override::exclusive_session();
         set_enabled(true);
         set_steer_audit_enabled(false);
 
@@ -1373,7 +1370,7 @@ mod tests {
 
     #[test]
     fn recovery_windows_close_on_the_first_message_to_the_restarted_node() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = config_override::exclusive_session();
         set_enabled(true);
 
         begin_run();
@@ -1405,7 +1402,7 @@ mod tests {
 
     #[test]
     fn a_crash_inside_an_open_recovery_window_is_an_overlap() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = config_override::exclusive_session();
         set_enabled(true);
 
         begin_run();
@@ -1427,7 +1424,7 @@ mod tests {
 
     #[test]
     fn timeline_key_growth_accumulates_into_one_curve_point() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = config_override::exclusive_session();
         set_enabled(true);
 
         record_timeline_keys(10, 10, 10);

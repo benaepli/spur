@@ -22,7 +22,7 @@
 
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Environment variable holding `;`- or newline-separated `path=value`
 /// assignments.
@@ -30,10 +30,19 @@ pub const OVERRIDE_ENV: &str = "SPUR_CONFIG_SET";
 
 static EXTRA_OVERRIDES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// Serializes callers that depend on process-global explorer state: the
+/// override list below and the utilization counters, which a session resets
+/// and then reads back. Two such callers running at once each read the other's
+/// assignments and counts, so anything that needs its own view holds this for
+/// as long as it needs it.
+static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
 /// Registers assignments supplied outside the environment (a command-line
 /// flag). Applied after the environment ones, so a flag wins a conflict.
 pub fn set_extra_overrides(assignments: Vec<String>) {
-    let mut slot = EXTRA_OVERRIDES.lock().expect("override list poisoned");
+    let mut slot = EXTRA_OVERRIDES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     *slot = assignments;
 }
 
@@ -46,11 +55,52 @@ pub fn active_overrides() -> Vec<String> {
     all.extend(
         EXTRA_OVERRIDES
             .lock()
-            .expect("override list poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .cloned(),
     );
     all
+}
+
+/// Exclusive use of the override list and the utilization counters. The
+/// assignments in force when the guard is taken are put back when it is
+/// dropped, including on an unwind, so a caller that installs overrides cannot
+/// leave them behind for whoever runs next.
+pub struct OverrideGuard {
+    previous: Vec<String>,
+    _exclusive: MutexGuard<'static, ()>,
+}
+
+impl Drop for OverrideGuard {
+    fn drop(&mut self) {
+        set_extra_overrides(std::mem::take(&mut self.previous));
+    }
+}
+
+/// Waits until no other guard is held and keeps the overrides unchanged. Use
+/// this when the state that must not be shared is the counters rather than the
+/// assignments.
+#[must_use]
+pub fn exclusive_session() -> OverrideGuard {
+    let exclusive = EXCLUSIVE.lock().unwrap_or_else(PoisonError::into_inner);
+    let previous = EXTRA_OVERRIDES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    OverrideGuard {
+        previous,
+        _exclusive: exclusive,
+    }
+}
+
+/// The same exclusivity with `assignments` installed for the guard's lifetime.
+/// The guard is not reentrant: one thread must drop the guard it holds before
+/// asking for another.
+#[must_use]
+pub fn scoped_overrides(assignments: Vec<String>) -> OverrideGuard {
+    let guard = exclusive_session();
+    set_extra_overrides(assignments);
+    guard
 }
 
 fn split_env(raw: &str) -> Vec<String> {
@@ -235,17 +285,18 @@ mod tests {
         )
         .expect("writes fixture");
 
-        set_extra_overrides(vec![
-            "num_runs_per_config=3".to_string(),
-            "purgatory.delay_probability=0.4".to_string(),
-            r#"num_write_ops={"min":2,"max":4,"step":1}"#.to_string(),
-            r#"num_read_ops={"min":4,"max":8,"step":2}"#.to_string(),
-            r#"num_keys={"min":1,"max":1,"step":1}"#.to_string(),
-            "dependency_density=[0.0,0.3]".to_string(),
-            "max_iterations=6000".to_string(),
-        ]);
-        let text = load_config_text(path.to_str().expect("utf-8 path")).expect("loads");
-        set_extra_overrides(Vec::new());
+        let text = {
+            let _scope = scoped_overrides(vec![
+                "num_runs_per_config=3".to_string(),
+                "purgatory.delay_probability=0.4".to_string(),
+                r#"num_write_ops={"min":2,"max":4,"step":1}"#.to_string(),
+                r#"num_read_ops={"min":4,"max":8,"step":2}"#.to_string(),
+                r#"num_keys={"min":1,"max":1,"step":1}"#.to_string(),
+                "dependency_density=[0.0,0.3]".to_string(),
+                "max_iterations=6000".to_string(),
+            ]);
+            load_config_text(path.to_str().expect("utf-8 path")).expect("loads")
+        };
 
         check_top_level_keys(&text, &[EXPLORER_CONFIG_KEYS]).expect("no unknown keys");
         let config: ExplorerConfig = serde_json::from_str(&text).expect("parses as a config");
@@ -327,6 +378,19 @@ mod tests {
         let config: ExplorerConfig = serde_json::from_str(&text).expect("parses");
         assert!((config.purgatory.delay_probability - 0.15).abs() < 1e-9);
         assert!(check_override_paths(&config, &assignments).is_err());
+    }
+
+    #[test]
+    fn a_scoped_assignment_lasts_exactly_as_long_as_its_guard() {
+        const ONLY_MINE: &str = "num_runs_per_config=17";
+
+        {
+            let _scope = scoped_overrides(vec![ONLY_MINE.to_string()]);
+            assert!(active_overrides().iter().any(|a| a == ONLY_MINE));
+        }
+
+        let _scope = exclusive_session();
+        assert!(!active_overrides().iter().any(|a| a == ONLY_MINE));
     }
 
     #[test]
