@@ -381,6 +381,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 EventAction::ClientRequest(op_spec) => {
                     op_id_counter += 1;
                     in_progress.insert(op_id_counter, node_idx);
+                    util_stats::record_client_op_invoked();
 
                     // Get a client node from the pool (creates one if needed)
                     let (client_node_id, is_new) =
