@@ -456,7 +456,7 @@ impl SingleRunConfig {
             within_queue_selector: constraints.within_queue_selector.clone(),
             quick_fire_multiplier: constraints.quick_fire_multiplier,
             purgatory: constraints.purgatory.clone(),
-            timeline_key_granularity: constraints.feedback.timeline_key_granularity,
+            timeline_key_granularity: constraints.feedback.key_granularity(),
             rng_stream_isolation: constraints.rng_stream_isolation,
         }
     }
@@ -905,7 +905,7 @@ fn run_explorer_impl<F: Feedback>(
                                                 purgatory: config.purgatory.clone(),
                                                 timeline_key_granularity: config
                                                     .feedback
-                                                    .timeline_key_granularity,
+                                                    .key_granularity(),
                                                 rng_stream_isolation: config.rng_stream_isolation,
                                             };
 
@@ -1164,7 +1164,7 @@ fn run_plan_impl<F: Feedback>(
             config.quick_fire_multiplier,
             &config.purgatory,
             &weights,
-            config.feedback.timeline_key_granularity,
+            config.feedback.key_granularity(),
         ) {
             Ok(_) => {
                 debug!(

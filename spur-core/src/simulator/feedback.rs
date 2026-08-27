@@ -26,6 +26,9 @@ fn default_cfg_weight() -> f64 {
 fn default_novel_scale() -> f64 {
     5.0
 }
+fn default_novelty_enabled() -> bool {
+    true
+}
 
 /// Weights for the blended genetic fitness and the timeline saturation curve.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -79,6 +82,11 @@ pub enum TimelineKeyGranularity {
     /// so an ordering seen before a crash is distinct from the same ordering
     /// seen after recovery.
     Fine,
+    /// Every ordering collapses onto one key, so no run can look more novel
+    /// than any other. Reached by turning `novelty_enabled` off, never named
+    /// directly in a config.
+    #[serde(skip)]
+    Constant,
 }
 
 impl TimelineKeyGranularity {
@@ -104,16 +112,26 @@ impl TimelineKeyGranularity {
                 b,
                 generation,
             },
+            Self::Constant => TimelineTuple {
+                dest: None,
+                a: 0,
+                b: 0,
+                generation: 0,
+            },
         }
     }
 
     fn tracks_generation(self) -> bool {
         matches!(self, Self::Fine)
     }
+
+    fn is_constant(self) -> bool {
+        matches!(self, Self::Constant)
+    }
 }
 
 /// Session-level feedback selection, deserialized from the explorer config.
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 pub struct FeedbackConfig {
     #[serde(default)]
     pub mode: FeedbackMode,
@@ -127,6 +145,12 @@ pub struct FeedbackConfig {
     /// Only meaningful for `Timeline`/`Both`.
     #[serde(default)]
     pub timeline_key_granularity: TimelineKeyGranularity,
+    /// Whether coverage novelty distinguishes runs at all. Off collapses every
+    /// timeline key onto one value and makes the within-run steering term
+    /// uniform, leaving the rest of the scheduler untouched, which isolates
+    /// what the coverage channel contributes on its own.
+    #[serde(default = "default_novelty_enabled")]
+    pub novelty_enabled: bool,
     /// Count, at every scheduling point, whether the step ran the runnable the
     /// scoring function ranked first and what took precedence when it did not.
     /// Reported under `steer_authority` and only recorded when `stats` is on.
@@ -136,7 +160,29 @@ pub struct FeedbackConfig {
     pub steer_audit: bool,
 }
 
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            mode: FeedbackMode::default(),
+            steer: false,
+            weights: CoverageConfig::default(),
+            timeline_key_granularity: TimelineKeyGranularity::default(),
+            steer_audit: false,
+            novelty_enabled: default_novelty_enabled(),
+        }
+    }
+}
+
 impl FeedbackConfig {
+    /// The key resolution a run should use, folding in whether novelty is on.
+    pub fn key_granularity(&self) -> TimelineKeyGranularity {
+        if self.novelty_enabled {
+            self.timeline_key_granularity
+        } else {
+            TimelineKeyGranularity::Constant
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let w = &self.weights;
         if w.timeline_weight < 0.0 || w.cfg_weight < 0.0 {
@@ -176,6 +222,9 @@ pub struct LocalTimeline {
 impl LocalTimeline {
     pub fn set_granularity(&mut self, granularity: TimelineKeyGranularity) {
         self.granularity = granularity;
+        if granularity.is_constant() {
+            util_stats::record_novelty_ablated_run();
+        }
     }
 
     fn generation(&self, dest: NodeId) -> u32 {
@@ -293,6 +342,9 @@ fn timeline_steer_bias<H: HashPolicy>(
     r: &Runnable<H>,
     snap: &TimelineSnap,
 ) -> f64 {
+    if tl.granularity.is_constant() {
+        return 1.0;
+    }
     let Runnable::Record(rec) = r else {
         return 1.0;
     };
@@ -765,6 +817,55 @@ mod tests {
         assert_ne!(
             TimelineKeyGranularity::Fine.key(d0, 1, 2, 0),
             TimelineKeyGranularity::Fine.key(d0, 1, 2, 1)
+        );
+    }
+
+    #[test]
+    fn novelty_enabled_defaults_on_and_selects_the_configured_granularity() {
+        let cfg: FeedbackConfig =
+            serde_json::from_str(r#"{"mode": "timeline", "timeline_key_granularity": "fine"}"#)
+                .expect("config should parse");
+        assert!(cfg.novelty_enabled);
+        assert_eq!(cfg.key_granularity(), TimelineKeyGranularity::Fine);
+        assert_eq!(
+            FeedbackConfig::default().key_granularity(),
+            TimelineKeyGranularity::Default
+        );
+    }
+
+    #[test]
+    fn disabling_novelty_collapses_every_run_to_one_key() {
+        let cfg: FeedbackConfig = serde_json::from_str(
+            r#"{"mode": "timeline", "timeline_key_granularity": "fine", "novelty_enabled": false}"#,
+        )
+        .expect("config should parse");
+        assert_eq!(cfg.key_granularity(), TimelineKeyGranularity::Constant);
+
+        let (d0, d1) = (node(0), node(1));
+        let mut tl = LocalTimeline::default();
+        tl.set_granularity(cfg.key_granularity());
+        for (dest, handler) in [(d0, 1), (d0, 2), (d1, 3), (d1, 4)] {
+            tl.note_delivery(dest, handler);
+        }
+        assert_eq!(tl.tuples.len(), 1, "all orderings hash to one key");
+
+        let g = GlobalTimeline::default();
+        g.merge(&tl);
+        let snap = g.snapshot();
+        assert_eq!(snap.counts.len(), 1);
+        assert_eq!(
+            tl.novel_count(&snap),
+            0,
+            "no run can look novel once the single key is seen"
+        );
+    }
+
+    #[test]
+    fn constant_keys_ignore_every_field() {
+        let (d0, d1) = (node(0), node(1));
+        assert_eq!(
+            TimelineKeyGranularity::Constant.key(d0, 1, 2, 0),
+            TimelineKeyGranularity::Constant.key(d1, 3, 4, 7)
         );
     }
 
