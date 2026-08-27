@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -55,6 +55,26 @@ static CA_STEPS_WITH_CRASH_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static CA_OFFERED: AtomicU64 = AtomicU64::new(0);
 static CA_CRASHES_TAKEN: AtomicU64 = AtomicU64::new(0);
 static CA_APPLIED: AtomicU64 = AtomicU64::new(0);
+static RW_CLOSED: AtomicU64 = AtomicU64::new(0);
+static RW_WIDTH_SUM: AtomicU64 = AtomicU64::new(0);
+static RW_MAX: AtomicU64 = AtomicU64::new(0);
+static RW_UNCLOSED: AtomicU64 = AtomicU64::new(0);
+static OH3_RUNS: AtomicU64 = AtomicU64::new(0);
+static OH3_WITH_H3: AtomicU64 = AtomicU64::new(0);
+static OH3_WITH_OVERLAP: AtomicU64 = AtomicU64::new(0);
+
+/// Recovery-window widths are tallied into a histogram so percentiles can be
+/// read without keeping every sample. Widths at or above the cap fold into the
+/// last slot, which the percentile reader reports as the cap itself.
+const RW_WIDTH_CAP: usize = 1024;
+static RW_WIDTHS: Mutex<[u64; RW_WIDTH_CAP + 1]> = Mutex::new([0; RW_WIDTH_CAP + 1]);
+
+/// Crash and recover events applied in one run, clamped, as the bucket index of
+/// the cross-tab. This is the only ordinal measure of how much fault activity a
+/// run saw that the simulator itself observes.
+const FAULT_EVENT_BUCKETS: usize = 9;
+static OH3_BY_FAULT_EVENTS: Mutex<[[u64; 3]; FAULT_EVENT_BUCKETS]> =
+    Mutex::new([[0; 3]; FAULT_EVENT_BUCKETS]);
 
 /// Delivery-effect counters, laid out as (total, acted) pairs. Index 0 is every
 /// delivery, index 1 every delivery that carried at least one bias, and the
@@ -122,11 +142,24 @@ pub fn set_enabled(on: bool) {
             &CA_OFFERED,
             &CA_CRASHES_TAKEN,
             &CA_APPLIED,
+            &RW_CLOSED,
+            &RW_WIDTH_SUM,
+            &RW_MAX,
+            &RW_UNCLOSED,
+            &OH3_RUNS,
+            &OH3_WITH_H3,
+            &OH3_WITH_OVERLAP,
         ] {
             c.store(0, Ordering::Relaxed);
         }
         for c in DELIVERIES.iter().chain(DELIVERIES_ACTED.iter()) {
             c.store(0, Ordering::Relaxed);
+        }
+        if let Ok(mut w) = RW_WIDTHS.lock() {
+            *w = [0; RW_WIDTH_CAP + 1];
+        }
+        if let Ok(mut x) = OH3_BY_FAULT_EVENTS.lock() {
+            *x = [[0; 3]; FAULT_EVENT_BUCKETS];
         }
         if let Ok(mut t) = TERMINATION.lock() {
             *t = TerminationStats::new();
@@ -388,16 +421,83 @@ pub fn record_feedback_scores(timeline: Option<f64>, cfg: Option<f64>) {
 
 /// Per-run bookkeeping for crash/recover crossings. Runs execute one at a time
 /// per thread, so this lives in thread-local storage and needs no locking.
-#[derive(Default)]
 struct RunCrossingState {
     /// Node index -> records addressed to that node before it crashed that are
     /// being held for redelivery when it comes back.
     held: HashMap<usize, u64>,
     counted_in_runs_with_crossing: bool,
+    /// Node index -> the scheduler step at which the node restarted, for nodes
+    /// whose new incarnation has not yet been handed a message from anyone
+    /// else. The recovery window is the span in which the protocol's restart
+    /// work and the traffic aimed at it can still interleave.
+    recovery_open: HashMap<usize, i32>,
+    /// Nodes that completed a crash-and-recover cycle in this run.
+    recovered: HashSet<usize>,
+    /// Crash and recover events applied in this run.
+    fault_events: u32,
+    /// Some node crashed while another node's recovery window was open.
+    crash_inside_recovery_window: bool,
+    finalized: bool,
+}
+
+impl Default for RunCrossingState {
+    fn default() -> Self {
+        Self {
+            held: HashMap::new(),
+            counted_in_runs_with_crossing: false,
+            recovery_open: HashMap::new(),
+            recovered: HashSet::new(),
+            fault_events: 0,
+            crash_inside_recovery_window: false,
+            // Nothing has been recorded yet, so there is no run to flush.
+            finalized: true,
+        }
+    }
 }
 
 thread_local! {
     static RUN_CROSSING: RefCell<RunCrossingState> = RefCell::new(RunCrossingState::default());
+}
+
+/// Fold this thread's finished run into the per-run tallies. Idempotent, so it
+/// can be called both from the normal end-of-run hook and from the start of the
+/// next run for runs that ended without reaching it.
+fn finish_run() {
+    let Some((unclosed, h3, ordered, bucket)) = RUN_CROSSING.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.finalized {
+            return None;
+        }
+        c.finalized = true;
+        let unclosed = c.recovery_open.len() as u64;
+        c.recovery_open.clear();
+        let h3 = c.recovered.len() >= 2;
+        Some((
+            unclosed,
+            h3,
+            h3 && c.crash_inside_recovery_window,
+            (c.fault_events as usize).min(FAULT_EVENT_BUCKETS - 1),
+        ))
+    }) else {
+        return;
+    };
+    RW_UNCLOSED.fetch_add(unclosed, Ordering::Relaxed);
+    OH3_RUNS.fetch_add(1, Ordering::Relaxed);
+    if h3 {
+        OH3_WITH_H3.fetch_add(1, Ordering::Relaxed);
+    }
+    if ordered {
+        OH3_WITH_OVERLAP.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Ok(mut x) = OH3_BY_FAULT_EVENTS.lock() {
+        x[bucket][0] += 1;
+        if h3 {
+            x[bucket][1] += 1;
+        }
+        if ordered {
+            x[bucket][2] += 1;
+        }
+    }
 }
 
 /// One plan execution is starting on this thread. Held-message bookkeeping is
@@ -407,11 +507,17 @@ pub fn begin_run() {
     if !enabled() {
         return;
     }
+    finish_run();
     CR_RUNS.fetch_add(1, Ordering::Relaxed);
     RUN_CROSSING.with(|c| {
         let mut c = c.borrow_mut();
         c.held.clear();
         c.counted_in_runs_with_crossing = false;
+        c.recovery_open.clear();
+        c.recovered.clear();
+        c.fault_events = 0;
+        c.crash_inside_recovery_window = false;
+        c.finalized = false;
     });
 }
 
@@ -424,10 +530,41 @@ pub fn record_crash(node_index: usize, held: u64, dropped: u64) {
     CR_CRASHES.fetch_add(1, Ordering::Relaxed);
     CR_HELD_AT_CRASH.fetch_add(held, Ordering::Relaxed);
     CR_DROPPED_AT_CRASH.fetch_add(dropped, Ordering::Relaxed);
-    if held > 0 {
-        RUN_CROSSING.with(|c| {
-            *c.borrow_mut().held.entry(node_index).or_insert(0) += held;
-        });
+    let closed_unclosed = RUN_CROSSING.with(|c| {
+        let mut c = c.borrow_mut();
+        if held > 0 {
+            *c.held.entry(node_index).or_insert(0) += held;
+        }
+        c.fault_events += 1;
+        // A node's own crash ends its recovery window without a width: no
+        // message ever reached the incarnation that came back.
+        let own = c.recovery_open.remove(&node_index).is_some();
+        if c.recovery_open.keys().any(|&n| n != node_index) {
+            c.crash_inside_recovery_window = true;
+        }
+        own
+    });
+    if closed_unclosed {
+        RW_UNCLOSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A message from another node entered a handler on `node_index` at scheduler
+/// step `step`. This closes the node's recovery window if one is open.
+pub fn record_message_entry(node_index: usize, step: i32) {
+    if !enabled() {
+        return;
+    }
+    let opened_at = RUN_CROSSING.with(|c| c.borrow_mut().recovery_open.remove(&node_index));
+    let Some(opened_at) = opened_at else {
+        return;
+    };
+    let width = step.saturating_sub(opened_at).max(0) as u64;
+    RW_CLOSED.fetch_add(1, Ordering::Relaxed);
+    RW_WIDTH_SUM.fetch_add(width, Ordering::Relaxed);
+    RW_MAX.fetch_max(width, Ordering::Relaxed);
+    if let Ok(mut w) = RW_WIDTHS.lock() {
+        w[(width as usize).min(RW_WIDTH_CAP)] += 1;
     }
 }
 
@@ -435,13 +572,16 @@ pub fn record_crash(node_index: usize, held: u64, dropped: u64) {
 /// it at this point, so each one is a delivery that crosses the node's own
 /// crash/recover boundary. Messages that arrived while the node was down are
 /// requeued too but are not counted: they were sent to an already-dead node.
-pub fn record_recover(node_index: usize) {
+pub fn record_recover(node_index: usize, step: i32) {
     if !enabled() {
         return;
     }
     CR_RECOVERS.fetch_add(1, Ordering::Relaxed);
     let first_crossing_of_run = RUN_CROSSING.with(|c| {
         let mut c = c.borrow_mut();
+        c.fault_events += 1;
+        c.recovered.insert(node_index);
+        c.recovery_open.insert(node_index, step);
         let crossings = c.held.remove(&node_index).unwrap_or(0);
         if crossings == 0 {
             return None;
@@ -589,6 +729,7 @@ pub fn record_run_termination(s: &RunTermination) {
     if !enabled() {
         return;
     }
+    finish_run();
     let bucket = s.recovered_nodes.min(2);
     if let Ok(mut t) = TERMINATION.lock() {
         t.all.add(s.end, s);
@@ -876,6 +1017,110 @@ pub struct CrashAnchorStats {
     pub applied: u64,
 }
 
+/// How wide the interval between a node's restart and the first message handed
+/// to the incarnation that came back is, in scheduler steps. A window that is
+/// only a step or two wide is one nothing else can be scheduled into.
+#[derive(Serialize)]
+pub struct RecoveryWindowStats {
+    /// Windows that closed because a message reached the restarted node.
+    pub count: u64,
+    /// Restarts whose window never closed: the node crashed again, or the run
+    /// ended, before anything was handed to it.
+    pub unclosed: u64,
+    pub mean_events_open: f64,
+    pub p50: u64,
+    pub p90: u64,
+    pub max: u64,
+    /// Widths at or above this are reported as this value.
+    pub width_cap: u64,
+}
+
+impl RecoveryWindowStats {
+    fn read() -> Self {
+        let count = RW_CLOSED.load(Ordering::Relaxed);
+        let hist = RW_WIDTHS
+            .lock()
+            .map(|w| *w)
+            .unwrap_or_else(|p| *p.into_inner());
+        Self {
+            count,
+            unclosed: RW_UNCLOSED.load(Ordering::Relaxed),
+            mean_events_open: if count == 0 {
+                0.0
+            } else {
+                RW_WIDTH_SUM.load(Ordering::Relaxed) as f64 / count as f64
+            },
+            p50: histogram_quantile(&hist, count, 0.5),
+            p90: histogram_quantile(&hist, count, 0.9),
+            max: RW_MAX.load(Ordering::Relaxed),
+            width_cap: RW_WIDTH_CAP as u64,
+        }
+    }
+}
+
+fn histogram_quantile(hist: &[u64], total: u64, q: f64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let target = ((total as f64) * q).ceil().max(1.0) as u64;
+    let mut seen = 0u64;
+    for (width, &n) in hist.iter().enumerate() {
+        seen += n;
+        if seen >= target {
+            return width as u64;
+        }
+    }
+    (hist.len() - 1) as u64
+}
+
+/// Runs holding two distinct nodes' crash-and-recover cycles, split by whether
+/// those cycles were merely both present or actually interleaved.
+#[derive(Serialize)]
+pub struct OrderedH3Stats {
+    /// Runs folded into these tallies, the denominator for both rates.
+    pub runs: u64,
+    /// Runs in which two or more distinct nodes each crashed and came back.
+    pub runs_with_h3: u64,
+    /// The subset of those in which a crash landed while some other node's
+    /// recovery window was still open, so the two cycles overlapped rather than
+    /// running one after the other.
+    pub runs_with_overlap: u64,
+    /// The same three counts split by how many crash and recover events the run
+    /// applied, index 0..8 with 8 meaning eight or more. The simulator has no
+    /// view of the grader's prefix depth, so this is the severity axis it can
+    /// report on its own.
+    pub by_fault_events: Vec<OrderedH3Bucket>,
+}
+
+#[derive(Serialize)]
+pub struct OrderedH3Bucket {
+    pub runs: u64,
+    pub runs_with_h3: u64,
+    pub runs_with_overlap: u64,
+}
+
+impl OrderedH3Stats {
+    fn read() -> Self {
+        let table = OH3_BY_FAULT_EVENTS
+            .lock()
+            .map(|x| *x)
+            .unwrap_or_else(|p| *p.into_inner());
+        Self {
+            runs: OH3_RUNS.load(Ordering::Relaxed),
+            runs_with_h3: OH3_WITH_H3.load(Ordering::Relaxed),
+            runs_with_overlap: OH3_WITH_OVERLAP.load(Ordering::Relaxed),
+            by_fault_events: table
+                .iter()
+                .map(|b| OrderedH3Bucket {
+                    runs: b[0],
+                    runs_with_h3: b[1],
+                    runs_with_overlap: b[2],
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
@@ -888,6 +1133,8 @@ pub struct UtilizationSnapshot {
     pub feedback: FeedbackStats,
     pub curriculum: CurriculumStats,
     pub crash_recovery: CrashRecoveryStats,
+    pub recovery_window: RecoveryWindowStats,
+    pub ordered_h3: OrderedH3Stats,
     pub delivery_effects: DeliveryEffectStats,
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
@@ -947,6 +1194,8 @@ pub fn snapshot() -> UtilizationSnapshot {
             crossing_deliveries: CR_CROSSING_DELIVERIES.load(Ordering::Relaxed),
             runs_with_crossing: CR_RUNS_WITH_CROSSING.load(Ordering::Relaxed),
         },
+        recovery_window: RecoveryWindowStats::read(),
+        ordered_h3: OrderedH3Stats::read(),
         delivery_effects: DeliveryEffectStats {
             all: DeliveryEffect::read(DELIVERY_ALL),
             biased: DeliveryEffect::read(DELIVERY_BIASED),
@@ -1047,6 +1296,60 @@ mod tests {
         set_enabled(false);
 
         assert_eq!(s.steps, 0);
+    }
+
+    #[test]
+    fn recovery_windows_close_on_the_first_message_to_the_restarted_node() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        set_enabled(true);
+
+        begin_run();
+        record_crash(0, 0, 0);
+        record_recover(0, 10);
+        // A message to a node with no open window leaves the tallies alone.
+        record_message_entry(1, 12);
+        record_message_entry(0, 14);
+        record_crash(1, 0, 0);
+        record_recover(1, 20);
+
+        begin_run();
+
+        let s = snapshot();
+        set_enabled(false);
+
+        assert_eq!(s.recovery_window.count, 1);
+        assert_eq!(s.recovery_window.max, 4);
+        assert_eq!(s.recovery_window.p50, 4);
+        assert_eq!(s.recovery_window.mean_events_open, 4.0);
+        // Node 1 recovered and the run ended with nothing delivered to it.
+        assert_eq!(s.recovery_window.unclosed, 1);
+        assert_eq!(s.ordered_h3.runs, 1);
+        assert_eq!(s.ordered_h3.runs_with_h3, 1);
+        // Node 1 crashed after node 0's window had already closed.
+        assert_eq!(s.ordered_h3.runs_with_overlap, 0);
+        assert_eq!(s.ordered_h3.by_fault_events[4].runs, 1);
+    }
+
+    #[test]
+    fn a_crash_inside_an_open_recovery_window_is_an_overlap() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        set_enabled(true);
+
+        begin_run();
+        record_crash(0, 0, 0);
+        record_recover(0, 5);
+        record_crash(1, 0, 0);
+        record_recover(1, 9);
+        record_message_entry(0, 11);
+        begin_run();
+
+        let s = snapshot();
+        set_enabled(false);
+
+        assert_eq!(s.ordered_h3.runs_with_h3, 1);
+        assert_eq!(s.ordered_h3.runs_with_overlap, 1);
+        assert_eq!(s.recovery_window.count, 1);
+        assert_eq!(s.recovery_window.max, 6);
     }
 
     #[test]

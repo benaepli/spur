@@ -723,16 +723,15 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     // Measure the effect of a message on its receiver: only a
                     // first entry into a handler for a message from another
                     // node counts, not the continuations it is re-queued as.
-                    let probe = (util_stats::acted_fraction_enabled()
-                        && record_origin != record_dest
-                        && r.pc == record_entry_pc)
-                        .then(|| {
-                            let mut bias = r.bias;
-                            if r.origin_incarnation != state.incarnation(record_origin) {
-                                bias.insert(DeliveryBias::SENDER_RESTARTED);
-                            }
-                            (bias, state.node_state_token(record_dest))
-                        });
+                    let message_entry = record_origin != record_dest && r.pc == record_entry_pc;
+                    let entry_step = state.crash_info.current_step;
+                    let probe = (util_stats::acted_fraction_enabled() && message_entry).then(|| {
+                        let mut bias = r.bias;
+                        if r.origin_incarnation != state.incarnation(record_origin) {
+                            bias.insert(DeliveryBias::SENDER_RESTARTED);
+                        }
+                        (bias, state.node_state_token(record_dest))
+                    });
                     let result = exec::<H, L, F>(
                         state,
                         logger,
@@ -747,6 +746,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     if let Some((bias, before)) = probe {
                         let acted = state.node_state_token(record_dest) != before;
                         util_stats::record_delivery(bias, acted);
+                    }
+                    if message_entry {
+                        util_stats::record_message_entry(record_dest.index, entry_step);
                     }
                     match result {
                         Some(client_op) => Ok(ScheduleResult::ClientOp(client_op)),
@@ -869,7 +871,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
     if let Some(inc) = state.incarnations.get_mut(node_id.index) {
         *inc = inc.saturating_add(1);
     }
-    util_stats::record_recover(node_id.index);
+    util_stats::record_recover(node_id.index, state.crash_info.current_step);
     F::note_recovery(feedback, node_id);
 
     state.nodes[node_id.index] = Env::<H>::default();
