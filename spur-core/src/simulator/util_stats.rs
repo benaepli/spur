@@ -40,6 +40,7 @@ static DEDUP_SKIPPED_LARGE: AtomicU64 = AtomicU64::new(0);
 static FEEDBACK_TIMELINE_SCORE_SUM: AtomicU64 = AtomicU64::new(0);
 static FEEDBACK_CFG_SCORE_SUM: AtomicU64 = AtomicU64::new(0);
 static FEEDBACK_SCORED_RUNS: AtomicU64 = AtomicU64::new(0);
+static FEEDBACK_CFG_SCORE_UPDATES: AtomicU64 = AtomicU64::new(0);
 static CURRICULUM_LOWERED_RUNS: AtomicU64 = AtomicU64::new(0);
 static CURRICULUM_CRASHES_SUM: AtomicU64 = AtomicU64::new(0);
 static CURRICULUM_SERVERS_SUM: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +107,7 @@ pub fn set_enabled(on: bool) {
             &FEEDBACK_TIMELINE_SCORE_SUM,
             &FEEDBACK_CFG_SCORE_SUM,
             &FEEDBACK_SCORED_RUNS,
+            &FEEDBACK_CFG_SCORE_UPDATES,
             &CURRICULUM_LOWERED_RUNS,
             &CURRICULUM_CRASHES_SUM,
             &CURRICULUM_SERVERS_SUM,
@@ -380,6 +382,7 @@ pub fn record_feedback_scores(timeline: Option<f64>, cfg: Option<f64>) {
     }
     if let Some(c) = cfg {
         add_f64(&FEEDBACK_CFG_SCORE_SUM, c);
+        FEEDBACK_CFG_SCORE_UPDATES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -796,6 +799,9 @@ pub struct FeedbackStats {
     pub timeline_score_sum: f64,
     pub cfg_score_sum: f64,
     pub scored_runs: u64,
+    /// Runs whose score included a control-flow-graph coverage term, so a
+    /// zero here means no strategy that tracks CFG coverage was built.
+    pub cfg_score_updates: u64,
 }
 
 /// How dense crash/recover activity is, and how often a message actually
@@ -925,6 +931,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             timeline_score_sum: f64::from_bits(FEEDBACK_TIMELINE_SCORE_SUM.load(Ordering::Relaxed)),
             cfg_score_sum: f64::from_bits(FEEDBACK_CFG_SCORE_SUM.load(Ordering::Relaxed)),
             scored_runs: FEEDBACK_SCORED_RUNS.load(Ordering::Relaxed),
+            cfg_score_updates: FEEDBACK_CFG_SCORE_UPDATES.load(Ordering::Relaxed),
         },
         curriculum: CurriculumStats {
             lowered_runs: CURRICULUM_LOWERED_RUNS.load(Ordering::Relaxed),
