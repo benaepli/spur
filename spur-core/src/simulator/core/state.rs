@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 /// Defines the priority band for a category of runnable.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PriorityBand {
     pub center: f64,
     pub width: f64,
@@ -42,7 +42,7 @@ pub enum RunnableCategory {
 }
 
 /// Configures how base priorities are sampled for new runnables.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum SchedulePolicy {
     /// Fixed priorities per category (legacy behavior).
@@ -115,7 +115,7 @@ fn default_heal_band() -> PriorityBand {
 }
 
 /// Configures probabilistic message delays ("purgatory").
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PurgatoryConfig {
     /// Probability that a remote ChannelSend is delayed. 0.0 = disabled.
     #[serde(default)]
