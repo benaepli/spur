@@ -64,6 +64,7 @@ static OH3_WITH_OVERLAP: AtomicU64 = AtomicU64::new(0);
 static PFO_PAIRS_SEEN: AtomicU64 = AtomicU64::new(0);
 static PFO_EDGES_ADDED: AtomicU64 = AtomicU64::new(0);
 static PFO_OPS_AFTER_LAST_RECOVER: AtomicU64 = AtomicU64::new(0);
+static NOVELTY_ABLATED_RUNS: AtomicU64 = AtomicU64::new(0);
 
 /// Recovery-window widths are tallied into a histogram so percentiles can be
 /// read without keeping every sample. Widths at or above the cap fold into the
@@ -153,6 +154,7 @@ pub fn set_enabled(on: bool) {
             &PFO_PAIRS_SEEN,
             &PFO_EDGES_ADDED,
             &PFO_OPS_AFTER_LAST_RECOVER,
+            &NOVELTY_ABLATED_RUNS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -813,6 +815,16 @@ impl TimelineKeyGrowth {
     }
 }
 
+/// A run built its coverage keys with novelty turned off, so every ordering it
+/// saw collapsed onto one key. Recorded once per run.
+#[inline]
+pub fn record_novelty_ablated_run() {
+    if !enabled() {
+        return;
+    }
+    NOVELTY_ABLATED_RUNS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// One run's coverage keys were folded into the shared store: `keys_in_run` is
 /// how many keys the run produced, `new_keys` how many of those the store had
 /// never seen, and `distinct_keys_live` the store's size afterwards (which is
@@ -862,6 +874,9 @@ pub struct TimelineKeyStats {
     pub distinct_keys_live: u64,
     pub saturation_run_index: u64,
     pub bucket_runs: u64,
+    /// Runs whose keys were built with novelty off. Nonzero means the coverage
+    /// channel was ablated, and `distinct_keys_live` should then be 1.
+    pub novelty_ablated_runs: u64,
     pub growth_curve: Vec<TimelineGrowthBucket>,
 }
 
@@ -901,6 +916,7 @@ impl TimelineKeyStats {
             distinct_keys_live,
             saturation_run_index,
             bucket_runs: TIMELINE_BUCKET_RUNS,
+            novelty_ablated_runs: NOVELTY_ABLATED_RUNS.load(Ordering::Relaxed),
             growth_curve: buckets,
         }
     }
