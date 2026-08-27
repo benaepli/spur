@@ -61,6 +61,18 @@ static DELIVERIES_ACTED: [AtomicU64; DELIVERY_BUCKETS] =
 
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
 
+/// Runs per point on the timeline-key growth curve. Small enough that a short
+/// session still produces several points, large enough that the per-point
+/// new-key rate is not dominated by single-run variance.
+const GROWTH_BUCKET_RUNS: u64 = 100;
+/// Points kept on the growth curve. Once the curve is this long the totals keep
+/// accumulating but no further points are appended, so the serialized snapshot
+/// stays bounded on very long sessions.
+const MAX_GROWTH_BUCKETS: usize = 4096;
+
+static TIMELINE_GROWTH: Mutex<TimelineGrowth> = Mutex::new(TimelineGrowth::new());
+static TL_DISTINCT_LIVE: AtomicU64 = AtomicU64::new(0);
+
 /// Enable or disable recording for this explorer session. Enabling resets all
 /// counters so repeated sessions in one process don't bleed into each other.
 pub fn set_enabled(on: bool) {
@@ -91,6 +103,7 @@ pub fn set_enabled(on: bool) {
             &CA_OFFERED,
             &CA_CRASHES_TAKEN,
             &CA_APPLIED,
+            &TL_DISTINCT_LIVE,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -99,6 +112,9 @@ pub fn set_enabled(on: bool) {
         }
         if let Ok(mut t) = TERMINATION.lock() {
             *t = TerminationStats::new();
+        }
+        if let Ok(mut g) = TIMELINE_GROWTH.lock() {
+            *g = TimelineGrowth::new();
         }
     }
     ENABLED.store(on, Ordering::Relaxed);
@@ -481,6 +497,97 @@ pub fn record_run_termination(s: &RunTermination) {
     }
 }
 
+/// One point on the timeline-key growth curve, covering `runs` consecutive
+/// merges in the order they reached the global store.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TimelineGrowthBucket {
+    /// 1-based merge index of this point's first run.
+    pub first_run: u64,
+    pub runs: u64,
+    pub keys_in_run_sum: u64,
+    /// Keys these runs contributed that no earlier run had produced.
+    pub new_keys: u64,
+    /// Distinct keys accumulated from the first run through this point.
+    pub cumulative_distinct: u64,
+}
+
+#[derive(Debug)]
+struct TimelineGrowth {
+    runs: u64,
+    keys_in_run_sum: u64,
+    cumulative_distinct: u64,
+    buckets: Vec<TimelineGrowthBucket>,
+}
+
+impl TimelineGrowth {
+    const fn new() -> Self {
+        Self {
+            runs: 0,
+            keys_in_run_sum: 0,
+            cumulative_distinct: 0,
+            buckets: Vec::new(),
+        }
+    }
+}
+
+/// One run's timeline keys were merged into the global store: `keys_in_run`
+/// distinct keys, of which `new_keys` had never been produced by any earlier
+/// run, leaving `distinct_keys_live` keys in the store. The live count differs
+/// from the cumulative count when the store is decayed, which drops keys that
+/// a later run can then rediscover.
+pub fn record_timeline_keys(keys_in_run: u64, new_keys: u64, distinct_keys_live: u64) {
+    if !enabled() {
+        return;
+    }
+    TL_DISTINCT_LIVE.fetch_max(distinct_keys_live, Ordering::Relaxed);
+    let Ok(mut g) = TIMELINE_GROWTH.lock() else {
+        return;
+    };
+    g.runs += 1;
+    g.keys_in_run_sum += keys_in_run;
+    g.cumulative_distinct += new_keys;
+
+    let index = g.runs;
+    let bucket = ((index - 1) / GROWTH_BUCKET_RUNS) as usize;
+    if bucket >= MAX_GROWTH_BUCKETS {
+        return;
+    }
+    if bucket == g.buckets.len() {
+        g.buckets.push(TimelineGrowthBucket {
+            first_run: index,
+            runs: 0,
+            keys_in_run_sum: 0,
+            new_keys: 0,
+            cumulative_distinct: 0,
+        });
+    }
+    let cumulative = g.cumulative_distinct;
+    let b = &mut g.buckets[bucket];
+    b.runs += 1;
+    b.keys_in_run_sum += keys_in_run;
+    b.new_keys += new_keys;
+    b.cumulative_distinct = cumulative;
+}
+
+/// How fast the timeline coverage key space is still growing. A key space that
+/// keeps yielding new keys at a constant rate is not saturated, so refining the
+/// key would split an already-unexhausted space; one whose growth has flattened
+/// is exhausted and refinement has somewhere to go.
+#[derive(Debug, Serialize)]
+pub struct TimelineKeyStats {
+    pub runs: u64,
+    /// Sum of per-run distinct key counts; divide by `runs` for the mean.
+    pub keys_in_run_sum: u64,
+    pub cumulative_distinct_keys: u64,
+    /// High-water mark of keys held in the global store at a merge.
+    pub distinct_keys_live: u64,
+    /// Merge index of the last run of the first full point on the curve whose
+    /// growth fell below one new key per run. Zero means it never fell below.
+    pub saturation_run_index: u64,
+    pub bucket_runs: u64,
+    pub growth_curve: Vec<TimelineGrowthBucket>,
+}
+
 /// The curriculum lowered its knobs into one concrete run config. Zero here
 /// means the curriculum was not on the path that produced these runs.
 #[inline]
@@ -616,6 +723,34 @@ pub struct UtilizationSnapshot {
     pub delivery_effects: DeliveryEffectStats,
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
+    pub timeline_keys: TimelineKeyStats,
+}
+
+fn timeline_key_stats() -> TimelineKeyStats {
+    let g = TIMELINE_GROWTH
+        .lock()
+        .map(|g| TimelineGrowth {
+            runs: g.runs,
+            keys_in_run_sum: g.keys_in_run_sum,
+            cumulative_distinct: g.cumulative_distinct,
+            buckets: g.buckets.clone(),
+        })
+        .unwrap_or_else(|_| TimelineGrowth::new());
+    let saturation_run_index = g
+        .buckets
+        .iter()
+        .find(|b| b.runs == GROWTH_BUCKET_RUNS && b.new_keys < b.runs)
+        .map(|b| b.first_run + b.runs - 1)
+        .unwrap_or(0);
+    TimelineKeyStats {
+        runs: g.runs,
+        keys_in_run_sum: g.keys_in_run_sum,
+        cumulative_distinct_keys: g.cumulative_distinct,
+        distinct_keys_live: TL_DISTINCT_LIVE.load(Ordering::Relaxed),
+        saturation_run_index,
+        bucket_runs: GROWTH_BUCKET_RUNS,
+        growth_curve: g.buckets,
+    }
 }
 
 pub fn snapshot() -> UtilizationSnapshot {
@@ -672,6 +807,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             .lock()
             .map(|t| *t)
             .unwrap_or_else(|p| *p.into_inner()),
+        timeline_keys: timeline_key_stats(),
     }
 }
 
@@ -679,8 +815,13 @@ pub fn snapshot() -> UtilizationSnapshot {
 mod tests {
     use super::*;
 
+    /// The counters are process-wide and enabling resets them, so tests that
+    /// enable them cannot run concurrently.
+    static COUNTERS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn delivery_effects_split_by_bias() {
+        let _guard = COUNTERS.lock().unwrap_or_else(|p| p.into_inner());
         set_enabled(true);
         set_acted_fraction_enabled(true);
 
@@ -703,5 +844,37 @@ mod tests {
         assert_eq!(s.receiver_restarted.deliveries, 0);
         assert_eq!(s.receiver_restarted.acted_fraction, 0.0);
         assert!((s.all.acted_fraction - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn timeline_growth_curve_finds_saturation_point() {
+        let _guard = COUNTERS.lock().unwrap_or_else(|p| p.into_inner());
+        set_enabled(true);
+
+        // First bucket grows at 5 new keys/run, second at 0.5.
+        for _ in 0..GROWTH_BUCKET_RUNS {
+            record_timeline_keys(20, 5, 100);
+        }
+        for i in 0..GROWTH_BUCKET_RUNS {
+            record_timeline_keys(20, i % 2, 100);
+        }
+        // A partial third bucket must not be read as saturated.
+        record_timeline_keys(20, 0, 100);
+
+        let s = snapshot().timeline_keys;
+        set_enabled(false);
+
+        assert_eq!(s.runs, 2 * GROWTH_BUCKET_RUNS + 1);
+        assert_eq!(s.keys_in_run_sum, 20 * (2 * GROWTH_BUCKET_RUNS + 1));
+        assert_eq!(
+            s.cumulative_distinct_keys,
+            5 * GROWTH_BUCKET_RUNS + GROWTH_BUCKET_RUNS / 2
+        );
+        assert_eq!(s.distinct_keys_live, 100);
+        assert_eq!(s.growth_curve.len(), 3);
+        assert_eq!(s.growth_curve[0].first_run, 1);
+        assert_eq!(s.growth_curve[1].first_run, GROWTH_BUCKET_RUNS + 1);
+        assert_eq!(s.growth_curve[2].runs, 1);
+        assert_eq!(s.saturation_run_index, 2 * GROWTH_BUCKET_RUNS);
     }
 }

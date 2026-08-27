@@ -244,12 +244,23 @@ impl GlobalTimeline {
     }
 
     pub fn merge(&self, local: &LocalTimeline) {
+        let mut new_keys = 0u64;
         for t in &local.tuples {
-            *self.counts.entry(*t).or_default() += 1;
+            let mut count = self.counts.entry(*t).or_default();
+            *count += 1;
+            if *count == 1 {
+                new_keys += 1;
+            }
         }
         let _ = self
             .total
             .fetch_add(local.tuples.len() as u64, Ordering::Relaxed);
+        let distinct_live = if util_stats::enabled() {
+            self.counts.len() as u64
+        } else {
+            0
+        };
+        util_stats::record_timeline_keys(local.tuples.len() as u64, new_keys, distinct_live);
     }
 
     /// Scale all tuple counts by factor.
