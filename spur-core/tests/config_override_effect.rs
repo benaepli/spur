@@ -34,6 +34,12 @@ const CONFIG: &str = r#"{
   "strict_config_keys": true
 }"#;
 
+/// Compilation and interpretation both recurse through the spec, and an
+/// unoptimized build spends far more stack per frame than the default a test
+/// thread is given, so the work runs on a thread sized for the deepest nesting
+/// rather than only passing when the crate is built with optimizations.
+const SESSION_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir()
         .join("spur_config_override_effect")
@@ -45,15 +51,17 @@ fn scratch(name: &str) -> PathBuf {
 
 /// Runs one session with `overrides` applied and returns the runs it executed
 /// and the crashes those runs applied. `set_enabled` inside the explorer resets
-/// the counters, so each call reports its own session.
+/// the counters, so the guard has to be held across the snapshot as well as the
+/// run for the numbers to belong to this session alone.
 fn session(name: &str, config_path: &str, overrides: &[&str]) -> Result<(u64, u64), String> {
     let program = compiler::compile(SPEC, "kv.spur")
         .into_program()
         .expect("spec compiles");
     let out = scratch(name);
-    config_override::set_extra_overrides(overrides.iter().map(|s| s.to_string()).collect());
+    let _scope =
+        config_override::scoped_overrides(overrides.iter().map(|s| s.to_string()).collect());
     let cancelled = Arc::new(AtomicBool::new(false));
-    let result = run_explorer(
+    run_explorer(
         &program,
         config_path,
         out.to_str().expect("utf-8 path"),
@@ -64,13 +72,20 @@ fn session(name: &str, config_path: &str, overrides: &[&str]) -> Result<(u64, u6
         let s = util_stats::snapshot().crash_recovery;
         (s.runs, s.crashes)
     })
-    .map_err(|e| e.to_string());
-    config_override::set_extra_overrides(Vec::new());
-    result
+    .map_err(|e| e.to_string())
 }
 
 #[test]
 fn an_override_changes_what_the_simulator_does() {
+    std::thread::Builder::new()
+        .stack_size(SESSION_STACK_BYTES)
+        .spawn(check_an_override_changes_what_the_simulator_does)
+        .expect("spawns the session thread")
+        .join()
+        .expect("the session thread runs to completion");
+}
+
+fn check_an_override_changes_what_the_simulator_does() {
     let config_path = std::env::temp_dir().join("spur_config_override_effect_config.json");
     fs::write(&config_path, CONFIG).expect("writes config");
     let config_path = config_path.to_str().expect("utf-8 path").to_string();
