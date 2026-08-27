@@ -244,12 +244,26 @@ impl GlobalTimeline {
     }
 
     pub fn merge(&self, local: &LocalTimeline) {
+        // `decay` drops keys that reach zero, so a zero count can only mean the
+        // entry was just created.
+        let mut new_keys = 0u64;
         for t in &local.tuples {
-            *self.counts.entry(*t).or_default() += 1;
+            let mut count = self.counts.entry(*t).or_default();
+            if *count == 0 {
+                new_keys += 1;
+            }
+            *count += 1;
         }
         let _ = self
             .total
             .fetch_add(local.tuples.len() as u64, Ordering::Relaxed);
+        if util_stats::enabled() {
+            util_stats::record_timeline_keys(
+                local.tuples.len() as u64,
+                new_keys,
+                self.counts.len() as u64,
+            );
+        }
     }
 
     /// Scale all tuple counts by factor.
