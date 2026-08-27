@@ -62,6 +62,14 @@ static DELIVERIES_ACTED: [AtomicU64; DELIVERY_BUCKETS] =
     [const { AtomicU64::new(0) }; DELIVERY_BUCKETS];
 
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
+static TIMELINE_KEYS: Mutex<TimelineKeyGrowth> = Mutex::new(TimelineKeyGrowth::new());
+
+/// Runs per point on the timeline-key growth curve, and the most points a
+/// session will report. Once the cap is reached every later run folds into the
+/// final point, so the curve keeps its shape at the head where growth is fast
+/// and stays bounded for a long session.
+const TIMELINE_BUCKET_RUNS: u64 = 100;
+const TIMELINE_MAX_BUCKETS: usize = 512;
 
 /// Enable or disable recording for this explorer session. Enabling resets all
 /// counters so repeated sessions in one process don't bleed into each other.
@@ -101,6 +109,9 @@ pub fn set_enabled(on: bool) {
         }
         if let Ok(mut t) = TERMINATION.lock() {
             *t = TerminationStats::new();
+        }
+        if let Ok(mut g) = TIMELINE_KEYS.lock() {
+            *g = TimelineKeyGrowth::new();
         }
     }
     ENABLED.store(on, Ordering::Relaxed);
@@ -499,6 +510,132 @@ pub fn record_run_termination(s: &RunTermination) {
     }
 }
 
+/// One point on the timeline-key growth curve, covering `runs` consecutive
+/// runs starting at `first_run`. `cumulative_distinct` is the running total of
+/// keys ever inserted as of the last run in the point.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TimelineGrowthBucket {
+    pub first_run: u64,
+    pub runs: u64,
+    pub keys_in_run_sum: u64,
+    pub new_keys: u64,
+    pub cumulative_distinct: u64,
+}
+
+/// Running totals over the coverage keys a session's runs produce.
+struct TimelineKeyGrowth {
+    runs: u64,
+    keys_in_run_sum: u64,
+    new_keys_sum: u64,
+    distinct_keys_live: u64,
+    buckets: Vec<TimelineGrowthBucket>,
+}
+
+impl TimelineKeyGrowth {
+    const fn new() -> Self {
+        Self {
+            runs: 0,
+            keys_in_run_sum: 0,
+            new_keys_sum: 0,
+            distinct_keys_live: 0,
+            buckets: Vec::new(),
+        }
+    }
+}
+
+/// One run's coverage keys were folded into the shared store: `keys_in_run` is
+/// how many keys the run produced, `new_keys` how many of those the store had
+/// never seen, and `distinct_keys_live` the store's size afterwards (which is
+/// smaller than the cumulative total whenever the store has been decayed).
+pub fn record_timeline_keys(keys_in_run: u64, new_keys: u64, distinct_keys_live: u64) {
+    if !enabled() {
+        return;
+    }
+    let Ok(mut g) = TIMELINE_KEYS.lock() else {
+        return;
+    };
+    g.runs += 1;
+    g.keys_in_run_sum += keys_in_run;
+    g.new_keys_sum += new_keys;
+    g.distinct_keys_live = distinct_keys_live;
+    let first_run = g.runs;
+    let cumulative = g.new_keys_sum;
+    let start_new = match g.buckets.last() {
+        Some(b) => b.runs >= TIMELINE_BUCKET_RUNS,
+        None => true,
+    };
+    if start_new && g.buckets.len() < TIMELINE_MAX_BUCKETS {
+        g.buckets.push(TimelineGrowthBucket {
+            first_run,
+            runs: 0,
+            keys_in_run_sum: 0,
+            new_keys: 0,
+            cumulative_distinct: 0,
+        });
+    }
+    if let Some(b) = g.buckets.last_mut() {
+        b.runs += 1;
+        b.keys_in_run_sum += keys_in_run;
+        b.new_keys += new_keys;
+        b.cumulative_distinct = cumulative;
+    }
+}
+
+/// How fast the coverage-key space is still growing. `saturation_run_index` is
+/// the run at which growth first fell below one new key per run over a whole
+/// curve point, or 0 if it never did.
+#[derive(Serialize)]
+pub struct TimelineKeyStats {
+    pub runs: u64,
+    pub keys_in_run_sum: u64,
+    pub cumulative_distinct_keys: u64,
+    pub distinct_keys_live: u64,
+    pub saturation_run_index: u64,
+    pub bucket_runs: u64,
+    pub growth_curve: Vec<TimelineGrowthBucket>,
+}
+
+impl TimelineKeyStats {
+    fn read() -> Self {
+        let g = TIMELINE_KEYS
+            .lock()
+            .map(|g| {
+                (
+                    g.runs,
+                    g.keys_in_run_sum,
+                    g.new_keys_sum,
+                    g.distinct_keys_live,
+                    g.buckets.clone(),
+                )
+            })
+            .unwrap_or_else(|p| {
+                let g = p.into_inner();
+                (
+                    g.runs,
+                    g.keys_in_run_sum,
+                    g.new_keys_sum,
+                    g.distinct_keys_live,
+                    g.buckets.clone(),
+                )
+            });
+        let (runs, keys_in_run_sum, new_keys_sum, distinct_keys_live, buckets) = g;
+        let saturation_run_index = buckets
+            .iter()
+            .find(|b| b.runs >= TIMELINE_BUCKET_RUNS && b.new_keys < b.runs)
+            .map(|b| b.first_run + b.runs - 1)
+            .unwrap_or(0);
+        Self {
+            runs,
+            keys_in_run_sum,
+            cumulative_distinct_keys: new_keys_sum,
+            distinct_keys_live,
+            saturation_run_index,
+            bucket_runs: TIMELINE_BUCKET_RUNS,
+            growth_curve: buckets,
+        }
+    }
+}
+
 /// The curriculum lowered its knobs into one concrete run config. Zero here
 /// means the curriculum was not on the path that produced these runs.
 #[inline]
@@ -643,6 +780,7 @@ pub struct UtilizationSnapshot {
     pub delivery_effects: DeliveryEffectStats,
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
+    pub timeline_keys: TimelineKeyStats,
 }
 
 pub fn snapshot() -> UtilizationSnapshot {
@@ -703,6 +841,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             .lock()
             .map(|t| *t)
             .unwrap_or_else(|p| *p.into_inner()),
+        timeline_keys: TimelineKeyStats::read(),
     }
 }
 
@@ -710,8 +849,13 @@ pub fn snapshot() -> UtilizationSnapshot {
 mod tests {
     use super::*;
 
+    /// `set_enabled` resets every counter process-wide, so tests that record
+    /// anything must not overlap.
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn delivery_effects_split_by_bias() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         set_enabled(true);
         set_acted_fraction_enabled(true);
 
@@ -734,5 +878,29 @@ mod tests {
         assert_eq!(s.receiver_restarted.deliveries, 0);
         assert_eq!(s.receiver_restarted.acted_fraction, 0.0);
         assert!((s.all.acted_fraction - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn timeline_key_growth_accumulates_into_one_curve_point() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        set_enabled(true);
+
+        record_timeline_keys(10, 10, 10);
+        record_timeline_keys(12, 3, 13);
+
+        let s = snapshot().timeline_keys;
+        set_enabled(false);
+
+        assert_eq!(s.runs, 2);
+        assert_eq!(s.keys_in_run_sum, 22);
+        assert_eq!(s.cumulative_distinct_keys, 13);
+        assert_eq!(s.distinct_keys_live, 13);
+        assert_eq!(s.growth_curve.len(), 1);
+        assert_eq!(s.growth_curve[0].first_run, 1);
+        assert_eq!(s.growth_curve[0].runs, 2);
+        assert_eq!(s.growth_curve[0].cumulative_distinct, 13);
+        // Saturation needs a full point to be judged, so a short session
+        // reports none rather than declaring saturation early.
+        assert_eq!(s.saturation_run_index, 0);
     }
 }
