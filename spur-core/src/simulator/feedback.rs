@@ -134,9 +134,27 @@ pub struct FeedbackConfig {
     /// at every step.
     #[serde(default)]
     pub steer_audit: bool,
+    /// Add control-flow-graph edge coverage to the feedback signal on top of
+    /// whatever `mode` already tracks, so runs that reach rarely-executed
+    /// program points score higher between runs.
+    #[serde(default)]
+    pub config_scoring: bool,
 }
 
 impl FeedbackConfig {
+    /// The strategy actually built for a session: `config_scoring` folds CFG
+    /// coverage into `mode`, leaving modes that already track it unchanged.
+    pub fn effective_mode(&self) -> FeedbackMode {
+        if !self.config_scoring {
+            return self.mode;
+        }
+        match self.mode {
+            FeedbackMode::None => FeedbackMode::Cfg,
+            FeedbackMode::Timeline => FeedbackMode::Both,
+            already_scoring => already_scoring,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let w = &self.weights;
         if w.timeline_weight < 0.0 || w.cfg_weight < 0.0 {
@@ -743,6 +761,24 @@ mod tests {
             defaulted.timeline_key_granularity,
             TimelineKeyGranularity::Default
         );
+    }
+
+    #[test]
+    fn config_scoring_folds_cfg_coverage_into_the_mode() {
+        let off: FeedbackConfig = serde_json::from_str(r#"{"mode": "timeline"}"#).unwrap();
+        assert!(!off.config_scoring);
+        assert_eq!(off.effective_mode(), FeedbackMode::Timeline);
+
+        let on: FeedbackConfig =
+            serde_json::from_str(r#"{"mode": "timeline", "config_scoring": true}"#).unwrap();
+        assert_eq!(on.effective_mode(), FeedbackMode::Both);
+
+        let bare: FeedbackConfig = serde_json::from_str(r#"{"config_scoring": true}"#).unwrap();
+        assert_eq!(bare.effective_mode(), FeedbackMode::Cfg);
+
+        let both: FeedbackConfig =
+            serde_json::from_str(r#"{"mode": "both", "config_scoring": true}"#).unwrap();
+        assert_eq!(both.effective_mode(), FeedbackMode::Both);
     }
 
     #[test]
