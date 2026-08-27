@@ -808,6 +808,7 @@ pub fn run_explorer(
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
+    util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1198,6 +1199,7 @@ pub fn run_explorer_genetic(
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
+    util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1619,6 +1621,7 @@ pub fn run_explorer_aos(
     info!("AOS session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
+    util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     dispatch_feedback!(config.feedback, F => run_explorer_aos_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -2241,6 +2244,7 @@ pub fn run_explorer_continuous(
     info!("Continuous session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
+    util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
     dispatch_feedback!(config.envelope.feedback, F => run_explorer_continuous_impl::<F>(program, config, output_path, backend, cancelled))
 }
 

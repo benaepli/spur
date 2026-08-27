@@ -130,6 +130,144 @@ fn priority_component<H: HashPolicy>(
     }
 }
 
+/// Where a runnable sits across the three kinds of queue, so the one the
+/// scoring function ranks first can be compared against the one a step runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueueSlot {
+    Local(usize, usize),
+    Network(usize),
+    Timer(usize),
+}
+
+impl QueueSlot {
+    fn same_queue(self, other: Self) -> bool {
+        match (self, other) {
+            (QueueSlot::Local(a, _), QueueSlot::Local(b, _)) => a == b,
+            (QueueSlot::Network(_), QueueSlot::Network(_)) => true,
+            (QueueSlot::Timer(_), QueueSlot::Timer(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The top-ranked runnable at one scheduling point, and whether anything is
+/// keeping it from being run.
+enum PreferredSlot {
+    NoneEligible,
+    Blocked(util_stats::SteerOutcome),
+    Eligible(QueueSlot),
+}
+
+/// Observation-only picture of what the scoring function wanted at one
+/// scheduling point, resolved against what the point went on to do.
+struct SteerPreference {
+    expressed: bool,
+    preferred: PreferredSlot,
+}
+
+impl SteerPreference {
+    fn outcome(&self, chosen: Option<QueueSlot>) -> util_stats::SteerOutcome {
+        match self.preferred {
+            PreferredSlot::NoneEligible => util_stats::SteerOutcome::NoEligibleCandidates,
+            PreferredSlot::Blocked(reason) => reason,
+            PreferredSlot::Eligible(slot) => match chosen {
+                None => util_stats::SteerOutcome::NoEligibleCandidates,
+                Some(c) if c == slot => util_stats::SteerOutcome::Honored,
+                Some(c) if c.same_queue(slot) => util_stats::SteerOutcome::SamplerChoseOther,
+                Some(_) => util_stats::SteerOutcome::OtherQueue,
+            },
+        }
+    }
+}
+
+/// A timer whose label is currently not permitted to fire; other runnables and
+/// unlabeled timers are never gated this way.
+fn timer_gate_blocks<H: HashPolicy>(state: &State<H>, r: &Runnable<H>) -> bool {
+    match r {
+        Runnable::Timer(t) => t
+            .label
+            .as_ref()
+            .is_some_and(|l| !state.allowed_timers.contains(&(t.node.index, l.clone()))),
+        _ => false,
+    }
+}
+
+/// Rank every runnable in every queue by the same score the selectors use, and
+/// report where the top-ranked one sits and what is in its way. Consumes no
+/// RNG and touches no state; the cost is one pass over all queues, which is
+/// why it is behind its own switch.
+fn audit_steer_preference<H: HashPolicy, F: Feedback>(
+    state: &State<H>,
+    feedback: &F::Local,
+    snapshot: &F::Snapshot,
+    quick_fire_multiplier: f64,
+    strict_timers: bool,
+    is_ineligible: &impl Fn(&Runnable<H>) -> bool,
+) -> SteerPreference {
+    let currently_crashed = &state.crash_info.currently_crashed;
+    let mut candidates: u64 = 0;
+    let mut any_eligible = false;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_slot: Option<(QueueSlot, Option<util_stats::SteerOutcome>)> = None;
+    let mut best_priority = f64::NEG_INFINITY;
+    let mut best_priority_slot: Option<QueueSlot> = None;
+
+    {
+        let mut visit = |slot: QueueSlot, r: &Runnable<H>, timer_gated: bool| {
+            let blocked = if is_ineligible(r) {
+                Some(util_stats::SteerOutcome::BlockedByOrder)
+            } else if timer_gated {
+                Some(util_stats::SteerOutcome::BlockedByTimerGate)
+            } else {
+                None
+            };
+            candidates += 1;
+            any_eligible |= blocked.is_none();
+            let score = score_runnable::<H, F>(
+                r,
+                feedback,
+                snapshot,
+                currently_crashed,
+                quick_fire_multiplier,
+            );
+            if score > best_score {
+                best_score = score;
+                best_slot = Some((slot, blocked));
+            }
+            let priority = priority_component(r, currently_crashed, quick_fire_multiplier);
+            if priority > best_priority {
+                best_priority = priority;
+                best_priority_slot = Some(slot);
+            }
+        };
+
+        for (node_idx, queue) in state.local_queues.iter().enumerate() {
+            for (i, r) in queue.iter().enumerate() {
+                visit(QueueSlot::Local(node_idx, i), r, false);
+            }
+        }
+        for (i, r) in state.network_queue.iter().enumerate() {
+            visit(QueueSlot::Network(i), r, false);
+        }
+        for (i, r) in state.timer_queue.iter().enumerate() {
+            let gated = strict_timers && timer_gate_blocks(state, r);
+            visit(QueueSlot::Timer(i), r, gated);
+        }
+    }
+
+    let expressed = candidates > 1 && best_slot.map(|(s, _)| s) != best_priority_slot;
+    let preferred = match best_slot {
+        _ if !any_eligible => PreferredSlot::NoneEligible,
+        Some((_, Some(reason))) => PreferredSlot::Blocked(reason),
+        Some((slot, None)) => PreferredSlot::Eligible(slot),
+        None => PreferredSlot::NoneEligible,
+    };
+    SteerPreference {
+        expressed,
+        preferred,
+    }
+}
+
 /// Select an eligible item from a single queue.
 ///
 /// `Tournament` samples `k` indices uniformly and takes the highest-scoring
@@ -299,6 +437,19 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         None
     };
 
+    // Observation-only steer-authority audit: what the scoring function ranks
+    // first here, resolved below against what this step actually runs.
+    let audit = util_stats::steer_audit_enabled().then(|| {
+        audit_steer_preference::<H, F>(
+            state,
+            feedback,
+            snapshot,
+            quick_fire_multiplier,
+            strict_timers,
+            &is_ineligible,
+        )
+    });
+
     // Build QueueInfo, accounting for strict_timers eligibility AND reservations.
     // Subtract reserved items so the QueueSelector doesn't route to queues
     // where all items are reserved (wastes iterations in fully-constrained plans).
@@ -335,18 +486,28 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     };
 
     rng.use_stream(Stream::QueueChoice);
-    let selection = match selector.select(&info, rng) {
-        Some(s) => s,
-        None => return Ok(ScheduleResult::None),
+    let record_unscheduled = |audit: &Option<SteerPreference>| {
+        if let Some(a) = audit {
+            util_stats::record_steer_authority(a.expressed, a.outcome(None));
+        }
     };
 
-    let runnable = match selection {
+    let selection = match selector.select(&info, rng) {
+        Some(s) => s,
+        None => {
+            record_unscheduled(&audit);
+            return Ok(ScheduleResult::None);
+        }
+    };
+
+    let (runnable, chosen_slot) = match selection {
         QueueSelection::Local(node_idx) => {
             let queue = &state.local_queues[node_idx];
             let eligible: Vec<usize> = (0..queue.len())
                 .filter(|&i| !is_ineligible(&queue[i]))
                 .collect();
             if eligible.is_empty() {
+                record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
             let idx = select_within_queue::<H, F>(
@@ -359,7 +520,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 within_queue,
                 rng,
             );
-            state.local_queues[node_idx].remove(idx)
+            (
+                state.local_queues[node_idx].remove(idx),
+                QueueSlot::Local(node_idx, idx),
+            )
         }
         QueueSelection::Network => {
             let queue = &state.network_queue;
@@ -367,6 +531,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 .filter(|&i| !is_ineligible(&queue[i]))
                 .collect();
             if eligible.is_empty() {
+                record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
             let idx = select_within_queue::<H, F>(
@@ -379,7 +544,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 within_queue,
                 rng,
             );
-            state.network_queue.remove(idx)
+            (state.network_queue.remove(idx), QueueSlot::Network(idx))
         }
         QueueSelection::Timer => {
             let queue = &state.timer_queue;
@@ -404,6 +569,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     .collect()
             };
             if eligible.is_empty() {
+                record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
             let idx = select_within_queue::<H, F>(
@@ -416,9 +582,13 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 within_queue,
                 rng,
             );
-            state.timer_queue.remove(idx)
+            (state.timer_queue.remove(idx), QueueSlot::Timer(idx))
         }
     };
+
+    if let Some(a) = &audit {
+        util_stats::record_steer_authority(a.expressed, a.outcome(Some(chosen_slot)));
+    }
 
     match runnable {
         Runnable::Crash { node_id, .. } => {
