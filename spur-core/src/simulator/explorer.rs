@@ -188,6 +188,15 @@ pub struct ExplorerConfig {
     #[serde(default = "default_emit_acted_fraction")]
     pub emit_acted_fraction: bool,
 
+    /// At each within-queue selection, re-rank the eligible candidates under a
+    /// fixed sweep of quick-fire magnitudes and count how often the top-ranked
+    /// candidate moves away from what the identity weighting ranks first.
+    /// Reported under `multiplier_authority` and only recorded when `stats` is
+    /// on. Observation-only; off by default because it re-ranks the candidate
+    /// set once per swept magnitude.
+    #[serde(default)]
+    pub emit_multiplier_authority: bool,
+
     /// Opt-in strict config parsing: when true, a top-level key that no
     /// explorer config field claims is a hard error instead of being silently
     /// ignored. Off by default (today's serde behaviour), so existing configs
@@ -239,6 +248,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "feedback",
     "stats",
     "emit_acted_fraction",
+    "emit_multiplier_authority",
     "strict_config_keys",
     "rng_stream_isolation",
 ];
@@ -820,6 +830,7 @@ pub fn run_explorer(
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
+    util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
     dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1214,6 +1225,7 @@ pub fn run_explorer_genetic(
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
+    util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
     dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1637,6 +1649,7 @@ pub fn run_explorer_aos(
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
+    util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
     dispatch_feedback!(config.feedback, F => run_explorer_aos_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -2261,6 +2274,7 @@ pub fn run_explorer_continuous(
     util_stats::set_enabled(config.envelope.stats);
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
+    util_stats::set_multiplier_audit_enabled(config.envelope.emit_multiplier_authority);
     dispatch_feedback!(config.envelope.feedback, F => run_explorer_continuous_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
