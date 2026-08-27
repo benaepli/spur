@@ -47,7 +47,7 @@ pub struct ExploreSummary {
 /// `$body`, so the generic type never escapes this match.
 macro_rules! dispatch_feedback {
     ($cfg:expr, $f:ident => $body:expr) => {{
-        match ($cfg.effective_mode(), $cfg.steer) {
+        match ($cfg.mode, $cfg.steer) {
             (FeedbackMode::None, _) => {
                 type $f = NoFeedback;
                 $body
