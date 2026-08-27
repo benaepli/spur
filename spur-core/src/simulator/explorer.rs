@@ -1,4 +1,5 @@
 use crate::compiler::cfg::Program;
+use crate::simulator::config_override;
 use crate::simulator::core::{
     Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
     Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
@@ -32,7 +33,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::{fs, thread};
+use std::thread;
 
 /// Non-generic result of an exploration session. The feedback type parameter is
 /// fully contained inside the dispatch, so callers (the CLI) never see it.
@@ -803,7 +804,7 @@ pub fn run_explorer(
     info!("Starting Execution Explorer...");
     info!("Config: {}", config_json_path);
 
-    let config_json = fs::read_to_string(config_json_path)?;
+    let config_json = config_override::load_config_text(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
@@ -1108,7 +1109,7 @@ pub fn run_plan(
     info!("Starting Plan Runner...");
     info!("Plan config: {}", config_json_path);
 
-    let config_json = fs::read_to_string(config_json_path)?;
+    let config_json = config_override::load_config_text(config_json_path)?;
     let config: PlanFileConfig = serde_json::from_str(&config_json)?;
     config
         .validate()
@@ -1196,7 +1197,7 @@ pub fn run_explorer_genetic(
     info!("Starting Genetic Execution Explorer...");
     info!("Config: {}", config_json_path);
 
-    let config_json = fs::read_to_string(config_json_path)?;
+    let config_json = config_override::load_config_text(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
@@ -1609,7 +1610,7 @@ pub fn run_explorer_aos(
     info!("Starting AOS (record-and-replay) controller...");
     info!("Config: {}", config_json_path);
 
-    let config_json = fs::read_to_string(config_json_path)?;
+    let config_json = config_override::load_config_text(config_json_path)?;
     let config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
@@ -2243,7 +2244,7 @@ pub fn run_explorer_continuous(
     info!("Starting Continuous Adaptive Explorer...");
     info!("Config: {}", config_json_path);
 
-    let config_json = fs::read_to_string(config_json_path)?;
+    let config_json = config_override::load_config_text(config_json_path)?;
     let config: ContinuousConfig = serde_json::from_str(&config_json)?;
     if config.envelope.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS, CONTINUOUS_CONFIG_KEYS])?;

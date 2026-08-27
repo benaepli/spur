@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use spur_core::compiler;
 use spur_core::compiler::pure::print_program as print_pure;
 use spur_core::debug::SimulatorDebugger;
+use spur_core::simulator::config_override;
 use spur_core::simulator::explorer::{
     ExploreSummary, run_explorer, run_explorer_aos, run_explorer_continuous, run_explorer_genetic,
     run_plan,
@@ -78,6 +79,12 @@ enum Commands {
         /// Output directory for results
         #[arg(short, long)]
         output_dir: PathBuf,
+        /// Override a config field without editing the file, as
+        /// `path.to.field=value` (repeatable). The value is read as JSON when
+        /// it parses and as a string otherwise. Applied on top of the
+        /// `SPUR_CONFIG_SET` environment variable.
+        #[arg(long = "set", value_name = "PATH=VALUE")]
+        set: Vec<String>,
         /// Explorer type to use
         #[arg(short, long, value_enum, default_value_t = ExplorerType::Standard)]
         explorer: ExplorerType,
@@ -203,10 +210,19 @@ fn main() {
             spec,
             config,
             output_dir,
+            set,
             explorer,
             log_backend,
             yes,
-        } => run_explore(spec, config, output_dir, explorer, log_backend.into(), yes),
+        } => run_explore(
+            spec,
+            config,
+            output_dir,
+            set,
+            explorer,
+            log_backend.into(),
+            yes,
+        ),
         Commands::RunPlan {
             spec,
             plan,
@@ -434,10 +450,17 @@ fn run_explore(
     spec_path: PathBuf,
     config_path: PathBuf,
     output_dir: PathBuf,
+    config_overrides: Vec<String>,
     explorer_type: ExplorerType,
     backend: LogBackend,
     yes: bool,
 ) -> Result<()> {
+    config_override::set_extra_overrides(config_overrides);
+    let active = config_override::active_overrides();
+    if !active.is_empty() {
+        println!("Config overrides: {}", active.join(", "));
+    }
+
     let source_code = fs::read_to_string(&spec_path)
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
