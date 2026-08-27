@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTED_ENABLED: AtomicBool = AtomicBool::new(true);
 static STEER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
+static MULTIPLIER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static RNG_ISOLATED_RUNS: AtomicU64 = AtomicU64::new(0);
 static RNG_SHARED_RUNS: AtomicU64 = AtomicU64::new(0);
@@ -65,6 +66,20 @@ static PFO_PAIRS_SEEN: AtomicU64 = AtomicU64::new(0);
 static PFO_EDGES_ADDED: AtomicU64 = AtomicU64::new(0);
 static PFO_OPS_AFTER_LAST_RECOVER: AtomicU64 = AtomicU64::new(0);
 static NOVELTY_ABLATED_RUNS: AtomicU64 = AtomicU64::new(0);
+static MA_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static MA_CONTESTED_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static MA_QUICK_FIRE_OFFERS: AtomicU64 = AtomicU64::new(0);
+static MA_QUICK_FIRE_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static MA_FLIPPED_CONFIGURED: AtomicU64 = AtomicU64::new(0);
+static MA_CONFIGURED_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// Multiplier magnitudes the authority probe ranks candidates under. Index 0 is
+/// the identity weighting, which every other entry is compared against, so its
+/// own flip count is zero by construction and reads as a self-check.
+pub const MULTIPLIER_SWEEP: [f64; 5] = [1.0, 3.0, 10.0, 100.0, 1000.0];
+
+static MA_FLIPPED: [AtomicU64; MULTIPLIER_SWEEP.len()] =
+    [const { AtomicU64::new(0) }; MULTIPLIER_SWEEP.len()];
 
 /// Recovery-window widths are tallied into a histogram so percentiles can be
 /// read without keeping every sample. Widths at or above the cap fold into the
@@ -155,10 +170,20 @@ pub fn set_enabled(on: bool) {
             &PFO_EDGES_ADDED,
             &PFO_OPS_AFTER_LAST_RECOVER,
             &NOVELTY_ABLATED_RUNS,
+            &MA_DECISIONS,
+            &MA_CONTESTED_DECISIONS,
+            &MA_QUICK_FIRE_OFFERS,
+            &MA_QUICK_FIRE_DECISIONS,
+            &MA_FLIPPED_CONFIGURED,
+            &MA_CONFIGURED_SUM,
         ] {
             c.store(0, Ordering::Relaxed);
         }
-        for c in DELIVERIES.iter().chain(DELIVERIES_ACTED.iter()) {
+        for c in DELIVERIES
+            .iter()
+            .chain(DELIVERIES_ACTED.iter())
+            .chain(MA_FLIPPED.iter())
+        {
             c.store(0, Ordering::Relaxed);
         }
         if let Ok(mut w) = RW_WIDTHS.lock() {
@@ -210,6 +235,67 @@ pub fn set_steer_audit_enabled(on: bool) {
 #[inline]
 pub fn steer_audit_enabled() -> bool {
     enabled() && STEER_AUDIT_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the multiplier-authority probe for this session. It also
+/// requires `set_enabled(true)`; the probe re-ranks the eligible candidates
+/// once per swept magnitude, so it is a separate switch from the cheap counters.
+pub fn set_multiplier_audit_enabled(on: bool) {
+    MULTIPLIER_AUDIT_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a within-queue selection should be re-ranked under each swept
+/// magnitude. Callers must check this before doing the extra ranking.
+#[inline]
+pub fn multiplier_audit_enabled() -> bool {
+    enabled() && MULTIPLIER_AUDIT_ENABLED.load(Ordering::Relaxed)
+}
+
+/// One within-queue selection was seen by the multiplier-authority probe.
+/// `contested` means more than one candidate was eligible, `quick_fire_present`
+/// that at least one of them is a candidate the multiplier applies to. Only a
+/// selection that is both can have its ranking changed by any magnitude, so
+/// splitting the two says whether a zero flip rate means the weighting lost or
+/// means it was never handed a competitor.
+#[inline]
+pub fn record_multiplier_decision(contested: bool, quick_fire_present: bool) {
+    if !multiplier_audit_enabled() {
+        return;
+    }
+    MA_DECISIONS.fetch_add(1, Ordering::Relaxed);
+    if contested {
+        MA_CONTESTED_DECISIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    if quick_fire_present {
+        MA_QUICK_FIRE_OFFERS.fetch_add(1, Ordering::Relaxed);
+        if contested {
+            MA_QUICK_FIRE_DECISIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The outcome of re-ranking one selection. `flipped[i]` means the top-ranked
+/// candidate under `MULTIPLIER_SWEEP[i]` differs from the one the identity
+/// weighting ranks first; `configured_flipped` is the same question asked of
+/// the magnitude the session is actually running with.
+#[inline]
+pub fn record_multiplier_flips(
+    configured_multiplier: f64,
+    flipped: &[bool; MULTIPLIER_SWEEP.len()],
+    configured_flipped: bool,
+) {
+    if !multiplier_audit_enabled() {
+        return;
+    }
+    add_f64(&MA_CONFIGURED_SUM, configured_multiplier);
+    if configured_flipped {
+        MA_FLIPPED_CONFIGURED.fetch_add(1, Ordering::Relaxed);
+    }
+    for (counter, &f) in MA_FLIPPED.iter().zip(flipped.iter()) {
+        if f {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// What stood between the highest-scoring runnable and the one a scheduling
@@ -1189,12 +1275,67 @@ pub struct PostFaultOpsStats {
     pub ops_invoked_after_last_recover: u64,
 }
 
+/// Whether raising the weight of the priority term can outvote the random draw
+/// priority is sampled from. `decisions` is every within-queue selection the
+/// probe saw, `contested_decisions` those with more than one eligible
+/// candidate, `quick_fire_offers` those holding a candidate the multiplier
+/// applies to, and `quick_fire_decisions` the intersection, which is the only
+/// place any magnitude can change the ranking and the denominator for every
+/// flip count. `flipped_configured` is the probe's own firing count: the
+/// selections the session's own magnitude reordered.
+#[derive(Serialize)]
+pub struct MultiplierAuthorityStats {
+    pub decisions: u64,
+    pub contested_decisions: u64,
+    pub quick_fire_offers: u64,
+    pub quick_fire_decisions: u64,
+    pub mean_configured_multiplier: f64,
+    pub flipped_configured: u64,
+    pub sweep: Vec<MultiplierFlip>,
+}
+
+/// Selections whose top-ranked candidate under `multiplier` differs from the
+/// one the identity weighting ranks first, out of `quick_fire_decisions`.
+#[derive(Serialize)]
+pub struct MultiplierFlip {
+    pub multiplier: f64,
+    pub flipped: u64,
+}
+
+impl MultiplierAuthorityStats {
+    fn read() -> Self {
+        let quick_fire_decisions = MA_QUICK_FIRE_DECISIONS.load(Ordering::Relaxed);
+        Self {
+            decisions: MA_DECISIONS.load(Ordering::Relaxed),
+            contested_decisions: MA_CONTESTED_DECISIONS.load(Ordering::Relaxed),
+            quick_fire_offers: MA_QUICK_FIRE_OFFERS.load(Ordering::Relaxed),
+            quick_fire_decisions,
+            mean_configured_multiplier: if quick_fire_decisions == 0 {
+                0.0
+            } else {
+                f64::from_bits(MA_CONFIGURED_SUM.load(Ordering::Relaxed))
+                    / quick_fire_decisions as f64
+            },
+            flipped_configured: MA_FLIPPED_CONFIGURED.load(Ordering::Relaxed),
+            sweep: MULTIPLIER_SWEEP
+                .iter()
+                .zip(MA_FLIPPED.iter())
+                .map(|(&multiplier, flipped)| MultiplierFlip {
+                    multiplier,
+                    flipped: flipped.load(Ordering::Relaxed),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
     pub rng_streams: RngStreamStats,
     pub steer: SteerStats,
     pub steer_authority: SteerAuthorityStats,
+    pub multiplier_authority: MultiplierAuthorityStats,
     pub purgatory: PurgatoryStats,
     pub aos: AosStats,
     pub dedup: DedupStats,
@@ -1231,6 +1372,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             other_queue: SA_OTHER_QUEUE.load(Ordering::Relaxed),
             sampler_chose_other: SA_SAMPLER_CHOSE_OTHER.load(Ordering::Relaxed),
         },
+        multiplier_authority: MultiplierAuthorityStats::read(),
         purgatory: PurgatoryStats {
             delayed_sends: PURGATORY_DELAYED_SENDS.load(Ordering::Relaxed),
         },

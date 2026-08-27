@@ -90,6 +90,30 @@ fn nodes_with_in_flight_send<H: HashPolicy>(state: &State<H>) -> Vec<bool> {
     senders
 }
 
+/// A runnable the quick-fire weighting applies to: bringing back a node that is
+/// down right now.
+fn is_quick_fire<H: HashPolicy>(r: &Runnable<H>, currently_crashed: &OrdSet<NodeId>) -> bool {
+    matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id))
+}
+
+/// Combine novelty and priority into a score in [0, 1]. Where the quick-fire
+/// weighting applies, `quick_fire_multiplier` raises the weight of priority
+/// relative to novelty while keeping the result in [0, 1]; a multiplier of 1
+/// makes both branches identical.
+fn blend_score(
+    novelty: f64,
+    priority: f64,
+    quick_fire: bool,
+    quick_fire_multiplier: f64,
+) -> f64 {
+    if quick_fire {
+        let w = 0.75 * quick_fire_multiplier;
+        (0.25 * novelty + w * priority) / (0.25 + w)
+    } else {
+        0.25 * novelty + 0.75 * priority
+    }
+}
+
 /// Score a runnable in [0, 1] by combining novelty and priority. For Recover
 /// events targeting a currently-crashed node, `quick_fire_multiplier` increases
 /// the weight of priority relative to novelty while keeping the result in [0, 1].
@@ -102,14 +126,70 @@ fn score_runnable<H: HashPolicy, F: Feedback>(
 ) -> f64 {
     let novelty = F::runnable_novelty(feedback, r, snapshot);
     let priority = r.priority();
-    let is_quick_fire =
-        matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
-    if is_quick_fire {
-        let w = 0.75 * quick_fire_multiplier;
-        (0.25 * novelty + w * priority) / (0.25 + w)
-    } else {
-        0.25 * novelty + 0.75 * priority
+    blend_score(
+        novelty,
+        priority,
+        is_quick_fire(r, currently_crashed),
+        quick_fire_multiplier,
+    )
+}
+
+/// Rank the eligible candidates once per swept magnitude and report how often
+/// the top-ranked one moves away from what the identity weighting ranks first.
+/// This asks whether reweighting the priority term can outvote the random draw
+/// priority itself is sampled from, which is a property of the scoring function
+/// and not of any one magnitude being configured. Consumes no RNG and does not
+/// influence the selection.
+///
+/// A selection with a single eligible candidate is still counted, so a zero
+/// flip rate can be told apart from a weighting that was never given a
+/// competitor to rank against.
+fn audit_multiplier_authority<H: HashPolicy, F: Feedback>(
+    queue: &[Runnable<H>],
+    eligible: &[usize],
+    feedback: &F::Local,
+    snapshot: &F::Snapshot,
+    currently_crashed: &OrdSet<NodeId>,
+    quick_fire_multiplier: f64,
+) {
+    let sweep = util_stats::MULTIPLIER_SWEEP;
+    let present = eligible
+        .iter()
+        .any(|&i| is_quick_fire(&queue[i], currently_crashed));
+    let contested = eligible.len() > 1;
+    util_stats::record_multiplier_decision(contested, present);
+    if !present || !contested {
+        return;
     }
+
+    let mut best = [(f64::NEG_INFINITY, usize::MAX); util_stats::MULTIPLIER_SWEEP.len()];
+    let mut best_configured = (f64::NEG_INFINITY, usize::MAX);
+    for &i in eligible {
+        let novelty = F::runnable_novelty(feedback, &queue[i], snapshot);
+        let priority = queue[i].priority();
+        let quick_fire = is_quick_fire(&queue[i], currently_crashed);
+        for (slot, &m) in best.iter_mut().zip(sweep.iter()) {
+            let s = blend_score(novelty, priority, quick_fire, m);
+            if s > slot.0 {
+                *slot = (s, i);
+            }
+        }
+        let s = blend_score(novelty, priority, quick_fire, quick_fire_multiplier);
+        if s > best_configured.0 {
+            best_configured = (s, i);
+        }
+    }
+
+    let baseline = best[0].1;
+    let mut flipped = [false; util_stats::MULTIPLIER_SWEEP.len()];
+    for (f, slot) in flipped.iter_mut().zip(best.iter()) {
+        *f = slot.1 != baseline;
+    }
+    util_stats::record_multiplier_flips(
+        quick_fire_multiplier,
+        &flipped,
+        best_configured.1 != baseline,
+    );
 }
 
 /// The priority-only share of `score_runnable` (novelty zeroed out, same
@@ -120,9 +200,7 @@ fn priority_component<H: HashPolicy>(
     quick_fire_multiplier: f64,
 ) -> f64 {
     let priority = r.priority();
-    let is_quick_fire =
-        matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id));
-    if is_quick_fire {
+    if is_quick_fire(r, currently_crashed) {
         let w = 0.75 * quick_fire_multiplier;
         (w * priority) / (0.25 + w)
     } else {
@@ -284,6 +362,16 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     selector: &WithinQueueSelector,
     rng: &mut impl StreamRng,
 ) -> usize {
+    if util_stats::multiplier_audit_enabled() {
+        audit_multiplier_authority::<H, F>(
+            queue,
+            eligible,
+            feedback,
+            snapshot,
+            currently_crashed,
+            quick_fire_multiplier,
+        );
+    }
     if eligible.len() <= 1 {
         return eligible[0];
     }
@@ -1165,6 +1253,34 @@ mod tests {
             "tournament should favor higher-score index 1: got {:?}",
             counts
         );
+    }
+
+    /// A multiplier of 1 collapses the two branches of `blend_score`, which is
+    /// what makes it usable as the unweighted baseline the sweep compares
+    /// against.
+    #[test]
+    fn identity_multiplier_makes_the_quick_fire_branch_a_no_op() {
+        for &novelty in &[0.0, 0.4, 1.0] {
+            for &priority in &[0.0, 0.3, 1.0] {
+                assert_eq!(
+                    blend_score(novelty, priority, true, 1.0),
+                    blend_score(novelty, priority, false, 1.0),
+                );
+            }
+        }
+    }
+
+    /// However large the multiplier grows, the quick-fire score converges on
+    /// the priority draw itself and never exceeds 1, so it cannot outrank a
+    /// competitor whose own blended score is already higher than that draw.
+    #[test]
+    fn quick_fire_score_is_bounded_by_the_priority_draw() {
+        let priority = 0.4;
+        for &m in &[3.0, 10.0, 100.0, 1000.0] {
+            let s = blend_score(1.0, priority, true, m);
+            assert!(s > priority && s <= 1.0, "m={} gave {}", m, s);
+        }
+        assert!(blend_score(1.0, priority, true, 1000.0) < blend_score(1.0, priority, true, 3.0));
     }
 
     #[test]
