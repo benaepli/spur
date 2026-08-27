@@ -517,15 +517,7 @@ fn run_explore(
     fs::write(&cfg_path, svg).context("Failed to write CFG SVG")?;
 
     // Dump opt-in utilization counters (enabled via `"stats": true` in the config)
-    let util_path = if util_stats::enabled() {
-        let path = output_dir.join("utilization.json");
-        let json = serde_json::to_string_pretty(&util_stats::snapshot())
-            .context("Failed to serialize utilization counters")?;
-        fs::write(&path, json).context("Failed to write utilization.json")?;
-        Some(path)
-    } else {
-        None
-    };
+    let util_paths = write_utilization_counters(&output_dir)?;
 
     println!(
         "Explorer finished in {:.2?}. Results saved to {}",
@@ -537,11 +529,50 @@ fn run_explore(
         None => println!("  - Coverage heatmap: skipped (no CFG feedback)"),
     }
     println!("  - CFG: {}", cfg_path.display());
-    if let Some(p) = &util_path {
+    for p in &util_paths {
         println!("  - Utilization counters: {}", p.display());
     }
 
     Ok(())
+}
+
+/// Path of a file beside `dir` rather than inside it. Returns `None` when
+/// `dir` has no name to append to.
+fn sibling_path(dir: &Path, suffix: &str) -> Option<PathBuf> {
+    let raw = dir.to_string_lossy();
+    let trimmed = raw.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(format!("{trimmed}{suffix}")))
+}
+
+/// Writes the utilization counters twice: once inside the output directory,
+/// and once beside it. Batch consumers delete the output directory once the
+/// corpus has been checked, which takes the counters with it, so the sibling
+/// copy is what lets a run's counters be read after the fact and attributed to
+/// that run by name. The sibling write is advisory: instrumentation must not
+/// fail a run that otherwise succeeded.
+fn write_utilization_counters(output_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !util_stats::enabled() {
+        return Ok(Vec::new());
+    }
+    let json = serde_json::to_string_pretty(&util_stats::snapshot())
+        .context("Failed to serialize utilization counters")?;
+    let inside = output_dir.join("utilization.json");
+    fs::write(&inside, &json).context("Failed to write utilization.json")?;
+    let mut written = vec![inside];
+    if let Some(beside) = sibling_path(output_dir, ".utilization.json") {
+        match fs::write(&beside, &json) {
+            Ok(()) => written.push(beside),
+            Err(e) => eprintln!(
+                "warning: could not write {}: {}",
+                beside.display(),
+                e
+            ),
+        }
+    }
+    Ok(written)
 }
 
 /// Renders the CFG coverage heatmap if the summary carries vertex coverage.
