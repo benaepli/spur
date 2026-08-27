@@ -13,11 +13,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTED_ENABLED: AtomicBool = AtomicBool::new(true);
+static STEER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static RNG_ISOLATED_RUNS: AtomicU64 = AtomicU64::new(0);
 static RNG_SHARED_RUNS: AtomicU64 = AtomicU64::new(0);
 static STEER_EVALUATIONS: AtomicU64 = AtomicU64::new(0);
 static STEER_DIVERGENT_PICKS: AtomicU64 = AtomicU64::new(0);
+static SA_STEPS: AtomicU64 = AtomicU64::new(0);
+static SA_PREFERENCE_EXPRESSED: AtomicU64 = AtomicU64::new(0);
+static SA_PREFERENCE_HONORED: AtomicU64 = AtomicU64::new(0);
+static SA_HONORED: AtomicU64 = AtomicU64::new(0);
+static SA_NO_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+static SA_BLOCKED_BY_ORDER: AtomicU64 = AtomicU64::new(0);
+static SA_BLOCKED_BY_TIMER_GATE: AtomicU64 = AtomicU64::new(0);
+static SA_OTHER_QUEUE: AtomicU64 = AtomicU64::new(0);
+static SA_SAMPLER_CHOSE_OTHER: AtomicU64 = AtomicU64::new(0);
 static PURGATORY_DELAYED_SENDS: AtomicU64 = AtomicU64::new(0);
 static AOS_TAPE_WINS: AtomicU64 = AtomicU64::new(0);
 static AOS_CONFIG_WINS: AtomicU64 = AtomicU64::new(0);
@@ -78,6 +88,15 @@ pub fn set_enabled(on: bool) {
         for c in [
             &STEER_EVALUATIONS,
             &STEER_DIVERGENT_PICKS,
+            &SA_STEPS,
+            &SA_PREFERENCE_EXPRESSED,
+            &SA_PREFERENCE_HONORED,
+            &SA_HONORED,
+            &SA_NO_ELIGIBLE,
+            &SA_BLOCKED_BY_ORDER,
+            &SA_BLOCKED_BY_TIMER_GATE,
+            &SA_OTHER_QUEUE,
+            &SA_SAMPLER_CHOSE_OTHER,
             &PURGATORY_DELAYED_SENDS,
             &AOS_TAPE_WINS,
             &AOS_CONFIG_WINS,
@@ -136,6 +155,70 @@ pub fn set_acted_fraction_enabled(on: bool) {
 #[inline]
 pub fn acted_fraction_enabled() -> bool {
     enabled() && ACTED_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the steer-authority audit for this session. It also
+/// requires `set_enabled(true)`; the audit walks every queue at every
+/// scheduling point, so it is a separate switch from the cheap counters.
+pub fn set_steer_audit_enabled(on: bool) {
+    STEER_AUDIT_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a scheduling point should be audited. Callers must check this
+/// before scoring the queues, which is the expensive part.
+#[inline]
+pub fn steer_audit_enabled() -> bool {
+    enabled() && STEER_AUDIT_ENABLED.load(Ordering::Relaxed)
+}
+
+/// What stood between the highest-scoring runnable and the one a scheduling
+/// point actually ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// The step ran the highest-scoring runnable.
+    Honored,
+    /// Every runnable was filtered out, or the queue the step routed to held
+    /// nothing it was allowed to run, so no event was scheduled at all.
+    NoEligibleCandidates,
+    /// The highest-scoring runnable was withheld by a deliver reservation or
+    /// by the per-link delivery order.
+    BlockedByOrder,
+    /// The highest-scoring runnable was a timer whose label was not currently
+    /// permitted to fire.
+    BlockedByTimerGate,
+    /// The highest-scoring runnable was eligible but sat in a queue the
+    /// queue-level router did not choose.
+    OtherQueue,
+    /// The highest-scoring runnable was eligible and in the chosen queue, but
+    /// the randomized within-queue sampler took a different one.
+    SamplerChoseOther,
+}
+
+/// One scheduling point was audited. `expressed` means the score ranking put a
+/// different runnable on top than priority alone would have, i.e. the steering
+/// term changed what "preferred" means at this point; `outcome` says what
+/// happened to that preferred runnable.
+#[inline]
+pub fn record_steer_authority(expressed: bool, outcome: SteerOutcome) {
+    if !steer_audit_enabled() {
+        return;
+    }
+    SA_STEPS.fetch_add(1, Ordering::Relaxed);
+    if expressed {
+        SA_PREFERENCE_EXPRESSED.fetch_add(1, Ordering::Relaxed);
+        if outcome == SteerOutcome::Honored {
+            SA_PREFERENCE_HONORED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let counter = match outcome {
+        SteerOutcome::Honored => &SA_HONORED,
+        SteerOutcome::NoEligibleCandidates => &SA_NO_ELIGIBLE,
+        SteerOutcome::BlockedByOrder => &SA_BLOCKED_BY_ORDER,
+        SteerOutcome::BlockedByTimerGate => &SA_BLOCKED_BY_TIMER_GATE,
+        SteerOutcome::OtherQueue => &SA_OTHER_QUEUE,
+        SteerOutcome::SamplerChoseOther => &SA_SAMPLER_CHOSE_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Which scheduler perturbations a message was carrying when it was delivered.
@@ -669,6 +752,27 @@ pub struct SteerStats {
     pub divergent_picks: u64,
 }
 
+/// How often the runnable the scoring function ranked first is the one the
+/// scheduling point ran, and what took precedence when it was not. The buckets
+/// after `honored` partition the remaining steps by the single constraint that
+/// stood in the way, so all six sum to `steps`.
+#[derive(Serialize)]
+pub struct SteerAuthorityStats {
+    pub steps: u64,
+    /// Steps where the steering term put a different runnable on top than
+    /// priority alone would have. The denominator for `preference_honored`:
+    /// on the other steps the audit cannot tell steer's choice from the
+    /// choice the scheduler would have made without it.
+    pub preference_expressed: u64,
+    pub preference_honored: u64,
+    pub honored: u64,
+    pub no_eligible_candidates: u64,
+    pub blocked_by_order: u64,
+    pub blocked_by_timer_gate: u64,
+    pub other_queue: u64,
+    pub sampler_chose_other: u64,
+}
+
 #[derive(Serialize)]
 pub struct PurgatoryStats {
     pub delayed_sends: u64,
@@ -771,6 +875,7 @@ pub struct CrashAnchorStats {
 pub struct UtilizationSnapshot {
     pub rng_streams: RngStreamStats,
     pub steer: SteerStats,
+    pub steer_authority: SteerAuthorityStats,
     pub purgatory: PurgatoryStats,
     pub aos: AosStats,
     pub dedup: DedupStats,
@@ -792,6 +897,17 @@ pub fn snapshot() -> UtilizationSnapshot {
         steer: SteerStats {
             evaluations: STEER_EVALUATIONS.load(Ordering::Relaxed),
             divergent_picks: STEER_DIVERGENT_PICKS.load(Ordering::Relaxed),
+        },
+        steer_authority: SteerAuthorityStats {
+            steps: SA_STEPS.load(Ordering::Relaxed),
+            preference_expressed: SA_PREFERENCE_EXPRESSED.load(Ordering::Relaxed),
+            preference_honored: SA_PREFERENCE_HONORED.load(Ordering::Relaxed),
+            honored: SA_HONORED.load(Ordering::Relaxed),
+            no_eligible_candidates: SA_NO_ELIGIBLE.load(Ordering::Relaxed),
+            blocked_by_order: SA_BLOCKED_BY_ORDER.load(Ordering::Relaxed),
+            blocked_by_timer_gate: SA_BLOCKED_BY_TIMER_GATE.load(Ordering::Relaxed),
+            other_queue: SA_OTHER_QUEUE.load(Ordering::Relaxed),
+            sampler_chose_other: SA_SAMPLER_CHOSE_OTHER.load(Ordering::Relaxed),
         },
         purgatory: PurgatoryStats {
             delayed_sends: PURGATORY_DELAYED_SENDS.load(Ordering::Relaxed),
@@ -878,6 +994,52 @@ mod tests {
         assert_eq!(s.receiver_restarted.deliveries, 0);
         assert_eq!(s.receiver_restarted.acted_fraction, 0.0);
         assert!((s.all.acted_fraction - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn steer_authority_outcomes_partition_the_steps() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        set_enabled(true);
+        set_steer_audit_enabled(true);
+
+        record_steer_authority(true, SteerOutcome::Honored);
+        record_steer_authority(false, SteerOutcome::Honored);
+        record_steer_authority(true, SteerOutcome::SamplerChoseOther);
+        record_steer_authority(true, SteerOutcome::OtherQueue);
+        record_steer_authority(false, SteerOutcome::BlockedByTimerGate);
+        record_steer_authority(false, SteerOutcome::BlockedByOrder);
+        record_steer_authority(false, SteerOutcome::NoEligibleCandidates);
+
+        let s = snapshot().steer_authority;
+        set_steer_audit_enabled(false);
+        set_enabled(false);
+
+        assert_eq!(s.steps, 7);
+        assert_eq!(s.preference_expressed, 3);
+        assert_eq!(s.preference_honored, 1);
+        assert_eq!(
+            s.honored
+                + s.no_eligible_candidates
+                + s.blocked_by_order
+                + s.blocked_by_timer_gate
+                + s.other_queue
+                + s.sampler_chose_other,
+            s.steps
+        );
+    }
+
+    #[test]
+    fn steer_authority_records_nothing_when_the_audit_is_off() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        set_enabled(true);
+        set_steer_audit_enabled(false);
+
+        record_steer_authority(true, SteerOutcome::Honored);
+
+        let s = snapshot().steer_authority;
+        set_enabled(false);
+
+        assert_eq!(s.steps, 0);
     }
 
     #[test]

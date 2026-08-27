@@ -127,6 +127,13 @@ pub struct FeedbackConfig {
     /// Only meaningful for `Timeline`/`Both`.
     #[serde(default)]
     pub timeline_key_granularity: TimelineKeyGranularity,
+    /// Count, at every scheduling point, whether the step ran the runnable the
+    /// scoring function ranked first and what took precedence when it did not.
+    /// Reported under `steer_authority` and only recorded when `stats` is on.
+    /// Observation-only, and off by default: it walks and scores every queue
+    /// at every step.
+    #[serde(default)]
+    pub steer_audit: bool,
 }
 
 impl FeedbackConfig {
