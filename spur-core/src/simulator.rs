@@ -1,3 +1,4 @@
+pub mod config_override;
 mod core;
 mod coverage;
 mod curriculum;
