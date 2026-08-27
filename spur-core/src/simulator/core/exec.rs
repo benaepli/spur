@@ -8,6 +8,7 @@ use crate::simulator::core::state::{
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
 use imbl::Vector;
 use rand::Rng;
+use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::util_stats;
@@ -24,7 +25,7 @@ pub fn exec_sync_on_node<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<Value<H>, RuntimeError> {
     let mut node_env = state.nodes[node_id.index].clone();
     let result = exec_sync_inner::<H, L, F>(
@@ -65,7 +66,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
     purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
     pending_trace_id: &mut Option<i64>,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
     match label {
         Label::Instr(instr, next) => match instr {
@@ -177,6 +178,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     bias: DeliveryBias::NONE,
                 };
 
+                rng.use_stream(Stream::SendDelay);
                 if purgatory_config.delay_probability > 0.0
                     && rng.random::<f64>() < purgatory_config.delay_probability
                 {
@@ -421,7 +423,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger, F: Feedback>(
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<Value<H>, RuntimeError> {
     let mut pc = start_pc;
     let mut prev_pc = pc;
@@ -474,7 +476,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
     feedback: &mut F::Local,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let causal_operation_id = record.causal_operation_id;
     let mut pending_trace_id = record.trace_id;
@@ -551,6 +553,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                         pc: *next,
                         priority: policy.sample(rng, RunnableCategory::ChannelSend),
                     };
+                    rng.use_stream(Stream::SendDelay);
                     if purgatory_config.delay_probability > 0.0
                         && rng.random::<f64>() < purgatory_config.delay_probability
                     {

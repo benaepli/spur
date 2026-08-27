@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTED_ENABLED: AtomicBool = AtomicBool::new(true);
 
+static RNG_ISOLATED_RUNS: AtomicU64 = AtomicU64::new(0);
+static RNG_SHARED_RUNS: AtomicU64 = AtomicU64::new(0);
 static STEER_EVALUATIONS: AtomicU64 = AtomicU64::new(0);
 static STEER_DIVERGENT_PICKS: AtomicU64 = AtomicU64::new(0);
 static PURGATORY_DELAYED_SENDS: AtomicU64 = AtomicU64::new(0);
@@ -217,6 +219,22 @@ pub fn record_steer_evaluation(divergent: bool) {
     STEER_EVALUATIONS.fetch_add(1, Ordering::Relaxed);
     if divergent {
         STEER_DIVERGENT_PICKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A run built its scheduling random source; `isolated` means the run drew
+/// each decision kind from its own generator rather than from one shared
+/// stream. `isolated_runs` equal to the number of runs is what "the mechanism
+/// was on for the whole session" looks like.
+#[inline]
+pub fn record_rng_isolation(isolated: bool) {
+    if !enabled() {
+        return;
+    }
+    if isolated {
+        RNG_ISOLATED_RUNS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        RNG_SHARED_RUNS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -500,6 +518,14 @@ pub struct CurriculumStats {
     pub servers_sum: u64,
 }
 
+/// How many runs drew their schedule from per-decision generators, and how
+/// many drew from a single shared one.
+#[derive(Serialize)]
+pub struct RngStreamStats {
+    pub isolated_runs: u64,
+    pub shared_runs: u64,
+}
+
 #[derive(Serialize)]
 pub struct SteerStats {
     pub evaluations: u64,
@@ -606,6 +632,7 @@ pub struct CrashAnchorStats {
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
+    pub rng_streams: RngStreamStats,
     pub steer: SteerStats,
     pub purgatory: PurgatoryStats,
     pub aos: AosStats,
@@ -620,6 +647,10 @@ pub struct UtilizationSnapshot {
 
 pub fn snapshot() -> UtilizationSnapshot {
     UtilizationSnapshot {
+        rng_streams: RngStreamStats {
+            isolated_runs: RNG_ISOLATED_RUNS.load(Ordering::Relaxed),
+            shared_runs: RNG_SHARED_RUNS.load(Ordering::Relaxed),
+        },
         steer: SteerStats {
             evaluations: STEER_EVALUATIONS.load(Ordering::Relaxed),
             divergent_picks: STEER_DIVERGENT_PICKS.load(Ordering::Relaxed),

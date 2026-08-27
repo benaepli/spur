@@ -5,9 +5,9 @@ use crate::simulator::core::eval::store;
 use crate::simulator::core::partition::{PartitionInfo, PartitionType};
 use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
+use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats::DeliveryBias;
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
-use rand::Rng;
 use rand_distr::{Beta, Distribution};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -140,7 +140,13 @@ fn default_delay_range() -> (i32, i32) {
 
 impl SchedulePolicy {
     /// Sample a priority value for the given runnable category.
-    pub fn sample(&self, rng: &mut impl Rng, cat: RunnableCategory) -> f64 {
+    pub fn sample(&self, rng: &mut impl StreamRng, cat: RunnableCategory) -> f64 {
+        rng.use_stream(match cat {
+            RunnableCategory::Record | RunnableCategory::ChannelSend => Stream::MessagePriority,
+            RunnableCategory::Timer => Stream::TimerPriority,
+            RunnableCategory::Crash | RunnableCategory::Recover => Stream::FaultPriority,
+            RunnableCategory::Partition | RunnableCategory::Heal => Stream::PartitionPriority,
+        });
         match self {
             SchedulePolicy::Fixed => match cat {
                 RunnableCategory::Record => 0.5,

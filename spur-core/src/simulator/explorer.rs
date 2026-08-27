@@ -17,8 +17,8 @@ use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::plan::ExecutionPlan;
 use crate::simulator::path::{PathState, RunOutcome, Topology, TopologyInfo, exec_plan};
 use crate::simulator::rng::{
-    LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, WORKLOAD_SALT,
-    derive_seed, mutate_tape,
+    LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, StreamRng,
+    StreamSet, WORKLOAD_SALT, derive_seed, mutate_tape,
 };
 use crate::simulator::util_stats;
 use crossbeam::channel;
@@ -190,6 +190,18 @@ pub struct ExplorerConfig {
     /// instead of producing a full run that quietly measures the old code.
     #[serde(default)]
     pub strict_config_keys: bool,
+
+    /// Give each kind of scheduling decision its own generator, seeded from the
+    /// run's schedule seed through a distinct salt, instead of drawing every
+    /// decision from one shared stream. Off by default, which is the shared
+    /// stream.
+    ///
+    /// With it on, a change that only alters how many values one decision kind
+    /// consumes leaves every other kind bit-identical at a fixed seed, so a
+    /// diff claiming to preserve behaviour can be checked by equality rather
+    /// than by a statistical test.
+    #[serde(default)]
+    pub rng_stream_isolation: bool,
 }
 
 /// Top-level JSON keys claimed by `ExplorerConfig` (serde names, i.e. after
@@ -221,6 +233,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "stats",
     "emit_acted_fraction",
     "strict_config_keys",
+    "rng_stream_isolation",
 ];
 
 /// Top-level keys added by `ContinuousConfig` on top of the envelope.
@@ -374,6 +387,7 @@ pub struct SingleRunConfig {
     pub quick_fire_multiplier: f64,
     pub purgatory: PurgatoryConfig,
     pub timeline_key_granularity: TimelineKeyGranularity,
+    pub rng_stream_isolation: bool,
 }
 
 impl SingleRunConfig {
@@ -435,6 +449,7 @@ impl SingleRunConfig {
             quick_fire_multiplier: constraints.quick_fire_multiplier,
             purgatory: constraints.purgatory.clone(),
             timeline_key_granularity: constraints.feedback.timeline_key_granularity,
+            rng_stream_isolation: constraints.rng_stream_isolation,
         }
     }
 
@@ -507,7 +522,7 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: F
     snapshot: &F::Snapshot,
     feedback: &mut F::Local,
     purgatory_config: &PurgatoryConfig,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<State<H>, RuntimeError> {
     // Look up role NameIds from the program
     let server_role = program
@@ -561,7 +576,7 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feed
     snapshot: &F::Snapshot,
     feedback: &mut F::Local,
     purgatory_config: &PurgatoryConfig,
-    rng: &mut impl Rng,
+    rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
     let init_fn_name = "Node.Init";
     let Some(init_fn) = program.get_func_by_name(init_fn_name) else {
@@ -683,10 +698,12 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     );
     F::set_key_granularity(&mut path_state.feedback, config.timeline_key_granularity);
 
-    // One scheduling RNG per run, threaded through init + execution so all
-    // schedule-shaping draws land on a single stream. `RecRng<S>` records or
-    // replays that stream per the chosen strategy (zero-cost for `LiveRng`).
-    let mut inner = SmallRng::seed_from_u64(schedule_seed);
+    // One scheduling RNG per run, threaded through init + execution. Its draws
+    // come from a single generator, or from one generator per decision kind
+    // when `rng_stream_isolation` is set. `RecRng<S>` records or replays the
+    // resulting stream per the chosen strategy (zero-cost for `LiveRng`).
+    util_stats::record_rng_isolation(config.rng_stream_isolation);
+    let mut inner = StreamSet::new(schedule_seed, config.rng_stream_isolation);
     let mut tape = S::new_tape(seed_tape);
     let mut rec = RecRng::<S> {
         tape: &mut tape,
@@ -877,6 +894,7 @@ fn run_explorer_impl<F: Feedback>(
                                                 timeline_key_granularity: config
                                                     .feedback
                                                     .timeline_key_granularity,
+                                                rng_stream_isolation: config.rng_stream_isolation,
                                             };
 
                                             info!("{}", "=".repeat(70));
