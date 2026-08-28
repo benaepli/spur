@@ -4,6 +4,7 @@ use crate::simulator::core::{
 use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use crossbeam::channel::{self, Receiver, Sender};
 use log::error;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -13,8 +14,7 @@ use serde_json::{Value as JsonValue, json};
 use std::error::Error;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 /// A pre-serialized operation ready for database / file insertion.
@@ -436,17 +436,28 @@ fn append_traces_batch(
 /// process termination.
 const PARQUET_ROTATION_INTERVAL: usize = 25_000;
 
-// Runs finish on every worker thread while one thread encodes parquet, so
-// the queue in front of the writer must be bounded or it holds every
-// unwritten run's history, logs and traces in memory. A full queue blocks
-// the worker until the writer catches up.
+// Runs finish on every simulation thread faster than the writers encode
+// parquet, so the queue in front of them must be bounded or it holds every
+// unwritten run's history, logs and traces in memory. In-flight runs are
+// bounded by this capacity plus one per writer thread; a full queue blocks
+// the simulation thread until a writer catches up.
 const HISTORY_QUEUE_CAPACITY: usize = 256;
 
-/// A background writer that serializes all Parquet writes to a single thread.
-/// Outputs batched files into `executions/` and `logs/` subdirectories.
+/// Persists run histories as parquet. `executions/`, `logs/` and `traces/`
+/// each hold a series of `batch_NNNN.parquet` files. Writer threads take
+/// finished runs from one bounded queue; each owns an open file per table
+/// and numbers its files so that no two writers name the same file.
 pub struct ParquetWriter {
-    sender: SyncSender<HistoryCommand>,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    sender: Sender<HistoryCommand>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+    writer_count: usize,
+}
+
+// One writer thread encodes roughly 600 runs/s of log-heavy output while
+// eight simulation threads produce about that many, so the writer count
+// follows the simulation thread count at that ratio.
+fn writer_thread_count() -> usize {
+    rayon::current_num_threads().div_ceil(8).max(1)
 }
 
 /// Helper: creates a new ArrowWriter for the given path and schema.
@@ -461,9 +472,108 @@ fn open_parquet_writer(
     Ok(ArrowWriter::try_new(file, schema, Some(props))?)
 }
 
+/// Batch numbers are shared across writers: writer `index` owns
+/// `index + 1`, `index + 1 + count`, `index + 1 + 2 * count`, ...
+fn batch_number(writer_index: usize, series: usize, writer_count: usize) -> usize {
+    writer_index + 1 + series * writer_count
+}
+
 /// Helper: formats a batch file name like `batch_0001.parquet`.
 fn batch_filename(batch_num: usize) -> String {
     format!("batch_{:04}.parquet", batch_num)
+}
+
+#[derive(Clone)]
+struct TableDirs {
+    executions: PathBuf,
+    logs: PathBuf,
+    traces: PathBuf,
+}
+
+/// The three files a writer has open for the batch it is filling.
+struct OpenBatch {
+    number: usize,
+    executions: ArrowWriter<File>,
+    logs: ArrowWriter<File>,
+    traces: ArrowWriter<File>,
+}
+
+impl OpenBatch {
+    fn open(dirs: &TableDirs, number: usize) -> Result<Self, Box<dyn Error>> {
+        let name = batch_filename(number);
+        Ok(Self {
+            number,
+            executions: open_parquet_writer(&dirs.executions.join(&name), executions_schema())?,
+            logs: open_parquet_writer(&dirs.logs.join(&name), logs_schema())?,
+            traces: open_parquet_writer(&dirs.traces.join(&name), traces_schema())?,
+        })
+    }
+
+    fn finish(mut self) {
+        if let Err(e) = self.executions.finish() {
+            error!("failed to finalize executions batch {}: {}", self.number, e);
+        }
+        if let Err(e) = self.logs.finish() {
+            error!("failed to finalize logs batch {}: {}", self.number, e);
+        }
+        if let Err(e) = self.traces.finish() {
+            error!("failed to finalize traces batch {}: {}", self.number, e);
+        }
+    }
+}
+
+fn writer_loop(
+    receiver: Receiver<HistoryCommand>,
+    dirs: TableDirs,
+    writer_index: usize,
+    writer_count: usize,
+    rotation_interval: usize,
+    mut batch: OpenBatch,
+) {
+    let mut writes_in_batch: usize = 0;
+    let mut series: usize = 0;
+    while let Ok(cmd) = receiver.recv() {
+        match cmd {
+            HistoryCommand::Write {
+                run_id,
+                history,
+                logs,
+                traces,
+            } => {
+                if !history.is_empty()
+                    && let Err(e) = append_executions_batch(&mut batch.executions, run_id, &history)
+                {
+                    error!("failed to save executions parquet for run {}: {}", run_id, e);
+                }
+                if !logs.is_empty()
+                    && let Err(e) = append_logs_batch(&mut batch.logs, run_id, &logs)
+                {
+                    error!("failed to save logs parquet for run {}: {}", run_id, e);
+                }
+                if !traces.is_empty()
+                    && let Err(e) = append_traces_batch(&mut batch.traces, run_id, &traces)
+                {
+                    error!("failed to save traces parquet for run {}: {}", run_id, e);
+                }
+                writes_in_batch += 1;
+                if writes_in_batch >= rotation_interval {
+                    batch.finish();
+                    series += 1;
+                    let number = batch_number(writer_index, series, writer_count);
+                    batch = match OpenBatch::open(&dirs, number) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            error!("failed to open batch {}: {}", number, e);
+                            return;
+                        }
+                    };
+                    writes_in_batch = 0;
+                }
+            }
+            HistoryCommand::Shutdown => break,
+        }
+    }
+    batch.finish();
 }
 
 impl ParquetWriter {
@@ -471,130 +581,43 @@ impl ParquetWriter {
     /// `output_dir` is the base directory. Files are written into
     /// `output_dir/executions/batch_NNNN.parquet` and `output_dir/logs/batch_NNNN.parquet`.
     pub fn new(output_dir: &Path) -> Result<Self, Box<dyn Error>> {
-        let exec_dir = output_dir.join("executions");
-        let logs_dir = output_dir.join("logs");
-        let traces_dir = output_dir.join("traces");
-        std::fs::create_dir_all(&exec_dir)?;
-        std::fs::create_dir_all(&logs_dir)?;
-        std::fs::create_dir_all(&traces_dir)?;
+        Self::spawn(output_dir, writer_thread_count(), PARQUET_ROTATION_INTERVAL)
+    }
 
-        let exec_schema = executions_schema();
-        let logs_schema_arc = logs_schema();
-        let traces_schema_arc = traces_schema();
-
-        let mut exec_writer =
-            open_parquet_writer(&exec_dir.join(batch_filename(1)), exec_schema.clone())?;
-        let mut log_writer =
-            open_parquet_writer(&logs_dir.join(batch_filename(1)), logs_schema_arc.clone())?;
-        let mut trace_writer = open_parquet_writer(
-            &traces_dir.join(batch_filename(1)),
-            traces_schema_arc.clone(),
-        )?;
-
-        let (sender, receiver) = mpsc::sync_channel::<HistoryCommand>(HISTORY_QUEUE_CAPACITY);
-
-        let handle = thread::spawn(move || {
-            let mut writes_in_batch: usize = 0;
-            let mut batch_num: usize = 1;
-
-            while let Ok(cmd) = receiver.recv() {
-                match cmd {
-                    HistoryCommand::Write {
-                        run_id,
-                        history,
-                        logs,
-                        traces,
-                    } => {
-                        if !history.is_empty()
-                            && let Err(e) =
-                                append_executions_batch(&mut exec_writer, run_id, &history)
-                            {
-                                error!(
-                                    "failed to save executions parquet for run {}: {}",
-                                    run_id, e
-                                );
-                            }
-                        if !logs.is_empty()
-                            && let Err(e) = append_logs_batch(&mut log_writer, run_id, &logs) {
-                                error!("failed to save logs parquet for run {}: {}", run_id, e);
-                            }
-                        if !traces.is_empty()
-                            && let Err(e) = append_traces_batch(&mut trace_writer, run_id, &traces)
-                            {
-                                error!("failed to save traces parquet for run {}: {}", run_id, e);
-                            }
-
-                        writes_in_batch += 1;
-
-                        // Rotate: finalize current files and open new ones
-                        if writes_in_batch >= PARQUET_ROTATION_INTERVAL {
-                            if let Err(e) = exec_writer.finish() {
-                                error!("failed to finalize executions batch {}: {}", batch_num, e);
-                            }
-                            if let Err(e) = log_writer.finish() {
-                                error!("failed to finalize logs batch {}: {}", batch_num, e);
-                            }
-                            if let Err(e) = trace_writer.finish() {
-                                error!("failed to finalize traces batch {}: {}", batch_num, e);
-                            }
-
-                            batch_num += 1;
-                            writes_in_batch = 0;
-
-                            match open_parquet_writer(
-                                &exec_dir.join(batch_filename(batch_num)),
-                                exec_schema.clone(),
-                            ) {
-                                Ok(w) => exec_writer = w,
-                                Err(e) => {
-                                    error!(
-                                        "failed to open new executions batch {}: {}",
-                                        batch_num, e
-                                    );
-                                    break;
-                                }
-                            }
-                            match open_parquet_writer(
-                                &logs_dir.join(batch_filename(batch_num)),
-                                logs_schema_arc.clone(),
-                            ) {
-                                Ok(w) => log_writer = w,
-                                Err(e) => {
-                                    error!("failed to open new logs batch {}: {}", batch_num, e);
-                                    break;
-                                }
-                            }
-                            match open_parquet_writer(
-                                &traces_dir.join(batch_filename(batch_num)),
-                                traces_schema_arc.clone(),
-                            ) {
-                                Ok(w) => trace_writer = w,
-                                Err(e) => {
-                                    error!("failed to open new traces batch {}: {}", batch_num, e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    HistoryCommand::Shutdown => {
-                        if let Err(e) = exec_writer.finish() {
-                            error!("failed to finalize executions batch {}: {}", batch_num, e);
-                        }
-                        if let Err(e) = log_writer.finish() {
-                            error!("failed to finalize logs batch {}: {}", batch_num, e);
-                        }
-                        if let Err(e) = trace_writer.finish() {
-                            error!("failed to finalize traces batch {}: {}", batch_num, e);
-                        }
-                        break;
-                    }
-                }
-            }
-        });
-
+    /// `rotation_interval` counts runs across all writers; each writer
+    /// rotates at its share, so finished files appear at the same cadence
+    /// whatever the writer count.
+    fn spawn(
+        output_dir: &Path,
+        writer_count: usize,
+        rotation_interval: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        let dirs = TableDirs {
+            executions: output_dir.join("executions"),
+            logs: output_dir.join("logs"),
+            traces: output_dir.join("traces"),
+        };
+        for dir in [&dirs.executions, &dirs.logs, &dirs.traces] {
+            std::fs::create_dir_all(dir)?;
+        }
+        let (sender, receiver) = channel::bounded::<HistoryCommand>(HISTORY_QUEUE_CAPACITY);
+        let per_writer_rotation = rotation_interval.div_ceil(writer_count).max(1);
+        let mut handles = Vec::with_capacity(writer_count);
+        for index in 0..writer_count {
+            let batch = OpenBatch::open(&dirs, batch_number(index, 0, writer_count))?;
+            let receiver = receiver.clone();
+            let dirs = dirs.clone();
+            let handle = thread::Builder::new()
+                .name(format!("parquet-writer-{index}"))
+                .spawn(move || {
+                    writer_loop(receiver, dirs, index, writer_count, per_writer_rotation, batch)
+                })?;
+            handles.push(handle);
+        }
         Ok(Self {
             sender,
-            handle: Mutex::new(Some(handle)),
+            handles: Mutex::new(handles),
+            writer_count,
         })
     }
 }
@@ -622,14 +645,120 @@ impl HistoryWriter for ParquetWriter {
     }
 
     fn shutdown(&self) {
-        if let Err(e) = self.sender.send(HistoryCommand::Shutdown) {
-            log::error!("Failed to send shutdown command to parquet writer: {}", e);
+        // Every writer consumes exactly one shutdown, after it has drained
+        // the writes queued ahead of it.
+        for _ in 0..self.writer_count {
+            if let Err(e) = self.sender.send(HistoryCommand::Shutdown) {
+                log::error!("Failed to send shutdown command to parquet writer: {}", e);
+                break;
+            }
         }
-        if let Ok(mut guard) = self.handle.lock()
-            && let Some(h) = guard.take()
-                && let Err(e) = h.join() {
+        if let Ok(mut guard) = self.handles.lock() {
+            for handle in guard.drain(..) {
+                if let Err(e) = handle.join() {
                     log::error!("Parquet writer thread panicked: {:?}", e);
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod parquet_writer_tests {
+    use super::*;
+    use arrow::array::AsArray;
+    use arrow::datatypes::Int64Type;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::collections::{HashMap, HashSet};
+
+    /// Every `(file, run_id, seq_num)` row of one table directory.
+    fn read_table(dir: &Path) -> Vec<(String, i64, i64)> {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let run_ids = batch.column_by_name("run_id").unwrap().as_primitive::<Int64Type>();
+                let seq_nums = batch.column_by_name("seq_num").unwrap().as_primitive::<Int64Type>();
+                for i in 0..batch.num_rows() {
+                    rows.push((name.clone(), run_ids.value(i), seq_nums.value(i)));
+                }
+            }
+        }
+        rows
+    }
+
+    fn rows_for(run_id: i64) -> usize {
+        (run_id % 7 + 1) as usize
+    }
+
+    #[test]
+    fn each_run_lands_in_one_file_with_contiguous_seq_nums() {
+        let dir = std::env::temp_dir().join(format!("spur-history-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let writer = ParquetWriter::spawn(&dir, 3, 20).unwrap();
+        let runs: i64 = 100;
+        for run_id in 0..runs {
+            let n = rows_for(run_id);
+            let history = (0..n)
+                .map(|i| PersistableOp {
+                    unique_id: i as i64,
+                    client_id: 0,
+                    kind: "Invocation",
+                    action: "Write".to_string(),
+                    payload_json: "{}".to_string(),
+                    step: i as i32,
+                })
+                .collect();
+            let logs = (0..n)
+                .map(|i| PersistableLog {
+                    node_id: 0,
+                    content: format!("line {i}"),
+                    step: i as i32,
+                })
+                .collect();
+            let traces = (0..n)
+                .map(|i| PersistableTrace {
+                    node_id: 0,
+                    step: i as i32,
+                    function_name: "f".to_string(),
+                    trace_kind: "enter",
+                    payload: "{}".to_string(),
+                    schedulable_count: 0,
+                    trace_id: i as i64,
+                    causal_operation_id: None,
+                })
+                .collect();
+            writer.write(run_id, history, logs, traces);
+        }
+        writer.shutdown();
+
+        for table in ["executions", "logs", "traces"] {
+            let mut per_run: HashMap<i64, (HashSet<String>, Vec<i64>)> = HashMap::new();
+            for (file, run_id, seq) in read_table(&dir.join(table)) {
+                let entry = per_run.entry(run_id).or_default();
+                entry.0.insert(file);
+                entry.1.push(seq);
+            }
+            assert_eq!(per_run.len(), runs as usize, "{table}: every run is present");
+            for (run_id, (files, mut seqs)) in per_run {
+                assert_eq!(files.len(), 1, "{table}: run {run_id} spans {files:?}");
+                seqs.sort_unstable();
+                let expected: Vec<i64> = (0..rows_for(run_id) as i64).collect();
+                assert_eq!(seqs, expected, "{table}: run {run_id} seq_nums");
+            }
+            let files = std::fs::read_dir(dir.join(table)).unwrap().count();
+            assert!(files > 3, "{table}: rotation produced only {files} files");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
