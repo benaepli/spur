@@ -402,7 +402,7 @@ impl<F: Feedback> Arm for GridArm<F> {
         let count = self.batch_size.min(max_runs.max(1));
         let batch: Vec<(i64, usize)> = (0..count)
             .map(|_| {
-                let run_id = ctx.run_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let run_id = ctx.run_counter.fetch_add(1, Ordering::Relaxed);
                 let config_index = (self.cursor % n) as usize;
                 self.cursor += 1;
                 (run_id, config_index)

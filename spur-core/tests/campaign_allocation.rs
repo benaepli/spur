@@ -124,10 +124,11 @@ fn session_timed(
     (summary, out)
 }
 
-fn arm_counts_in_runs_table(dir: &Path) -> HashMap<String, u64> {
+fn runs_table(dir: &Path) -> Vec<(i64, String)> {
     use arrow::array::{Array, AsArray};
+    use arrow::datatypes::Int64Type;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    let mut counts = HashMap::new();
+    let mut rows = Vec::new();
     for entry in fs::read_dir(dir.join("runs")).expect("runs dir") {
         let path = entry.expect("entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
@@ -139,13 +140,78 @@ fn arm_counts_in_runs_table(dir: &Path) -> HashMap<String, u64> {
             .unwrap();
         for batch in reader {
             let batch = batch.unwrap();
+            let ids = batch
+                .column_by_name("run_id")
+                .unwrap()
+                .as_primitive::<Int64Type>();
             let arms = batch.column_by_name("arm").unwrap().as_string::<i32>();
             for i in 0..arms.len() {
-                *counts.entry(arms.value(i).to_string()).or_insert(0) += 1;
+                rows.push((ids.value(i), arms.value(i).to_string()));
             }
         }
     }
+    rows
+}
+
+fn arm_counts_in_runs_table(dir: &Path) -> HashMap<String, u64> {
+    let mut counts = HashMap::new();
+    for (_, arm) in runs_table(dir) {
+        *counts.entry(arm).or_insert(0) += 1;
+    }
     counts
+}
+
+/// A grid arm and a strategy arm draw from one counter and must never share
+/// a run id: two runs under one id are one merged history to every consumer.
+#[test]
+fn run_ids_are_unique_across_arm_kinds() {
+    std::thread::Builder::new()
+        .stack_size(SESSION_STACK_BYTES)
+        .spawn(check_unique_ids)
+        .expect("spawns the session thread")
+        .join()
+        .expect("the session thread runs to completion");
+}
+
+fn check_unique_ids() {
+    let program = compiler::compile(SPEC, "kv.spur")
+        .into_program()
+        .expect("spec compiles");
+    let config_path = std::env::temp_dir().join("spur_campaign_unique_ids.json");
+    fs::write(
+        &config_path,
+        CONFIG
+            .replace("ALLOCATION", r#"{"kind": "round_robin"}"#)
+            .replace("REWARD", "runs")
+            .replace("\"stats\": true,", "\"stats\": true, \"feedback\": {\"mode\": \"timeline\"},")
+            .replace(
+                "{\"id\": \"starved\", \"mode\": \"grid\", \"overlay\": {\"max_iterations\": 4}}",
+                "{\"id\": \"aos\", \"mode\": \"aos\"}, {\"id\": \"curriculum\", \"mode\": \"curriculum\"}",
+            ),
+    )
+    .expect("writes config");
+    let out = scratch("unique_ids");
+    let _scope = config_override::exclusive_session();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let summary = run_explorer_campaign(
+        &program,
+        config_path.to_str().expect("utf-8 path"),
+        out.to_str().expect("utf-8 path"),
+        LogBackend::Parquet,
+        &cancelled,
+    )
+    .expect("campaign runs");
+    let rows = runs_table(&out);
+    let mut ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    let before = ids.len();
+    ids.dedup();
+    assert_eq!(ids.len(), before, "run ids repeat across arms: {rows:?}");
+    let report = summary.campaign.expect("reports");
+    assert_eq!(rows.len() as u64, report.runs_total);
+    assert!(report.arms.iter().all(|a| a.runs > 0), "{:?}", report.arms);
+    let _ = fs::remove_file(&config_path);
+    let _ = fs::remove_dir_all(&out);
 }
 
 #[test]
