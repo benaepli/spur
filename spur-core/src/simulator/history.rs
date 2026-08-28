@@ -13,7 +13,7 @@ use serde_json::{Value as JsonValue, json};
 use std::error::Error;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -436,10 +436,16 @@ fn append_traces_batch(
 /// process termination.
 const PARQUET_ROTATION_INTERVAL: usize = 25_000;
 
+// Runs finish on every worker thread while one thread encodes parquet, so
+// the queue in front of the writer must be bounded or it holds every
+// unwritten run's history, logs and traces in memory. A full queue blocks
+// the worker until the writer catches up.
+const HISTORY_QUEUE_CAPACITY: usize = 256;
+
 /// A background writer that serializes all Parquet writes to a single thread.
 /// Outputs batched files into `executions/` and `logs/` subdirectories.
 pub struct ParquetWriter {
-    sender: Sender<HistoryCommand>,
+    sender: SyncSender<HistoryCommand>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -485,7 +491,7 @@ impl ParquetWriter {
             traces_schema_arc.clone(),
         )?;
 
-        let (sender, receiver) = mpsc::channel::<HistoryCommand>();
+        let (sender, receiver) = mpsc::sync_channel::<HistoryCommand>(HISTORY_QUEUE_CAPACITY);
 
         let handle = thread::spawn(move || {
             let mut writes_in_batch: usize = 0;
