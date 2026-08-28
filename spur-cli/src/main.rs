@@ -541,6 +541,7 @@ fn run_explore(
 
     // Dump opt-in utilization counters (enabled via `"stats": true` in the config)
     let util_paths = write_utilization_counters(&output_dir)?;
+    let session_paths = write_session_summary(&summary, &output_dir)?;
 
     println!(
         "Explorer finished in {:.2?}. Results saved to {}",
@@ -555,8 +556,35 @@ fn run_explore(
     for p in &util_paths {
         println!("  - Utilization counters: {}", p.display());
     }
+    for p in &session_paths {
+        println!("  - Session summary: {}", p.display());
+    }
 
     Ok(())
+}
+
+/// Writes the explorer's own exposure account inside and beside the output
+/// directory, for the same reason the utilization counters are written twice.
+/// Modes that do not measure a session write nothing.
+fn write_session_summary(summary: &ExploreSummary, output_dir: &Path) -> Result<Vec<PathBuf>> {
+    let Some(session) = &summary.session else {
+        return Ok(Vec::new());
+    };
+    let json = serde_json::to_string_pretty(session).context("Failed to serialize session summary")?;
+    let inside = output_dir.join("session.json");
+    fs::write(&inside, &json).context("Failed to write session.json")?;
+    let mut written = vec![inside];
+    if let Some(beside) = sibling_path(output_dir, ".session.json") {
+        match fs::write(&beside, &json) {
+            Ok(()) => written.push(beside),
+            Err(e) => eprintln!(
+                "warning: could not write {}: {}",
+                beside.display(),
+                e
+            ),
+        }
+    }
+    Ok(written)
 }
 
 /// Path of a file beside `dir` rather than inside it. Returns `None` when

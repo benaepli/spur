@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::thread;
 
 /// Non-generic result of an exploration session. The feedback type parameter is
@@ -41,6 +41,29 @@ pub struct ExploreSummary {
     /// Per-vertex CFG hit counts for the heatmap, present only when the chosen
     /// feedback strategy tracks CFG coverage.
     pub vertex_coverage: Option<HashMap<usize, u64>>,
+    /// The explorer's own account of the session's exposure. Present for the
+    /// standard explorer; the other modes leave it `None`.
+    pub session: Option<SessionSummary>,
+}
+
+/// What a session spent and produced, measured on the explorer's own
+/// monotonic clock. Written as `session.json` beside the corpus so a consumer
+/// normalising by wall time reads the exposure the runs actually had, not a
+/// deadline imposed from outside.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionSummary {
+    /// Wall time from the first queued run to the last finished one.
+    pub wall_ms: u64,
+    pub runs_completed: u64,
+    pub runs_failed: u64,
+    /// Runs handed to a worker after the session was cut, never started.
+    pub runs_skipped: u64,
+    pub wall_budget_sec: f64,
+    /// True when the budget, not the grid, ended the session.
+    pub budget_hit: bool,
+    /// Time spent draining the history writer after the last run, outside
+    /// `wall_ms`.
+    pub writer_flush_ms: u64,
 }
 
 /// Resolves a runtime `FeedbackConfig` to a monomorphized call. Each arm binds
@@ -217,6 +240,15 @@ pub struct ExplorerConfig {
     /// than by a statistical test.
     #[serde(default)]
     pub rng_stream_isolation: bool,
+
+    /// Wall-clock budget for the whole session, in seconds; 0 means the grid
+    /// alone ends the session. Under a budget the grid is walked in rounds,
+    /// one run of every configuration per round, so a cut leaves every
+    /// configuration within one run of every other and the corpus keeps the
+    /// grid's composition whatever the throughput. Runs already started
+    /// finish. A budgeted session is not reproducible run for run.
+    #[serde(default)]
+    pub wall_budget_sec: f64,
 }
 
 /// Top-level JSON keys claimed by `ExplorerConfig` (serde names, i.e. after
@@ -251,6 +283,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "emit_multiplier_authority",
     "strict_config_keys",
     "rng_stream_isolation",
+    "wall_budget_sec",
 ];
 
 /// Top-level keys added by `ContinuousConfig` on top of the envelope.
@@ -334,8 +367,87 @@ impl ExplorerConfig {
                 ));
             }
         }
+        if !self.wall_budget_sec.is_finite() || self.wall_budget_sec < 0.0 {
+            return Err(format!(
+                "wall_budget_sec must be a finite number >= 0 (got {})",
+                self.wall_budget_sec
+            ));
+        }
         Ok(())
     }
+
+    /// Every configuration of the grid in the producer's nesting order:
+    /// servers, writes, reads, rmws, keys, crashes, partitions, concurrent
+    /// writes, density.
+    pub fn expand_grid(&self) -> Vec<SingleRunConfig> {
+        let all_max_concurrent: Vec<Option<i32>> = match &self.max_concurrent_writes_range {
+            Some(r) => r.expand().into_iter().map(Some).collect(),
+            None => vec![None],
+        };
+        let mut configs = Vec::new();
+        for &num_servers in &self.num_servers_range.expand() {
+            for &num_write_ops in &self.num_write_ops_range.expand() {
+                for &num_read_ops in &self.num_read_ops_range.expand() {
+                    for &num_rmw_ops in &self.num_rmw_ops_range.expand() {
+                        for &num_keys in &self.num_keys_range.expand() {
+                            for &num_crashes in &self.num_crashes_range.expand() {
+                                for &num_partitions in &self.num_partitions_range.expand() {
+                                    for &max_concurrent_writes in &all_max_concurrent {
+                                        for &dependency_density in &self.dependency_density_values {
+                                            configs.push(SingleRunConfig {
+                                                num_servers,
+                                                num_write_ops,
+                                                num_read_ops,
+                                                num_rmw_ops,
+                                                num_keys,
+                                                num_crashes,
+                                                num_partitions,
+                                                max_concurrent_writes,
+                                                dependency_density,
+                                                post_fault_client_ops: self.post_fault_client_ops,
+                                                use_coverage_scheduling: self
+                                                    .use_coverage_scheduling,
+                                                max_iterations: self.max_iterations,
+                                                schedule_policy: self.schedule_policy.clone(),
+                                                queue_policy: self.queue_policy.clone(),
+                                                within_queue_selector: self
+                                                    .within_queue_selector
+                                                    .clone(),
+                                                quick_fire_multiplier: self.quick_fire_multiplier,
+                                                purgatory: self.purgatory.clone(),
+                                                timeline_key_granularity: self
+                                                    .feedback
+                                                    .key_granularity(),
+                                                rng_stream_isolation: self.rng_stream_isolation,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        configs
+    }
+}
+
+/// The order runs are issued in, as `(run_id, config_index)` pairs with run
+/// ids starting at 1. Blocked order issues every run of one configuration
+/// before the next; interleaved order issues one run of every configuration
+/// per round, which is the order a session that may be cut short has to use.
+pub fn grid_order(
+    configs: usize,
+    runs_per_config: i32,
+    interleaved: bool,
+) -> impl Iterator<Item = (i64, usize)> {
+    let runs = runs_per_config.max(0) as usize;
+    let total = configs * runs;
+    (0..total).map(move |i| {
+        let config_index = if interleaved { i % configs } else { i / runs };
+        ((i + 1) as i64, config_index)
+    })
 }
 
 fn default_partitions_range() -> Range {
@@ -844,119 +956,54 @@ fn run_explorer_impl<F: Feedback>(
     let weights = config.feedback.weights;
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
 
-    let (sender, receiver) = channel::bounded::<(i64, SingleRunConfig)>(100);
+    let configs: Arc<Vec<SingleRunConfig>> = Arc::new(config.expand_grid());
+    let budgeted = config.wall_budget_sec > 0.0;
+    let budget = std::time::Duration::from_secs_f64(config.wall_budget_sec);
+    info!("Total unique configurations: {}", configs.len());
+    info!("Runs per config: {}", config.num_runs_per_config);
+    if budgeted {
+        info!(
+            "Wall budget: {:.1}s (grid walked in rounds)",
+            config.wall_budget_sec
+        );
+    }
+    for (index, c) in configs.iter().enumerate() {
+        info!(
+            "Config {}/{}: s{}_w{}_r{}_rmw{}_k{}_crash{}_part{}_mcw{}_d{:.2}",
+            index + 1,
+            configs.len(),
+            c.num_servers,
+            c.num_write_ops,
+            c.num_read_ops,
+            c.num_rmw_ops,
+            c.num_keys,
+            c.num_crashes,
+            c.num_partitions,
+            c.max_concurrent_writes
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            c.dependency_density
+        );
+    }
 
-    let config_producer = config.clone();
+    let (sender, receiver) = channel::bounded::<(i64, usize)>(100);
+    let session_start = std::time::Instant::now();
+    let budget_hit = Arc::new(AtomicBool::new(false));
+
+    let order = grid_order(configs.len(), config.num_runs_per_config, budgeted);
     let cancelled_producer = cancelled.clone();
-
+    let budget_hit_producer = budget_hit.clone();
     thread::spawn(move || {
-        let config = config_producer;
-
-        let all_servers = config.num_servers_range.expand();
-        let all_writes = config.num_write_ops_range.expand();
-        let all_reads = config.num_read_ops_range.expand();
-        let all_rmws = config.num_rmw_ops_range.expand();
-        let all_keys = config.num_keys_range.expand();
-        let all_crashes = config.num_crashes_range.expand();
-        let all_partitions = config.num_partitions_range.expand();
-        let all_max_concurrent: Vec<Option<i32>> = match &config.max_concurrent_writes_range {
-            Some(r) => r.expand().into_iter().map(Some).collect(),
-            None => vec![None],
-        };
-        let all_densities = &config.dependency_density_values;
-
-        let mut config_counter = 0;
-        let mut run_counter = 0;
-        let total_configs = all_servers.len()
-            * all_writes.len()
-            * all_reads.len()
-            * all_rmws.len()
-            * all_keys.len()
-            * all_crashes.len()
-            * all_partitions.len()
-            * all_max_concurrent.len()
-            * all_densities.len();
-
-        info!("Total unique configurations: {}", total_configs);
-        info!("Runs per config: {}", config.num_runs_per_config);
-
-        'outer: for &num_servers in &all_servers {
-            for &num_writes in &all_writes {
-                for &num_reads in &all_reads {
-                    for &num_rmws in &all_rmws {
-                        for &num_keys in &all_keys {
-                            for &num_crashes in &all_crashes {
-                                for &num_partitions in &all_partitions {
-                                    for &max_concurrent in &all_max_concurrent {
-                                        for &density in all_densities {
-                                            if cancelled_producer.load(Ordering::Relaxed) {
-                                                break 'outer;
-                                            }
-                                            config_counter += 1;
-
-                                            let run_config = SingleRunConfig {
-                                                num_servers,
-                                                num_write_ops: num_writes,
-                                                num_read_ops: num_reads,
-                                                num_rmw_ops: num_rmws,
-                                                num_keys,
-                                                num_crashes,
-                                                num_partitions,
-                                                max_concurrent_writes: max_concurrent,
-                                                dependency_density: density,
-                                                post_fault_client_ops: config
-                                                    .post_fault_client_ops,
-                                                use_coverage_scheduling: config
-                                                    .use_coverage_scheduling,
-                                                max_iterations: config.max_iterations,
-                                                schedule_policy: config.schedule_policy.clone(),
-                                                queue_policy: config.queue_policy.clone(),
-                                                within_queue_selector: config
-                                                    .within_queue_selector
-                                                    .clone(),
-                                                quick_fire_multiplier: config.quick_fire_multiplier,
-                                                purgatory: config.purgatory.clone(),
-                                                timeline_key_granularity: config
-                                                    .feedback
-                                                    .key_granularity(),
-                                                rng_stream_isolation: config.rng_stream_isolation,
-                                            };
-
-                                            info!("{}", "=".repeat(70));
-                                            info!(
-                                                "Queuing Config {}/{}: s{}_w{}_r{}_rmw{}_k{}_crash{}_part{}_mcw{}_d{:.2}",
-                                                config_counter,
-                                                total_configs,
-                                                num_servers,
-                                                num_writes,
-                                                num_reads,
-                                                num_rmws,
-                                                num_keys,
-                                                num_crashes,
-                                                num_partitions,
-                                                max_concurrent
-                                                    .map(|k| k.to_string())
-                                                    .unwrap_or_else(|| "-".to_string()),
-                                                density
-                                            );
-                                            info!("{}", "=".repeat(70));
-
-                                            for _ in 1..=config.num_runs_per_config {
-                                                run_counter += 1;
-                                                if sender
-                                                    .send((run_counter, run_config.clone()))
-                                                    .is_err()
-                                                {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        for item in order {
+            if budgeted && session_start.elapsed() >= budget {
+                budget_hit_producer.store(true, Ordering::Relaxed);
+                cancelled_producer.store(true, Ordering::Relaxed);
+            }
+            if cancelled_producer.load(Ordering::Relaxed) {
+                return;
+            }
+            if sender.send(item).is_err() {
+                return;
             }
         }
     });
@@ -964,40 +1011,73 @@ fn run_explorer_impl<F: Feedback>(
     info!("Starting parallel simulation...");
 
     let global_state = Arc::new(GlobalState::<F>::new());
+    let completed = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let skipped = AtomicU64::new(0);
 
     receiver
         .into_iter()
         .par_bridge()
-        .for_each(|(run_id, run_config)| {
+        .for_each(|(run_id, config_index)| {
+            if cancelled.load(Ordering::Relaxed) {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let start = std::time::Instant::now();
             match run_single_simulation::<F, LiveRng>(
                 program,
                 &writer,
                 &global_state,
                 run_id,
-                &run_config,
+                &configs[config_index],
                 &weights,
                 derive_seed(config.session_seed, run_id, WORKLOAD_SALT),
                 derive_seed(config.session_seed, run_id, SCHEDULE_SALT),
                 None,
             ) {
                 Ok(_) => {
+                    completed.fetch_add(1, Ordering::Relaxed);
                     debug!(
                         "Run {} Success ({:.4}s)",
                         run_id,
                         start.elapsed().as_secs_f64()
                     );
                 }
-                Err(e) => error!("Run {} failed: {}", run_id, e),
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    error!("Run {} failed: {}", run_id, e);
+                }
             }
         });
 
+    let wall_ms = session_start.elapsed().as_millis() as u64;
+    let flush_start = std::time::Instant::now();
     // Shutdown the writer, waiting for all pending writes to complete
     writer.shutdown();
+    let writer_flush_ms = flush_start.elapsed().as_millis() as u64;
 
-    info!("Execution explorer finished.");
+    let session = SessionSummary {
+        wall_ms,
+        runs_completed: completed.load(Ordering::Relaxed),
+        runs_failed: failed.load(Ordering::Relaxed),
+        runs_skipped: skipped.load(Ordering::Relaxed),
+        wall_budget_sec: config.wall_budget_sec,
+        budget_hit: budget_hit.load(Ordering::Relaxed),
+        writer_flush_ms,
+    };
+    info!(
+        "Execution explorer finished: {} runs in {} ms{}",
+        session.runs_completed,
+        session.wall_ms,
+        if session.budget_hit {
+            " (wall budget hit)"
+        } else {
+            ""
+        }
+    );
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&global_state.feedback),
+        session: Some(session),
     })
 }
 
@@ -1194,6 +1274,7 @@ fn run_plan_impl<F: Feedback>(
     info!("Plan runner finished.");
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&global_state.feedback),
+        session: None,
     })
 }
 
@@ -1322,6 +1403,7 @@ fn run_explorer_genetic_impl<F: Feedback>(
     info!("Genetic explorer finished.");
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&global_state.feedback),
+        session: None,
     })
 }
 
@@ -1730,6 +1812,7 @@ fn run_explorer_aos_impl<F: Feedback>(
     info!("AOS controller finished.");
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&aos.global_state.feedback),
+        session: None,
     })
 }
 
@@ -2365,7 +2448,10 @@ fn run_explorer_continuous_impl<F: Feedback>(
 
     writer.shutdown();
     info!("Continuous explorer finished after {} runs.", total_runs);
-    Ok(ExploreSummary { vertex_coverage })
+    Ok(ExploreSummary {
+        vertex_coverage,
+        session: None,
+    })
 }
 
 #[cfg(test)]
@@ -2420,6 +2506,50 @@ mod strict_config_keys_tests {
         assert!(
             check_top_level_keys(&cont, &[EXPLORER_CONFIG_KEYS, CONTINUOUS_CONFIG_KEYS]).is_ok()
         );
+    }
+
+    /// Blocked order is the historical run id to configuration mapping;
+    /// interleaved order visits every configuration once per round.
+    #[test]
+    fn grid_order_blocked_and_interleaved() {
+        let blocked: Vec<(i64, usize)> = grid_order(3, 2, false).collect();
+        assert_eq!(blocked, vec![(1, 0), (2, 0), (3, 1), (4, 1), (5, 2), (6, 2)]);
+        let interleaved: Vec<(i64, usize)> = grid_order(3, 2, true).collect();
+        assert_eq!(
+            interleaved,
+            vec![(1, 0), (2, 1), (3, 2), (4, 0), (5, 1), (6, 2)]
+        );
+        assert_eq!(grid_order(0, 5, true).count(), 0);
+        assert_eq!(grid_order(4, 0, false).count(), 0);
+    }
+
+    /// The grid expands in the producer's nesting order, density innermost.
+    #[test]
+    fn expand_grid_nests_density_innermost() {
+        let cfg = MINIMAL
+            .replace("\"num_crashes\": {\"min\": 0, \"max\": 0}", "\"num_crashes\": {\"min\": 0, \"max\": 1}")
+            .replace("[0.0]", "[0.0, 0.5]");
+        let parsed: ExplorerConfig = serde_json::from_str(&cfg).expect("parses");
+        let grid = parsed.expand_grid();
+        let shape: Vec<(i32, f64)> = grid
+            .iter()
+            .map(|c| (c.num_crashes, c.dependency_density))
+            .collect();
+        assert_eq!(shape, vec![(0, 0.0), (0, 0.5), (1, 0.0), (1, 0.5)]);
+    }
+
+    /// A negative or non-finite budget is rejected; zero is the unbounded
+    /// default.
+    #[test]
+    fn wall_budget_is_validated() {
+        let parsed: ExplorerConfig = serde_json::from_str(MINIMAL).expect("parses");
+        assert_eq!(parsed.wall_budget_sec, 0.0);
+        assert!(parsed.validate().is_ok());
+        let negative: ExplorerConfig = serde_json::from_str(
+            &MINIMAL.replace("\"max_iterations\": 100", "\"max_iterations\": 100, \"wall_budget_sec\": -1"),
+        )
+        .expect("parses");
+        assert!(negative.validate().is_err());
     }
 
     /// Default is today's behaviour: unknown keys are ignored unless the
