@@ -318,6 +318,8 @@ pub enum OpKind {
     Recover,
     Partition,
     Heal,
+    /// A node's timer fired; the payload carries the node and the label.
+    TimerFired,
 }
 
 #[derive(Clone, Debug)]

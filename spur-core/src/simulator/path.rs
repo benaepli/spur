@@ -199,7 +199,7 @@ fn schedule_client_op<H: HashPolicy>(
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunOutcome {
-    Completed,
+    Completed { steps: i32 },
     Deadlock { step: i32, pending_ops: usize },
     /// The step budget ran out with planned events still outstanding.
     IterationsExhausted { outstanding_events: usize },
@@ -339,7 +339,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 max_iterations,
                 recovered_nodes.len(),
             );
-            return Ok(RunOutcome::Completed);
+            return Ok(RunOutcome::Completed { steps: step });
         }
 
         path_state.state.crash_info.current_step = step;
@@ -569,6 +569,21 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     }
                 }
                 ScheduleResult::TimerFired { node_id, label } => {
+                    // Recorded beside crashes and recoveries so a consumer can
+                    // order a timer against the deliveries and faults around
+                    // it. The label is the specification's own name for the
+                    // timer.
+                    path_state.history.push(Operation {
+                        client_id: -1,
+                        op_action: "System.TimerFired".to_string(),
+                        kind: OpKind::TimerFired,
+                        payload: vec![
+                            Value::<H>::node(node_id),
+                            Value::<H>::string(label.as_str().into()),
+                        ],
+                        unique_id: -1,
+                        step: path_state.state.crash_info.current_step,
+                    });
                     let key = (node_id.index, label);
                     if let Some(plan_node) = pending_allow_timer.remove(&key) {
                         engine.mark_event_completed(plan_node);

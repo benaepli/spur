@@ -46,13 +46,14 @@ pub struct ExploreSummary {
     pub session: Option<SessionSummary>,
 }
 
-/// What a session spent and produced, measured on the explorer's own
-/// monotonic clock. Written as `session.json` beside the corpus so a consumer
-/// normalising by wall time reads the exposure the runs actually had, not a
-/// deadline imposed from outside.
+/// What a session spent and produced, measured as active time on the
+/// explorer's own monotonic clock, which a machine suspend does not advance.
+/// Written as `session.json` beside the corpus so a consumer normalising by
+/// time reads the exposure the runs actually had, not a deadline imposed
+/// from outside.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionSummary {
-    /// Wall time from the first queued run to the last finished one.
+    /// Active time from the first queued run to the last finished one.
     pub wall_ms: u64,
     pub runs_completed: u64,
     pub runs_failed: u64,
@@ -241,8 +242,9 @@ pub struct ExplorerConfig {
     #[serde(default)]
     pub rng_stream_isolation: bool,
 
-    /// Wall-clock budget for the whole session, in seconds; 0 means the grid
-    /// alone ends the session. Under a budget the grid is walked in rounds,
+    /// Active-time budget for the whole session, in seconds, on a monotonic
+    /// clock that a machine suspend does not advance; 0 means the grid alone
+    /// ends the session. Under a budget the grid is walked in rounds,
     /// one run of every configuration per round, so a cut leaves every
     /// configuration within one run of every other and the corpus keeps the
     /// grid's composition whatever the throughput. Runs already started
@@ -766,11 +768,79 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feed
 }
 
 /// Outcome of a single run: the genetic fitness, the (optional) self-contained
-/// schedule recording, and the run's timeline-tuple set (for AOS credit).
+/// schedule recording, the run's timeline-tuple set (for AOS credit), and
+/// how the run ended.
 pub struct RunResult {
     pub score: f64,
     pub recording: Option<Recording>,
     pub tuples: HashSet<TimelineTuple>,
+    pub outcome: RunOutcome,
+}
+
+/// Which strategy issued a run, for the `runs` table. A single-strategy
+/// session names its explorer mode with no index; a grid point carries its
+/// index into the expanded grid.
+#[derive(Clone, Debug)]
+pub struct RunAttribution {
+    pub arm: Arc<str>,
+    pub arm_index: i32,
+    pub config_index: i32,
+}
+
+impl RunAttribution {
+    pub fn mode(name: &str) -> Self {
+        Self {
+            arm: Arc::from(name),
+            arm_index: -1,
+            config_index: -1,
+        }
+    }
+
+    pub fn with_config(&self, config_index: usize) -> Self {
+        Self {
+            config_index: config_index as i32,
+            ..self.clone()
+        }
+    }
+}
+
+/// The origin of `session_offset_ms` in the `runs` table: the first run of
+/// the process. One process runs one session, so a run's offset is its
+/// position in that session's wall time.
+fn session_elapsed_ms() -> i64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as i64
+}
+
+fn run_row(
+    run_id: i64,
+    attribution: &RunAttribution,
+    workload_seed: u64,
+    schedule_seed: u64,
+    outcome: &RunOutcome,
+    max_iterations: i32,
+    wall: std::time::Duration,
+) -> crate::simulator::history::PersistableRun {
+    let (steps_used, end_reason) = match outcome {
+        RunOutcome::Completed { steps } => (*steps, "plan_complete"),
+        RunOutcome::Deadlock { step, .. } => (*step, "deadlock"),
+        RunOutcome::IterationsExhausted { .. } => (max_iterations, "iterations_exhausted"),
+    };
+    crate::simulator::history::PersistableRun {
+        run_id,
+        arm: attribution.arm.to_string(),
+        arm_index: attribution.arm_index,
+        config_index: attribution.config_index,
+        workload_seed,
+        schedule_seed,
+        steps_used,
+        wall_us: wall.as_micros() as i64,
+        end_reason,
+        session_offset_ms: session_elapsed_ms(),
+    }
 }
 
 /// Runs a single simulation configuration. `S` selects the RNG strategy
@@ -787,7 +857,9 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     workload_seed: u64,
     schedule_seed: u64,
     seed_tape: Option<Recording>,
+    attribution: &RunAttribution,
 ) -> Result<RunResult, Box<dyn Error>> {
+    let started = std::time::Instant::now();
     let snapshot = F::snapshot(&global_state.feedback);
     let gen_config = GeneratorConfig {
         num_servers: config.num_servers,
@@ -907,11 +979,21 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     let serialized_logs = serialize_logs(&path_state.logs.entries);
     let serialized_traces = serialize_traces(&path_state.logs.traces);
     writer.write(run_id, serialized, serialized_logs, serialized_traces);
+    writer.write_run(run_row(
+        run_id,
+        attribution,
+        workload_seed,
+        schedule_seed,
+        &outcome,
+        config.max_iterations,
+        started.elapsed(),
+    ));
 
     Ok(RunResult {
         score: plan_score,
         recording,
         tuples,
+        outcome,
     })
 }
 
@@ -1014,6 +1096,7 @@ fn run_explorer_impl<F: Feedback>(
     let completed = AtomicU64::new(0);
     let failed = AtomicU64::new(0);
     let skipped = AtomicU64::new(0);
+    let attribution = RunAttribution::mode("standard");
 
     receiver
         .into_iter()
@@ -1034,6 +1117,7 @@ fn run_explorer_impl<F: Feedback>(
                 derive_seed(config.session_seed, run_id, WORKLOAD_SALT),
                 derive_seed(config.session_seed, run_id, SCHEDULE_SALT),
                 None,
+                &attribution.with_config(config_index),
             ) {
                 Ok(_) => {
                     completed.fetch_add(1, Ordering::Relaxed);
@@ -1099,7 +1183,9 @@ fn run_single_plan<F: Feedback>(
     purgatory_config: &PurgatoryConfig,
     weights: &CoverageConfig,
     key_granularity: TimelineKeyGranularity,
+    attribution: &RunAttribution,
 ) -> Result<f64, Box<dyn Error>> {
+    let started = std::time::Instant::now();
     let snapshot = F::snapshot(&global_state.feedback);
     let num_servers_usize = num_servers as usize;
 
@@ -1184,6 +1270,15 @@ fn run_single_plan<F: Feedback>(
     let serialized_logs = serialize_logs(&path_state.logs.entries);
     let serialized_traces = serialize_traces(&path_state.logs.traces);
     writer.write(run_id, serialized, serialized_logs, serialized_traces);
+    writer.write_run(run_row(
+        run_id,
+        attribution,
+        0,
+        0,
+        &outcome,
+        max_iterations,
+        started.elapsed(),
+    ));
 
     Ok(plan_score)
 }
@@ -1258,6 +1353,7 @@ fn run_plan_impl<F: Feedback>(
             &config.purgatory,
             &weights,
             config.feedback.key_granularity(),
+            &RunAttribution::mode("plan"),
         ) {
             Ok(_) => {
                 debug!(
@@ -1357,6 +1453,7 @@ fn run_explorer_genetic_impl<F: Feedback>(
                     derive_seed(config.session_seed, run_id, WORKLOAD_SALT),
                     derive_seed(config.session_seed, run_id, SCHEDULE_SALT),
                     None,
+                    &RunAttribution::mode("genetic"),
                 );
                 match result {
                     Ok(r) => (run_config.clone(), r.score),
@@ -1639,6 +1736,7 @@ fn run_recorded<F: Feedback>(
     cfg: SingleRunConfig,
     session_seed: u64,
     run_id: i64,
+    attribution: &RunAttribution,
 ) -> AosChild {
     let workload_seed = derive_seed(session_seed, run_id, WORKLOAD_SALT);
     let r = run_single_simulation::<F, RecordRng>(
@@ -1651,6 +1749,7 @@ fn run_recorded<F: Feedback>(
         workload_seed,
         derive_seed(session_seed, run_id, SCHEDULE_SALT),
         None,
+        attribution,
     );
     package_child(Operator::ConfigMutate, cfg, workload_seed, run_id, r)
 }
@@ -1666,6 +1765,7 @@ fn run_aos_child<F: Feedback>(
     run_id: i64,
     op: Operator,
     parent: &Individual,
+    attribution: &RunAttribution,
 ) -> AosChild {
     let session = config.session_seed;
     match op {
@@ -1683,6 +1783,7 @@ fn run_aos_child<F: Feedback>(
                 parent.workload_seed,
                 derive_seed(session, run_id, SCHEDULE_SALT),
                 Some(mutated),
+                attribution,
             );
             package_child(op, parent.cfg.clone(), parent.workload_seed, run_id, r)
         }
@@ -1690,7 +1791,7 @@ fn run_aos_child<F: Feedback>(
             // New scenario: jitter the workload and record fresh.
             let mut mrng = SmallRng::seed_from_u64(derive_seed(session, run_id, MUTATE_SALT));
             let cfg = parent.cfg.mutate(config, &mut mrng);
-            run_recorded::<F>(program, writer, global_state, weights, cfg, session, run_id)
+            run_recorded::<F>(program, writer, global_state, weights, cfg, session, run_id, attribution)
         }
     }
 }
@@ -1780,12 +1881,14 @@ fn run_explorer_aos_impl<F: Feedback>(
     let num_batches = config.num_generations.max(1);
     let mut aos = AosExplorer::<F>::new(config, batch_size, weights, session_seed);
 
+    let attribution = RunAttribution::mode("aos");
     let ctx = StepCtx {
         program,
         writer: &writer,
         run_counter: &run_counter,
         weights: &weights,
         session_seed,
+        attribution: &attribution,
     };
 
     for batch in 0..num_batches {
@@ -1925,6 +2028,8 @@ pub struct StepCtx<'a> {
     pub run_counter: &'a AtomicI64,
     pub weights: &'a CoverageConfig,
     pub session_seed: u64,
+    /// Names the strategy taking this step in the `runs` table.
+    pub attribution: &'a RunAttribution,
 }
 
 /// A resumable exploration strategy: each `step` runs one internally-parallel
@@ -2012,6 +2117,7 @@ impl<F: Feedback> Strategy<F> for CurriculumExplorer<F> {
                     derive_seed(ctx.session_seed, *run_id, WORKLOAD_SALT),
                     derive_seed(ctx.session_seed, *run_id, SCHEDULE_SALT),
                     None,
+                    ctx.attribution,
                 ) {
                     Ok(r) => r.score,
                     Err(e) => {
@@ -2113,6 +2219,7 @@ impl<F: Feedback> Strategy<F> for AosExplorer<F> {
                         cfg,
                         ctx.session_seed,
                         run_id,
+                        ctx.attribution,
                     )
                 })
                 .collect();
@@ -2153,6 +2260,7 @@ impl<F: Feedback> Strategy<F> for AosExplorer<F> {
                         *run_id,
                         *op,
                         parent,
+                        ctx.attribution,
                     )
                 })
                 .collect();
@@ -2268,6 +2376,7 @@ impl<F: Feedback> Strategy<F> for CurriculumRnrExplorer<F> {
                     cfg.clone(),
                     ctx.session_seed,
                     *run_id,
+                    ctx.attribution,
                 )
                 .individual,
                 SeedOrRefine::Refine(parent) => {
@@ -2280,6 +2389,7 @@ impl<F: Feedback> Strategy<F> for CurriculumRnrExplorer<F> {
                         *run_id,
                         Operator::TapeMutate,
                         parent,
+                        ctx.attribution,
                     )
                     .individual
                 }
@@ -2375,19 +2485,16 @@ fn run_explorer_continuous_impl<F: Feedback>(
 
     // Construct each referenced mode once; its state persists across slices.
     let mut modes: HashMap<ModeId, Box<dyn Strategy<F>>> = HashMap::new();
+    let mut attributions: HashMap<ModeId, RunAttribution> = HashMap::new();
     for slice in &config.rotation {
         if !modes.contains_key(&slice.mode) {
             modes.insert(slice.mode, build_mode::<F>(slice.mode, &config));
+            attributions.insert(
+                slice.mode,
+                RunAttribution::mode(&format!("continuous:{:?}", slice.mode).to_lowercase()),
+            );
         }
     }
-
-    let ctx = StepCtx {
-        program,
-        writer: &writer,
-        run_counter: &run_counter,
-        weights: &weights,
-        session_seed,
-    };
 
     info!(
         "Continuous explorer: {} mode(s), total_runs cap {}",
@@ -2403,6 +2510,14 @@ fn run_explorer_continuous_impl<F: Feedback>(
                 break 'session;
             }
             let mode = modes.get_mut(&slice.mode).expect("mode built above");
+            let ctx = StepCtx {
+                program,
+                writer: &writer,
+                run_counter: &run_counter,
+                weights: &weights,
+                session_seed,
+                attribution: attributions.get(&slice.mode).expect("attribution built above"),
+            };
             let mut slice_runs: u64 = 0;
             let slice_start = std::time::Instant::now();
             loop {
