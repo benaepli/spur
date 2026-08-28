@@ -124,6 +124,36 @@ fn session_timed(
     (summary, out)
 }
 
+/// `(session_offset_ms, wall_us)` per row of the runs table.
+fn run_clocks(dir: &Path) -> Vec<(i64, i64)> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::Int64Type;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut rows = Vec::new();
+    for entry in fs::read_dir(dir.join("runs")).expect("runs dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+            continue;
+        }
+        let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let offsets = batch
+                .column_by_name("session_offset_ms")
+                .unwrap()
+                .as_primitive::<Int64Type>();
+            let walls = batch.column_by_name("wall_us").unwrap().as_primitive::<Int64Type>();
+            for i in 0..offsets.len() {
+                rows.push((offsets.value(i), walls.value(i)));
+            }
+        }
+    }
+    rows
+}
+
 fn runs_table(dir: &Path) -> Vec<(i64, String)> {
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::Int64Type;
@@ -338,3 +368,30 @@ fn check_cancel() {
     let _ = fs::remove_file(&config_path);
     let _ = fs::remove_dir_all(&out);
 }
+
+/// A run's offset from the session start covers at least the run's own wall:
+/// the clock starts when the session does, not when its first row lands.
+#[test]
+fn session_offsets_start_at_the_session() {
+    std::thread::Builder::new()
+        .stack_size(SESSION_STACK_BYTES)
+        .spawn(|| {
+            let (summary, out) = session_timed("offsets", r#"{"kind": "round_robin", "min_slice_sec": 1}"#, "runs", 3.0);
+            let session = summary.session.expect("campaign reports a session");
+            assert_eq!(session.runs_failed, 0, "the fixture's runs do not fail");
+            assert_eq!(session.runs_completed, summary.campaign.expect("report").runs_total);
+            let clocks = run_clocks(&out);
+            assert!(!clocks.is_empty());
+            for (offset_ms, wall_us) in clocks {
+                assert!(
+                    offset_ms >= wall_us / 1000 - 1,
+                    "a run ending {offset_ms} ms into the session cannot have taken {wall_us} us"
+                );
+            }
+            let _ = fs::remove_dir_all(&out);
+        })
+        .expect("spawns")
+        .join()
+        .expect("runs");
+}
+

@@ -396,6 +396,7 @@ impl<F: Feedback> Arm for GridArm<F> {
         if n == 0 {
             return StepReport {
                 runs: 0,
+                failed: 0,
                 best_score: 0.0,
             };
         }
@@ -412,7 +413,7 @@ impl<F: Feedback> Arm for GridArm<F> {
         let config = &self.config;
         let configs = &self.configs;
         let arm_seed = self.arm_seed;
-        let scores: Vec<f64> = batch
+        let scores: Vec<Option<f64>> = batch
             .par_iter()
             .map(|&(run_id, config_index)| {
                 match run_single_simulation::<F, LiveRng>(
@@ -427,17 +428,18 @@ impl<F: Feedback> Arm for GridArm<F> {
                     None,
                     &ctx.attribution.with_config(config_index),
                 ) {
-                    Ok(r) => r.score,
+                    Ok(r) => Some(r.score),
                     Err(e) => {
                         error!("Campaign run {} failed: {}", run_id, e);
-                        0.0
+                        None
                     }
                 }
             })
             .collect();
         StepReport {
             runs: scores.len() as u64,
-            best_score: scores.iter().cloned().fold(0.0, f64::max),
+            failed: scores.iter().filter(|s| s.is_none()).count() as u64,
+            best_score: scores.iter().flatten().cloned().fold(0.0, f64::max),
         }
     }
 
@@ -885,7 +887,9 @@ fn run_campaign_impl(
     );
 
     let session_start = Instant::now();
+    crate::simulator::explorer::session_clock_start();
     let mut runs_total: u64 = 0;
+    let mut runs_failed: u64 = 0;
     let mut was_cancelled = false;
     let mut slice_no: u64 = 0;
     while let Some(slice) = planner.next(&mut ledger, session_start.elapsed().as_secs_f64()) {
@@ -920,6 +924,7 @@ fn run_campaign_impl(
             }
             let report = arm.arm.step(&ctx, remaining);
             slice_runs += report.runs;
+            runs_failed += report.failed;
             if report.runs == 0 {
                 break;
             }
@@ -1005,8 +1010,8 @@ fn run_campaign_impl(
         vertex_coverage,
         session: Some(SessionSummary {
             wall_ms: elapsed.as_millis() as u64,
-            runs_completed: runs_total,
-            runs_failed: 0,
+            runs_completed: runs_total - runs_failed,
+            runs_failed,
             runs_skipped: 0,
             wall_budget_sec: block.wall_budget_sec,
             budget_hit: !was_cancelled && block.deterministic_slice_runs.is_none(),

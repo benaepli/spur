@@ -807,13 +807,24 @@ impl RunAttribution {
     }
 }
 
-/// The origin of `session_offset_ms` in the `runs` table: the first run of
-/// the process. One process runs one session, so a run's offset is its
-/// position in that session's wall time.
+/// The origin of `session_offset_ms` in the `runs` table. A session sets it
+/// when it starts, before any run; a run row written outside a session
+/// measures from the first row instead.
+static SESSION_ORIGIN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+pub(crate) fn session_clock_start() {
+    if let Ok(mut o) = SESSION_ORIGIN.lock() {
+        *o = Some(std::time::Instant::now());
+    }
+}
+
 fn session_elapsed_ms() -> i64 {
-    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    ORIGIN
-        .get_or_init(std::time::Instant::now)
+    let mut guard = match SESSION_ORIGIN.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .get_or_insert_with(std::time::Instant::now)
         .elapsed()
         .as_millis() as i64
 }
@@ -1082,6 +1093,7 @@ fn run_explorer_impl<F: Feedback>(
 
     let (sender, receiver) = channel::bounded::<(i64, usize)>(100);
     let session_start = std::time::Instant::now();
+    session_clock_start();
     let budget_hit = Arc::new(AtomicBool::new(false));
 
     let order = grid_order(configs.len(), config.num_runs_per_config, budgeted);
@@ -2035,6 +2047,8 @@ impl ContinuousConfig {
 /// Outcome of one strategy step (one internally-parallel batch).
 pub struct StepReport {
     pub runs: u64,
+    /// Runs among `runs` that ended in an error rather than an outcome.
+    pub failed: u64,
     pub best_score: f64,
 }
 
@@ -2166,6 +2180,7 @@ impl<F: Feedback> Strategy<F> for CurriculumExplorer<F> {
         }
 
         StepReport {
+            failed: 0,
             runs: self.batch_size as u64,
             best_score: best,
         }
@@ -2299,6 +2314,7 @@ impl<F: Feedback> Strategy<F> for AosExplorer<F> {
             .map(|x| x.score)
             .fold(0.0_f64, f64::max);
         StepReport {
+            failed: 0,
             runs: self.batch_size as u64,
             best_score: best,
         }
@@ -2428,6 +2444,7 @@ impl<F: Feedback> Strategy<F> for CurriculumRnrExplorer<F> {
             .fold(0.0_f64, f64::max);
         StepReport {
             runs,
+            failed: 0,
             best_score: best,
         }
     }
