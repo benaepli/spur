@@ -2,6 +2,7 @@ pub mod config_override;
 mod core;
 mod coverage;
 mod curriculum;
+pub mod campaign;
 pub mod explorer;
 mod feedback;
 mod hash_utils;

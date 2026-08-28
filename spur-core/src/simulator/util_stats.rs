@@ -1351,6 +1351,65 @@ pub struct UtilizationSnapshot {
     pub timeline_keys: TimelineKeyStats,
 }
 
+/// The snapshot as JSON, for readers that difference or accumulate it.
+pub fn snapshot_value() -> serde_json::Value {
+    serde_json::to_value(snapshot()).unwrap_or(serde_json::Value::Null)
+}
+
+/// `after - before` on every integer leaf, keeping the object structure.
+/// Floats, arrays and strings are ratios, curves and labels, not counts, so
+/// they are dropped; a reader recomputes ratios from the integer leaves.
+pub fn delta(before: &serde_json::Value, after: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match (before, after) {
+        (Value::Object(b), Value::Object(a)) => {
+            let mut out = serde_json::Map::new();
+            for (k, av) in a {
+                let bv = b.get(k).unwrap_or(&Value::Null);
+                match delta(bv, av) {
+                    Value::Null => {}
+                    v => {
+                        out.insert(k.clone(), v);
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        (_, Value::Number(a)) if a.is_u64() || a.is_i64() => {
+            let av = a.as_i64().unwrap_or_else(|| a.as_u64().unwrap_or(0) as i64);
+            let bv = match before {
+                Value::Number(b) => b.as_i64().unwrap_or_else(|| b.as_u64().unwrap_or(0) as i64),
+                _ => 0,
+            };
+            Value::from(av - bv)
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Adds every integer leaf of `delta` into `acc`, creating what is missing.
+pub fn add(acc: &mut serde_json::Value, delta: &serde_json::Value) {
+    use serde_json::Value;
+    if !acc.is_object() {
+        *acc = Value::Object(serde_json::Map::new());
+    }
+    let Value::Object(d) = delta else { return };
+    let acc_map = acc.as_object_mut().expect("made an object above");
+    for (k, dv) in d {
+        match dv {
+            Value::Object(_) => {
+                let slot = acc_map.entry(k.clone()).or_insert_with(|| Value::Object(serde_json::Map::new()));
+                add(slot, dv);
+            }
+            Value::Number(n) => {
+                let cur = acc_map.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+                acc_map.insert(k.clone(), Value::from(cur + n.as_i64().unwrap_or(0)));
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn snapshot() -> UtilizationSnapshot {
     UtilizationSnapshot {
         rng_streams: RngStreamStats {

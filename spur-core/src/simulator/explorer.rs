@@ -44,6 +44,8 @@ pub struct ExploreSummary {
     /// The explorer's own account of the session's exposure. Present for the
     /// standard explorer; the other modes leave it `None`.
     pub session: Option<SessionSummary>,
+    /// Per-arm accounting of a campaign session; `None` for every other mode.
+    pub campaign: Option<crate::simulator::campaign::CampaignReport>,
 }
 
 /// What a session spent and produced, measured as active time on the
@@ -100,6 +102,7 @@ macro_rules! dispatch_feedback {
         }
     }};
 }
+pub(crate) use dispatch_feedback;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Range {
@@ -1162,6 +1165,7 @@ fn run_explorer_impl<F: Feedback>(
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&global_state.feedback),
         session: Some(session),
+        campaign: None,
     })
 }
 
@@ -1371,6 +1375,7 @@ fn run_plan_impl<F: Feedback>(
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&global_state.feedback),
         session: None,
+        campaign: None,
     })
 }
 
@@ -1501,6 +1506,7 @@ fn run_explorer_genetic_impl<F: Feedback>(
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&global_state.feedback),
         session: None,
+        campaign: None,
     })
 }
 
@@ -1916,6 +1922,7 @@ fn run_explorer_aos_impl<F: Feedback>(
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&aos.global_state.feedback),
         session: None,
+        campaign: None,
     })
 }
 
@@ -2035,7 +2042,7 @@ pub struct StepCtx<'a> {
 /// A resumable exploration strategy: each `step` runs one internally-parallel
 /// batch and reports how many runs it did plus the best score, so the conductor
 /// can rotate across modes while each keeps its own persistent state.
-trait Strategy<F: Feedback> {
+pub(crate) trait Strategy<F: Feedback> {
     fn step(&mut self, ctx: &StepCtx) -> StepReport;
 
     /// Per-vertex CFG hit counts from this mode's feedback store, if tracked.
@@ -2044,7 +2051,7 @@ trait Strategy<F: Feedback> {
 
 /// Mode A: curriculum over fresh `LiveRng` samples. Owns an isolated feedback
 /// store and a curriculum clock.
-struct CurriculumExplorer<F: Feedback> {
+pub(crate) struct CurriculumExplorer<F: Feedback> {
     envelope: ExplorerConfig,
     global_state: GlobalState<F>,
     curriculum: Curriculum,
@@ -2059,7 +2066,7 @@ struct CurriculumExplorer<F: Feedback> {
 }
 
 impl<F: Feedback> CurriculumExplorer<F> {
-    fn new(
+    pub(crate) fn new(
         envelope: ExplorerConfig,
         batch_size: usize,
         total_runs: u64,
@@ -2158,7 +2165,7 @@ impl<F: Feedback> Strategy<F> for CurriculumExplorer<F> {
 /// The adaptive-operator-selection bandit (standalone `-e aos`, and Mode C of
 /// the continuous explorer). Requires timeline feedback (enforced by both
 /// entry points).
-struct AosExplorer<F: Feedback> {
+pub(crate) struct AosExplorer<F: Feedback> {
     envelope: ExplorerConfig,
     global_state: GlobalState<F>,
     weights: CoverageConfig,
@@ -2171,7 +2178,7 @@ struct AosExplorer<F: Feedback> {
 }
 
 impl<F: Feedback> AosExplorer<F> {
-    fn new(
+    pub(crate) fn new(
         envelope: ExplorerConfig,
         batch_size: usize,
         weights: CoverageConfig,
@@ -2299,7 +2306,7 @@ enum SeedOrRefine {
 /// only when minting new seed scenarios; each refinement reuses a corpus
 /// member's frozen `cfg` + `workload_seed` and only mutates its schedule tape.
 /// No bandit: seeds and refinements run on a fixed ratio.
-struct CurriculumRnrExplorer<F: Feedback> {
+pub(crate) struct CurriculumRnrExplorer<F: Feedback> {
     envelope: ExplorerConfig,
     global_state: GlobalState<F>,
     weights: CoverageConfig,
@@ -2311,7 +2318,7 @@ struct CurriculumRnrExplorer<F: Feedback> {
 }
 
 impl<F: Feedback> CurriculumRnrExplorer<F> {
-    fn new(
+    pub(crate) fn new(
         envelope: ExplorerConfig,
         batch_size: usize,
         weights: CoverageConfig,
@@ -2566,6 +2573,7 @@ fn run_explorer_continuous_impl<F: Feedback>(
     Ok(ExploreSummary {
         vertex_coverage,
         session: None,
+        campaign: None,
     })
 }
 

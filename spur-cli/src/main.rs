@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use spur_core::compiler;
 use spur_core::compiler::pure::print_program as print_pure;
 use spur_core::debug::SimulatorDebugger;
+use spur_core::simulator::campaign::run_explorer_campaign;
 use spur_core::simulator::config_override;
 use spur_core::simulator::explorer::{
     ExploreSummary, run_explorer, run_explorer_aos, run_explorer_continuous, run_explorer_genetic,
@@ -128,6 +129,9 @@ pub enum ExplorerType {
     /// Continuous adaptive explorer: conductor rotating over curriculum / RnR /
     /// AOS modes
     Continuous,
+    /// Several arms under one active-time budget; needs a `campaign` block
+    /// in the config
+    Campaign,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -495,6 +499,14 @@ fn run_explore(
         .context("Config path contains invalid UTF-8")?;
 
     let summary = match explorer_type {
+        ExplorerType::Campaign => run_explorer_campaign(
+            &program,
+            config_path_str,
+            &output_path_str,
+            backend,
+            &cancelled,
+        )
+        .map_err(|e| anyhow::anyhow!("Explorer failed: {}", e))?,
         ExplorerType::Standard => run_explorer(
             &program,
             config_path_str,
@@ -542,6 +554,7 @@ fn run_explore(
     // Dump opt-in utilization counters (enabled via `"stats": true` in the config)
     let util_paths = write_utilization_counters(&output_dir)?;
     let session_paths = write_session_summary(&summary, &output_dir)?;
+    let campaign_paths = write_campaign_report(&summary, &output_dir)?;
 
     println!(
         "Explorer finished in {:.2?}. Results saved to {}",
@@ -559,8 +572,34 @@ fn run_explore(
     for p in &session_paths {
         println!("  - Session summary: {}", p.display());
     }
+    for p in &campaign_paths {
+        println!("  - Campaign report: {}", p.display());
+    }
 
     Ok(())
+}
+
+/// Writes a campaign's per-arm report inside and beside the output directory,
+/// on the same terms as the session summary.
+fn write_campaign_report(summary: &ExploreSummary, output_dir: &Path) -> Result<Vec<PathBuf>> {
+    let Some(report) = &summary.campaign else {
+        return Ok(Vec::new());
+    };
+    let json = serde_json::to_string_pretty(report).context("Failed to serialize campaign report")?;
+    let inside = output_dir.join("campaign.json");
+    fs::write(&inside, &json).context("Failed to write campaign.json")?;
+    let mut written = vec![inside];
+    if let Some(beside) = sibling_path(output_dir, ".campaign.json") {
+        match fs::write(&beside, &json) {
+            Ok(()) => written.push(beside),
+            Err(e) => eprintln!(
+                "warning: could not write {}: {}",
+                beside.display(),
+                e
+            ),
+        }
+    }
+    Ok(written)
 }
 
 /// Writes the explorer's own exposure account inside and beside the output

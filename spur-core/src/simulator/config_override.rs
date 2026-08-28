@@ -195,6 +195,16 @@ fn path_exists(root: &Value, path: &[String]) -> bool {
     true
 }
 
+/// Writes `value` at a dotted `path`, creating intermediate objects, the way
+/// an assignment does.
+pub fn set_dotted(root: &mut Value, path: &str, value: Value) -> Result<(), String> {
+    let segments: Vec<String> = path.split('.').map(str::to_string).collect();
+    if segments.iter().any(|seg| seg.is_empty()) {
+        return Err(format!("path `{}` has an empty segment", path));
+    }
+    set_path(root, &segments, value)
+}
+
 fn set_path(root: &mut Value, path: &[String], value: Value) -> Result<(), String> {
     let mut cursor: &mut Map<String, Value> = root
         .as_object_mut()
