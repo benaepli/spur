@@ -96,6 +96,7 @@ fn make_record_with_cont(
         link_seq: None,
         origin_incarnation: 0,
         bias: crate::simulator::util_stats::DeliveryBias::NONE,
+        timer_entry: None,
     }
 }
 

@@ -176,6 +176,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     link_seq,
                     origin_incarnation: state.incarnation(node_id),
                     bias: DeliveryBias::NONE,
+                    timer_entry: None,
                 };
 
                 rng.use_stream(Stream::SendDelay);

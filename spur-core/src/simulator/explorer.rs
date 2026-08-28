@@ -826,6 +826,7 @@ fn run_row(
     outcome: &RunOutcome,
     max_iterations: i32,
     wall: std::time::Duration,
+    timers: crate::simulator::core::state::TimerRunStats,
 ) -> crate::simulator::history::PersistableRun {
     let (steps_used, end_reason) = match outcome {
         RunOutcome::Completed { steps } => (*steps, "plan_complete"),
@@ -843,6 +844,13 @@ fn run_row(
         wall_us: wall.as_micros() as i64,
         end_reason,
         session_offset_ms: session_elapsed_ms(),
+        timers_fired: timers.fired as i32,
+        timers_acted: timers.acted as i32,
+        timers_inflight_fired: timers.inflight_fired as i32,
+        timers_inflight_acted: timers.inflight_acted as i32,
+        timers_idle_fired: timers.idle_fired as i32,
+        timers_idle_acted: timers.idle_acted as i32,
+        max_inert_streak: timers.max_inert_streak as i32,
     }
 }
 
@@ -990,6 +998,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &outcome,
         config.max_iterations,
         started.elapsed(),
+        path_state.state.timer_stats,
     ));
 
     Ok(RunResult {
@@ -1282,6 +1291,7 @@ fn run_single_plan<F: Feedback>(
         &outcome,
         max_iterations,
         started.elapsed(),
+        path_state.state.timer_stats,
     ));
 
     Ok(plan_score)

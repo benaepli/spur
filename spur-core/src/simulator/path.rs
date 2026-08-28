@@ -193,6 +193,7 @@ fn schedule_client_op<H: HashPolicy>(
         link_seq: None,
         origin_incarnation: state.incarnation(client_node_id),
         bias: DeliveryBias::NONE,
+        timer_entry: None,
     }));
     Ok(())
 }

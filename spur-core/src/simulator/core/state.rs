@@ -254,6 +254,10 @@ pub struct Record<H: HashPolicy> {
     /// Observation only, and deliberately excluded from `Hash` so state
     /// deduplication is unaffected.
     pub bias: DeliveryBias,
+    /// Set when a timer firing woke this record: the vertex it resumes at,
+    /// so the effect of the firing is measured on that first segment only.
+    /// Observation only, excluded from `Hash`.
+    pub timer_entry: Option<Vertex>,
 }
 
 impl<H: HashPolicy> Record<H> {
@@ -523,6 +527,26 @@ pub struct State<H: HashPolicy> {
     /// A FIFO-tagged runnable with `(link_id, seq)` is only deliverable when
     /// `seq == link_deliver_seq[link_id]`. Bumped on successful delivery.
     pub link_deliver_seq: ImHashMap<LinkId, u32>,
+    /// Timer firings this run and what they changed. Observation only,
+    /// excluded from `signature()`.
+    pub timer_stats: TimerRunStats,
+    /// Consecutive inert timer firings per (node index, resume vertex),
+    /// reset when a firing at that vertex changes the node's state.
+    timer_inert_streaks: Vec<(usize, Vertex, u32)>,
+}
+
+/// Per-run totals of timer firings that woke a waiting record, split by
+/// whether a delivery to the node was pending when it fired, and whether the
+/// woken segment changed the node's state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimerRunStats {
+    pub fired: u32,
+    pub acted: u32,
+    pub inflight_fired: u32,
+    pub inflight_acted: u32,
+    pub idle_fired: u32,
+    pub idle_acted: u32,
+    pub max_inert_streak: u32,
 }
 
 impl<H: HashPolicy> State<H> {
@@ -566,6 +590,67 @@ impl<H: HashPolicy> State<H> {
             link_meta: ImHashMap::new(),
             link_send_seq: ImHashMap::new(),
             link_deliver_seq: ImHashMap::new(),
+            timer_stats: TimerRunStats::default(),
+            timer_inert_streaks: Vec::new(),
+        }
+    }
+
+    /// Messages from other nodes addressed to `node` that are queued or held
+    /// by a delay and not yet delivered.
+    pub fn pending_deliveries_to(&self, node: NodeId) -> usize {
+        let to_node = |r: &Runnable<H>| match r {
+            Runnable::Record(rec) => rec.node == node && rec.origin_node != node,
+            Runnable::ChannelSend {
+                origin_node, target, ..
+            } => *target == node && *origin_node != node,
+            _ => false,
+        };
+        self.network_queue.iter().filter(|r| to_node(r)).count()
+            + self.purgatory.iter().filter(|(_, r)| to_node(r)).count()
+    }
+
+    /// Consecutive inert timer firings at `pc` on node `node` so far in
+    /// this run.
+    pub fn timer_inert_streak(&self, node: usize, pc: Vertex) -> u32 {
+        self.timer_inert_streaks
+            .iter()
+            .find(|(n, p, _)| *n == node && *p == pc)
+            .map(|(_, _, s)| *s)
+            .unwrap_or(0)
+    }
+
+    /// Account one timer firing that woke a record at `pc` on node `node`.
+    pub fn note_timer_effect(&mut self, node: usize, pc: Vertex, inflight: bool, acted: bool) {
+        let t = &mut self.timer_stats;
+        t.fired += 1;
+        if acted {
+            t.acted += 1;
+        }
+        if inflight {
+            t.inflight_fired += 1;
+            if acted {
+                t.inflight_acted += 1;
+            }
+        } else {
+            t.idle_fired += 1;
+            if acted {
+                t.idle_acted += 1;
+            }
+        }
+        let entry = match self
+            .timer_inert_streaks
+            .iter_mut()
+            .find(|(n, p, _)| *n == node && *p == pc)
+        {
+            Some(e) => e,
+            None => {
+                self.timer_inert_streaks.push((node, pc, 0));
+                self.timer_inert_streaks.last_mut().expect("just pushed")
+            }
+        };
+        entry.2 = if acted { 0 } else { entry.2 + 1 };
+        if entry.2 > t.max_inert_streak {
+            t.max_inert_streak = entry.2;
         }
     }
 

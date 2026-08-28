@@ -108,6 +108,17 @@ pub struct PersistableRun {
     pub end_reason: &'static str,
     /// Active time from the session's start to the run's end.
     pub session_offset_ms: i64,
+    /// Timer firings that woke a waiting record, and how many of those
+    /// segments changed the node's state, split by whether a delivery to
+    /// the node was pending at the firing.
+    pub timers_fired: i32,
+    pub timers_acted: i32,
+    pub timers_inflight_fired: i32,
+    pub timers_inflight_acted: i32,
+    pub timers_idle_fired: i32,
+    pub timers_idle_acted: i32,
+    /// Longest run of inert firings at one resume point on one node.
+    pub max_inert_streak: i32,
 }
 
 fn json_of_value<H: crate::simulator::hash_utils::HashPolicy>(v: &Value<H>) -> JsonValue {
@@ -473,6 +484,13 @@ fn runs_schema() -> Arc<Schema> {
         Field::new("wall_us", DataType::Int64, false),
         Field::new("end_reason", DataType::Utf8, false),
         Field::new("session_offset_ms", DataType::Int64, false),
+        Field::new("timers_fired", DataType::Int32, false),
+        Field::new("timers_acted", DataType::Int32, false),
+        Field::new("timers_inflight_fired", DataType::Int32, false),
+        Field::new("timers_inflight_acted", DataType::Int32, false),
+        Field::new("timers_idle_fired", DataType::Int32, false),
+        Field::new("timers_idle_acted", DataType::Int32, false),
+        Field::new("max_inert_streak", DataType::Int32, false),
     ]))
 }
 
@@ -491,6 +509,14 @@ fn append_runs_batch(
     let walls: Int64Array = runs.iter().map(|r| r.wall_us).collect::<Vec<_>>().into();
     let reasons: StringArray = runs.iter().map(|r| r.end_reason).collect::<Vec<_>>().into();
     let offsets: Int64Array = runs.iter().map(|r| r.session_offset_ms).collect::<Vec<_>>().into();
+    let timer_col = |f: fn(&PersistableRun) -> i32| -> Int32Array { runs.iter().map(f).collect::<Vec<_>>().into() };
+    let timers_fired = timer_col(|r| r.timers_fired);
+    let timers_acted = timer_col(|r| r.timers_acted);
+    let timers_inflight_fired = timer_col(|r| r.timers_inflight_fired);
+    let timers_inflight_acted = timer_col(|r| r.timers_inflight_acted);
+    let timers_idle_fired = timer_col(|r| r.timers_idle_fired);
+    let timers_idle_acted = timer_col(|r| r.timers_idle_acted);
+    let max_inert_streak = timer_col(|r| r.max_inert_streak);
     let batch = RecordBatch::try_new(
         runs_schema(),
         vec![
@@ -504,6 +530,13 @@ fn append_runs_batch(
             Arc::new(walls),
             Arc::new(reasons),
             Arc::new(offsets),
+            Arc::new(timers_fired),
+            Arc::new(timers_acted),
+            Arc::new(timers_inflight_fired),
+            Arc::new(timers_inflight_acted),
+            Arc::new(timers_idle_fired),
+            Arc::new(timers_idle_acted),
+            Arc::new(max_inert_streak),
         ],
     )?;
     writer.write(&batch)?;
@@ -866,6 +899,13 @@ mod parquet_writer_tests {
                 wall_us: 10,
                 end_reason: "plan_complete",
                 session_offset_ms: run_id,
+                timers_fired: 0,
+                timers_acted: 0,
+                timers_inflight_fired: 0,
+                timers_inflight_acted: 0,
+                timers_idle_fired: 0,
+                timers_idle_acted: 0,
+                max_inert_streak: 0,
             });
         }
         writer.shutdown();

@@ -8,7 +8,7 @@
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -111,6 +111,46 @@ static DELIVERIES_ACTED: [AtomicU64; DELIVERY_BUCKETS] =
     [const { AtomicU64::new(0) }; DELIVERY_BUCKETS];
 
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
+
+/// Context of one timer firing: the vertex the woken record resumes at (so a
+/// spec's timer handlers are told apart without naming them), whether a
+/// delivery to the node was pending, the node's incarnation and how many
+/// firings at that vertex on that node had changed nothing before this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+pub struct TimerKey {
+    pub vertex: usize,
+    pub inflight: bool,
+    /// 0, 1, or 2 for two or more recoveries.
+    pub incarnation: u8,
+    /// 0 for none, 1 for 1-2, 2 for 3-7, 3 for 8 or more.
+    pub inert_streak: u8,
+}
+
+impl TimerKey {
+    pub fn new(vertex: usize, inflight: bool, incarnation: u32, inert_streak: u32) -> Self {
+        Self {
+            vertex,
+            inflight,
+            incarnation: incarnation.min(2) as u8,
+            inert_streak: match inert_streak {
+                0 => 0,
+                1..=2 => 1,
+                3..=7 => 2,
+                _ => 3,
+            },
+        }
+    }
+}
+
+/// Keys are a small product of vertices and buckets; the cap only guards
+/// against a spec with an unexpected number of timer resume points.
+const TIMER_KEY_CAP: usize = 4096;
+static TIMER_EFFECTS: LazyLock<Mutex<HashMap<TimerKey, (u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TIMERS_FIRED: AtomicU64 = AtomicU64::new(0);
+static TIMERS_ACTED: AtomicU64 = AtomicU64::new(0);
+static TIMERS_INFLIGHT_FIRED: AtomicU64 = AtomicU64::new(0);
+static TIMERS_INFLIGHT_ACTED: AtomicU64 = AtomicU64::new(0);
 static TIMELINE_KEYS: Mutex<TimelineKeyGrowth> = Mutex::new(TimelineKeyGrowth::new());
 
 /// Runs per point on the timeline-key growth curve, and the most points a
@@ -197,6 +237,17 @@ pub fn set_enabled(on: bool) {
         }
         if let Ok(mut g) = TIMELINE_KEYS.lock() {
             *g = TimelineKeyGrowth::new();
+        }
+        for c in [
+            &TIMERS_FIRED,
+            &TIMERS_ACTED,
+            &TIMERS_INFLIGHT_FIRED,
+            &TIMERS_INFLIGHT_ACTED,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+        if let Ok(mut t) = TIMER_EFFECTS.lock() {
+            t.clear();
         }
     }
     ENABLED.store(on, Ordering::Relaxed);
@@ -1108,6 +1159,107 @@ pub struct CrashRecoveryStats {
     pub runs_with_crossing: u64,
 }
 
+/// Record one timer firing that woke a waiting record and whether the woken
+/// segment changed the node's state. Same switch as the delivery probe.
+#[inline]
+pub fn record_timer(key: TimerKey, acted: bool) {
+    if !acted_fraction_enabled() {
+        return;
+    }
+    TIMERS_FIRED.fetch_add(1, Ordering::Relaxed);
+    if acted {
+        TIMERS_ACTED.fetch_add(1, Ordering::Relaxed);
+    }
+    if key.inflight {
+        TIMERS_INFLIGHT_FIRED.fetch_add(1, Ordering::Relaxed);
+        if acted {
+            TIMERS_INFLIGHT_ACTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if let Ok(mut t) = TIMER_EFFECTS.lock() {
+        if let Some(e) = t.get_mut(&key) {
+            e.0 += 1;
+            if acted {
+                e.1 += 1;
+            }
+        } else if t.len() < TIMER_KEY_CAP {
+            t.insert(key, (1, u64::from(acted)));
+        }
+    }
+}
+
+/// Timer firings and the share that changed the node's state, for one slice.
+#[derive(Serialize)]
+pub struct TimerEffect {
+    pub fired: u64,
+    pub acted: u64,
+    pub acted_fraction: f64,
+}
+
+impl TimerEffect {
+    fn of(fired: u64, acted: u64) -> Self {
+        Self {
+            fired,
+            acted,
+            acted_fraction: if fired == 0 { 0.0 } else { acted as f64 / fired as f64 },
+        }
+    }
+}
+
+/// One context key of the timer effect table with its counts.
+#[derive(Serialize)]
+pub struct TimerKeyEffect {
+    pub vertex: usize,
+    pub inflight: bool,
+    pub incarnation: u8,
+    pub inert_streak: u8,
+    pub fired: u64,
+    pub acted: u64,
+}
+
+/// Timer firings in the session: overall, with a delivery to the node in
+/// flight, on an idle node, and per context key. Only firings that woke a
+/// waiting record are counted; a firing whose channel had no reader is
+/// consumed later by a receive and is not attributed.
+#[derive(Serialize)]
+pub struct TimerEffectStats {
+    pub all: TimerEffect,
+    pub with_inflight: TimerEffect,
+    pub idle: TimerEffect,
+    pub by_key: Vec<TimerKeyEffect>,
+}
+
+impl TimerEffectStats {
+    fn read() -> Self {
+        let fired = TIMERS_FIRED.load(Ordering::Relaxed);
+        let acted = TIMERS_ACTED.load(Ordering::Relaxed);
+        let inflight = TIMERS_INFLIGHT_FIRED.load(Ordering::Relaxed);
+        let inflight_acted = TIMERS_INFLIGHT_ACTED.load(Ordering::Relaxed);
+        let mut by_key: Vec<TimerKeyEffect> = TIMER_EFFECTS
+            .lock()
+            .map(|t| {
+                t.iter()
+                    .map(|(k, (f, a))| TimerKeyEffect {
+                        vertex: k.vertex,
+                        inflight: k.inflight,
+                        incarnation: k.incarnation,
+                        inert_streak: k.inert_streak,
+                        fired: *f,
+                        acted: *a,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        by_key.sort_by_key(|e| (e.vertex, e.inflight, e.incarnation, e.inert_streak));
+        Self {
+            all: TimerEffect::of(fired, acted),
+            with_inflight: TimerEffect::of(inflight, inflight_acted),
+            idle: TimerEffect::of(fired - inflight, acted - inflight_acted),
+            by_key,
+        }
+    }
+}
+
 /// Deliveries and the share of them that changed the receiving node's state,
 /// for one bias bucket.
 #[derive(Serialize)]
@@ -1346,6 +1498,7 @@ pub struct UtilizationSnapshot {
     pub ordered_h3: OrderedH3Stats,
     pub post_fault_ops: PostFaultOpsStats,
     pub delivery_effects: DeliveryEffectStats,
+    pub timer_effects: TimerEffectStats,
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
     pub timeline_keys: TimelineKeyStats,
@@ -1477,6 +1630,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             sender_restarted: DeliveryEffect::read(DELIVERY_SENDER_RESTARTED),
             receiver_restarted: DeliveryEffect::read(DELIVERY_RECEIVER_RESTARTED),
         },
+        timer_effects: TimerEffectStats::read(),
         crash_anchor: CrashAnchorStats {
             steps_with_crash_eligible: CA_STEPS_WITH_CRASH_ELIGIBLE.load(Ordering::Relaxed),
             offered: CA_OFFERED.load(Ordering::Relaxed),
@@ -1521,6 +1675,55 @@ mod tests {
         assert_eq!(s.receiver_restarted.deliveries, 0);
         assert_eq!(s.receiver_restarted.acted_fraction, 0.0);
         assert!((s.all.acted_fraction - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn timer_effects_split_by_context_and_reset_the_streak_when_acted() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        set_acted_fraction_enabled(true);
+
+        record_timer(TimerKey::new(7, false, 0, 0), false);
+        record_timer(TimerKey::new(7, false, 0, 1), false);
+        record_timer(TimerKey::new(7, false, 0, 2), true);
+        record_timer(TimerKey::new(7, true, 1, 0), false);
+        record_timer(TimerKey::new(9, true, 3, 12), true);
+
+        let s = snapshot().timer_effects;
+        set_enabled(false);
+
+        assert_eq!(s.all.fired, 5);
+        assert_eq!(s.all.acted, 2);
+        assert_eq!(s.with_inflight.fired, 2);
+        assert_eq!(s.with_inflight.acted, 1);
+        assert_eq!(s.idle.fired, 3);
+        assert_eq!(s.idle.acted, 1);
+        assert_eq!(s.by_key.len(), 4, "streaks 1 and 2 share a bucket");
+        let short = s.by_key.iter().find(|e| e.vertex == 7 && e.inert_streak == 1).expect("streak bucket 1 keyed");
+        assert_eq!((short.fired, short.acted), (2, 1));
+        let deep = s.by_key.iter().find(|e| e.vertex == 9).expect("vertex 9 keyed");
+        assert_eq!((deep.incarnation, deep.inert_streak), (2, 3));
+        assert!(s.by_key.windows(2).all(|w| (w[0].vertex, w[0].inflight) <= (w[1].vertex, w[1].inflight)));
+
+        set_enabled(true);
+        assert_eq!(snapshot().timer_effects.all.fired, 0, "enabling resets the table");
+        set_enabled(false);
+    }
+
+    #[test]
+    fn a_timer_streak_counts_inert_firings_and_resets_on_an_effect() {
+        use crate::analysis::resolver::NameId;
+        use crate::simulator::core::state::State;
+        use crate::simulator::hash_utils::NoHashing;
+        let mut st = State::<NoHashing>::new(&[(NameId(0), 1)], 4);
+        st.note_timer_effect(0, 5, false, false);
+        st.note_timer_effect(0, 5, false, false);
+        assert_eq!(st.timer_inert_streak(0, 5), 2);
+        st.note_timer_effect(0, 5, true, true);
+        assert_eq!(st.timer_inert_streak(0, 5), 0);
+        assert_eq!(st.timer_stats.max_inert_streak, 2);
+        assert_eq!((st.timer_stats.fired, st.timer_stats.acted), (3, 1));
+        assert_eq!((st.timer_stats.idle_fired, st.timer_stats.inflight_fired), (2, 1));
     }
 
     #[test]

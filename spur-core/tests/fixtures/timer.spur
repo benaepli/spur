@@ -1,0 +1,48 @@
+// A key-value store whose nodes run two timer loops: one whose firing writes
+// node state and one whose firing changes nothing. Used by tests that measure
+// what a timer firing does to the node that waited for it.
+
+role Node {
+    var db: map<string, int> = {};
+    var ticks: int = 0;
+
+    fn Init(me: int, peers: list<Node>) {
+        Tick();
+        Idle();
+    }
+
+    async fn Tick() {
+        for ;; {
+            <- set_timer("tick");
+            ticks = ticks + 1;
+        }
+    }
+
+    async fn Idle() {
+        for ;; {
+            <- set_timer("idle");
+        }
+    }
+
+    async fn Write(key: string, uid: int): bool {
+        db = db[key] := uid;
+        return true;
+    }
+
+    async fn Read(key: string): int {
+        if (exists(db, key)) {
+            return db[key];
+        }
+        return 0;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        <-dest->Write(key, uid);
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

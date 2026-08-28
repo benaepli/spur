@@ -730,6 +730,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     }
                     let node_index = reader.node.index;
                     state.nodes[node_index] = r_node_env;
+                    reader.timer_entry = Some(reader.pc);
                     state.push_to_local(node_index, Runnable::Record(reader));
                 } else {
                     chan.buffer.push_back(Value::<H>::unit());
@@ -820,6 +821,20 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         }
                         (bias, state.node_state_token(record_dest))
                     });
+                    // The segment a timer firing woke, measured the same way
+                    // as a delivery: the token counts state writes, so a
+                    // segment that only sends reads as inert.
+                    let timer_entry = r.timer_entry == Some(r.pc);
+                    let timer_probe = (util_stats::acted_fraction_enabled() && timer_entry).then(|| {
+                        let inflight = state.pending_deliveries_to(record_dest) > 0;
+                        let key = util_stats::TimerKey::new(
+                            r.pc,
+                            inflight,
+                            state.incarnation(record_dest),
+                            state.timer_inert_streak(record_dest.index, r.pc),
+                        );
+                        (r.pc, key, inflight, state.node_state_token(record_dest))
+                    });
                     let result = exec::<H, L, F>(
                         state,
                         logger,
@@ -834,6 +849,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     if let Some((bias, before)) = probe {
                         let acted = state.node_state_token(record_dest) != before;
                         util_stats::record_delivery(bias, acted);
+                    }
+                    if let Some((pc, key, inflight, before)) = timer_probe {
+                        let acted = state.node_state_token(record_dest) != before;
+                        state.note_timer_effect(record_dest.index, pc, inflight, acted);
+                        util_stats::record_timer(key, acted);
                     }
                     if message_entry {
                         util_stats::record_message_entry(record_dest.index, entry_step);
@@ -863,6 +883,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                             }
                             let node_index = reader.node.index;
                             state.nodes[node_index] = r_node_env;
+                            reader.timer_entry = None;
                             state.push_to_local(node_index, Runnable::Record(reader));
                         } else {
                             chan.buffer.push_back(message);
@@ -1107,6 +1128,7 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         link_seq: None,
         origin_incarnation: state.incarnation(node_id),
         bias: DeliveryBias::NONE,
+        timer_entry: None,
     };
 
     exec::<H, L, F>(
