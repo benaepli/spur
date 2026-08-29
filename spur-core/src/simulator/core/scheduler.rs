@@ -837,7 +837,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             }
 
             if let Some(mut chan) = state.channels.get(&timer.channel).cloned() {
-                if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                if let Some((mut reader, lhs)) = chan.pop_waiting_reader() {
                     let mut r_node_env = state.nodes[reader.node.index].clone();
                     if let Err(e) = crate::simulator::core::eval::store(
                         &lhs,
@@ -996,7 +996,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     channel, message, ..
                 } => {
                     if let Some(mut chan) = state.channels.get(&channel).cloned() {
-                        if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                        if let Some((mut reader, lhs)) = chan.pop_waiting_reader() {
                             let mut r_node_env = state.nodes[reader.node.index].clone();
                             if let Err(e) = crate::simulator::core::eval::store(
                                 &lhs,
