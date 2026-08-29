@@ -78,13 +78,18 @@ impl PlanEngine {
     }
 
     /// Returns a list of all events that are currently ready, marking them as InProgress.
+    /// Events are released in index order: the statuses map has no order of
+    /// its own, and the release order decides which operation gets which id
+    /// and which client node, so a run is only a function of its seed when
+    /// this order is fixed.
     pub fn get_ready_events(&mut self) -> Vec<(NodeIndex, &PlannedEvent)> {
-        let ready: Vec<_> = self
+        let mut ready: Vec<_> = self
             .statuses
             .iter()
             .filter(|(_, s)| **s == EventStatus::Ready)
             .map(|(idx, _)| *idx)
             .collect();
+        ready.sort_unstable();
 
         for idx in &ready {
             self.statuses.insert(*idx, EventStatus::InProgress);
