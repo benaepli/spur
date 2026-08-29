@@ -192,6 +192,19 @@ static TIMERS_FIRED: AtomicU64 = AtomicU64::new(0);
 static TIMERS_ACTED: AtomicU64 = AtomicU64::new(0);
 static TIMERS_INFLIGHT_FIRED: AtomicU64 = AtomicU64::new(0);
 static TIMERS_INFLIGHT_ACTED: AtomicU64 = AtomicU64::new(0);
+
+/// One slot per `TimerKey::inert_streak` bucket. The per-key table is a list
+/// and readers that difference the snapshot keep only integer leaves, so the
+/// same split is also kept as named counters.
+const STREAK_BUCKETS: usize = 4;
+static TIMER_STREAK_FIRED: [AtomicU64; STREAK_BUCKETS] =
+    [const { AtomicU64::new(0) }; STREAK_BUCKETS];
+static TIMER_STREAK_ACTED: [AtomicU64; STREAK_BUCKETS] =
+    [const { AtomicU64::new(0) }; STREAK_BUCKETS];
+
+static TIMER_STEER_EVALUATED: AtomicU64 = AtomicU64::new(0);
+static TIMER_STEER_RAISED: AtomicU64 = AtomicU64::new(0);
+static TIMER_STEER_LOWERED: AtomicU64 = AtomicU64::new(0);
 static TIMELINE_KEYS: Mutex<TimelineKeyGrowth> = Mutex::new(TimelineKeyGrowth::new());
 
 /// Runs per point on the timeline-key growth curve, and the most points a
@@ -284,7 +297,13 @@ pub fn set_enabled(on: bool) {
             &TIMERS_ACTED,
             &TIMERS_INFLIGHT_FIRED,
             &TIMERS_INFLIGHT_ACTED,
+            &TIMER_STEER_EVALUATED,
+            &TIMER_STEER_RAISED,
+            &TIMER_STEER_LOWERED,
         ] {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in TIMER_STREAK_FIRED.iter().chain(TIMER_STREAK_ACTED.iter()) {
             c.store(0, Ordering::Relaxed);
         }
         if let Ok(mut t) = TIMER_EFFECTS.lock() {
@@ -1410,6 +1429,11 @@ pub fn record_timer(key: TimerKey, acted: bool) {
             TIMERS_INFLIGHT_ACTED.fetch_add(1, Ordering::Relaxed);
         }
     }
+    let bucket = usize::from(key.inert_streak).min(STREAK_BUCKETS - 1);
+    TIMER_STREAK_FIRED[bucket].fetch_add(1, Ordering::Relaxed);
+    if acted {
+        TIMER_STREAK_ACTED[bucket].fetch_add(1, Ordering::Relaxed);
+    }
     if let Ok(mut t) = TIMER_EFFECTS.lock() {
         if let Some(e) = t.get_mut(&key) {
             e.0 += 1;
@@ -1460,7 +1484,73 @@ pub struct TimerEffectStats {
     pub all: TimerEffect,
     pub with_inflight: TimerEffect,
     pub idle: TimerEffect,
+    pub inert_streak: InertStreakHistogram,
     pub by_key: Vec<TimerKeyEffect>,
+}
+
+/// Timer firings grouped by how many firings at the same resume point on the
+/// same node had changed nothing before this one: none, one or two, three to
+/// seven, eight or more.
+#[derive(Serialize)]
+pub struct InertStreakHistogram {
+    pub none: TimerEffect,
+    pub short: TimerEffect,
+    pub medium: TimerEffect,
+    pub long: TimerEffect,
+}
+
+impl InertStreakHistogram {
+    fn read() -> Self {
+        let b = |i: usize| {
+            TimerEffect::of(
+                TIMER_STREAK_FIRED[i].load(Ordering::Relaxed),
+                TIMER_STREAK_ACTED[i].load(Ordering::Relaxed),
+            )
+        };
+        Self {
+            none: b(0),
+            short: b(1),
+            medium: b(2),
+            long: b(3),
+        }
+    }
+}
+
+/// Steps where admitting a timer was an actual choice, i.e. a timer and a
+/// message delivery were both schedulable, and which of the two the step ran.
+/// A mechanism that reweights timers against deliveries moves `raised` and
+/// `lowered` against this denominator; with none configured the split is
+/// whatever the queue selector draws.
+#[derive(Serialize)]
+pub struct TimerSteerStats {
+    pub evaluated: u64,
+    pub raised: u64,
+    pub lowered: u64,
+}
+
+impl TimerSteerStats {
+    fn read() -> Self {
+        Self {
+            evaluated: TIMER_STEER_EVALUATED.load(Ordering::Relaxed),
+            raised: TIMER_STEER_RAISED.load(Ordering::Relaxed),
+            lowered: TIMER_STEER_LOWERED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Record one step at which a timer and a delivery were both schedulable.
+/// `chose_timer` says which one the step ran.
+#[inline]
+pub fn record_timer_admission(chose_timer: bool) {
+    if !enabled() {
+        return;
+    }
+    TIMER_STEER_EVALUATED.fetch_add(1, Ordering::Relaxed);
+    if chose_timer {
+        TIMER_STEER_RAISED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TIMER_STEER_LOWERED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl TimerEffectStats {
@@ -1489,6 +1579,7 @@ impl TimerEffectStats {
             all: TimerEffect::of(fired, acted),
             with_inflight: TimerEffect::of(inflight, inflight_acted),
             idle: TimerEffect::of(fired - inflight, acted - inflight_acted),
+            inert_streak: InertStreakHistogram::read(),
             by_key,
         }
     }
@@ -1734,6 +1825,7 @@ pub struct UtilizationSnapshot {
     pub post_fault_ops: PostFaultOpsStats,
     pub delivery_effects: DeliveryEffectStats,
     pub timer_effects: TimerEffectStats,
+    pub timer_steer: TimerSteerStats,
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
     pub timeline_keys: TimelineKeyStats,
@@ -1872,6 +1964,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             receiver_restarted: DeliveryEffect::read(DELIVERY_RECEIVER_RESTARTED),
         },
         timer_effects: TimerEffectStats::read(),
+        timer_steer: TimerSteerStats::read(),
         crash_anchor: CrashAnchorStats {
             steps_with_crash_eligible: CA_STEPS_WITH_CRASH_ELIGIBLE.load(Ordering::Relaxed),
             offered: CA_OFFERED.load(Ordering::Relaxed),
@@ -1995,9 +2088,41 @@ mod tests {
         assert_eq!((deep.incarnation, deep.inert_streak), (2, 3));
         assert!(s.by_key.windows(2).all(|w| (w[0].vertex, w[0].inflight) <= (w[1].vertex, w[1].inflight)));
 
+        let h = &s.inert_streak;
+        assert_eq!((h.none.fired, h.none.acted), (2, 0));
+        assert_eq!((h.short.fired, h.short.acted), (2, 1));
+        assert_eq!((h.medium.fired, h.medium.acted), (0, 0));
+        assert_eq!((h.long.fired, h.long.acted), (1, 1));
+        assert_eq!(
+            h.none.fired + h.short.fired + h.medium.fired + h.long.fired,
+            s.all.fired
+        );
+
         set_enabled(true);
         assert_eq!(snapshot().timer_effects.all.fired, 0, "enabling resets the table");
+        assert_eq!(snapshot().timer_effects.inert_streak.short.fired, 0);
         set_enabled(false);
+    }
+
+    #[test]
+    fn timer_admission_splits_contested_steps() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+
+        record_timer_admission(true);
+        record_timer_admission(false);
+        record_timer_admission(false);
+
+        let s = snapshot().timer_steer;
+        set_enabled(false);
+
+        assert_eq!(s.evaluated, 3);
+        assert_eq!(s.raised, 1);
+        assert_eq!(s.lowered, 2);
+        assert_eq!(s.raised + s.lowered, s.evaluated);
+
+        record_timer_admission(true);
+        assert_eq!(snapshot().timer_steer.evaluated, 3, "records nothing when off");
     }
 
     #[test]
