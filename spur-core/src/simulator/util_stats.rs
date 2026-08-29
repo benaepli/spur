@@ -205,6 +205,9 @@ static TIMER_STREAK_ACTED: [AtomicU64; STREAK_BUCKETS] =
 static TIMER_STEER_EVALUATED: AtomicU64 = AtomicU64::new(0);
 static TIMER_STEER_RAISED: AtomicU64 = AtomicU64::new(0);
 static TIMER_STEER_LOWERED: AtomicU64 = AtomicU64::new(0);
+static TIMER_STEER_GATED_EARLY: AtomicU64 = AtomicU64::new(0);
+static TIMER_STEER_LATE_CONSIDERED: AtomicU64 = AtomicU64::new(0);
+static TIMER_STEER_DAMPED: AtomicU64 = AtomicU64::new(0);
 static TIMELINE_KEYS: Mutex<TimelineKeyGrowth> = Mutex::new(TimelineKeyGrowth::new());
 
 /// Runs per point on the timeline-key growth curve, and the most points a
@@ -300,6 +303,9 @@ pub fn set_enabled(on: bool) {
             &TIMER_STEER_EVALUATED,
             &TIMER_STEER_RAISED,
             &TIMER_STEER_LOWERED,
+            &TIMER_STEER_GATED_EARLY,
+            &TIMER_STEER_LATE_CONSIDERED,
+            &TIMER_STEER_DAMPED,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -1521,11 +1527,20 @@ impl InertStreakHistogram {
 /// A mechanism that reweights timers against deliveries moves `raised` and
 /// `lowered` against this denominator; with none configured the split is
 /// whatever the queue selector draws.
+///
+/// The last three describe the inert-timer damping: `gated_early` counts timer
+/// candidates whose score was left alone because the run had not yet spent the
+/// configured share of its step budget, `late_considered` the ones scored past
+/// that point, and `damped` the subset whose score was actually multiplied
+/// down. All three stay at zero while the damping is off.
 #[derive(Serialize)]
 pub struct TimerSteerStats {
     pub evaluated: u64,
     pub raised: u64,
     pub lowered: u64,
+    pub gated_early: u64,
+    pub late_considered: u64,
+    pub damped: u64,
 }
 
 impl TimerSteerStats {
@@ -1534,7 +1549,32 @@ impl TimerSteerStats {
             evaluated: TIMER_STEER_EVALUATED.load(Ordering::Relaxed),
             raised: TIMER_STEER_RAISED.load(Ordering::Relaxed),
             lowered: TIMER_STEER_LOWERED.load(Ordering::Relaxed),
+            gated_early: TIMER_STEER_GATED_EARLY.load(Ordering::Relaxed),
+            late_considered: TIMER_STEER_LATE_CONSIDERED.load(Ordering::Relaxed),
+            damped: TIMER_STEER_DAMPED.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// Record one timer candidate whose score the budget gate left untouched.
+#[inline]
+pub fn record_timer_damping_gated() {
+    if !enabled() {
+        return;
+    }
+    TIMER_STEER_GATED_EARLY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one timer candidate scored past the budget gate, and whether its
+/// score was multiplied down.
+#[inline]
+pub fn record_timer_damping(damped: bool) {
+    if !enabled() {
+        return;
+    }
+    TIMER_STEER_LATE_CONSIDERED.fetch_add(1, Ordering::Relaxed);
+    if damped {
+        TIMER_STEER_DAMPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 

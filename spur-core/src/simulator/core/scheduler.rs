@@ -18,6 +18,7 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
 use crate::simulator::rng::{Stream, StreamRng};
+use crate::simulator::timer_effect_steer;
 use crate::simulator::util_stats;
 use crate::simulator::util_stats::DeliveryBias;
 use imbl::OrdSet;
@@ -103,6 +104,30 @@ fn bonus_of(terms: &ResolvedTerms, mask: u8) -> f64 {
     bonus
 }
 
+/// How much a timer candidate's score is cut for having changed nothing at
+/// this resume point before. 1 for everything else, and for every candidate
+/// until the run is far enough into its step budget.
+fn inert_timer_damping<H: HashPolicy>(r: &Runnable<H>, state: &State<H>) -> f64 {
+    let Runnable::Timer(t) = r else {
+        return 1.0;
+    };
+    if !timer_effect_steer::armed(state.crash_info.current_step) {
+        return 1.0;
+    }
+    // The vertex the firing would resume at, which is what makes one timer of
+    // a spec distinguishable from another without naming either.
+    let Some(vertex) = state
+        .channels
+        .get(&t.channel)
+        .and_then(|c| c.waiting_readers.front())
+        .map(|reader| reader.0.pc)
+    else {
+        return 1.0;
+    };
+    let inflight = state.pending_deliveries_to(t.node) > 0;
+    timer_effect_steer::score_multiplier(t.node.index, vertex, inflight)
+}
+
 /// Score a runnable in [0, 1] and report which predicates were true of it.
 /// The predicates are read from the run's state only when a predicate
 /// carries weight or the counters want them (`want_mask`); otherwise the
@@ -128,7 +153,8 @@ fn score_with_terms<H: HashPolicy, F: Feedback>(
     } else {
         0.0
     };
-    (blend(terms, novelty, priority, quick_fire, bonus), mask)
+    let score = blend(terms, novelty, priority, quick_fire, bonus);
+    (score * inert_timer_damping(r, state), mask)
 }
 
 /// Score a runnable in [0, 1]. For a recover of a node that is down,
@@ -944,7 +970,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     // as a delivery: the token counts state writes, so a
                     // segment that only sends reads as inert.
                     let timer_entry = r.timer_entry == Some(r.pc);
-                    let timer_probe = (util_stats::acted_fraction_enabled() && timer_entry).then(|| {
+                    let want_timer_probe = timer_entry
+                        && (util_stats::acted_fraction_enabled() || timer_effect_steer::enabled());
+                    let timer_probe = want_timer_probe.then(|| {
                         let inflight = state.pending_deliveries_to(record_dest) > 0;
                         let key = util_stats::TimerKey::new(
                             r.pc,
@@ -978,6 +1006,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     if let Some((pc, key, inflight, before)) = timer_probe {
                         let acted = state.node_state_token(record_dest) != before;
                         state.note_timer_effect(record_dest.index, pc, inflight, acted);
+                        timer_effect_steer::note_firing(record_dest.index, pc, inflight, acted);
                         util_stats::record_timer(key, acted);
                     }
                     if message_entry {

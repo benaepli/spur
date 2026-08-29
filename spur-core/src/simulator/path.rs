@@ -14,6 +14,7 @@ use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
 use crate::simulator::rng::StreamRng;
+use crate::simulator::timer_effect_steer;
 use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
@@ -253,6 +254,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
+    timer_effect_steer::begin_run(max_iterations);
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
