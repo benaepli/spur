@@ -5,8 +5,7 @@ use crate::simulator::core::state::{
     ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, PurgatoryConfig, Record,
     Runnable, RunnableCategory, SchedulePolicy, State, Timer, TraceEntry, TraceKind,
 };
-use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind};
-use imbl::Vector;
+use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind, ValueSeq};
 use rand::Rng;
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::feedback::Feedback;
@@ -316,8 +315,8 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                         local_env.set(iter_slot_idx, Value::unit());
                         Ok(Some(StepOutcome::Continue(*next)))
                     } else {
-                        let item = l.head().ok_or(RuntimeError::EmptyCollection)?.clone();
-                        let new_l = Value::list(l.skip(1));
+                        let item = l.first().ok_or(RuntimeError::EmptyCollection)?.clone();
+                        let new_l = Value::list(ValueSeq::from(&l[1..]));
                         local_env.set(iter_slot_idx, new_l);
 
                         store(lhs, item, local_env, node_env)?;
@@ -336,7 +335,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                         let new_m = m.without(&k);
                         local_env.set(iter_slot_idx, Value::map(new_m));
 
-                        let pair = Value::tuple(Vector::from(vec![k, v]));
+                        let pair = Value::tuple(ValueSeq::from([k, v]));
                         store(lhs, pair, local_env, node_env)?;
                         Ok(Some(StepOutcome::Continue(*body)))
                     }
