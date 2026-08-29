@@ -22,7 +22,6 @@ use crate::simulator::rng::{
     LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, StreamRng,
     StreamSet, WORKLOAD_SALT, derive_seed, mutate_tape,
 };
-use crate::simulator::timer_effect_steer;
 use crate::simulator::util_stats;
 use crossbeam::channel;
 use log::{debug, error, info, warn};
@@ -135,43 +134,6 @@ impl Range {
     }
 }
 
-/// When the inert-timer damping starts applying within a run.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TimerEffectSteerConfig {
-    /// Share of a run's step budget that must be spent before a timer
-    /// candidate's score may be cut. 1.0 leaves every score untouched, which
-    /// is the scoring of a session with no damping at all.
-    #[serde(default = "default_late_fraction")]
-    pub late_fraction: f64,
-}
-
-fn default_late_fraction() -> f64 {
-    1.0
-}
-
-impl Default for TimerEffectSteerConfig {
-    fn default() -> Self {
-        Self {
-            late_fraction: default_late_fraction(),
-        }
-    }
-}
-
-impl TimerEffectSteerConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.late_fraction.is_finite()
-            || self.late_fraction < 0.0
-            || self.late_fraction > 1.0
-        {
-            return Err(format!(
-                "timer_effect_steer.late_fraction must be between 0 and 1 (got {})",
-                self.late_fraction
-            ));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExplorerConfig {
     #[serde(rename = "num_servers")]
@@ -241,11 +203,6 @@ pub struct ExplorerConfig {
 
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
-
-    /// Damping of timer candidates that have changed nothing at the same
-    /// resume point before; see `simulator::timer_effect_steer`.
-    #[serde(default)]
-    pub timer_effect_steer: TimerEffectSteerConfig,
 
     #[serde(default)]
     pub feedback: FeedbackConfig,
@@ -332,7 +289,6 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "quick_fire_multiplier",
     "steer_terms",
     "purgatory",
-    "timer_effect_steer",
     "feedback",
     "stats",
     "emit_acted_fraction",
@@ -430,7 +386,6 @@ impl ExplorerConfig {
             ));
         }
         self.steer_terms.resolve(self.quick_fire_multiplier)?;
-        self.timer_effect_steer.validate()?;
         Ok(())
     }
 
@@ -1109,7 +1064,6 @@ pub fn run_explorer(
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
-    timer_effect_steer::set_late_fraction(config.timer_effect_steer.late_fraction);
     dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1493,7 +1447,6 @@ pub fn run_explorer_genetic(
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
-    timer_effect_steer::set_late_fraction(config.timer_effect_steer.late_fraction);
     dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1925,7 +1878,6 @@ pub fn run_explorer_aos(
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
-    timer_effect_steer::set_late_fraction(config.timer_effect_steer.late_fraction);
     dispatch_feedback!(config.feedback, F => run_explorer_aos_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -2567,7 +2519,6 @@ pub fn run_explorer_continuous(
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
     util_stats::set_multiplier_audit_enabled(config.envelope.emit_multiplier_authority);
-    timer_effect_steer::set_late_fraction(config.envelope.timer_effect_steer.late_fraction);
     dispatch_feedback!(config.envelope.feedback, F => run_explorer_continuous_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
