@@ -2,7 +2,6 @@ use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::state::NodeId;
 use crate::simulator::hash_utils::{HashPolicy, mix};
 use ecow::{EcoString, EcoVec};
-use imbl::Vector;
 use std::cmp::Ordering;
 use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
@@ -26,13 +25,23 @@ pub struct LinkId(pub usize);
 pub type ValueMap<H> =
     imbl::GenericHashMap<Value<H>, Value<H>, BuildHasherDefault<FxHasher>, imbl::shared_ptr::DefaultSharedPtr>;
 
+/// Sequence storage of a spec value.
+///
+/// `EcoVec` is a copy-on-write vector behind one allocation sized to the
+/// element count, so a short list costs bytes proportional to its length
+/// rather than a fixed branching-factor block, and it is two words wide so it
+/// does not set the size of `Value`. Cloning is a refcount bump; the first
+/// write after a clone copies `len` elements. Element order is the sequence
+/// order the spec wrote, so nothing a spec observes depends on the layout.
+pub type ValueSeq<H> = EcoVec<Value<H>>;
+
 /// The inner representation of a value, without cached signature.
 #[derive(Clone, Debug)]
 pub enum ValueKind<H: HashPolicy> {
     Int(i64),
     Bool(bool),
     Map(ValueMap<H>),
-    List(Vector<Value<H>>),
+    List(ValueSeq<H>),
     Option(Option<Arc<Value<H>>>),
     Channel(ChannelId),
     Node(NodeId),
@@ -42,7 +51,7 @@ pub enum ValueKind<H: HashPolicy> {
     FifoLink(LinkId, NodeId),
     String(EcoString),
     Unit,
-    Tuple(Vector<Value<H>>),
+    Tuple(ValueSeq<H>),
     Variant(u32, EcoString, Option<Arc<Value<H>>>), // (enum_id, variant_name, payload)
 }
 
@@ -243,12 +252,12 @@ impl<H: HashPolicy> Value<H> {
     }
 
     #[inline]
-    pub fn tuple(v: Vector<Value<H>>) -> Self {
+    pub fn tuple(v: ValueSeq<H>) -> Self {
         Self::new(ValueKind::Tuple(v))
     }
 
     #[inline]
-    pub fn list(v: Vector<Value<H>>) -> Self {
+    pub fn list(v: ValueSeq<H>) -> Self {
         Self::new(ValueKind::List(v))
     }
 
@@ -481,7 +490,7 @@ impl<H: HashPolicy> Value<H> {
             })
         }
     }
-    pub fn as_list(&self) -> Result<&Vector<Value<H>>, RuntimeError> {
+    pub fn as_list(&self) -> Result<&ValueSeq<H>, RuntimeError> {
         if let ValueKind::List(l) = &self.kind {
             Ok(l)
         } else {
@@ -755,6 +764,22 @@ mod tests {
                  prop_assert_ne!(env1.sig, env2.sig);
              }
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::simulator::hash_utils::WithHashing;
+
+    /// `Value` is copied and cloned on every slot read, record enqueue and
+    /// collection update, so its width sets the memory traffic of the whole
+    /// interpreter. Every variant must stay behind a pointer-sized handle;
+    /// storing a collection inline widens all of them at once.
+    #[test]
+    fn value_stays_narrow() {
+        assert_eq!(std::mem::size_of::<Value<WithHashing>>(), 40);
+        assert_eq!(std::mem::size_of::<ValueSeq<WithHashing>>(), 16);
     }
 }
 

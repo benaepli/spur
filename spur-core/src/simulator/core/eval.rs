@@ -1,10 +1,9 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, VarSlot};
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::core::values::{Env, Value, ValueKind, hash_map_entry, ValueMap};
+use crate::simulator::core::values::{Env, Value, ValueKind, ValueMap, ValueSeq, hash_map_entry};
 use crate::simulator::hash_utils::HashPolicy;
 use ecow::EcoString;
-use imbl::Vector;
 use std::collections::HashMap;
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
@@ -113,7 +112,7 @@ fn update_collection<H: HashPolicy>(
 
             Ok(Value::<H>::with_sig(ValueKind::Map(new_map), new_sig))
         }
-        List(l) => {
+        List(mut l) => {
             let idx = key.as_int()? as usize;
             if idx >= l.len() {
                 return Err(RuntimeError::IndexOutOfBounds {
@@ -121,7 +120,8 @@ fn update_collection<H: HashPolicy>(
                     len: l.len(),
                 });
             }
-            Ok(Value::<H>::list(l.update(idx, val)))
+            l.make_mut()[idx] = val;
+            Ok(Value::<H>::list(l))
         }
         _ => Err(RuntimeError::NotACollection {
             got: col.type_name(),
@@ -198,14 +198,14 @@ pub fn eval<H: HashPolicy>(
             local_env, node_env, e, role_names,
         )?)),
         Expr::Tuple(es) => {
-            let vals: Result<Vector<_>, _> = es
+            let vals: Result<ValueSeq<H>, _> = es
                 .iter()
                 .map(|e| eval(local_env, node_env, e, role_names))
                 .collect();
             Ok(Value::<H>::tuple(vals?))
         }
         Expr::List(es) => {
-            let vals: Result<Vector<_>, _> = es
+            let vals: Result<ValueSeq<H>, _> = es
                 .iter()
                 .map(|e| eval(local_env, node_env, e, role_names))
                 .collect();
@@ -242,20 +242,18 @@ pub fn eval<H: HashPolicy>(
         }
         Expr::ListPrepend(head, tail) => {
             let h = eval(local_env, node_env, head, role_names)?;
-            let t = eval(local_env, node_env, tail, role_names)?
-                .as_list()?
-                .clone();
-            let mut new_list = Vector::new();
-            new_list.push_back(h);
-            new_list.append(t);
+            let tail_val = eval(local_env, node_env, tail, role_names)?;
+            let t = tail_val.as_list()?;
+            let mut new_list = ValueSeq::<H>::with_capacity(t.len() + 1);
+            new_list.push(h);
+            new_list.extend_from_slice(t);
             Ok(Value::<H>::list(new_list))
         }
         Expr::ListAppend(list, item) => {
-            let mut l = eval(local_env, node_env, list, role_names)?
-                .as_list()?
-                .clone();
+            let list_val = eval(local_env, node_env, list, role_names)?;
+            let mut l = list_val.as_list()?.clone();
             let i = eval(local_env, node_env, item, role_names)?;
-            l.push_back(i);
+            l.push(i);
             Ok(Value::<H>::list(l))
         }
         Expr::ListSubsequence(list, start, end) => {
@@ -270,7 +268,7 @@ pub fn eval<H: HashPolicy>(
                     len: vec.len(),
                 });
             }
-            Ok(Value::<H>::list(vec.clone().slice(s..e)))
+            Ok(Value::<H>::list(ValueSeq::<H>::from(&vec[s..e])))
         }
         Expr::LessThanEquals(e1, e2) => Ok(Value::<H>::bool(
             eval(local_env, node_env, e1, role_names)?
