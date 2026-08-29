@@ -584,7 +584,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                         .ok_or(RuntimeError::ChannelNotFound(cid.id))?
                         .clone();
 
-                    if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                    if let Some((mut reader, lhs)) = chan.pop_waiting_reader() {
                         let mut r_node_env = state.nodes[reader.node.index].clone();
                         store(&lhs, val, &mut reader.env, &mut r_node_env)?;
                         let node_index = reader.node.index;
@@ -618,7 +618,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                     let node_id = record.node;
                     record.env = local_env;
                     record.pc = *next; // When woke, proceed to next
-                    chan.waiting_readers.push_back((record, lhs.clone()));
+                    chan.push_waiting_reader(record, lhs.clone());
                     state.channels.insert(cid, chan);
                     state.nodes[node_id.index] = node_env;
                     return Ok(None); // Stop execution

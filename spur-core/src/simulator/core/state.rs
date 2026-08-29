@@ -13,6 +13,7 @@ use rand_distr::{Beta, Distribution};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// Defines the priority band for a category of runnable.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -308,11 +309,21 @@ impl<H: HashPolicy> Hash for CrashInfo<H> {
     }
 }
 
+/// A reader blocked on a channel, paired with the destination the delivered
+/// value is stored into.
+///
+/// Held behind a shared pointer because the persistent vector sizes its
+/// storage by the element: with `Record` inline the element is hundreds of
+/// bytes, so a channel holding a single blocked reader owns a multi-kilobyte
+/// heap chunk that is reallocated and copied on every copy-on-write. At one
+/// word the same readers fit in the vector's inline storage.
+pub type WaitingReader<H> = Arc<(Record<H>, Lhs)>;
+
 #[derive(Debug, Clone, Hash)]
 pub struct ChannelState<H: HashPolicy> {
     pub buffer: Vector<Value<H>>,
     // We move Record out of Runnable and into Waiting.
-    pub waiting_readers: Vector<(Record<H>, Lhs)>,
+    pub waiting_readers: Vector<WaitingReader<H>>,
 }
 
 impl<H: HashPolicy> ChannelState<H> {
@@ -321,6 +332,18 @@ impl<H: HashPolicy> ChannelState<H> {
             buffer: Vector::new(),
             waiting_readers: Vector::new(),
         }
+    }
+
+    pub fn push_waiting_reader(&mut self, record: Record<H>, lhs: Lhs) {
+        self.waiting_readers.push_back(Arc::new((record, lhs)));
+    }
+
+    /// Takes the longest-waiting reader, copying it only when the channel
+    /// state it came from is still shared.
+    pub fn pop_waiting_reader(&mut self) -> Option<(Record<H>, Lhs)> {
+        self.waiting_readers
+            .pop_front()
+            .map(|entry| Arc::try_unwrap(entry).unwrap_or_else(|shared| (*shared).clone()))
     }
 }
 
@@ -1150,7 +1173,7 @@ impl<H: HashPolicy> Continuation<H> {
                         return None;
                     }
                 };
-                if let Some((mut reader, lhs)) = chan.waiting_readers.pop_front() {
+                if let Some((mut reader, lhs)) = chan.pop_waiting_reader() {
                     let mut node_env = state.nodes[reader.node.index].clone();
                     if let Err(e) = store(&lhs, val, &mut reader.env, &mut node_env) {
                         log::warn!("Store failed in async continuation: {}", e);
@@ -1178,6 +1201,31 @@ impl<H: HashPolicy> Continuation<H> {
                 unreachable!("_Phantom variant should never be constructed")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::simulator::hash_utils::WithHashing;
+
+    /// The persistent vector holding a channel's blocked readers sizes its
+    /// heap chunk by the element type, so a wide element costs an allocation
+    /// and a copy per copy-on-write even when one reader is waiting. Keeping
+    /// the element one word wide keeps those readers in inline storage; the
+    /// `Record` assertion is the tripwire that says why the indirection is
+    /// there.
+    #[test]
+    fn waiting_reader_stays_narrow() {
+        assert_eq!(
+            std::mem::size_of::<WaitingReader<WithHashing>>(),
+            std::mem::size_of::<usize>()
+        );
+        assert!(
+            std::mem::size_of::<(Record<WithHashing>, Lhs)>()
+                > 8 * std::mem::size_of::<WaitingReader<WithHashing>>(),
+            "a reader narrow enough to sit in the vector inline no longer needs the indirection"
+        );
     }
 }
 
