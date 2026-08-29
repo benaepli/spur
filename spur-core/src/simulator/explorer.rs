@@ -1,5 +1,6 @@
 use crate::compiler::cfg::Program;
 use crate::simulator::config_override;
+use crate::simulator::core::steer_terms::{ResolvedTerms, SteerTerms};
 use crate::simulator::core::{
     Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
     Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
@@ -195,6 +196,11 @@ pub struct ExplorerConfig {
     #[serde(default = "default_quick_fire_multiplier")]
     pub quick_fire_multiplier: f64,
 
+    /// The weights of the scheduling score; see `core::steer_terms`.
+    /// `recover_crashed` unset reads `quick_fire_multiplier`.
+    #[serde(default)]
+    pub steer_terms: SteerTerms,
+
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
 
@@ -281,6 +287,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "queue_policy",
     "within_queue_selector",
     "quick_fire_multiplier",
+    "steer_terms",
     "purgatory",
     "feedback",
     "stats",
@@ -378,7 +385,16 @@ impl ExplorerConfig {
                 self.wall_budget_sec
             ));
         }
+        self.steer_terms.resolve(self.quick_fire_multiplier)?;
         Ok(())
+    }
+
+    /// The score weights every run of this session uses. `validate` has
+    /// already rejected a block that cannot resolve.
+    pub fn steer_terms_resolved(&self) -> ResolvedTerms {
+        self.steer_terms
+            .resolve(self.quick_fire_multiplier)
+            .expect("steer_terms were validated with the config")
     }
 
     /// Every configuration of the grid in the producer's nesting order:
@@ -418,7 +434,7 @@ impl ExplorerConfig {
                                                 within_queue_selector: self
                                                     .within_queue_selector
                                                     .clone(),
-                                                quick_fire_multiplier: self.quick_fire_multiplier,
+                                                steer_terms: self.steer_terms_resolved(),
                                                 purgatory: self.purgatory.clone(),
                                                 timeline_key_granularity: self
                                                     .feedback
@@ -519,7 +535,7 @@ pub struct SingleRunConfig {
     pub schedule_policy: SchedulePolicy,
     pub queue_policy: QueuePolicyConfig,
     pub within_queue_selector: WithinQueueSelector,
-    pub quick_fire_multiplier: f64,
+    pub steer_terms: ResolvedTerms,
     pub purgatory: PurgatoryConfig,
     pub timeline_key_granularity: TimelineKeyGranularity,
     pub rng_stream_isolation: bool,
@@ -582,7 +598,7 @@ impl SingleRunConfig {
             schedule_policy: constraints.schedule_policy.clone(),
             queue_policy,
             within_queue_selector: constraints.within_queue_selector.clone(),
-            quick_fire_multiplier: constraints.quick_fire_multiplier,
+            steer_terms: constraints.steer_terms_resolved(),
             purgatory: constraints.purgatory.clone(),
             timeline_key_granularity: constraints.feedback.key_granularity(),
             rng_stream_isolation: constraints.rng_stream_isolation,
@@ -976,7 +992,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         false,
         &config.queue_policy,
         &config.within_queue_selector,
-        config.quick_fire_multiplier,
+        &config.steer_terms,
         &config.purgatory,
         &mut rec,
     )?;
@@ -1204,7 +1220,7 @@ fn run_single_plan<F: Feedback>(
     strict_timers: bool,
     queue_policy: &QueuePolicyConfig,
     within_queue: &WithinQueueSelector,
-    quick_fire_multiplier: f64,
+    terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
     weights: &CoverageConfig,
     key_granularity: TimelineKeyGranularity,
@@ -1276,7 +1292,7 @@ fn run_single_plan<F: Feedback>(
         strict_timers,
         queue_policy,
         within_queue,
-        quick_fire_multiplier,
+        terms,
         purgatory_config,
         &mut rng,
     )?;
@@ -1358,6 +1374,7 @@ fn run_plan_impl<F: Feedback>(
 
     let runs: Vec<i64> = (1..=config.num_runs as i64).collect();
 
+    let plan_terms = config.steer_terms_resolved();
     runs.par_iter().for_each(|&run_id| {
         if cancelled.load(Ordering::Relaxed) {
             return;
@@ -1375,7 +1392,7 @@ fn run_plan_impl<F: Feedback>(
             config.strict_timers,
             &config.queue_policy,
             &config.within_queue_selector,
-            config.quick_fire_multiplier,
+            &plan_terms,
             &config.purgatory,
             &weights,
             config.feedback.key_granularity(),

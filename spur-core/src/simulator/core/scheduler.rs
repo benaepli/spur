@@ -10,6 +10,7 @@ use crate::simulator::core::state::{
     Continuation, Logger, NodeId, PurgatoryConfig, Record, Runnable, RunnableCategory,
     SchedulePolicy, ScheduleResult, State,
 };
+use crate::simulator::core::steer_terms::ResolvedTerms;
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
@@ -96,42 +97,41 @@ fn is_quick_fire<H: HashPolicy>(r: &Runnable<H>, currently_crashed: &OrdSet<Node
     matches!(r, Runnable::Recover { node_id, .. } if currently_crashed.contains(node_id))
 }
 
-/// Combine novelty and priority into a score in [0, 1]. Where the quick-fire
-/// weighting applies, `quick_fire_multiplier` raises the weight of priority
-/// relative to novelty while keeping the result in [0, 1]; a multiplier of 1
-/// makes both branches identical.
-fn blend_score(
-    novelty: f64,
-    priority: f64,
-    quick_fire: bool,
-    quick_fire_multiplier: f64,
-) -> f64 {
-    if quick_fire {
-        let w = 0.75 * quick_fire_multiplier;
-        (0.25 * novelty + w * priority) / (0.25 + w)
+/// Combine the score terms into [0, 1]. Where the quick-fire weighting
+/// applies, `recover_crashed` multiplies the priority weight, which raises
+/// priority relative to novelty; a multiplier of 1 makes both branches
+/// identical. `bonus` is the summed weight of the predicates true of the
+/// runnable and enters both the numerator and the denominator, so the score
+/// stays in [0, 1] and a runnable with every predicate true scores 1 only
+/// when its other terms do.
+fn blend(terms: &ResolvedTerms, novelty: f64, priority: f64, quick_fire: bool, bonus: f64) -> f64 {
+    let w = if quick_fire {
+        terms.priority * terms.recover_crashed
     } else {
-        0.25 * novelty + 0.75 * priority
+        terms.priority
+    };
+    let num = terms.novelty * novelty + w * priority;
+    let den = terms.novelty + w;
+    if bonus > 0.0 {
+        (num + bonus) / (den + bonus)
+    } else {
+        num / den
     }
 }
 
-/// Score a runnable in [0, 1] by combining novelty and priority. For Recover
-/// events targeting a currently-crashed node, `quick_fire_multiplier` increases
-/// the weight of priority relative to novelty while keeping the result in [0, 1].
+/// Score a runnable in [0, 1] from its novelty and priority terms. For a
+/// recover of a node that is down, `terms.recover_crashed` raises the weight
+/// of priority relative to novelty.
 fn score_runnable<H: HashPolicy, F: Feedback>(
     r: &Runnable<H>,
     feedback: &F::Local,
     snapshot: &F::Snapshot,
     currently_crashed: &OrdSet<NodeId>,
-    quick_fire_multiplier: f64,
+    terms: &ResolvedTerms,
 ) -> f64 {
     let novelty = F::runnable_novelty(feedback, r, snapshot);
     let priority = r.priority();
-    blend_score(
-        novelty,
-        priority,
-        is_quick_fire(r, currently_crashed),
-        quick_fire_multiplier,
-    )
+    blend(terms, novelty, priority, is_quick_fire(r, currently_crashed), 0.0)
 }
 
 /// Rank the eligible candidates once per swept magnitude and report how often
@@ -150,7 +150,7 @@ fn audit_multiplier_authority<H: HashPolicy, F: Feedback>(
     feedback: &F::Local,
     snapshot: &F::Snapshot,
     currently_crashed: &OrdSet<NodeId>,
-    quick_fire_multiplier: f64,
+    terms: &ResolvedTerms,
 ) {
     let sweep = util_stats::MULTIPLIER_SWEEP;
     let present = eligible
@@ -169,12 +169,12 @@ fn audit_multiplier_authority<H: HashPolicy, F: Feedback>(
         let priority = queue[i].priority();
         let quick_fire = is_quick_fire(&queue[i], currently_crashed);
         for (slot, &m) in best.iter_mut().zip(sweep.iter()) {
-            let s = blend_score(novelty, priority, quick_fire, m);
+            let s = blend(&terms.with_recover_crashed(m), novelty, priority, quick_fire, 0.0);
             if s > slot.0 {
                 *slot = (s, i);
             }
         }
-        let s = blend_score(novelty, priority, quick_fire, quick_fire_multiplier);
+        let s = blend(terms, novelty, priority, quick_fire, 0.0);
         if s > best_configured.0 {
             best_configured = (s, i);
         }
@@ -186,7 +186,7 @@ fn audit_multiplier_authority<H: HashPolicy, F: Feedback>(
         *f = slot.1 != baseline;
     }
     util_stats::record_multiplier_flips(
-        quick_fire_multiplier,
+        terms.recover_crashed,
         &flipped,
         best_configured.1 != baseline,
     );
@@ -197,15 +197,15 @@ fn audit_multiplier_authority<H: HashPolicy, F: Feedback>(
 fn priority_component<H: HashPolicy>(
     r: &Runnable<H>,
     currently_crashed: &OrdSet<NodeId>,
-    quick_fire_multiplier: f64,
+    terms: &ResolvedTerms,
 ) -> f64 {
     let priority = r.priority();
-    if is_quick_fire(r, currently_crashed) {
-        let w = 0.75 * quick_fire_multiplier;
-        (w * priority) / (0.25 + w)
+    let w = if is_quick_fire(r, currently_crashed) {
+        terms.priority * terms.recover_crashed
     } else {
-        0.75 * priority
-    }
+        terms.priority
+    };
+    (w * priority) / (terms.novelty + w)
 }
 
 /// Where a runnable sits across the three kinds of queue, so the one the
@@ -278,7 +278,7 @@ fn audit_steer_preference<H: HashPolicy, F: Feedback>(
     state: &State<H>,
     feedback: &F::Local,
     snapshot: &F::Snapshot,
-    quick_fire_multiplier: f64,
+    terms: &ResolvedTerms,
     strict_timers: bool,
     is_ineligible: &impl Fn(&Runnable<H>) -> bool,
 ) -> SteerPreference {
@@ -301,18 +301,12 @@ fn audit_steer_preference<H: HashPolicy, F: Feedback>(
             };
             candidates += 1;
             any_eligible |= blocked.is_none();
-            let score = score_runnable::<H, F>(
-                r,
-                feedback,
-                snapshot,
-                currently_crashed,
-                quick_fire_multiplier,
-            );
+            let score = score_runnable::<H, F>(r, feedback, snapshot, currently_crashed, terms);
             if score > best_score {
                 best_score = score;
                 best_slot = Some((slot, blocked));
             }
-            let priority = priority_component(r, currently_crashed, quick_fire_multiplier);
+            let priority = priority_component(r, currently_crashed, terms);
             if priority > best_priority {
                 best_priority = priority;
                 best_priority_slot = Some(slot);
@@ -358,19 +352,12 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     feedback: &F::Local,
     snapshot: &F::Snapshot,
     currently_crashed: &OrdSet<NodeId>,
-    quick_fire_multiplier: f64,
+    terms: &ResolvedTerms,
     selector: &WithinQueueSelector,
     rng: &mut impl StreamRng,
 ) -> usize {
     if util_stats::multiplier_audit_enabled() {
-        audit_multiplier_authority::<H, F>(
-            queue,
-            eligible,
-            feedback,
-            snapshot,
-            currently_crashed,
-            quick_fire_multiplier,
-        );
+        audit_multiplier_authority::<H, F>(queue, eligible, feedback, snapshot, currently_crashed, terms);
     }
     if eligible.len() <= 1 {
         return eligible[0];
@@ -387,14 +374,8 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
         let mut best_prio = f64::NEG_INFINITY;
         let mut best_prio_idx = eligible[0];
         for &i in eligible {
-            let blend = score_runnable::<H, F>(
-                &queue[i],
-                feedback,
-                snapshot,
-                currently_crashed,
-                quick_fire_multiplier,
-            );
-            let prio = priority_component(&queue[i], currently_crashed, quick_fire_multiplier);
+            let blend = score_runnable::<H, F>(&queue[i], feedback, snapshot, currently_crashed, terms);
+            let prio = priority_component(&queue[i], currently_crashed, terms);
             if blend > best_blend {
                 best_blend = blend;
                 best_blend_idx = i;
@@ -411,22 +392,11 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
         WithinQueueSelector::Tournament { k } => {
             let k = (*k).max(1);
             let mut best_idx = eligible[rng.random_range(0..eligible.len())];
-            let mut best_score = score_runnable::<H, F>(
-                &queue[best_idx],
-                feedback,
-                snapshot,
-                currently_crashed,
-                quick_fire_multiplier,
-            );
+            let mut best_score =
+                score_runnable::<H, F>(&queue[best_idx], feedback, snapshot, currently_crashed, terms);
             for _ in 1..k.min(eligible.len()) {
                 let i = eligible[rng.random_range(0..eligible.len())];
-                let s = score_runnable::<H, F>(
-                    &queue[i],
-                    feedback,
-                    snapshot,
-                    currently_crashed,
-                    quick_fire_multiplier,
-                );
+                let s = score_runnable::<H, F>(&queue[i], feedback, snapshot, currently_crashed, terms);
                 if s > best_score {
                     best_idx = i;
                     best_score = s;
@@ -445,13 +415,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
             let mut best_idx = eligible[0];
             let mut best_key = f64::NEG_INFINITY;
             for &i in eligible {
-                let s = score_runnable::<H, F>(
-                    &queue[i],
-                    feedback,
-                    snapshot,
-                    currently_crashed,
-                    quick_fire_multiplier,
-                );
+                let s = score_runnable::<H, F>(&queue[i], feedback, snapshot, currently_crashed, terms);
                 let weight = s.powf(*exponent).max(1e-9);
                 let u: f64 = rng.random();
                 // u is in (0, 1); ln(u) is negative; key = ln(u) / weight is negative.
@@ -479,7 +443,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     strict_timers: bool,
     selector: &mut Q,
     within_queue: &WithinQueueSelector,
-    quick_fire_multiplier: f64,
+    terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
     reservations: &[Reservation],
     rng: &mut impl StreamRng,
@@ -532,7 +496,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             state,
             feedback,
             snapshot,
-            quick_fire_multiplier,
+            terms,
             strict_timers,
             &is_ineligible,
         )
@@ -604,7 +568,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 feedback,
                 snapshot,
                 &state.crash_info.currently_crashed,
-                quick_fire_multiplier,
+                terms,
                 within_queue,
                 rng,
             );
@@ -628,7 +592,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 feedback,
                 snapshot,
                 &state.crash_info.currently_crashed,
-                quick_fire_multiplier,
+                terms,
                 within_queue,
                 rng,
             );
@@ -666,7 +630,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 feedback,
                 snapshot,
                 &state.crash_info.currently_crashed,
-                quick_fire_multiplier,
+                terms,
                 within_queue,
                 rng,
             );
@@ -1157,6 +1121,72 @@ mod tests {
         Runnable::Heal { priority }
     }
 
+    fn terms_with(multiplier: f64) -> ResolvedTerms {
+        ResolvedTerms::default().with_recover_crashed(multiplier)
+    }
+
+    /// The fixed blend the scheduler scored with before its terms had
+    /// names, kept as the oracle the named form is checked against.
+    fn blend_score(novelty: f64, priority: f64, quick_fire: bool, multiplier: f64) -> f64 {
+        if quick_fire {
+            let w = 0.75 * multiplier;
+            (0.25 * novelty + w * priority) / (0.25 + w)
+        } else {
+            0.25 * novelty + 0.75 * priority
+        }
+    }
+
+    /// The priority-only share of `blend_score`, the same way.
+    fn legacy_priority_component(priority: f64, quick_fire: bool, multiplier: f64) -> f64 {
+        if quick_fire {
+            let w = 0.75 * multiplier;
+            (w * priority) / (0.25 + w)
+        } else {
+            0.75 * priority
+        }
+    }
+
+    /// At the default weights the named blend is the fixed blend bit for
+    /// bit: the weights are dyadic, `0.25 + 0.75` is exactly `1.0`, and a
+    /// division by `1.0` is the identity, so the extra normalisation cannot
+    /// move a single bit. The quick-fire branch performs the same operations
+    /// in the same order as the fixed form.
+    #[test]
+    fn default_terms_reproduce_blend_score_bitwise() {
+        let crashed_node = NodeId {
+            role: crate::analysis::resolver::NameId(0),
+            index: 0,
+        };
+        let mut crashed = OrdSet::new();
+        crashed.insert(crashed_node);
+        for &novelty in &[0.0, 0.3, 0.4, 1.0] {
+            for &priority in &[0.0, 0.15, 0.3, 0.65, 0.95, 1.0] {
+                for &m in &[1.0, 3.0, 5.0, 8.0, 1000.0] {
+                    let terms = terms_with(m);
+                    for &quick_fire in &[false, true] {
+                        assert_eq!(
+                            blend(&terms, novelty, priority, quick_fire, 0.0).to_bits(),
+                            blend_score(novelty, priority, quick_fire, m).to_bits(),
+                            "novelty {novelty} priority {priority} m {m} quick_fire {quick_fire}"
+                        );
+                    }
+                    let recover = Runnable::<NoHashing>::Recover {
+                        node_id: crashed_node,
+                        priority,
+                    };
+                    assert_eq!(
+                        priority_component(&recover, &crashed, &terms).to_bits(),
+                        legacy_priority_component(priority, true, m).to_bits()
+                    );
+                    assert_eq!(
+                        priority_component(&heal(priority), &crashed, &terms).to_bits(),
+                        legacy_priority_component(priority, false, m).to_bits()
+                    );
+                }
+            }
+        }
+    }
+
     /// Score under default `score_runnable` parameters (no novelty signal,
     /// no quick-fire boost) is `0.25 + 0.75 * priority`.
     fn expected_score(priority: f64) -> f64 {
@@ -1184,7 +1214,7 @@ mod tests {
                 &(),
                 &(),
                 &crashed,
-                1.0,
+                &terms_with(1.0),
                 &selector,
                 &mut rng,
             );
@@ -1227,7 +1257,7 @@ mod tests {
                 &(),
                 &(),
                 &crashed,
-                1.0,
+                &terms_with(1.0),
                 &selector,
                 &mut rng,
             );
@@ -1263,7 +1293,7 @@ mod tests {
                 &(),
                 &(),
                 &crashed,
-                1.0,
+                &terms_with(1.0),
                 &selector,
                 &mut rng,
             );
@@ -1322,7 +1352,7 @@ mod tests {
                 &(),
                 &(),
                 &crashed,
-                1.0,
+                &terms_with(1.0),
                 selector,
                 &mut rng,
             );

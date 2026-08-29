@@ -6,6 +6,7 @@ pub mod exec;
 pub mod scheduler;
 pub mod partition;
 pub mod queue_selector;
+pub mod steer_terms;
 
 pub use error::*;
 pub use values::*;

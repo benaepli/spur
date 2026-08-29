@@ -190,7 +190,9 @@ pub fn lower(knobs: &Knobs, constraints: &ExplorerConfig, _rng: &mut impl Rng) -
 
     // recover band rises with tightness; quick-fire weight rises with tightness.
     let schedule_policy = shaped_with_recover_center(lerp(0.5, 1.0, knobs.fault_tightness));
-    let quick_fire_multiplier = lerp(1.0, 8.0, knobs.fault_tightness);
+    let steer_terms = constraints
+        .steer_terms_resolved()
+        .with_recover_crashed(lerp(1.0, 8.0, knobs.fault_tightness));
 
     // Keep the selector greedy when we lean on priority; else honor config.
     let within_queue_selector = if knobs.fault_tightness > 0.5 {
@@ -217,7 +219,7 @@ pub fn lower(knobs: &Knobs, constraints: &ExplorerConfig, _rng: &mut impl Rng) -
         schedule_policy,
         queue_policy,
         within_queue_selector,
-        quick_fire_multiplier,
+        steer_terms,
         purgatory: constraints.purgatory.clone(),
         timeline_key_granularity: constraints.feedback.key_granularity(),
         rng_stream_isolation: constraints.rng_stream_isolation,

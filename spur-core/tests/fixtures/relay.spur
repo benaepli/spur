@@ -1,0 +1,61 @@
+// Two nodes that keep sending to each other: a timer loop whose firing sends
+// a beat to the peer, a write that forwards a beat before it writes, and a
+// beat handler that writes the node's state. Every kind of send the score
+// terms look at occurs here, so tests that need a timer-triggered send, a
+// delivery-triggered send, a stale delivery or a client request in flight
+// can use one fixture.
+
+role Node {
+    var db: map<string, int> = {};
+    var ticks: int = 0;
+    var last_beat: int = 0;
+    var me: int = 0;
+    var peers: list<Node> = [];
+
+    fn Init(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Heartbeat();
+    }
+
+    async fn RecoverInit(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Heartbeat();
+    }
+
+    async fn Heartbeat() {
+        for ;; {
+            <- set_timer("beat");
+            ticks = ticks + 1;
+            peers[(me + 1) % len(peers)]->Beat(ticks);
+        }
+    }
+
+    async fn Beat(n: int) {
+        last_beat = n;
+    }
+
+    async fn Write(key: string, uid: int): bool {
+        peers[(me + 1) % len(peers)]->Beat(uid);
+        db = db[key] := uid;
+        return true;
+    }
+
+    async fn Read(key: string): int {
+        if (exists(db, key)) {
+            return db[key];
+        }
+        return 0;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        <-dest->Write(key, uid);
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

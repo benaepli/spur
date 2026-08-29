@@ -1,5 +1,6 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, Vertex};
+use crate::simulator::core::steer_terms::ResolvedTerms;
 use crate::simulator::core::{
     Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, PurgatoryConfig,
     QueuePolicyConfig, Record, Reservation, Runnable, RunnableCategory,
@@ -243,7 +244,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     strict_timers: bool,
     queue_policy: &QueuePolicyConfig,
     within_queue: &WithinQueueSelector,
-    quick_fire_multiplier: f64,
+    terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
@@ -517,7 +518,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 strict_timers,
                 &mut selector,
                 within_queue,
-                quick_fire_multiplier,
+                terms,
                 purgatory_config,
                 &reservations,
                 rng,

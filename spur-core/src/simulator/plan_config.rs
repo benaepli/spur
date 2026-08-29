@@ -1,3 +1,4 @@
+use crate::simulator::core::steer_terms::{ResolvedTerms, SteerTerms};
 use crate::simulator::core::partition::PartitionType;
 use crate::simulator::core::state::NodeId;
 use ecow::EcoString;
@@ -34,6 +35,8 @@ pub enum PlanConfigError {
     InvalidNumRuns(i32),
     #[error("invalid feedback config: {0}")]
     InvalidFeedback(String),
+    #[error("invalid steer terms: {0}")]
+    InvalidSteerTerms(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize)]
@@ -198,6 +201,11 @@ pub struct PlanFileConfig {
     #[serde(default = "default_quick_fire_multiplier")]
     pub quick_fire_multiplier: f64,
 
+    /// The weights of the scheduling score; `recover_crashed` unset reads
+    /// `quick_fire_multiplier`.
+    #[serde(default)]
+    pub steer_terms: SteerTerms,
+
     /// When true, labeled timers only fire when explicitly allowed by an AllowTimer event.
     #[serde(default)]
     pub strict_timers: bool,
@@ -224,6 +232,9 @@ impl PlanFileConfig {
         self.feedback
             .validate()
             .map_err(PlanConfigError::InvalidFeedback)?;
+        self.steer_terms
+            .resolve(self.quick_fire_multiplier)
+            .map_err(PlanConfigError::InvalidSteerTerms)?;
 
         // Validate node indices
         for (id, spec) in &self.events {
@@ -241,6 +252,14 @@ impl PlanFileConfig {
         }
 
         Ok(())
+    }
+
+    /// The score weights every plan run uses; `validate` has already
+    /// rejected a block that cannot resolve.
+    pub fn steer_terms_resolved(&self) -> ResolvedTerms {
+        self.steer_terms
+            .resolve(self.quick_fire_multiplier)
+            .expect("steer_terms were validated with the plan")
     }
 
     pub fn to_execution_plan(&self) -> Result<DiGraph<PlannedEvent, ()>, PlanConfigError> {
