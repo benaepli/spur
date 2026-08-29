@@ -208,9 +208,58 @@ impl ResolvedTerms {
     }
 }
 
+/// Probability that a record with predicate weight `w` beats the best of
+/// `competitors` records without it inside one queue, where every priority
+/// is drawn from the default record band (centre 0.5, half-width 0.15,
+/// Beta(0.5, 0.5)) and novelty is constant. A record with bonus `w` scores
+/// `(0.25 + 0.75 p + w) / (1 + w)` against `0.25 + 0.75 p`; from
+/// `w >= 0.857` the lowest draw beats the highest and the win is certain.
+/// The table in PARAMETERS.md is this function at a few points.
+#[cfg(test)]
+pub fn within_queue_win_probability(w: f64, competitors: usize, samples: usize, seed: u64) -> f64 {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand_distr::{Beta, Distribution};
+    let mut rng = StdRng::seed_from_u64(seed);
+    let band = Beta::new(0.5, 0.5).expect("a valid Beta");
+    let mut draw = |rng: &mut StdRng| 0.5 + 0.15 * (2.0 * band.sample(rng) - 1.0);
+    let mut wins = 0usize;
+    for _ in 0..samples {
+        let mine = (0.25 + 0.75 * draw(&mut rng) + w) / (1.0 + w);
+        let best = (0..competitors)
+            .map(|_| 0.25 + 0.75 * draw(&mut rng))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if mine > best {
+            wins += 1;
+        }
+    }
+    wins as f64 / samples as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The within-queue win table the weight derivation rests on.
+    #[test]
+    fn within_queue_win_table_reproduces() {
+        let table: [(f64, [f64; 4]); 5] = [
+            (0.0, [0.500, 0.334, 0.201, 0.109]),
+            (0.25, [0.752, 0.612, 0.484, 0.405]),
+            (0.5, [0.881, 0.795, 0.692, 0.607]),
+            (0.75, [0.969, 0.943, 0.901, 0.847]),
+            (1.0, [1.0, 1.0, 1.0, 1.0]),
+        ];
+        for (w, row) in table {
+            for (m, expected) in [1usize, 2, 4, 8].into_iter().zip(row) {
+                let p = within_queue_win_probability(w, m, 40_000, 17);
+                assert!(
+                    (p - expected).abs() < 0.02,
+                    "w {w} against {m}: expected {expected:.3}, got {p:.3}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn defaults_reproduce_the_legacy_blend_weights() {
