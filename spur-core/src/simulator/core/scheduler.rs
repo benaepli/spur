@@ -597,6 +597,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     reservations: &[Reservation],
     rng: &mut impl StreamRng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
+    util_stats::record_steer_step();
     if state.all_queues_empty() {
         return Ok(ScheduleResult::None);
     }
@@ -626,15 +627,15 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
 
     // Observation-only steer-authority audit: what the scoring function ranks
     // first here, resolved below against what this step actually runs. It ranks
-    // every runnable in every queue, and with no predicate carrying weight
-    // there is no weighted preference for it to resolve, so it is skipped and
-    // the skip is counted.
-    let graded = terms.any_predicate();
+    // every runnable in every queue, and with no predicate carrying weight the
+    // ranking is novelty and priority alone, which is worth resolving only when
+    // the session asks for it; otherwise it is skipped and the skip is counted.
     let audit_wanted = util_stats::steer_audit_enabled();
-    if audit_wanted && !graded {
+    let resolvable = terms.any_predicate() || util_stats::steer_audit_always();
+    if audit_wanted && !resolvable {
         util_stats::record_empty_slice_skip(util_stats::EmptySliceStage::QueueAudit);
     }
-    let audit = (audit_wanted && graded).then(|| {
+    let audit = (audit_wanted && resolvable).then(|| {
         audit_steer_preference::<H, F>(
             state,
             feedback,

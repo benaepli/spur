@@ -158,6 +158,11 @@ pub struct FeedbackConfig {
     /// at every step.
     #[serde(default)]
     pub steer_audit: bool,
+    /// Extend that audit to a session where no predicate carries weight, whose
+    /// ranking is novelty and priority alone. Off, such a session counts only
+    /// how often the audit was skipped, and the outcome breakdown stays empty.
+    #[serde(default)]
+    pub steer_audit_always: bool,
 }
 
 impl Default for FeedbackConfig {
@@ -168,6 +173,7 @@ impl Default for FeedbackConfig {
             weights: CoverageConfig::default(),
             timeline_key_granularity: TimelineKeyGranularity::default(),
             steer_audit: false,
+            steer_audit_always: false,
             novelty_enabled: default_novelty_enabled(),
         }
     }

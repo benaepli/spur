@@ -1063,6 +1063,7 @@ pub fn run_explorer(
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
+    util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
     dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
 }
@@ -1446,6 +1447,7 @@ pub fn run_explorer_genetic(
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
+    util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
     dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
 }
@@ -1877,6 +1879,7 @@ pub fn run_explorer_aos(
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
+    util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
     dispatch_feedback!(config.feedback, F => run_explorer_aos_impl::<F>(program, config, output_path, backend, cancelled))
 }
@@ -2518,6 +2521,7 @@ pub fn run_explorer_continuous(
     util_stats::set_enabled(config.envelope.stats);
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
+    util_stats::set_steer_audit_always(config.envelope.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.envelope.emit_multiplier_authority);
     dispatch_feedback!(config.envelope.feedback, F => run_explorer_continuous_impl::<F>(program, config, output_path, backend, cancelled))
 }
