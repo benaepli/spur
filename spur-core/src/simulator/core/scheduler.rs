@@ -836,25 +836,25 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 return Ok(ScheduleResult::None);
             }
 
-            if let Some(mut chan) = state.channels.get(&timer.channel).cloned() {
-                if let Some((mut reader, lhs)) = chan.pop_waiting_reader() {
-                    let mut r_node_env = state.nodes[reader.node.index].clone();
-                    if let Err(e) = crate::simulator::core::eval::store(
-                        &lhs,
-                        Value::<H>::unit(),
-                        &mut reader.env,
-                        &mut r_node_env,
-                    ) {
-                        log::warn!("Store failed in timer completion: {}", e);
+            if let Some(chan) = state.channels.get_mut(&timer.channel) {
+                match chan.pop_waiting_reader() {
+                    None => chan.buffer.push_back(Value::<H>::unit()),
+                    Some((mut reader, lhs)) => {
+                        let node_index = reader.node.index;
+                        let mut r_node_env = state.nodes[node_index].clone();
+                        if let Err(e) = crate::simulator::core::eval::store(
+                            &lhs,
+                            Value::<H>::unit(),
+                            &mut reader.env,
+                            &mut r_node_env,
+                        ) {
+                            log::warn!("Store failed in timer completion: {}", e);
+                        }
+                        state.nodes[node_index] = r_node_env;
+                        reader.timer_entry = Some(reader.pc);
+                        state.push_to_local(node_index, Runnable::Record(reader));
                     }
-                    let node_index = reader.node.index;
-                    state.nodes[node_index] = r_node_env;
-                    reader.timer_entry = Some(reader.pc);
-                    state.push_to_local(node_index, Runnable::Record(reader));
-                } else {
-                    chan.buffer.push_back(Value::<H>::unit());
                 }
-                state.channels.insert(timer.channel, chan);
             }
             if let Some(label) = timer.label {
                 state
@@ -995,25 +995,25 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 Runnable::ChannelSend {
                     channel, message, ..
                 } => {
-                    if let Some(mut chan) = state.channels.get(&channel).cloned() {
-                        if let Some((mut reader, lhs)) = chan.pop_waiting_reader() {
-                            let mut r_node_env = state.nodes[reader.node.index].clone();
-                            if let Err(e) = crate::simulator::core::eval::store(
-                                &lhs,
-                                message,
-                                &mut reader.env,
-                                &mut r_node_env,
-                            ) {
-                                log::warn!("Store failed in remote channel delivery: {}", e);
+                    if let Some(chan) = state.channels.get_mut(&channel) {
+                        match chan.pop_waiting_reader() {
+                            None => chan.buffer.push_back(message),
+                            Some((mut reader, lhs)) => {
+                                let node_index = reader.node.index;
+                                let mut r_node_env = state.nodes[node_index].clone();
+                                if let Err(e) = crate::simulator::core::eval::store(
+                                    &lhs,
+                                    message,
+                                    &mut reader.env,
+                                    &mut r_node_env,
+                                ) {
+                                    log::warn!("Store failed in remote channel delivery: {}", e);
+                                }
+                                state.nodes[node_index] = r_node_env;
+                                reader.timer_entry = None;
+                                state.push_to_local(node_index, Runnable::Record(reader));
                             }
-                            let node_index = reader.node.index;
-                            state.nodes[node_index] = r_node_env;
-                            reader.timer_entry = None;
-                            state.push_to_local(node_index, Runnable::Record(reader));
-                        } else {
-                            chan.buffer.push_back(message);
                         }
-                        state.channels.insert(channel, chan);
                     }
                     Ok(ScheduleResult::None)
                 }

@@ -10,10 +10,16 @@ use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats::DeliveryBias;
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use rand_distr::{Beta, Distribution};
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
+
+/// Channel storage. The hasher carries no per-process seed, so a session at
+/// one seed replays the same schedule; the only place the map is iterated
+/// combines entries with XOR, so iteration order is not observable either way.
+pub type ChannelMap<H> = HashMap<ChannelId, ChannelState<H>, BuildHasherDefault<FxHasher>>;
 
 /// Defines the priority band for a category of runnable.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -542,7 +548,9 @@ pub struct State<H: HashPolicy> {
     pub timer_queue: Vec<Runnable<H>>,
     /// Delayed runnables not yet schedulable. (release_step, runnable)
     pub purgatory: Vec<(i32, Runnable<H>)>,
-    pub channels: ImHashMap<ChannelId, ChannelState<H>>,
+    /// Owned outright like `nodes` and the run queues, so a channel is updated
+    /// through the map rather than copied out and put back.
+    pub channels: ChannelMap<H>,
     pub crash_info: CrashInfo<H>,
     pub partition_info: PartitionInfo<H>,
     /// Per-node durable storage that survives crashes. Keyed by node index.
@@ -648,7 +656,7 @@ impl<H: HashPolicy> State<H> {
             network_queue: Vec::new(),
             timer_queue: Vec::new(),
             purgatory: Vec::new(),
-            channels: ImHashMap::new(),
+            channels: ChannelMap::default(),
             crash_info: CrashInfo {
                 currently_crashed: OrdSet::new(),
                 queued_messages: Vector::new(),
@@ -1166,25 +1174,25 @@ impl<H: HashPolicy> Continuation<H> {
         match self {
             Continuation::Recover => None,
             Continuation::Async { chan_id } => {
-                let mut chan = match state.channels.get(&chan_id) {
-                    Some(c) => c.clone(),
+                let chan = match state.channels.get_mut(&chan_id) {
+                    Some(c) => c,
                     None => {
                         log::error!("Channel not found in async continuation: {}", chan_id.id);
                         return None;
                     }
                 };
-                if let Some((mut reader, lhs)) = chan.pop_waiting_reader() {
-                    let mut node_env = state.nodes[reader.node.index].clone();
-                    if let Err(e) = store(&lhs, val, &mut reader.env, &mut node_env) {
-                        log::warn!("Store failed in async continuation: {}", e);
+                match chan.pop_waiting_reader() {
+                    None => chan.buffer.push_back(val),
+                    Some((mut reader, lhs)) => {
+                        let node_index = reader.node.index;
+                        let mut node_env = state.nodes[node_index].clone();
+                        if let Err(e) = store(&lhs, val, &mut reader.env, &mut node_env) {
+                            log::warn!("Store failed in async continuation: {}", e);
+                        }
+                        state.nodes[node_index] = node_env;
+                        state.push_to_local(node_index, Runnable::Record(reader));
                     }
-                    let node_index = reader.node.index;
-                    state.nodes[node_index] = node_env;
-                    state.push_to_local(node_index, Runnable::Record(reader));
-                } else {
-                    chan.buffer.push_back(val);
                 }
-                state.channels.insert(chan_id, chan);
                 None
             }
             Continuation::ClientOp {
@@ -1225,6 +1233,23 @@ mod layout_tests {
             std::mem::size_of::<(Record<WithHashing>, Lhs)>()
                 > 8 * std::mem::size_of::<WaitingReader<WithHashing>>(),
             "a reader narrow enough to sit in the vector inline no longer needs the indirection"
+        );
+    }
+
+    /// A hash-array-mapped trie allocates one node per branch at the full
+    /// branching factor of 32 entries, whatever the occupancy, so a wide entry
+    /// puts every node above the allocator's 1032-byte fast path. Channels are
+    /// updated in place through an owned map instead; the assertion is the
+    /// tripwire that says why a persistent map is the wrong container here.
+    #[test]
+    fn channel_entry_is_too_wide_for_a_trie_node() {
+        const TRIE_BRANCHING_FACTOR: usize = 32;
+        const SMALL_ALLOCATION_LIMIT: usize = 1032;
+        assert!(
+            TRIE_BRANCHING_FACTOR
+                * std::mem::size_of::<(ChannelId, ChannelState<WithHashing>)>()
+                > SMALL_ALLOCATION_LIMIT,
+            "a channel entry narrow enough to fit a trie node no longer forces a large allocation"
         );
     }
 }
