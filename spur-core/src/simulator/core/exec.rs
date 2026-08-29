@@ -578,22 +578,21 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                     record.pc = *next;
                 } else {
                     // Local Send
-                    let mut chan = state
+                    let chan = state
                         .channels
-                        .get(&cid)
-                        .ok_or(RuntimeError::ChannelNotFound(cid.id))?
-                        .clone();
+                        .get_mut(&cid)
+                        .ok_or(RuntimeError::ChannelNotFound(cid.id))?;
 
-                    if let Some((mut reader, lhs)) = chan.pop_waiting_reader() {
-                        let mut r_node_env = state.nodes[reader.node.index].clone();
-                        store(&lhs, val, &mut reader.env, &mut r_node_env)?;
-                        let node_index = reader.node.index;
-                        state.nodes[node_index] = r_node_env;
-                        state.push_to_local(node_index, Runnable::Record(reader));
-                    } else {
-                        chan.buffer.push_back(val);
+                    match chan.pop_waiting_reader() {
+                        None => chan.buffer.push_back(val),
+                        Some((mut reader, lhs)) => {
+                            let node_index = reader.node.index;
+                            let mut r_node_env = state.nodes[node_index].clone();
+                            store(&lhs, val, &mut reader.env, &mut r_node_env)?;
+                            state.nodes[node_index] = r_node_env;
+                            state.push_to_local(node_index, Runnable::Record(reader));
+                        }
                     }
-                    state.channels.insert(cid, chan);
                     record.pc = *next;
                 }
             }
@@ -604,11 +603,10 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                     return Err(RuntimeError::RemoteChannelRead);
                 }
 
-                let mut chan = state
+                let chan = state
                     .channels
-                    .get(&cid)
-                    .ok_or(RuntimeError::ChannelNotFound(cid.id))?
-                    .clone();
+                    .get_mut(&cid)
+                    .ok_or(RuntimeError::ChannelNotFound(cid.id))?;
 
                 if let Some(val) = chan.buffer.pop_front() {
                     store(lhs, val, &mut local_env, &mut node_env)?;
@@ -619,11 +617,9 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                     record.env = local_env;
                     record.pc = *next; // When woke, proceed to next
                     chan.push_waiting_reader(record, lhs.clone());
-                    state.channels.insert(cid, chan);
                     state.nodes[node_id.index] = node_env;
                     return Ok(None); // Stop execution
                 }
-                state.channels.insert(cid, chan);
             }
             Label::Pause(next) => {
                 let node_id = record.node;
