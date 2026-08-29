@@ -238,6 +238,8 @@ pub fn activate_partition<H: HashPolicy>(
                 if r.origin_node != r.node
                     && state.partition_info.is_blocked(r.origin_node, r.node) =>
             {
+                state.flight_leave(&task);
+                state.net_leave(&task);
                 let mut r = r.clone();
                 r.reset();
                 state.partition_info.buffer_record(r.node, r);
@@ -250,6 +252,7 @@ pub fn activate_partition<H: HashPolicy>(
                 pc,
                 priority,
             } if state.partition_info.is_blocked(*origin_node, *target) => {
+                state.flight_leave(&task);
                 state.partition_info.buffer_channel_send(
                     *target,
                     *channel,

@@ -162,6 +162,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     (lid, next)
                 });
 
+                let send_ordinal = state.next_send_ordinal(node_id);
                 let mut new_record = Record {
                     pc: func_info.entry,
                     node: target_node,
@@ -177,6 +178,8 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     origin_incarnation: state.incarnation(node_id),
                     bias: DeliveryBias::NONE,
                     timer_entry: None,
+                    send_ordinal,
+                    receiver_token_at_send: state.node_state_token(target_node),
                 };
 
                 rng.use_stream(Stream::SendDelay);

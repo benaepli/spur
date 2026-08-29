@@ -7,10 +7,10 @@ use crate::simulator::core::queue_selector::{
     QueueInfo, QueueSelection, QueueSelector, WithinQueueSelector,
 };
 use crate::simulator::core::state::{
-    Continuation, Logger, NodeId, PurgatoryConfig, Record, Runnable, RunnableCategory,
-    SchedulePolicy, ScheduleResult, State,
+    Continuation, HandlerTrigger, Logger, NodeId, PurgatoryConfig, Record, Runnable,
+    RunnableCategory, SchedulePolicy, ScheduleResult, State,
 };
-use crate::simulator::core::steer_terms::ResolvedTerms;
+use crate::simulator::core::steer_terms::{ResolvedTerms, Term, TERMS};
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
@@ -63,34 +63,6 @@ fn is_fifo_blocked<H: HashPolicy>(
     false
 }
 
-/// Per-node flag: the node originated a remote message that has not been
-/// delivered yet, counting sends still waiting out a purgatory delay. Indexed
-/// by node index; nodes added after the queues were sized read as false.
-fn nodes_with_in_flight_send<H: HashPolicy>(state: &State<H>) -> Vec<bool> {
-    let mut senders = vec![false; state.local_queues.len()];
-    let mut mark = |r: &Runnable<H>| {
-        let origin = match r {
-            Runnable::Record(rec) if rec.origin_node != rec.node => rec.origin_node.index,
-            Runnable::ChannelSend {
-                origin_node,
-                target,
-                ..
-            } if origin_node != target => origin_node.index,
-            _ => return,
-        };
-        if let Some(slot) = senders.get_mut(origin) {
-            *slot = true;
-        }
-    };
-    for r in &state.network_queue {
-        mark(r);
-    }
-    for (_, r) in &state.purgatory {
-        mark(r);
-    }
-    senders
-}
-
 /// A runnable the quick-fire weighting applies to: bringing back a node that is
 /// down right now.
 fn is_quick_fire<H: HashPolicy>(r: &Runnable<H>, currently_crashed: &OrdSet<NodeId>) -> bool {
@@ -119,19 +91,58 @@ fn blend(terms: &ResolvedTerms, novelty: f64, priority: f64, quick_fire: bool, b
     }
 }
 
-/// Score a runnable in [0, 1] from its novelty and priority terms. For a
-/// recover of a node that is down, `terms.recover_crashed` raises the weight
-/// of priority relative to novelty.
+/// The summed weight of the predicates in `mask`.
+#[inline]
+fn bonus_of(terms: &ResolvedTerms, mask: u8) -> f64 {
+    let mut bonus = 0.0;
+    for t in Term::ALL {
+        if mask & (1u8 << t.index()) != 0 {
+            bonus += terms.weight(t);
+        }
+    }
+    bonus
+}
+
+/// Score a runnable in [0, 1] and report which predicates were true of it.
+/// The predicates are read from the run's state only when a predicate
+/// carries weight or the counters want them (`want_mask`); otherwise the
+/// score is the novelty and priority terms alone and no state is consulted.
+fn score_with_terms<H: HashPolicy, F: Feedback>(
+    r: &Runnable<H>,
+    feedback: &F::Local,
+    snapshot: &F::Snapshot,
+    state: &State<H>,
+    terms: &ResolvedTerms,
+    want_mask: bool,
+) -> (f64, u8) {
+    let novelty = F::runnable_novelty(feedback, r, snapshot);
+    let priority = r.priority();
+    let quick_fire = is_quick_fire(r, &state.crash_info.currently_crashed);
+    let mask = if want_mask || terms.any_predicate() {
+        state.term_mask(r)
+    } else {
+        0
+    };
+    let bonus = if terms.any_predicate() {
+        bonus_of(terms, mask)
+    } else {
+        0.0
+    };
+    (blend(terms, novelty, priority, quick_fire, bonus), mask)
+}
+
+/// Score a runnable in [0, 1]. For a recover of a node that is down,
+/// `terms.recover_crashed` raises the weight of priority relative to
+/// novelty; a predicate that carries weight raises the score of a runnable
+/// it is true of.
 fn score_runnable<H: HashPolicy, F: Feedback>(
     r: &Runnable<H>,
     feedback: &F::Local,
     snapshot: &F::Snapshot,
-    currently_crashed: &OrdSet<NodeId>,
+    state: &State<H>,
     terms: &ResolvedTerms,
 ) -> f64 {
-    let novelty = F::runnable_novelty(feedback, r, snapshot);
-    let priority = r.priority();
-    blend(terms, novelty, priority, is_quick_fire(r, currently_crashed), 0.0)
+    score_with_terms::<H, F>(r, feedback, snapshot, state, terms, false).0
 }
 
 /// Rank the eligible candidates once per swept magnitude and report how often
@@ -149,9 +160,10 @@ fn audit_multiplier_authority<H: HashPolicy, F: Feedback>(
     eligible: &[usize],
     feedback: &F::Local,
     snapshot: &F::Snapshot,
-    currently_crashed: &OrdSet<NodeId>,
+    state: &State<H>,
     terms: &ResolvedTerms,
 ) {
+    let currently_crashed = &state.crash_info.currently_crashed;
     let sweep = util_stats::MULTIPLIER_SWEEP;
     let present = eligible
         .iter()
@@ -168,13 +180,18 @@ fn audit_multiplier_authority<H: HashPolicy, F: Feedback>(
         let novelty = F::runnable_novelty(feedback, &queue[i], snapshot);
         let priority = queue[i].priority();
         let quick_fire = is_quick_fire(&queue[i], currently_crashed);
+        let bonus = if terms.any_predicate() {
+            bonus_of(terms, state.term_mask(&queue[i]))
+        } else {
+            0.0
+        };
         for (slot, &m) in best.iter_mut().zip(sweep.iter()) {
-            let s = blend(&terms.with_recover_crashed(m), novelty, priority, quick_fire, 0.0);
+            let s = blend(&terms.with_recover_crashed(m), novelty, priority, quick_fire, bonus);
             if s > slot.0 {
                 *slot = (s, i);
             }
         }
-        let s = blend(terms, novelty, priority, quick_fire, 0.0);
+        let s = blend(terms, novelty, priority, quick_fire, bonus);
         if s > best_configured.0 {
             best_configured = (s, i);
         }
@@ -301,7 +318,7 @@ fn audit_steer_preference<H: HashPolicy, F: Feedback>(
             };
             candidates += 1;
             any_eligible |= blocked.is_none();
-            let score = score_runnable::<H, F>(r, feedback, snapshot, currently_crashed, terms);
+            let score = score_runnable::<H, F>(r, feedback, snapshot, state, terms);
             if score > best_score {
                 best_score = score;
                 best_slot = Some((slot, blocked));
@@ -327,6 +344,7 @@ fn audit_steer_preference<H: HashPolicy, F: Feedback>(
         }
     }
 
+    util_stats::record_audit_candidates(candidates as usize);
     let expressed = candidates > 1 && best_slot.map(|(s, _)| s) != best_priority_slot;
     let preferred = match best_slot {
         _ if !any_eligible => PreferredSlot::NoneEligible,
@@ -340,7 +358,8 @@ fn audit_steer_preference<H: HashPolicy, F: Feedback>(
     }
 }
 
-/// Select an eligible item from a single queue.
+/// Select an eligible item from a single queue, returning its index and
+/// the predicates true of it.
 ///
 /// `Tournament` samples `k` indices uniformly and takes the highest-scoring
 /// (near-greedy for typical k). `Proportional` uses Efraimidis-Spirakis weighted
@@ -351,16 +370,31 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     eligible: &[usize],
     feedback: &F::Local,
     snapshot: &F::Snapshot,
-    currently_crashed: &OrdSet<NodeId>,
+    state: &State<H>,
     terms: &ResolvedTerms,
     selector: &WithinQueueSelector,
     rng: &mut impl StreamRng,
-) -> usize {
+) -> (usize, u8) {
+    let stats = util_stats::enabled();
     if util_stats::multiplier_audit_enabled() {
-        audit_multiplier_authority::<H, F>(queue, eligible, feedback, snapshot, currently_crashed, terms);
+        audit_multiplier_authority::<H, F>(queue, eligible, feedback, snapshot, state, terms);
     }
+    // The predicates true of any eligible candidate, for the counters only.
+    let present = if stats {
+        eligible.iter().fold(0u8, |m, &i| m | state.term_mask(&queue[i]))
+    } else {
+        0
+    };
     if eligible.len() <= 1 {
-        return eligible[0];
+        let (_, mask) = score_with_terms::<H, F>(&queue[eligible[0]], feedback, snapshot, state, terms, stats);
+        if stats {
+            let mut evaluated = [0u64; TERMS];
+            for t in Term::ALL {
+                evaluated[t.index()] = u64::from(mask & (1u8 << t.index()) != 0);
+            }
+            util_stats::record_term_decision(eligible.len(), present, &evaluated, mask, false);
+        }
+        return (eligible[0], mask);
     }
     rng.use_stream(Stream::WithinQueue);
 
@@ -368,13 +402,14 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     // novelty/steer term were dropped? Compares the blended-score argmax with
     // the priority-only argmax (first index wins ties). Consumes no RNG and
     // does not influence the selection below.
-    if util_stats::enabled() {
+    if stats {
+        let currently_crashed = &state.crash_info.currently_crashed;
         let mut best_blend = f64::NEG_INFINITY;
         let mut best_blend_idx = eligible[0];
         let mut best_prio = f64::NEG_INFINITY;
         let mut best_prio_idx = eligible[0];
         for &i in eligible {
-            let blend = score_runnable::<H, F>(&queue[i], feedback, snapshot, currently_crashed, terms);
+            let blend = score_runnable::<H, F>(&queue[i], feedback, snapshot, state, terms);
             let prio = priority_component(&queue[i], currently_crashed, terms);
             if blend > best_blend {
                 best_blend = blend;
@@ -388,21 +423,51 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
         util_stats::record_steer_evaluation(best_blend_idx != best_prio_idx);
     }
 
-    match selector {
+    let mut evaluated = [0u64; TERMS];
+    let mut count_mask = |mask: u8| {
+        for t in Term::ALL {
+            if mask & (1u8 << t.index()) != 0 {
+                evaluated[t.index()] += 1;
+            }
+        }
+    };
+    let (best_idx, best_mask, flipped) = match selector {
         WithinQueueSelector::Tournament { k } => {
             let k = (*k).max(1);
+            // The choice the score makes without predicate weights, kept
+            // beside the real one so a flip can be counted.
+            let unweighted = ResolvedTerms {
+                weights: [0.0; TERMS],
+                ..*terms
+            };
             let mut best_idx = eligible[rng.random_range(0..eligible.len())];
-            let mut best_score =
-                score_runnable::<H, F>(&queue[best_idx], feedback, snapshot, currently_crashed, terms);
+            let (mut best_score, mut best_mask) =
+                score_with_terms::<H, F>(&queue[best_idx], feedback, snapshot, state, terms, stats);
+            count_mask(best_mask);
+            let mut plain_idx = best_idx;
+            let mut plain_score = if terms.any_predicate() {
+                score_runnable::<H, F>(&queue[best_idx], feedback, snapshot, state, &unweighted)
+            } else {
+                best_score
+            };
             for _ in 1..k.min(eligible.len()) {
                 let i = eligible[rng.random_range(0..eligible.len())];
-                let s = score_runnable::<H, F>(&queue[i], feedback, snapshot, currently_crashed, terms);
+                let (s, mask) = score_with_terms::<H, F>(&queue[i], feedback, snapshot, state, terms, stats);
+                count_mask(mask);
                 if s > best_score {
                     best_idx = i;
                     best_score = s;
+                    best_mask = mask;
+                }
+                if terms.any_predicate() {
+                    let s0 = score_runnable::<H, F>(&queue[i], feedback, snapshot, state, &unweighted);
+                    if s0 > plain_score {
+                        plain_idx = i;
+                        plain_score = s0;
+                    }
                 }
             }
-            best_idx
+            (best_idx, best_mask, terms.any_predicate() && plain_idx != best_idx)
         }
         WithinQueueSelector::Proportional { exponent } => {
             // Efraimidis-Spirakis: argmax of (ln(u_i) / w_i) is exact weighted
@@ -413,9 +478,11 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
             // a score of exactly 0 would have 0 selection probability and a
             // score of 0 with exponent 0 would produce 0/0.
             let mut best_idx = eligible[0];
+            let mut best_mask = 0u8;
             let mut best_key = f64::NEG_INFINITY;
             for &i in eligible {
-                let s = score_runnable::<H, F>(&queue[i], feedback, snapshot, currently_crashed, terms);
+                let (s, mask) = score_with_terms::<H, F>(&queue[i], feedback, snapshot, state, terms, stats);
+                count_mask(mask);
                 let weight = s.powf(*exponent).max(1e-9);
                 let u: f64 = rng.random();
                 // u is in (0, 1); ln(u) is negative; key = ln(u) / weight is negative.
@@ -424,11 +491,80 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
                 if key > best_key {
                     best_key = key;
                     best_idx = i;
+                    best_mask = mask;
                 }
             }
-            best_idx
+            (best_idx, best_mask, false)
+        }
+    };
+    if stats {
+        util_stats::record_term_decision(eligible.len(), present, &evaluated, best_mask, flipped);
+    }
+    (best_idx, best_mask)
+}
+
+/// Where a predicated candidate would send the step. With a predicate
+/// weight W among the terms' total, the step goes to a queue holding such a
+/// candidate with probability W / (W + novelty + priority), the share the
+/// predicate holds of the score; otherwise the ordinary queue roll decides.
+/// Reads only the ledger, so the cost is one pass over the nodes, and
+/// consumes exactly one draw when a candidate exists and none otherwise.
+fn route_by_terms<H: HashPolicy>(
+    state: &State<H>,
+    info: &QueueInfo,
+    terms: &ResolvedTerms,
+    rng: &mut impl StreamRng,
+) -> Option<QueueSelection> {
+    if !terms.any_predicate() {
+        return None;
+    }
+    let mut queues: Vec<(QueueSelection, f64)> = Vec::new();
+    for (n, ledger) in state.send_ledger.iter().enumerate() {
+        if ledger.crash_pending == 0 || info.local_queue_sizes.get(n).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        if let Some(t) = state.crash_after_sends_term(n) {
+            let w = terms.weight(t);
+            if w > 0.0 {
+                queues.push((QueueSelection::Local(n), w));
+            }
         }
     }
+    if info.network_queue_size > 0 && state.net_stale_records > 0 {
+        let w_stale = terms.weight(Term::StaleLate);
+        let w_request = if state.net_requests > 0 {
+            terms.weight(Term::RequestBeforeStale)
+        } else {
+            0.0
+        };
+        let w = w_stale.max(w_request);
+        if w > 0.0 {
+            queues.push((QueueSelection::Network, w));
+        }
+    }
+    let total: f64 = queues.iter().map(|(_, w)| w).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    rng.use_stream(Stream::QueueChoice);
+    let u: f64 = rng.random();
+    let share = total / (total + terms.novelty + terms.priority);
+    let routed = if u < share {
+        let mut x = (u / share) * total;
+        let mut pick = queues[queues.len() - 1].0;
+        for (q, w) in &queues {
+            if x < *w {
+                pick = *q;
+                break;
+            }
+            x -= w;
+        }
+        Some(pick)
+    } else {
+        None
+    };
+    util_stats::record_term_authority(routed.is_some());
+    routed
 }
 
 pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback>(
@@ -461,33 +597,19 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
 
     // Observation-only crash-anchor probe: is there a schedulable crash for a
     // node whose own message is still in flight, and does the step take it?
-    // The senders vector is kept for the crash arm below so both sides of the
-    // ratio are measured against the same queue contents.
-    let in_flight_senders: Option<Vec<bool>> = if util_stats::enabled() {
-        let crash_nodes: Vec<usize> = state
-            .local_queues
-            .iter()
-            .enumerate()
-            .filter(|(_, q)| {
-                q.iter()
-                    .any(|r| matches!(r, Runnable::Crash { .. }) && !is_ineligible(r))
-            })
-            .map(|(idx, _)| idx)
-            .collect();
-        if crash_nodes.is_empty() {
-            util_stats::record_crash_anchor_offer(false, false);
-            None
-        } else {
-            let senders = nodes_with_in_flight_send(state);
-            let anchored = crash_nodes
-                .iter()
-                .any(|&idx| senders.get(idx).copied().unwrap_or(false));
-            util_stats::record_crash_anchor_offer(true, anchored);
-            Some(senders)
+    // A crash is never withheld by a reservation or a link order, so a
+    // pending crash is a schedulable one.
+    if util_stats::enabled() {
+        let mut crash_eligible = false;
+        let mut anchored = false;
+        for ledger in &state.send_ledger {
+            if ledger.crash_pending > 0 {
+                crash_eligible = true;
+                anchored |= ledger.in_flight > 0;
+            }
         }
-    } else {
-        None
-    };
+        util_stats::record_crash_anchor_offer(crash_eligible, anchored);
+    }
 
     // Observation-only steer-authority audit: what the scoring function ranks
     // first here, resolved below against what this step actually runs.
@@ -537,22 +659,26 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         step: state.crash_info.current_step,
     };
 
-    rng.use_stream(Stream::QueueChoice);
     let record_unscheduled = |audit: &Option<SteerPreference>| {
         if let Some(a) = audit {
             util_stats::record_steer_authority(a.expressed, a.outcome(None));
         }
     };
 
-    let selection = match selector.select(&info, rng) {
+    let routed = route_by_terms(state, &info, terms, rng);
+    rng.use_stream(Stream::QueueChoice);
+    let selection = match routed {
         Some(s) => s,
-        None => {
-            record_unscheduled(&audit);
-            return Ok(ScheduleResult::None);
-        }
+        None => match selector.select(&info, rng) {
+            Some(s) => s,
+            None => {
+                record_unscheduled(&audit);
+                return Ok(ScheduleResult::None);
+            }
+        },
     };
 
-    let (runnable, chosen_slot) = match selection {
+    let (runnable, chosen_slot, chosen_mask) = match selection {
         QueueSelection::Local(node_idx) => {
             let queue = &state.local_queues[node_idx];
             let eligible: Vec<usize> = (0..queue.len())
@@ -562,19 +688,20 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
-            let idx = select_within_queue::<H, F>(
+            let (idx, mask) = select_within_queue::<H, F>(
                 queue,
                 &eligible,
                 feedback,
                 snapshot,
-                &state.crash_info.currently_crashed,
+                state,
                 terms,
                 within_queue,
                 rng,
             );
             (
-                state.local_queues[node_idx].remove(idx),
+                state.take_local(node_idx, idx),
                 QueueSlot::Local(node_idx, idx),
+                mask,
             )
         }
         QueueSelection::Network => {
@@ -586,17 +713,17 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
-            let idx = select_within_queue::<H, F>(
+            let (idx, mask) = select_within_queue::<H, F>(
                 queue,
                 &eligible,
                 feedback,
                 snapshot,
-                &state.crash_info.currently_crashed,
+                state,
                 terms,
                 within_queue,
                 rng,
             );
-            (state.network_queue.remove(idx), QueueSlot::Network(idx))
+            (state.take_network(idx), QueueSlot::Network(idx), mask)
         }
         QueueSelection::Timer => {
             let queue = &state.timer_queue;
@@ -624,17 +751,17 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
-            let idx = select_within_queue::<H, F>(
+            let (idx, mask) = select_within_queue::<H, F>(
                 queue,
                 &eligible,
                 feedback,
                 snapshot,
-                &state.crash_info.currently_crashed,
+                state,
                 terms,
                 within_queue,
                 rng,
             );
-            (state.timer_queue.remove(idx), QueueSlot::Timer(idx))
+            (state.timer_queue.remove(idx), QueueSlot::Timer(idx), mask)
         }
     };
 
@@ -644,10 +771,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
 
     match runnable {
         Runnable::Crash { node_id, .. } => {
-            if let Some(senders) = &in_flight_senders {
-                util_stats::record_crash_anchor_apply(
-                    senders.get(node_id.index).copied().unwrap_or(false),
-                );
+            if util_stats::enabled() {
+                let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
+                util_stats::record_crash_anchor_apply(ledger.in_flight > 0);
+                util_stats::record_term_acted(chosen_mask, ledger.recent > 0);
             }
             crash_node(state, node_id);
             Ok(ScheduleResult::Crash { node_id })
@@ -799,6 +926,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         );
                         (r.pc, key, inflight, state.node_state_token(record_dest))
                     });
+                    if message_entry {
+                        state.note_handler_entry(record_dest.index, HandlerTrigger::Delivery);
+                    } else if timer_entry {
+                        state.note_handler_entry(record_dest.index, HandlerTrigger::Timer);
+                    }
                     let result = exec::<H, L, F>(
                         state,
                         logger,
@@ -813,6 +945,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     if let Some((bias, before)) = probe {
                         let acted = state.node_state_token(record_dest) != before;
                         util_stats::record_delivery(bias, acted);
+                        util_stats::record_term_acted(chosen_mask, acted);
                     }
                     if let Some((pc, key, inflight, before)) = timer_probe {
                         let acted = state.node_state_token(record_dest) != before;
@@ -868,6 +1001,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
         return;
     }
     state.crash_info.currently_crashed.insert(node_id);
+    state.note_handler_entry(node_id.index, HandlerTrigger::None);
 
     let mut held: u64 = 0;
     let mut dropped: u64 = 0;
@@ -875,6 +1009,11 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     // 1. Process local queue for crashed node: save external records, drop the rest
     let local = std::mem::take(&mut state.local_queues[node_id.index]);
     for task in local {
+        if let Runnable::Crash { .. } = &task
+            && let Some(l) = state.send_ledger.get_mut(node_id.index)
+        {
+            l.crash_pending = l.crash_pending.saturating_sub(1);
+        }
         if let Runnable::Record(record) = task
             && record.origin_node != record.node {
                 let mut record = record;
@@ -894,6 +1033,8 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     for task in net {
         match &task {
             Runnable::Record(r) if r.node == node_id => {
+                state.flight_leave(&task);
+                state.net_leave(&task);
                 if r.origin_node != r.node {
                     let mut r = r.clone();
                     r.reset();
@@ -903,7 +1044,10 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
                     dropped += 1;
                 }
             }
-            Runnable::ChannelSend { target, .. } if *target == node_id => dropped += 1,
+            Runnable::ChannelSend { target, .. } if *target == node_id => {
+                state.flight_leave(&task);
+                dropped += 1
+            }
             Runnable::Crash { node_id: nid, .. } | Runnable::Recover { node_id: nid, .. }
                 if *nid == node_id => {}
             _ => state.network_queue.push(task),
@@ -944,6 +1088,8 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
     if let Some(inc) = state.incarnations.get_mut(node_id.index) {
         *inc = inc.saturating_add(1);
     }
+    state.note_incarnation_bump(node_id.index);
+    state.note_handler_entry(node_id.index, HandlerTrigger::None);
     util_stats::record_recover(node_id.index, state.crash_info.current_step);
     F::note_recovery(feedback, node_id);
 
@@ -1093,6 +1239,8 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         origin_incarnation: state.incarnation(node_id),
         bias: DeliveryBias::NONE,
         timer_entry: None,
+        send_ordinal: state.next_send_ordinal(node_id),
+        receiver_token_at_send: state.node_state_token(node_id),
     };
 
     exec::<H, L, F>(
@@ -1114,8 +1262,8 @@ mod tests {
     use super::*;
     use crate::simulator::feedback::NoFeedback;
     use crate::simulator::hash_utils::NoHashing;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
 
     fn heal(priority: f64) -> Runnable<NoHashing> {
         Runnable::Heal { priority }
@@ -1123,6 +1271,10 @@ mod tests {
 
     fn terms_with(multiplier: f64) -> ResolvedTerms {
         ResolvedTerms::default().with_recover_crashed(multiplier)
+    }
+
+    fn empty_state() -> State<NoHashing> {
+        State::new(&[(crate::analysis::resolver::NameId(0), 1)], 1)
     }
 
     /// The fixed blend the scheduler scored with before its terms had
@@ -1195,25 +1347,26 @@ mod tests {
 
     #[test]
     fn proportional_selection_matches_expected_distribution() {
+        let _serial = crate::simulator::config_override::exclusive_session();
         let queue: Vec<Runnable<NoHashing>> = vec![
             heal(0.0), // score 0.25
             heal(0.5), // score 0.625
             heal(1.0), // score 1.00
         ];
         let eligible: Vec<usize> = (0..queue.len()).collect();
-        let crashed = OrdSet::new();
+        let state = empty_state();
         let selector = WithinQueueSelector::Proportional { exponent: 1.0 };
 
         let mut rng = StdRng::seed_from_u64(0xdeadbeef);
         let trials = 50_000usize;
         let mut counts = [0usize; 3];
         for _ in 0..trials {
-            let idx = select_within_queue::<NoHashing, NoFeedback>(
+            let (idx, _) = select_within_queue::<NoHashing, NoFeedback>(
                 &queue,
                 &eligible,
                 &(),
                 &(),
-                &crashed,
+                &state,
                 &terms_with(1.0),
                 &selector,
                 &mut rng,
@@ -1242,21 +1395,22 @@ mod tests {
 
     #[test]
     fn proportional_with_zero_exponent_is_uniform() {
+        let _serial = crate::simulator::config_override::exclusive_session();
         let queue: Vec<Runnable<NoHashing>> = vec![heal(0.0), heal(0.5), heal(1.0)];
         let eligible: Vec<usize> = (0..queue.len()).collect();
-        let crashed = OrdSet::new();
+        let state = empty_state();
         let selector = WithinQueueSelector::Proportional { exponent: 0.0 };
 
         let mut rng = StdRng::seed_from_u64(42);
         let trials = 30_000usize;
         let mut counts = [0usize; 3];
         for _ in 0..trials {
-            let idx = select_within_queue::<NoHashing, NoFeedback>(
+            let (idx, _) = select_within_queue::<NoHashing, NoFeedback>(
                 &queue,
                 &eligible,
                 &(),
                 &(),
-                &crashed,
+                &state,
                 &terms_with(1.0),
                 &selector,
                 &mut rng,
@@ -1276,23 +1430,24 @@ mod tests {
 
     #[test]
     fn tournament_default_preserves_existing_behavior() {
+        let _serial = crate::simulator::config_override::exclusive_session();
         // Default selector is Tournament { k: 10 }. With sampling-with-replacement,
         // the top-scoring item should dominate but not deterministically.
         let queue: Vec<Runnable<NoHashing>> = vec![heal(0.1), heal(0.9)];
         let eligible: Vec<usize> = (0..queue.len()).collect();
-        let crashed = OrdSet::new();
+        let state = empty_state();
         let selector = WithinQueueSelector::default();
         assert!(matches!(selector, WithinQueueSelector::Tournament { k: 10 }));
 
         let mut rng = StdRng::seed_from_u64(7);
         let mut counts = [0usize; 2];
         for _ in 0..4_000 {
-            let idx = select_within_queue::<NoHashing, NoFeedback>(
+            let (idx, _) = select_within_queue::<NoHashing, NoFeedback>(
                 &queue,
                 &eligible,
                 &(),
                 &(),
-                &crashed,
+                &state,
                 &terms_with(1.0),
                 &selector,
                 &mut rng,
@@ -1335,23 +1490,88 @@ mod tests {
         assert!(blend_score(1.0, priority, true, 1000.0) < blend_score(1.0, priority, true, 3.0));
     }
 
+    /// With every predicate weight at zero the router draws nothing, so the
+    /// queue roll sees exactly the sequence it saw before terms existed.
+    #[test]
+    fn zero_weights_consume_no_queue_choice_draw() {
+        let mut state = empty_state();
+        state.send_ledger[0].crash_pending = 1;
+        state.send_ledger[0].recent = 1;
+        state.send_ledger[0].trigger = HandlerTrigger::Delivery;
+        state.net_stale_records = 1;
+        state.net_requests = 1;
+        let info = QueueInfo {
+            local_queue_sizes: vec![1],
+            network_queue_size: 4,
+            timer_queue_size: 0,
+            step: 0,
+        };
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut untouched = StdRng::seed_from_u64(5);
+        assert!(route_by_terms(&state, &info, &ResolvedTerms::default(), &mut rng).is_none());
+        assert_eq!(rng.next_u64(), untouched.next_u64(), "a draw was consumed");
+    }
+
+    /// A crash of a node with sends in flight from a delivery-triggered
+    /// handler is routed to that node's queue with the predicate's share of
+    /// the score, and nothing is routed when no predicate holds.
+    #[test]
+    fn authority_routes_with_the_configured_share() {
+        let mut state = empty_state();
+        state.send_ledger[0].crash_pending = 1;
+        state.send_ledger[0].recent = 1;
+        state.send_ledger[0].trigger = HandlerTrigger::Delivery;
+        let info = QueueInfo {
+            local_queue_sizes: vec![1],
+            network_queue_size: 40,
+            timer_queue_size: 0,
+            step: 0,
+        };
+        let terms = ResolvedTerms {
+            weights: [0.0, 2.33, 0.0, 0.0],
+            ..ResolvedTerms::default()
+        };
+        let mut rng = StdRng::seed_from_u64(11);
+        let trials = 20_000;
+        let mut local = 0usize;
+        for _ in 0..trials {
+            match route_by_terms(&state, &info, &terms, &mut rng) {
+                Some(QueueSelection::Local(0)) => local += 1,
+                Some(other) => panic!("routed to {other:?}"),
+                None => {}
+            }
+        }
+        let share = 2.33 / (2.33 + 1.0);
+        let observed = local as f64 / trials as f64;
+        assert!(
+            (observed - share).abs() < 0.02,
+            "expected share {share:.3}, observed {observed:.3}"
+        );
+        state.send_ledger[0].trigger = HandlerTrigger::Timer;
+        assert!(route_by_terms(&state, &info, &terms, &mut rng).is_none(), "the timer term carries no weight");
+        state.send_ledger[0].trigger = HandlerTrigger::Delivery;
+        state.send_ledger[0].recent = 0;
+        assert!(route_by_terms(&state, &info, &terms, &mut rng).is_none(), "no sends in flight");
+    }
+
     #[test]
     fn select_within_queue_handles_singleton() {
+        let _serial = crate::simulator::config_override::exclusive_session();
         let queue: Vec<Runnable<NoHashing>> = vec![heal(0.5)];
         let eligible = vec![0];
-        let crashed = OrdSet::new();
+        let state = empty_state();
         let mut rng = StdRng::seed_from_u64(1);
 
         let tournament = WithinQueueSelector::Tournament { k: 10 };
         let proportional = WithinQueueSelector::Proportional { exponent: 1.0 };
 
         for selector in [&tournament, &proportional] {
-            let idx = select_within_queue::<NoHashing, NoFeedback>(
+            let (idx, _) = select_within_queue::<NoHashing, NoFeedback>(
                 &queue,
                 &eligible,
                 &(),
                 &(),
-                &crashed,
+                &state,
                 &terms_with(1.0),
                 selector,
                 &mut rng,

@@ -176,6 +176,8 @@ fn schedule_client_op<H: HashPolicy>(
         step: state.crash_info.current_step,
     });
 
+    let send_ordinal = state.next_send_ordinal(client_node_id);
+    let receiver_token_at_send = state.node_state_token(client_node_id);
     state.push_runnable(Runnable::Record(Record {
         pc: op_func.entry,
         node: client_node_id,
@@ -195,6 +197,8 @@ fn schedule_client_op<H: HashPolicy>(
         origin_incarnation: state.incarnation(client_node_id),
         bias: DeliveryBias::NONE,
         timer_entry: None,
+        send_ordinal,
+        receiver_token_at_send,
     }));
     Ok(())
 }

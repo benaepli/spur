@@ -5,6 +5,7 @@
 //! never affect scheduling, scoring, or RNG consumption. When disabled, every
 //! probe is a single relaxed atomic load.
 
+use crate::simulator::core::steer_terms::{Term, TERMS};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -111,6 +112,43 @@ static DELIVERIES_ACTED: [AtomicU64; DELIVERY_BUCKETS] =
     [const { AtomicU64::new(0) }; DELIVERY_BUCKETS];
 
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
+
+/// Per-term counters, laid out as `TERM_*` rows by `Term::index`: how many
+/// within-queue candidates were scored with the term true (`evaluated`),
+/// how many selections had such a candidate at all (`present`) and among
+/// more than one eligible candidate (`contested`), how many selections
+/// chose one (`won`), how many of those choices differ from what the score
+/// without predicate weights would have chosen (`flipped`), and how many
+/// chosen candidates were measured for their effect (`measured`) and had
+/// one (`acted`).
+const TERM_EVALUATED: usize = 0;
+const TERM_PRESENT: usize = 1;
+const TERM_CONTESTED: usize = 2;
+const TERM_WON: usize = 3;
+const TERM_FLIPPED: usize = 4;
+const TERM_MEASURED: usize = 5;
+const TERM_ACTED: usize = 6;
+const TERM_COUNTERS: usize = 7;
+static TERM: [[AtomicU64; TERM_COUNTERS]; TERMS] =
+    [const { [const { AtomicU64::new(0) }; TERM_COUNTERS] }; TERMS];
+static TERM_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static TERM_AUTHORITY_DRAWS: AtomicU64 = AtomicU64::new(0);
+static TERM_AUTHORITY_ROUTED: AtomicU64 = AtomicU64::new(0);
+
+/// Log2 buckets of eligible-candidate and audited-candidate counts per
+/// selection: 0, 1, 2, 3-4, 5-8, ... up to 2^14 and above.
+const HIST_BUCKETS: usize = 16;
+static ELIGIBLE_HIST: [AtomicU64; HIST_BUCKETS] = [const { AtomicU64::new(0) }; HIST_BUCKETS];
+static CANDIDATES_HIST: [AtomicU64; HIST_BUCKETS] = [const { AtomicU64::new(0) }; HIST_BUCKETS];
+
+fn hist_bucket(n: usize) -> usize {
+    match n {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => ((usize::BITS - (n - 1).leading_zeros()) as usize + 1).min(HIST_BUCKETS - 1),
+    }
+}
 
 /// Context of one timer firing: the vertex the woken record resumes at (so a
 /// spec's timer handlers are told apart without naming them), whether a
@@ -249,8 +287,154 @@ pub fn set_enabled(on: bool) {
         if let Ok(mut t) = TIMER_EFFECTS.lock() {
             t.clear();
         }
+        for row in TERM.iter() {
+            for c in row {
+                c.store(0, Ordering::Relaxed);
+            }
+        }
+        for c in [&TERM_DECISIONS, &TERM_AUTHORITY_DRAWS, &TERM_AUTHORITY_ROUTED] {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in ELIGIBLE_HIST.iter().chain(CANDIDATES_HIST.iter()) {
+            c.store(0, Ordering::Relaxed);
+        }
     }
     ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// One within-queue selection was scored with terms. `present` and
+/// `chosen` are term masks over the eligible candidates and the chosen one;
+/// `evaluated` counts, per term, the sampled candidates the term was true
+/// of; `flipped` says whether the choice differs from the one the score
+/// without predicate weights would have made.
+#[inline]
+pub fn record_term_decision(
+    eligible: usize,
+    present: u8,
+    evaluated: &[u64; TERMS],
+    chosen: u8,
+    flipped: bool,
+) {
+    if !enabled() {
+        return;
+    }
+    TERM_DECISIONS.fetch_add(1, Ordering::Relaxed);
+    ELIGIBLE_HIST[hist_bucket(eligible)].fetch_add(1, Ordering::Relaxed);
+    for t in Term::ALL {
+        let i = t.index();
+        let bit = 1u8 << i;
+        let row = &TERM[i];
+        row[TERM_EVALUATED].fetch_add(evaluated[i], Ordering::Relaxed);
+        if present & bit != 0 {
+            row[TERM_PRESENT].fetch_add(1, Ordering::Relaxed);
+            if eligible > 1 {
+                row[TERM_CONTESTED].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if chosen & bit != 0 {
+            row[TERM_WON].fetch_add(1, Ordering::Relaxed);
+            if flipped {
+                row[TERM_FLIPPED].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The candidate chosen with terms `mask` true was measured for its effect.
+#[inline]
+pub fn record_term_acted(mask: u8, acted: bool) {
+    if !enabled() || mask == 0 {
+        return;
+    }
+    for t in Term::ALL {
+        if mask & (1u8 << t.index()) != 0 {
+            let row = &TERM[t.index()];
+            row[TERM_MEASURED].fetch_add(1, Ordering::Relaxed);
+            if acted {
+                row[TERM_ACTED].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The queue router drew for a predicated candidate; `routed` says whether
+/// the draw sent the step to that candidate's queue.
+#[inline]
+pub fn record_term_authority(routed: bool) {
+    if !enabled() {
+        return;
+    }
+    TERM_AUTHORITY_DRAWS.fetch_add(1, Ordering::Relaxed);
+    if routed {
+        TERM_AUTHORITY_ROUTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The steer audit ranked `candidates` runnables at one scheduling point.
+#[inline]
+pub fn record_audit_candidates(candidates: usize) {
+    if !enabled() {
+        return;
+    }
+    CANDIDATES_HIST[hist_bucket(candidates)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The counters of one term.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermCounters {
+    pub evaluated: u64,
+    pub present: u64,
+    pub contested: u64,
+    pub won: u64,
+    pub flipped: u64,
+    pub measured: u64,
+    pub acted: u64,
+}
+
+impl TermCounters {
+    fn read(i: usize) -> Self {
+        let row = &TERM[i];
+        let get = |k: usize| row[k].load(Ordering::Relaxed);
+        Self {
+            evaluated: get(TERM_EVALUATED),
+            present: get(TERM_PRESENT),
+            contested: get(TERM_CONTESTED),
+            won: get(TERM_WON),
+            flipped: get(TERM_FLIPPED),
+            measured: get(TERM_MEASURED),
+            acted: get(TERM_ACTED),
+        }
+    }
+}
+
+/// The score terms' counters for one session.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SteerTermStats {
+    pub decisions: u64,
+    pub authority_draws: u64,
+    pub authority_routed: u64,
+    pub crash_after_timer_sends: TermCounters,
+    pub crash_after_delivery_sends: TermCounters,
+    pub stale_late: TermCounters,
+    pub request_before_stale: TermCounters,
+    pub eligible_hist: Vec<u64>,
+    pub candidates_hist: Vec<u64>,
+}
+
+impl SteerTermStats {
+    fn read() -> Self {
+        Self {
+            decisions: TERM_DECISIONS.load(Ordering::Relaxed),
+            authority_draws: TERM_AUTHORITY_DRAWS.load(Ordering::Relaxed),
+            authority_routed: TERM_AUTHORITY_ROUTED.load(Ordering::Relaxed),
+            crash_after_timer_sends: TermCounters::read(Term::CrashAfterTimerSends.index()),
+            crash_after_delivery_sends: TermCounters::read(Term::CrashAfterDeliverySends.index()),
+            stale_late: TermCounters::read(Term::StaleLate.index()),
+            request_before_stale: TermCounters::read(Term::RequestBeforeStale.index()),
+            eligible_hist: ELIGIBLE_HIST.iter().map(|c| c.load(Ordering::Relaxed)).collect(),
+            candidates_hist: CANDIDATES_HIST.iter().map(|c| c.load(Ordering::Relaxed)).collect(),
+        }
+    }
 }
 
 /// Whether recording is enabled. Callers with a non-trivial probe (e.g. the
@@ -1502,6 +1686,7 @@ pub struct UtilizationSnapshot {
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
     pub timeline_keys: TimelineKeyStats,
+    pub steer_terms: SteerTermStats,
 }
 
 /// The snapshot as JSON, for readers that difference or accumulate it.
@@ -1642,6 +1827,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             .map(|t| *t)
             .unwrap_or_else(|p| *p.into_inner()),
         timeline_keys: TimelineKeyStats::read(),
+        steer_terms: SteerTermStats::read(),
     }
 }
 
@@ -1649,6 +1835,54 @@ pub fn snapshot() -> UtilizationSnapshot {
 mod tests {
     use super::*;
     use crate::simulator::config_override;
+
+    #[test]
+    fn term_counters_reset_and_snapshot() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        let stale = 1u8 << Term::StaleLate.index();
+        let crash = 1u8 << Term::CrashAfterTimerSends.index();
+        record_term_decision(3, stale | crash, &[0, 0, 2, 0], stale, true);
+        record_term_decision(1, crash, &[1, 0, 0, 0], 0, false);
+        record_term_acted(stale, true);
+        record_term_acted(stale, false);
+        record_term_authority(true);
+        record_term_authority(false);
+        record_audit_candidates(7);
+        let s = snapshot().steer_terms;
+        assert_eq!(s.decisions, 2);
+        assert_eq!(s.stale_late.evaluated, 2);
+        assert_eq!(s.stale_late.present, 1);
+        assert_eq!(s.stale_late.contested, 1);
+        assert_eq!(s.stale_late.won, 1);
+        assert_eq!(s.stale_late.flipped, 1);
+        assert_eq!(s.stale_late.measured, 2);
+        assert_eq!(s.stale_late.acted, 1);
+        assert_eq!(s.crash_after_timer_sends.present, 2);
+        assert_eq!(s.crash_after_timer_sends.contested, 1);
+        assert_eq!(s.crash_after_timer_sends.won, 0);
+        assert_eq!(s.authority_draws, 2);
+        assert_eq!(s.authority_routed, 1);
+        assert_eq!(s.eligible_hist[hist_bucket(3)], 1);
+        assert_eq!(s.candidates_hist[hist_bucket(7)], 1);
+        set_enabled(true);
+        let z = snapshot().steer_terms;
+        assert_eq!(z, SteerTermStats { eligible_hist: vec![0; HIST_BUCKETS], candidates_hist: vec![0; HIST_BUCKETS], ..SteerTermStats::default() });
+        set_enabled(false);
+    }
+
+    #[test]
+    fn hist_buckets_are_log2_with_small_counts_exact() {
+        assert_eq!(hist_bucket(0), 0);
+        assert_eq!(hist_bucket(1), 1);
+        assert_eq!(hist_bucket(2), 2);
+        assert_eq!(hist_bucket(3), 3);
+        assert_eq!(hist_bucket(4), 3);
+        assert_eq!(hist_bucket(5), 4);
+        assert_eq!(hist_bucket(8), 4);
+        assert_eq!(hist_bucket(9), 5);
+        assert_eq!(hist_bucket(1 << 20), HIST_BUCKETS - 1);
+    }
 
     #[test]
     fn delivery_effects_split_by_bias() {

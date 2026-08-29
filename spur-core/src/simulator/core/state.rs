@@ -3,6 +3,7 @@ use crate::analysis::type_id::TypeId;
 use crate::compiler::cfg::{Lhs, Vertex};
 use crate::simulator::core::eval::store;
 use crate::simulator::core::partition::{PartitionInfo, PartitionType};
+use crate::simulator::core::steer_terms::Term;
 use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use crate::simulator::rng::{Stream, StreamRng};
@@ -258,6 +259,15 @@ pub struct Record<H: HashPolicy> {
     /// so the effect of the firing is measured on that first segment only.
     /// Observation only, excluded from `Hash`.
     pub timer_entry: Option<Vertex>,
+    /// Position of this send among the origin's sends, so a record can be
+    /// told apart from sends issued before the origin's last handler entry.
+    /// Excluded from `Hash`: it describes when the record was made, not
+    /// what it does.
+    pub send_ordinal: u32,
+    /// The receiver's state token when the record was sent, so a delivery
+    /// can tell whether the receiver moved on in between. Excluded from
+    /// `Hash` for the same reason.
+    pub receiver_token_at_send: u64,
 }
 
 impl<H: HashPolicy> Record<H> {
@@ -534,6 +544,45 @@ pub struct State<H: HashPolicy> {
     /// Consecutive inert timer firings per (node index, resume vertex),
     /// reset when a firing at that vertex changes the node's state.
     timer_inert_streaks: Vec<(usize, Vertex, u32)>,
+    /// Per-node send bookkeeping the score's predicates read; indexed like
+    /// `nodes`. Kept exact by the queue hooks below and excluded from
+    /// `signature()`, so it cannot change deduplication.
+    pub send_ledger: Vec<SendLedger>,
+    /// Remote records in the network queue whose origin has restarted since
+    /// sending them: the sum over nodes of `net_records - net_fresh`.
+    pub net_stale_records: u32,
+    /// Remote records in the network queue whose origin has another role
+    /// than the receiver, which is how a client request looks to a server.
+    pub net_requests: u32,
+}
+
+/// What woke the handler a node ran last.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HandlerTrigger {
+    #[default]
+    None,
+    Timer,
+    Delivery,
+}
+
+/// One node's send bookkeeping. `issued` numbers the node's sends; `floor`
+/// is `issued` at the node's last handler entry, so a record with
+/// `send_ordinal >= floor` was sent by that handler. `in_flight` counts the
+/// node's remote records and channel sends in the network queue or held by
+/// a delay; `recent` the subset sent by the last handler. `net_records` and
+/// `net_fresh` count the node's remote records in the network queue and the
+/// ones whose origin incarnation is still current. `crash_pending` counts
+/// the crashes of this node waiting in its local queue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendLedger {
+    pub issued: u32,
+    pub floor: u32,
+    pub trigger: HandlerTrigger,
+    pub in_flight: u32,
+    pub recent: u32,
+    pub net_records: u32,
+    pub net_fresh: u32,
+    pub crash_pending: u32,
 }
 
 /// Per-run totals of timer firings that woke a waiting record, split by
@@ -593,6 +642,9 @@ impl<H: HashPolicy> State<H> {
             link_deliver_seq: ImHashMap::new(),
             timer_stats: TimerRunStats::default(),
             timer_inert_streaks: Vec::new(),
+            send_ledger: vec![SendLedger::default(); num_nodes],
+            net_stale_records: 0,
+            net_requests: 0,
         }
     }
 
@@ -671,6 +723,7 @@ impl<H: HashPolicy> State<H> {
         self.nodes.push(env);
         self.incarnations.push(0);
         self.local_queues.push(Vec::new());
+        self.send_ledger.push(SendLedger::default());
         node_id
     }
 
@@ -711,11 +764,21 @@ impl<H: HashPolicy> State<H> {
     pub fn push_runnable(&mut self, runnable: Runnable<H>) {
         match &runnable {
             Runnable::Timer(_) => self.timer_queue.push(runnable),
-            Runnable::ChannelSend { .. } => self.network_queue.push(runnable),
+            Runnable::ChannelSend { .. } => {
+                self.flight_enter(&runnable);
+                self.network_queue.push(runnable)
+            }
             Runnable::Partition { .. } | Runnable::Heal { .. } => {
                 self.network_queue.push(runnable)
             }
-            Runnable::Crash { node_id, .. } | Runnable::Recover { node_id, .. } => {
+            Runnable::Crash { node_id, .. } => {
+                let idx = node_id.index;
+                if let Some(l) = self.send_ledger.get_mut(idx) {
+                    l.crash_pending += 1;
+                }
+                self.local_queues[idx].push(runnable);
+            }
+            Runnable::Recover { node_id, .. } => {
                 let idx = node_id.index;
                 self.local_queues[idx].push(runnable);
             }
@@ -723,9 +786,187 @@ impl<H: HashPolicy> State<H> {
                 if r.origin_node == r.node {
                     self.local_queues[r.node.index].push(runnable);
                 } else {
+                    self.flight_enter(&runnable);
+                    self.net_enter(&runnable);
                     self.network_queue.push(runnable);
                 }
             }
+        }
+    }
+
+    /// Remove and return the network queue entry at `idx`, keeping the
+    /// ledger exact.
+    pub fn take_network(&mut self, idx: usize) -> Runnable<H> {
+        let r = self.network_queue.remove(idx);
+        self.flight_leave(&r);
+        self.net_leave(&r);
+        r
+    }
+
+    /// Remove and return the entry at `idx` of `node`'s local queue, keeping
+    /// the ledger exact.
+    pub fn take_local(&mut self, node: usize, idx: usize) -> Runnable<H> {
+        let r = self.local_queues[node].remove(idx);
+        if let Runnable::Crash { node_id, .. } = &r
+            && let Some(l) = self.send_ledger.get_mut(node_id.index)
+        {
+            l.crash_pending = l.crash_pending.saturating_sub(1);
+        }
+        r
+    }
+
+    /// The origin of a remote message, or `None` for anything else.
+    fn remote_origin(r: &Runnable<H>) -> Option<usize> {
+        match r {
+            Runnable::Record(rec) if rec.origin_node != rec.node => Some(rec.origin_node.index),
+            Runnable::ChannelSend {
+                origin_node, target, ..
+            } if origin_node != target => Some(origin_node.index),
+            _ => None,
+        }
+    }
+
+    /// A remote message became undelivered: queued or held by a delay.
+    pub fn flight_enter(&mut self, r: &Runnable<H>) {
+        let Some(origin) = Self::remote_origin(r) else { return };
+        let Some(l) = self.send_ledger.get_mut(origin) else { return };
+        l.in_flight += 1;
+        if let Runnable::Record(rec) = r
+            && rec.send_ordinal >= l.floor
+        {
+            l.recent += 1;
+        }
+    }
+
+    /// A remote message stopped being undelivered: delivered, dropped, or
+    /// set aside by a crash or a partition.
+    pub fn flight_leave(&mut self, r: &Runnable<H>) {
+        let Some(origin) = Self::remote_origin(r) else { return };
+        let Some(l) = self.send_ledger.get_mut(origin) else { return };
+        l.in_flight = l.in_flight.saturating_sub(1);
+        if let Runnable::Record(rec) = r
+            && rec.send_ordinal >= l.floor
+        {
+            l.recent = l.recent.saturating_sub(1);
+        }
+    }
+
+    /// A remote record entered the network queue.
+    pub fn net_enter(&mut self, r: &Runnable<H>) {
+        let Runnable::Record(rec) = r else { return };
+        if rec.origin_node == rec.node {
+            return;
+        }
+        let fresh = rec.origin_incarnation == self.incarnation(rec.origin_node);
+        let Some(l) = self.send_ledger.get_mut(rec.origin_node.index) else { return };
+        l.net_records += 1;
+        if fresh {
+            l.net_fresh += 1;
+        } else {
+            self.net_stale_records += 1;
+        }
+        if rec.origin_node.role != rec.node.role {
+            self.net_requests += 1;
+        }
+    }
+
+    /// A remote record left the network queue.
+    pub fn net_leave(&mut self, r: &Runnable<H>) {
+        let Runnable::Record(rec) = r else { return };
+        if rec.origin_node == rec.node {
+            return;
+        }
+        let fresh = rec.origin_incarnation == self.incarnation(rec.origin_node);
+        let Some(l) = self.send_ledger.get_mut(rec.origin_node.index) else { return };
+        l.net_records = l.net_records.saturating_sub(1);
+        if fresh {
+            l.net_fresh = l.net_fresh.saturating_sub(1);
+        } else {
+            self.net_stale_records = self.net_stale_records.saturating_sub(1);
+        }
+        if rec.origin_node.role != rec.node.role {
+            self.net_requests = self.net_requests.saturating_sub(1);
+        }
+    }
+
+    /// Number the next send of `node`.
+    pub fn next_send_ordinal(&mut self, node: NodeId) -> u32 {
+        match self.send_ledger.get_mut(node.index) {
+            Some(l) => {
+                let o = l.issued;
+                l.issued += 1;
+                o
+            }
+            None => 0,
+        }
+    }
+
+    /// `node` is entering a handler woken by `trigger`: the sends it issues
+    /// from here on are the ones a crash of the node would strand.
+    pub fn note_handler_entry(&mut self, node: usize, trigger: HandlerTrigger) {
+        if let Some(l) = self.send_ledger.get_mut(node) {
+            l.floor = l.issued;
+            l.recent = 0;
+            l.trigger = trigger;
+        }
+    }
+
+    /// `node` came back from a crash: every remote record it sent before
+    /// now carries an incarnation that no longer exists.
+    pub fn note_incarnation_bump(&mut self, node: usize) {
+        if let Some(l) = self.send_ledger.get_mut(node) {
+            self.net_stale_records += l.net_fresh;
+            l.net_fresh = 0;
+        }
+    }
+
+    /// Which crash term a crash of `node` satisfies right now, if any.
+    pub fn crash_after_sends_term(&self, node: usize) -> Option<Term> {
+        let l = self.send_ledger.get(node)?;
+        if l.recent == 0 {
+            return None;
+        }
+        match l.trigger {
+            HandlerTrigger::Timer => Some(Term::CrashAfterTimerSends),
+            HandlerTrigger::Delivery => Some(Term::CrashAfterDeliverySends),
+            HandlerTrigger::None => None,
+        }
+    }
+
+    /// The record's origin restarted since it was sent and its receiver has
+    /// written state since.
+    pub fn stale_late(&self, rec: &Record<H>) -> bool {
+        rec.origin_node != rec.node
+            && rec.origin_incarnation != self.incarnation(rec.origin_node)
+            && self.node_state_token(rec.node) != rec.receiver_token_at_send
+    }
+
+    /// The record is a request across roles while some record from a
+    /// restarted origin is still undelivered.
+    pub fn request_before_stale(&self, rec: &Record<H>) -> bool {
+        rec.origin_node != rec.node
+            && rec.origin_node.role != rec.node.role
+            && self.net_stale_records > 0
+    }
+
+    /// The predicates true of `r`, one bit per `Term::index`.
+    pub fn term_mask(&self, r: &Runnable<H>) -> u8 {
+        match r {
+            Runnable::Crash { node_id, .. } => match self.crash_after_sends_term(node_id.index) {
+                Some(t) => 1 << t.index(),
+                None => 0,
+            },
+            Runnable::Record(rec) => {
+                let mut m = 0;
+                if self.stale_late(rec) {
+                    m |= 1 << Term::StaleLate.index();
+                }
+                if self.request_before_stale(rec) {
+                    m |= 1 << Term::RequestBeforeStale.index();
+                }
+                m
+            }
+            _ => 0,
         }
     }
 
@@ -744,6 +985,7 @@ impl<H: HashPolicy> State<H> {
 
     /// Move a runnable into purgatory, delaying it until `release_step`.
     pub fn delay_runnable(&mut self, release_step: i32, runnable: Runnable<H>) {
+        self.flight_enter(&runnable);
         self.purgatory.push((release_step, runnable));
     }
 
@@ -753,6 +995,7 @@ impl<H: HashPolicy> State<H> {
         while i < self.purgatory.len() {
             if self.purgatory[i].0 <= current_step {
                 let (_, runnable) = self.purgatory.swap_remove(i);
+                self.flight_leave(&runnable);
                 self.push_runnable(runnable);
                 // Don't increment i — swap_remove moved the last element here
             } else {
@@ -935,5 +1178,276 @@ impl<H: HashPolicy> Continuation<H> {
                 unreachable!("_Phantom variant should never be constructed")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use crate::analysis::resolver::NameId;
+    use crate::simulator::hash_utils::NoHashing;
+
+    const SERVER: NameId = NameId(0);
+    const CLIENT: NameId = NameId(1);
+
+    fn node(role: NameId, index: usize) -> NodeId {
+        NodeId { role, index }
+    }
+
+    /// Three servers and one client; the client is node 3.
+    fn state() -> State<NoHashing> {
+        State::new(&[(SERVER, 3), (CLIENT, 1)], 2)
+    }
+
+    fn record(state: &mut State<NoHashing>, origin: NodeId, dest: NodeId) -> Record<NoHashing> {
+        let env = Env::<NoHashing>::with_slots(1);
+        Record {
+            pc: 0,
+            node: dest,
+            origin_node: origin,
+            continuation: Continuation::Recover,
+            entry_pc: 0,
+            initial_env: env.clone(),
+            env,
+            priority: 0.5,
+            causal_operation_id: None,
+            trace_id: None,
+            link_seq: None,
+            origin_incarnation: state.incarnation(origin),
+            bias: DeliveryBias::NONE,
+            timer_entry: None,
+            send_ordinal: state.next_send_ordinal(origin),
+            receiver_token_at_send: state.node_state_token(dest),
+        }
+    }
+
+    /// The ledger recomputed from the queues, the oracle the hooks are held to.
+    fn recount(state: &State<NoHashing>) -> (Vec<SendLedger>, u32, u32) {
+        let mut ledgers: Vec<SendLedger> = state
+            .send_ledger
+            .iter()
+            .map(|l| SendLedger {
+                in_flight: 0,
+                recent: 0,
+                net_records: 0,
+                net_fresh: 0,
+                crash_pending: 0,
+                ..*l
+            })
+            .collect();
+        let mut stale = 0;
+        let mut requests = 0;
+        let mut count = |r: &Runnable<NoHashing>, in_network: bool| match r {
+            Runnable::Record(rec) if rec.origin_node != rec.node => {
+                let l = &mut ledgers[rec.origin_node.index];
+                l.in_flight += 1;
+                if rec.send_ordinal >= l.floor {
+                    l.recent += 1;
+                }
+                if in_network {
+                    l.net_records += 1;
+                    if rec.origin_incarnation == state.incarnation(rec.origin_node) {
+                        l.net_fresh += 1;
+                    } else {
+                        stale += 1;
+                    }
+                    if rec.origin_node.role != rec.node.role {
+                        requests += 1;
+                    }
+                }
+            }
+            Runnable::ChannelSend {
+                origin_node, target, ..
+            } if origin_node != target => ledgers[origin_node.index].in_flight += 1,
+            _ => {}
+        };
+        for r in &state.network_queue {
+            count(r, true);
+        }
+        for (_, r) in &state.purgatory {
+            count(r, false);
+        }
+        for (n, q) in state.local_queues.iter().enumerate() {
+            ledgers[n].crash_pending =
+                q.iter().filter(|r| matches!(r, Runnable::Crash { .. })).count() as u32;
+        }
+        (ledgers, stale, requests)
+    }
+
+    fn assert_exact(state: &State<NoHashing>, when: &str) {
+        let (ledgers, stale, requests) = recount(state);
+        assert_eq!(state.send_ledger, ledgers, "ledger drifted {when}");
+        assert_eq!(state.net_stale_records, stale, "stale count drifted {when}");
+        assert_eq!(state.net_requests, requests, "request count drifted {when}");
+    }
+
+    #[test]
+    fn crash_after_sends_keys_on_last_trigger() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        assert_eq!(st.crash_after_sends_term(0), None);
+        st.note_handler_entry(0, HandlerTrigger::Timer);
+        let r1 = record(&mut st, a, b);
+        let r2 = record(&mut st, a, b);
+        st.push_runnable(Runnable::Record(r1));
+        st.push_runnable(Runnable::Record(r2));
+        assert_eq!(st.send_ledger[0].recent, 2);
+        assert_eq!(st.crash_after_sends_term(0), Some(Term::CrashAfterTimerSends));
+        st.take_network(0);
+        assert_eq!(st.send_ledger[0].recent, 1);
+        st.note_handler_entry(0, HandlerTrigger::Delivery);
+        assert_eq!(st.send_ledger[0].recent, 0);
+        assert_eq!(st.crash_after_sends_term(0), None);
+        let r3 = record(&mut st, a, b);
+        st.push_runnable(Runnable::Record(r3));
+        assert_eq!(st.crash_after_sends_term(0), Some(Term::CrashAfterDeliverySends));
+        st.note_handler_entry(0, HandlerTrigger::None);
+        let r4 = record(&mut st, a, b);
+        st.push_runnable(Runnable::Record(r4));
+        assert_eq!(st.crash_after_sends_term(0), None, "sends with no trigger name no term");
+        assert_exact(&st, "after the trigger sequence");
+    }
+
+    #[test]
+    fn stale_late_needs_both_conjuncts() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        let r = record(&mut st, a, b);
+        assert!(!st.stale_late(&r), "fresh origin, receiver unchanged");
+        st.incarnations[0] += 1;
+        assert!(!st.stale_late(&r), "stale origin but the receiver has not moved on");
+        let mut env = st.nodes[1].clone();
+        env.set(0, Value::<NoHashing>::int(7));
+        st.nodes[1] = env;
+        assert!(st.stale_late(&r), "stale origin and a receiver that wrote state");
+        st.incarnations[0] -= 1;
+        assert!(!st.stale_late(&r), "receiver moved on but the origin is current");
+        let own = record(&mut st, b, b);
+        st.incarnations[1] += 1;
+        assert!(!st.stale_late(&own), "a record to itself is never a stale delivery");
+    }
+
+    #[test]
+    fn request_before_stale_reads_the_global_count() {
+        let mut st = state();
+        let client = node(CLIENT, 3);
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        let req = record(&mut st, client, a);
+        assert!(!st.request_before_stale(&req));
+        let msg = record(&mut st, a, b);
+        st.incarnations[0] += 1;
+        st.push_runnable(Runnable::Record(msg));
+        assert_eq!(st.net_stale_records, 1);
+        assert!(st.request_before_stale(&req));
+        let peer = record(&mut st, a, b);
+        assert!(!st.request_before_stale(&peer), "a message between servers is not a request");
+        st.take_network(0);
+        assert!(!st.request_before_stale(&req));
+    }
+
+    #[test]
+    fn term_mask_names_each_predicate_bit() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        let crash = Runnable::<NoHashing>::Crash {
+            node_id: a,
+            priority: 1.0,
+        };
+        assert_eq!(st.term_mask(&crash), 0);
+        st.note_handler_entry(0, HandlerTrigger::Timer);
+        let r = record(&mut st, a, b);
+        st.push_runnable(Runnable::Record(r));
+        assert_eq!(st.term_mask(&crash), 1 << Term::CrashAfterTimerSends.index());
+        let held = record(&mut st, a, b);
+        st.incarnations[0] += 1;
+        let mut env = st.nodes[1].clone();
+        env.set(0, Value::<NoHashing>::int(1));
+        st.nodes[1] = env;
+        assert_eq!(
+            st.term_mask(&Runnable::Record(held)),
+            1 << Term::StaleLate.index()
+        );
+    }
+
+    #[test]
+    fn stale_accounting_is_exact_under_events() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        let c = node(SERVER, 2);
+        let client = node(CLIENT, 3);
+        st.note_handler_entry(0, HandlerTrigger::Delivery);
+        for _ in 0..3 {
+            let r = record(&mut st, a, b);
+            st.push_runnable(Runnable::Record(r));
+        }
+        let req = record(&mut st, client, a);
+        st.push_runnable(Runnable::Record(req));
+        let delayed = record(&mut st, b, c);
+        st.delay_runnable(5, Runnable::Record(delayed));
+        st.push_runnable(Runnable::ChannelSend {
+            target: c,
+            channel: ChannelId { node: c, id: 0 },
+            message: Value::<NoHashing>::unit(),
+            origin_node: a,
+            pc: 0,
+            priority: 0.5,
+        });
+        st.push_runnable(Runnable::Crash {
+            node_id: a,
+            priority: 1.0,
+        });
+        assert_exact(&st, "after pushes");
+        assert_eq!(st.send_ledger[0].recent, 3);
+        assert_eq!(st.net_requests, 1);
+
+        let taken = st.take_network(1);
+        assert!(matches!(taken, Runnable::Record(_)));
+        assert_exact(&st, "after a delivery");
+
+        st.incarnations[0] += 1;
+        st.note_incarnation_bump(0);
+        assert_exact(&st, "after the origin restarted");
+        assert_eq!(st.net_stale_records, 2);
+
+        st.release_from_purgatory(5);
+        assert_exact(&st, "after a purgatory release");
+
+        let crash = st.take_local(0, 0);
+        assert!(matches!(crash, Runnable::Crash { .. }));
+        assert_eq!(st.send_ledger[0].crash_pending, 0);
+        assert_exact(&st, "after the crash was taken");
+
+        st.push_runnable(Runnable::Crash {
+            node_id: b,
+            priority: 1.0,
+        });
+        st.push_runnable(Runnable::Crash {
+            node_id: b,
+            priority: 1.0,
+        });
+        assert_eq!(st.send_ledger[1].crash_pending, 2);
+        assert_exact(&st, "with two crashes pending");
+    }
+
+    #[test]
+    fn send_ordinals_count_from_the_handler_floor() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        let early = record(&mut st, a, b);
+        st.note_handler_entry(0, HandlerTrigger::Timer);
+        let late = record(&mut st, a, b);
+        st.push_runnable(Runnable::Record(early));
+        st.push_runnable(Runnable::Record(late));
+        assert_eq!(st.send_ledger[0].in_flight, 2);
+        assert_eq!(st.send_ledger[0].recent, 1, "only the send after the entry counts");
+        st.take_network(0);
+        assert_eq!(st.send_ledger[0].recent, 1, "removing the early send leaves recent alone");
+        assert_exact(&st, "after removing the early send");
     }
 }

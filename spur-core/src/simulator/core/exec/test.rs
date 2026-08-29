@@ -95,6 +95,8 @@ fn make_record_with_cont(
         trace_id: None,
         link_seq: None,
         origin_incarnation: 0,
+        send_ordinal: 0,
+        receiver_token_at_send: 0,
         bias: crate::simulator::util_stats::DeliveryBias::NONE,
         timer_entry: None,
     }
