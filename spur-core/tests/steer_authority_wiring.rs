@@ -104,6 +104,11 @@ fn check() {
         skips.queue_audit_skipped > 0,
         "the skipped audit was not counted: {skips:?}"
     );
+    check_consultation(&skipped);
+    assert_eq!(
+        skipped.preference_source_absent, skipped.preference_consulted,
+        "a session with no weighted predicate read a preference source anyway"
+    );
 
     let (always, always_skips, always_steps_used) = session("always", true);
     assert!(always_steps_used > 0);
@@ -135,6 +140,26 @@ fn check() {
         always.honored > 0,
         "no step ever ran the top-ranked runnable"
     );
+    check_consultation(&always);
 
     let _ = fs::remove_dir_all(std::env::temp_dir().join("spur_steer_authority_wiring"));
+}
+
+/// A session that reached scheduling points must report that the decision
+/// sites read a preference source, so a zero elsewhere in the block can be
+/// read as "nothing to prefer" rather than "the site never ran".
+fn check_consultation(s: &SteerAuthorityStats) {
+    assert!(
+        s.steps == 0 || s.preference_consulted > 0,
+        "steps were reached and no preference source was ever consulted: {} steps",
+        s.steps
+    );
+    assert!(
+        s.preference_source_absent <= s.preference_consulted,
+        "more consultations found no source than were counted at all"
+    );
+    assert!(
+        s.preference_expressed <= s.preference_consulted,
+        "a preference was expressed more often than one was consulted"
+    );
 }
