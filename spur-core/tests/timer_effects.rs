@@ -149,8 +149,13 @@ fn check() {
 
     let mut fired_rows: HashMap<i64, i64> = HashMap::new();
     for (run_id, action) in string_column(&out, "executions", "run_id", "action") {
-        if action == "System.TimerFired" {
+        if action.starts_with("System.TimerFired/") {
             *fired_rows.entry(run_id).or_insert(0) += 1;
+        }
+    }
+    for (client_id, kind) in string_column(&out, "executions", "client_id", "kind") {
+        if kind == "TimerFired" {
+            assert!(client_id >= 0, "a timer row names its node in client_id");
         }
     }
 

@@ -572,11 +572,15 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 ScheduleResult::TimerFired { node_id, label } => {
                     // Recorded beside crashes and recoveries so a consumer can
                     // order a timer against the deliveries and faults around
-                    // it. The label is the specification's own name for the
-                    // timer.
+                    // it. The node goes in `client_id` and the label after the
+                    // `/` in the action, so a reader can select the firings it
+                    // wants by column without parsing the payload; the payload
+                    // carries both as values. The label is the specification's
+                    // own name for the timer.
+                    let action = format!("System.TimerFired/{label}");
                     path_state.history.push(Operation {
-                        client_id: -1,
-                        op_action: "System.TimerFired".to_string(),
+                        client_id: node_id.index as i32,
+                        op_action: action,
                         kind: OpKind::TimerFired,
                         payload: vec![
                             Value::<H>::node(node_id),

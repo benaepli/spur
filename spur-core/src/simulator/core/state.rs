@@ -322,7 +322,8 @@ pub enum OpKind {
     Recover,
     Partition,
     Heal,
-    /// A node's timer fired; the payload carries the node and the label.
+    /// A node's timer fired. The payload carries the node and the label;
+    /// the row's client id is the node and its action ends in `/label`.
     TimerFired,
 }
 
