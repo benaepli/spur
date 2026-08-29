@@ -1,10 +1,10 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, VarSlot};
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::core::values::{Env, Value, ValueKind, hash_map_entry};
+use crate::simulator::core::values::{Env, Value, ValueKind, hash_map_entry, ValueMap};
 use crate::simulator::hash_utils::HashPolicy;
 use ecow::EcoString;
-use imbl::{HashMap as ImHashMap, Vector};
+use imbl::Vector;
 use std::collections::HashMap;
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
@@ -212,7 +212,7 @@ pub fn eval<H: HashPolicy>(
             Ok(Value::<H>::list(vals?))
         }
         Expr::Map(kv) => {
-            let mut m = ImHashMap::new();
+            let mut m = ValueMap::<H>::new();
             for (k, v) in kv {
                 m.insert(
                     eval(local_env, node_env, k, role_names)?,

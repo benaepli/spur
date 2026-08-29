@@ -1,0 +1,66 @@
+// Two nodes whose timer loop walks a map with several entries and sends one
+// beat per entry, so the order the runtime iterates a map is written into
+// the schedule. A session on this fixture is reproducible only if map
+// iteration is a function of the map's contents alone.
+
+role Node {
+    var slots: map<int, int> = {};
+    var last_beat: int = 0;
+    var me: int = 0;
+    var peers: list<Node> = [];
+
+    fn Init(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        slots = slots[me] := 0;
+        slots = slots[7 + me] := 1;
+        slots = slots[14 + me] := 2;
+        slots = slots[21 + me] := 3;
+        slots = slots[28 + me] := 4;
+        slots = slots[35 + me] := 5;
+        slots = slots[42 + me] := 6;
+        slots = slots[49 + me] := 7;
+        Sweep();
+    }
+
+    async fn RecoverInit(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Sweep();
+    }
+
+    @trace
+    async fn Sweep() {
+        for ;; {
+            <- set_timer("sweep");
+            for (k, v) in slots {
+                peers[(me + 1) % len(peers)]->Beat(k);
+            }
+        }
+    }
+
+    @trace
+    async fn Beat(n: int) {
+        last_beat = n;
+        slots = slots[n] := last_beat;
+    }
+
+    async fn Write(key: string, uid: int): bool {
+        slots = slots[uid] := uid;
+        return true;
+    }
+
+    async fn Read(key: string): int {
+        return last_beat;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        <-dest->Write(key, uid);
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

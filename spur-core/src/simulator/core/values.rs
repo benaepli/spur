@@ -2,9 +2,10 @@ use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::state::NodeId;
 use crate::simulator::hash_utils::{HashPolicy, mix};
 use ecow::{EcoString, EcoVec};
-use imbl::{HashMap as ImHashMap, Vector};
+use imbl::Vector;
 use std::cmp::Ordering;
 use rustc_hash::FxHasher;
+use std::hash::BuildHasherDefault;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -18,12 +19,19 @@ pub struct ChannelId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LinkId(pub usize);
 
+/// Map storage of a spec value. The hasher carries no per-process seed, so
+/// the order a spec sees when it iterates or takes the head of a map is a
+/// function of the entries alone, and two sessions at one seed replay the
+/// same schedule.
+pub type ValueMap<H> =
+    imbl::GenericHashMap<Value<H>, Value<H>, BuildHasherDefault<FxHasher>, imbl::shared_ptr::DefaultSharedPtr>;
+
 /// The inner representation of a value, without cached signature.
 #[derive(Clone, Debug)]
 pub enum ValueKind<H: HashPolicy> {
     Int(i64),
     Bool(bool),
-    Map(ImHashMap<Value<H>, Value<H>>),
+    Map(ValueMap<H>),
     List(Vector<Value<H>>),
     Option(Option<Arc<Value<H>>>),
     Channel(ChannelId),
@@ -245,7 +253,7 @@ impl<H: HashPolicy> Value<H> {
     }
 
     #[inline]
-    pub fn map(m: ImHashMap<Value<H>, Value<H>>) -> Self {
+    pub fn map(m: ValueMap<H>) -> Self {
         Self::new(ValueKind::Map(m))
     }
 
@@ -463,7 +471,7 @@ impl<H: HashPolicy> Value<H> {
             }),
         }
     }
-    pub fn as_map(&self) -> Result<&ImHashMap<Value<H>, Value<H>>, RuntimeError> {
+    pub fn as_map(&self) -> Result<&ValueMap<H>, RuntimeError> {
         if let ValueKind::Map(m) = &self.kind {
             Ok(m)
         } else {
