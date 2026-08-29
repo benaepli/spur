@@ -27,6 +27,7 @@ use crate::simulator::feedback::{
 };
 use crate::simulator::history::{HistoryWriter, LogBackend, create_writer};
 use crate::simulator::rng::{LiveRng, SCHEDULE_SALT, WORKLOAD_SALT, derive_seed};
+use crate::simulator::timer_effect_steer;
 use crate::simulator::util_stats;
 use log::{error, info};
 use rayon::prelude::*;
@@ -833,6 +834,7 @@ pub fn run_explorer_campaign(
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
     util_stats::set_multiplier_audit_enabled(config.envelope.emit_multiplier_authority);
+    timer_effect_steer::set_late_fraction(config.envelope.timer_effect_steer.late_fraction);
     run_campaign_impl(
         program,
         config,
