@@ -29,6 +29,8 @@ static SA_STEPS: AtomicU64 = AtomicU64::new(0);
 static SA_AUDITED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_EXPRESSED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_HONORED: AtomicU64 = AtomicU64::new(0);
+static SA_PREFERENCE_CONSULTED: AtomicU64 = AtomicU64::new(0);
+static SA_PREFERENCE_SOURCE_ABSENT: AtomicU64 = AtomicU64::new(0);
 static SA_HONORED: AtomicU64 = AtomicU64::new(0);
 static SA_NO_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static SA_BLOCKED_BY_ORDER: AtomicU64 = AtomicU64::new(0);
@@ -227,6 +229,8 @@ pub fn set_enabled(on: bool) {
             &SA_AUDITED,
             &SA_PREFERENCE_EXPRESSED,
             &SA_PREFERENCE_HONORED,
+            &SA_PREFERENCE_CONSULTED,
+            &SA_PREFERENCE_SOURCE_ABSENT,
             &SA_HONORED,
             &SA_NO_ELIGIBLE,
             &SA_BLOCKED_BY_ORDER,
@@ -607,6 +611,26 @@ pub fn record_steer_step() {
         return;
     }
     SA_STEPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A scheduling decision asked what the run prefers. Recorded at every site
+/// that reads a preference source, before the site decides whether the answer
+/// is worth using, so a session that scheduled anything can never report zero
+/// consultations. `source_present` is false when no preference source is
+/// configured, i.e. no predicate carries weight, which is the reading that
+/// separates "the site never ran" from "the site ran and had nothing to say".
+///
+/// A single scheduling point reaches several such sites - queue routing, the
+/// within-queue ranking, and the audit - so this is not a count of steps.
+#[inline]
+pub fn record_preference_consultation(source_present: bool) {
+    if !steer_audit_enabled() {
+        return;
+    }
+    SA_PREFERENCE_CONSULTED.fetch_add(1, Ordering::Relaxed);
+    if !source_present {
+        SA_PREFERENCE_SOURCE_ABSENT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// One scheduling point had its preference resolved. `expressed` means the
@@ -1398,6 +1422,15 @@ pub struct SteerAuthorityStats {
     /// choice the scheduler would have made without it.
     pub preference_expressed: u64,
     pub preference_honored: u64,
+    /// Every read of a preference source, counted before the reader decides
+    /// what to do with the answer. Several per step, so it is not comparable
+    /// with `steps`; it is the denominator that says whether the decision
+    /// sites execute at all, which `preference_expressed` alone cannot.
+    pub preference_consulted: u64,
+    /// The subset of `preference_consulted` where nothing was configured to
+    /// have a preference. Equal to `preference_consulted` means the sites all
+    /// ran and every one of them had no source to read.
+    pub preference_source_absent: u64,
     pub honored: u64,
     pub no_eligible_candidates: u64,
     pub blocked_by_order: u64,
@@ -1951,6 +1984,8 @@ pub fn snapshot() -> UtilizationSnapshot {
             audited: SA_AUDITED.load(Ordering::Relaxed),
             preference_expressed: SA_PREFERENCE_EXPRESSED.load(Ordering::Relaxed),
             preference_honored: SA_PREFERENCE_HONORED.load(Ordering::Relaxed),
+            preference_consulted: SA_PREFERENCE_CONSULTED.load(Ordering::Relaxed),
+            preference_source_absent: SA_PREFERENCE_SOURCE_ABSENT.load(Ordering::Relaxed),
             honored: SA_HONORED.load(Ordering::Relaxed),
             no_eligible_candidates: SA_NO_ELIGIBLE.load(Ordering::Relaxed),
             blocked_by_order: SA_BLOCKED_BY_ORDER.load(Ordering::Relaxed),
@@ -2226,11 +2261,30 @@ mod tests {
 
         record_steer_step();
         record_steer_authority(true, SteerOutcome::Honored);
+        record_preference_consultation(true);
 
         let s = snapshot().steer_authority;
         set_enabled(false);
 
-        assert_eq!((s.steps, s.audited), (0, 0));
+        assert_eq!((s.steps, s.audited, s.preference_consulted), (0, 0, 0));
+    }
+
+    #[test]
+    fn preference_consultations_split_into_sourced_and_sourceless_reads() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        set_steer_audit_enabled(true);
+
+        record_preference_consultation(false);
+        record_preference_consultation(false);
+        record_preference_consultation(true);
+
+        let s = snapshot().steer_authority;
+        set_steer_audit_enabled(false);
+        set_enabled(false);
+
+        assert_eq!(s.preference_consulted, 3);
+        assert_eq!(s.preference_source_absent, 2);
     }
 
     #[test]
