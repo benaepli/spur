@@ -790,6 +790,13 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         util_stats::record_steer_authority(a.expressed, a.outcome(Some(chosen_slot)));
     }
 
+    // Observation-only timer-admission probe: when a timer and a message
+    // delivery are both schedulable, which of the two the step runs. Nothing
+    // else in the counters observes that ordering.
+    if util_stats::enabled() && info.timer_queue_size > 0 && info.network_queue_size > 0 {
+        util_stats::record_timer_admission(matches!(chosen_slot, QueueSlot::Timer(_)));
+    }
+
     match runnable {
         Runnable::Crash { node_id, .. } => {
             if util_stats::enabled() {
