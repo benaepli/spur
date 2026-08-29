@@ -21,6 +21,9 @@ static RNG_ISOLATED_RUNS: AtomicU64 = AtomicU64::new(0);
 static RNG_SHARED_RUNS: AtomicU64 = AtomicU64::new(0);
 static STEER_EVALUATIONS: AtomicU64 = AtomicU64::new(0);
 static STEER_DIVERGENT_PICKS: AtomicU64 = AtomicU64::new(0);
+static ES_CANDIDATE_MASK: AtomicU64 = AtomicU64::new(0);
+static ES_RANKING_PASS: AtomicU64 = AtomicU64::new(0);
+static ES_QUEUE_AUDIT: AtomicU64 = AtomicU64::new(0);
 static SA_STEPS: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_EXPRESSED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_HONORED: AtomicU64 = AtomicU64::new(0);
@@ -293,6 +296,9 @@ pub fn set_enabled(on: bool) {
             }
         }
         for c in [&TERM_DECISIONS, &TERM_AUTHORITY_DRAWS, &TERM_AUTHORITY_ROUTED] {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in [&ES_CANDIDATE_MASK, &ES_RANKING_PASS, &ES_QUEUE_AUDIT] {
             c.store(0, Ordering::Relaxed);
         }
         for c in ELIGIBLE_HIST.iter().chain(CANDIDATES_HIST.iter()) {
@@ -676,6 +682,40 @@ pub fn record_steer_evaluation(divergent: bool) {
     if divergent {
         STEER_DIVERGENT_PICKS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// A stage of the scoring path that reads the run's state, or ranks a set of
+/// runnables, only so the term counters have something to report. With no
+/// predicate carrying weight there is nothing for those counters to separate,
+/// so each stage is skipped and the skip is counted here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptySliceStage {
+    /// The predicate reads over the eligible set of one within-queue selection.
+    CandidateMask,
+    /// The second ranking of the eligible set that compares the blended argmax
+    /// with the priority-only one.
+    RankingPass,
+    /// The ranking of every runnable in every queue at one scheduling point.
+    QueueAudit,
+}
+
+/// One occurrence of a stage being skipped. `candidate_mask_skipped` and
+/// `ranking_pass_skipped` count within-queue selections, `queue_audit_skipped`
+/// counts scheduling points, so a session in which the mechanism applied
+/// everywhere has all three at the same magnitude as the corresponding
+/// unskipped counters (`steer_terms.decisions`, `steer.evaluations`,
+/// `steer_authority.steps`) reach when a predicate does carry weight.
+#[inline]
+pub fn record_empty_slice_skip(stage: EmptySliceStage) {
+    if !enabled() {
+        return;
+    }
+    let counter = match stage {
+        EmptySliceStage::CandidateMask => &ES_CANDIDATE_MASK,
+        EmptySliceStage::RankingPass => &ES_RANKING_PASS,
+        EmptySliceStage::QueueAudit => &ES_QUEUE_AUDIT,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A run built its scheduling random source; `isolated` means the run drew
@@ -1276,6 +1316,16 @@ pub struct SteerStats {
     pub divergent_picks: u64,
 }
 
+/// How often each stage of the scoring path was skipped because no predicate
+/// carried weight. All zero means every stage ran, which is what a session with
+/// a nonzero weight looks like.
+#[derive(Serialize, Debug)]
+pub struct EmptySliceStats {
+    pub candidate_mask_skipped: u64,
+    pub ranking_pass_skipped: u64,
+    pub queue_audit_skipped: u64,
+}
+
 /// How often the runnable the scoring function ranked first is the one the
 /// scheduling point ran, and what took precedence when it was not. The buckets
 /// after `honored` partition the remaining steps by the single constraint that
@@ -1670,6 +1720,7 @@ impl MultiplierAuthorityStats {
 pub struct UtilizationSnapshot {
     pub rng_streams: RngStreamStats,
     pub steer: SteerStats,
+    pub steer_empty_slice: EmptySliceStats,
     pub steer_authority: SteerAuthorityStats,
     pub multiplier_authority: MultiplierAuthorityStats,
     pub purgatory: PurgatoryStats,
@@ -1757,6 +1808,11 @@ pub fn snapshot() -> UtilizationSnapshot {
         steer: SteerStats {
             evaluations: STEER_EVALUATIONS.load(Ordering::Relaxed),
             divergent_picks: STEER_DIVERGENT_PICKS.load(Ordering::Relaxed),
+        },
+        steer_empty_slice: EmptySliceStats {
+            candidate_mask_skipped: ES_CANDIDATE_MASK.load(Ordering::Relaxed),
+            ranking_pass_skipped: ES_RANKING_PASS.load(Ordering::Relaxed),
+            queue_audit_skipped: ES_QUEUE_AUDIT.load(Ordering::Relaxed),
         },
         steer_authority: SteerAuthorityStats {
             steps: SA_STEPS.load(Ordering::Relaxed),

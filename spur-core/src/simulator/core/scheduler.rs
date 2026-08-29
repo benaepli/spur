@@ -379,15 +379,24 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     if util_stats::multiplier_audit_enabled() {
         audit_multiplier_authority::<H, F>(queue, eligible, feedback, snapshot, state, terms);
     }
+    // The term counters can only separate candidates a predicate is true of
+    // from the rest when some predicate carries weight. With none carrying
+    // weight, the state reads and the extra ranking below report a constant, so
+    // they are skipped and each skip is counted.
+    let count_terms = stats && terms.any_predicate();
+    if stats && !count_terms {
+        util_stats::record_empty_slice_skip(util_stats::EmptySliceStage::CandidateMask);
+    }
     // The predicates true of any eligible candidate, for the counters only.
-    let present = if stats {
+    let present = if count_terms {
         eligible.iter().fold(0u8, |m, &i| m | state.term_mask(&queue[i]))
     } else {
         0
     };
     if eligible.len() <= 1 {
-        let (_, mask) = score_with_terms::<H, F>(&queue[eligible[0]], feedback, snapshot, state, terms, stats);
-        if stats {
+        let (_, mask) =
+            score_with_terms::<H, F>(&queue[eligible[0]], feedback, snapshot, state, terms, count_terms);
+        if count_terms {
             let mut evaluated = [0u64; TERMS];
             for t in Term::ALL {
                 evaluated[t.index()] = u64::from(mask & (1u8 << t.index()) != 0);
@@ -402,7 +411,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     // novelty/steer term were dropped? Compares the blended-score argmax with
     // the priority-only argmax (first index wins ties). Consumes no RNG and
     // does not influence the selection below.
-    if stats {
+    if count_terms {
         let currently_crashed = &state.crash_info.currently_crashed;
         let mut best_blend = f64::NEG_INFINITY;
         let mut best_blend_idx = eligible[0];
@@ -421,6 +430,8 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
             }
         }
         util_stats::record_steer_evaluation(best_blend_idx != best_prio_idx);
+    } else if stats {
+        util_stats::record_empty_slice_skip(util_stats::EmptySliceStage::RankingPass);
     }
 
     let mut evaluated = [0u64; TERMS];
@@ -442,7 +453,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
             };
             let mut best_idx = eligible[rng.random_range(0..eligible.len())];
             let (mut best_score, mut best_mask) =
-                score_with_terms::<H, F>(&queue[best_idx], feedback, snapshot, state, terms, stats);
+                score_with_terms::<H, F>(&queue[best_idx], feedback, snapshot, state, terms, count_terms);
             count_mask(best_mask);
             let mut plain_idx = best_idx;
             let mut plain_score = if terms.any_predicate() {
@@ -452,7 +463,8 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
             };
             for _ in 1..k.min(eligible.len()) {
                 let i = eligible[rng.random_range(0..eligible.len())];
-                let (s, mask) = score_with_terms::<H, F>(&queue[i], feedback, snapshot, state, terms, stats);
+                let (s, mask) =
+                    score_with_terms::<H, F>(&queue[i], feedback, snapshot, state, terms, count_terms);
                 count_mask(mask);
                 if s > best_score {
                     best_idx = i;
@@ -481,7 +493,8 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
             let mut best_mask = 0u8;
             let mut best_key = f64::NEG_INFINITY;
             for &i in eligible {
-                let (s, mask) = score_with_terms::<H, F>(&queue[i], feedback, snapshot, state, terms, stats);
+                let (s, mask) =
+                    score_with_terms::<H, F>(&queue[i], feedback, snapshot, state, terms, count_terms);
                 count_mask(mask);
                 let weight = s.powf(*exponent).max(1e-9);
                 let u: f64 = rng.random();
@@ -497,7 +510,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
             (best_idx, best_mask, false)
         }
     };
-    if stats {
+    if count_terms {
         util_stats::record_term_decision(eligible.len(), present, &evaluated, best_mask, flipped);
     }
     (best_idx, best_mask)
@@ -612,8 +625,16 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     }
 
     // Observation-only steer-authority audit: what the scoring function ranks
-    // first here, resolved below against what this step actually runs.
-    let audit = util_stats::steer_audit_enabled().then(|| {
+    // first here, resolved below against what this step actually runs. It ranks
+    // every runnable in every queue, and with no predicate carrying weight
+    // there is no weighted preference for it to resolve, so it is skipped and
+    // the skip is counted.
+    let graded = terms.any_predicate();
+    let audit_wanted = util_stats::steer_audit_enabled();
+    if audit_wanted && !graded {
+        util_stats::record_empty_slice_skip(util_stats::EmptySliceStage::QueueAudit);
+    }
+    let audit = (audit_wanted && graded).then(|| {
         audit_steer_preference::<H, F>(
             state,
             feedback,

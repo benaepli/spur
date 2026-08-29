@@ -1,13 +1,14 @@
-//! Every predicate has to be seen on the relay fixture: at zero weight the
-//! counters say each one was present without the choice ever changing or a
-//! routing draw being made, and with weights on, the choices flip, the
-//! router routes, and the schedule differs from the zero-weight session.
+//! Every predicate has to be seen on the relay fixture: with weights on, the
+//! counters say each one was present, the choices flip, the router routes, and
+//! the schedule differs from a session carrying no weight at all. That session
+//! reports the ranking passes it skipped in place of term counters, because a
+//! predicate no weight rides on cannot separate one candidate from another.
 
 use spur_core::compiler;
 use spur_core::simulator::config_override;
 use spur_core::simulator::explorer::run_explorer;
 use spur_core::simulator::history::LogBackend;
-use spur_core::simulator::util_stats::{self, SteerTermStats};
+use spur_core::simulator::util_stats::{self, EmptySliceStats, SteerTermStats};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,7 +70,10 @@ fn executions(dir: &Path) -> Vec<(i64, i64, String)> {
     rows
 }
 
-fn session(name: &str, terms: &str) -> (SteerTermStats, Vec<(i64, i64, String)>) {
+fn session(
+    name: &str,
+    terms: &str,
+) -> (SteerTermStats, EmptySliceStats, Vec<(i64, i64, String)>) {
     let program = compiler::compile(SPEC, "relay.spur")
         .into_program()
         .expect("spec compiles");
@@ -86,11 +90,11 @@ fn session(name: &str, terms: &str) -> (SteerTermStats, Vec<(i64, i64, String)>)
         &cancelled,
     )
     .expect("session runs");
-    let stats = util_stats::snapshot().steer_terms;
+    let snapshot = util_stats::snapshot();
     let _ = fs::remove_file(&config_path);
     let rows = executions(&out);
     let _ = fs::remove_dir_all(&out);
-    (stats, rows)
+    (snapshot.steer_terms, snapshot.steer_empty_slice, rows)
 }
 
 #[test]
@@ -105,29 +109,41 @@ fn every_predicate_is_seen_and_weights_change_the_schedule() {
 
 fn check() {
     let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
-    let (zero, zero_rows) = session("zero", "");
-    assert!(zero.decisions > 0, "no selection was counted");
-    let mut missing = Vec::new();
-    for (name, c) in [
-        ("crash_after_timer_sends", &zero.crash_after_timer_sends),
-        ("crash_after_delivery_sends", &zero.crash_after_delivery_sends),
-        ("stale_late", &zero.stale_late),
-        ("request_before_stale", &zero.request_before_stale),
-    ] {
-        if c.present == 0 || c.evaluated == 0 {
-            missing.push(format!("{name}: {c:?}"));
-        }
-        assert_eq!(c.flipped, 0, "{name} flipped a choice at zero weight");
-    }
-    assert!(missing.is_empty(), "predicates never seen at zero weight: {missing:?}; all: {zero:?}");
+    let (zero, zero_skips, zero_rows) = session("zero", "");
+    assert_eq!(zero.decisions, 0, "the term counters ran with no weight to report on");
     assert_eq!(zero.authority_draws, 0, "the router drew at zero weight");
     assert_eq!(zero.authority_routed, 0);
+    assert!(
+        zero_skips.candidate_mask_skipped > 0,
+        "no selection reached the scorer: {zero_skips:?}"
+    );
+    assert!(
+        zero_skips.ranking_pass_skipped > 0,
+        "no selection had more than one eligible candidate: {zero_skips:?}"
+    );
 
-    let (on, on_rows) = session(
+    let (on, on_skips, on_rows) = session(
         "weighted",
         r#",
   "steer_terms": {"stale_late": 2.33, "crash_after_timer_sends": 2.33}"#,
     );
+    assert_eq!(
+        (on_skips.candidate_mask_skipped, on_skips.ranking_pass_skipped),
+        (0, 0),
+        "a weighted session skipped a ranking pass: {on_skips:?}"
+    );
+    let mut missing = Vec::new();
+    for (name, c) in [
+        ("crash_after_timer_sends", &on.crash_after_timer_sends),
+        ("crash_after_delivery_sends", &on.crash_after_delivery_sends),
+        ("stale_late", &on.stale_late),
+        ("request_before_stale", &on.request_before_stale),
+    ] {
+        if c.present == 0 || c.evaluated == 0 {
+            missing.push(format!("{name}: {c:?}"));
+        }
+    }
+    assert!(missing.is_empty(), "predicates never seen: {missing:?}; all: {on:?}");
     assert!(on.stale_late.won > 0, "stale_late never won: {:?}", on.stale_late);
     assert!(
         on.stale_late.flipped + on.crash_after_timer_sends.flipped > 0,
