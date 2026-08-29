@@ -832,6 +832,7 @@ pub fn run_explorer_campaign(
     util_stats::set_enabled(config.envelope.stats);
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
+    util_stats::set_steer_audit_always(config.envelope.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.envelope.emit_multiplier_authority);
     run_campaign_impl(
         program,

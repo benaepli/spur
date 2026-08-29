@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTED_ENABLED: AtomicBool = AtomicBool::new(true);
 static STEER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
+static STEER_AUDIT_ALWAYS: AtomicBool = AtomicBool::new(false);
 static MULTIPLIER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static RNG_ISOLATED_RUNS: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +26,7 @@ static ES_CANDIDATE_MASK: AtomicU64 = AtomicU64::new(0);
 static ES_RANKING_PASS: AtomicU64 = AtomicU64::new(0);
 static ES_QUEUE_AUDIT: AtomicU64 = AtomicU64::new(0);
 static SA_STEPS: AtomicU64 = AtomicU64::new(0);
+static SA_AUDITED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_EXPRESSED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_HONORED: AtomicU64 = AtomicU64::new(0);
 static SA_HONORED: AtomicU64 = AtomicU64::new(0);
@@ -222,6 +224,7 @@ pub fn set_enabled(on: bool) {
             &STEER_EVALUATIONS,
             &STEER_DIVERGENT_PICKS,
             &SA_STEPS,
+            &SA_AUDITED,
             &SA_PREFERENCE_EXPRESSED,
             &SA_PREFERENCE_HONORED,
             &SA_HONORED,
@@ -497,6 +500,20 @@ pub fn steer_audit_enabled() -> bool {
     enabled() && STEER_AUDIT_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Extend the steer-authority audit to sessions where no predicate carries
+/// weight, whose ranking is novelty and priority alone. Off leaves those
+/// sessions counting only the skip.
+pub fn set_steer_audit_always(on: bool) {
+    STEER_AUDIT_ALWAYS.store(on, Ordering::Relaxed);
+}
+
+/// Whether a scheduling point should be audited even with an unweighted
+/// ranking.
+#[inline]
+pub fn steer_audit_always() -> bool {
+    STEER_AUDIT_ALWAYS.load(Ordering::Relaxed)
+}
+
 /// Enable or disable the multiplier-authority probe for this session. It also
 /// requires `set_enabled(true)`; the probe re-ranks the eligible candidates
 /// once per swept magnitude, so it is a separate switch from the cheap counters.
@@ -581,16 +598,27 @@ pub enum SteerOutcome {
     SamplerChoseOther,
 }
 
-/// One scheduling point was audited. `expressed` means the score ranking put a
-/// different runnable on top than priority alone would have, i.e. the steering
-/// term changed what "preferred" means at this point; `outcome` says what
-/// happened to that preferred runnable.
+/// One scheduling point was reached. Counted for every step-selection call
+/// whatever the scoring weights are, so `steps` is the denominator the audited
+/// steps are a subset of, and a session that ran steps can never report zero.
+#[inline]
+pub fn record_steer_step() {
+    if !steer_audit_enabled() {
+        return;
+    }
+    SA_STEPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One scheduling point had its preference resolved. `expressed` means the
+/// score ranking put a different runnable on top than priority alone would
+/// have, i.e. the steering term changed what "preferred" means at this point;
+/// `outcome` says what happened to that preferred runnable.
 #[inline]
 pub fn record_steer_authority(expressed: bool, outcome: SteerOutcome) {
     if !steer_audit_enabled() {
         return;
     }
-    SA_STEPS.fetch_add(1, Ordering::Relaxed);
+    SA_AUDITED.fetch_add(1, Ordering::Relaxed);
     if expressed {
         SA_PREFERENCE_EXPRESSED.fetch_add(1, Ordering::Relaxed);
         if outcome == SteerOutcome::Honored {
@@ -723,7 +751,7 @@ pub enum EmptySliceStage {
 /// counts scheduling points, so a session in which the mechanism applied
 /// everywhere has all three at the same magnitude as the corresponding
 /// unskipped counters (`steer_terms.decisions`, `steer.evaluations`,
-/// `steer_authority.steps`) reach when a predicate does carry weight.
+/// `steer_authority.audited`) reach when a predicate does carry weight.
 #[inline]
 pub fn record_empty_slice_skip(stage: EmptySliceStage) {
     if !enabled() {
@@ -1154,6 +1182,12 @@ pub fn record_run_termination(s: &RunTermination) {
     if !enabled() {
         return;
     }
+    debug_assert!(
+        !(steer_audit_enabled() && s.steps_used > 0 && SA_STEPS.load(Ordering::Relaxed) == 0),
+        "a run took {} scheduling steps and none was counted; the steer-authority \
+         counters are not reaching the scheduler",
+        s.steps_used
+    );
     finish_run();
     let bucket = s.recovered_nodes.min(2);
     if let Ok(mut t) = TERMINATION.lock() {
@@ -1347,11 +1381,17 @@ pub struct EmptySliceStats {
 
 /// How often the runnable the scoring function ranked first is the one the
 /// scheduling point ran, and what took precedence when it was not. The buckets
-/// after `honored` partition the remaining steps by the single constraint that
-/// stood in the way, so all six sum to `steps`.
+/// after `honored` partition the audited steps by the single constraint that
+/// stood in the way, so all six sum to `audited`.
 #[derive(Serialize)]
 pub struct SteerAuthorityStats {
+    /// Every scheduling point the session reached, audited or not. Zero here
+    /// with steps used in the session means the counter is not wired up.
     pub steps: u64,
+    /// The subset of `steps` where the ranking was resolved against what the
+    /// step ran. Short of `steps` by the points the audit skipped, which
+    /// `steer_empty_slice.queue_audit_skipped` counts.
+    pub audited: u64,
     /// Steps where the steering term put a different runnable on top than
     /// priority alone would have. The denominator for `preference_honored`:
     /// on the other steps the audit cannot tell steer's choice from the
@@ -1908,6 +1948,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         },
         steer_authority: SteerAuthorityStats {
             steps: SA_STEPS.load(Ordering::Relaxed),
+            audited: SA_AUDITED.load(Ordering::Relaxed),
             preference_expressed: SA_PREFERENCE_EXPRESSED.load(Ordering::Relaxed),
             preference_honored: SA_PREFERENCE_HONORED.load(Ordering::Relaxed),
             honored: SA_HONORED.load(Ordering::Relaxed),
@@ -2142,11 +2183,14 @@ mod tests {
     }
 
     #[test]
-    fn steer_authority_outcomes_partition_the_steps() {
+    fn steer_authority_outcomes_partition_the_audited_steps() {
         let _serial = config_override::exclusive_session();
         set_enabled(true);
         set_steer_audit_enabled(true);
 
+        for _ in 0..9 {
+            record_steer_step();
+        }
         record_steer_authority(true, SteerOutcome::Honored);
         record_steer_authority(false, SteerOutcome::Honored);
         record_steer_authority(true, SteerOutcome::SamplerChoseOther);
@@ -2159,7 +2203,8 @@ mod tests {
         set_steer_audit_enabled(false);
         set_enabled(false);
 
-        assert_eq!(s.steps, 7);
+        assert_eq!(s.steps, 9);
+        assert_eq!(s.audited, 7);
         assert_eq!(s.preference_expressed, 3);
         assert_eq!(s.preference_honored, 1);
         assert_eq!(
@@ -2169,7 +2214,7 @@ mod tests {
                 + s.blocked_by_timer_gate
                 + s.other_queue
                 + s.sampler_chose_other,
-            s.steps
+            s.audited
         );
     }
 
@@ -2179,12 +2224,13 @@ mod tests {
         set_enabled(true);
         set_steer_audit_enabled(false);
 
+        record_steer_step();
         record_steer_authority(true, SteerOutcome::Honored);
 
         let s = snapshot().steer_authority;
         set_enabled(false);
 
-        assert_eq!(s.steps, 0);
+        assert_eq!((s.steps, s.audited), (0, 0));
     }
 
     #[test]
