@@ -160,9 +160,15 @@ impl SteerTerms {
             novelty: self.novelty,
             priority: self.priority,
             recover_crashed,
-            weights,
+            source: bind(weights),
         })
     }
+}
+
+/// The predicate weights when at least one of them can change a score, and
+/// nothing otherwise.
+fn bind(weights: [f64; TERMS]) -> Option<[f64; TERMS]> {
+    weights.iter().any(|&w| w > 0.0).then_some(weights)
 }
 
 /// The weights a run scores with. Copied into every run configuration, so
@@ -172,7 +178,11 @@ pub struct ResolvedTerms {
     pub novelty: f64,
     pub priority: f64,
     pub recover_crashed: f64,
-    pub weights: [f64; TERMS],
+    /// The predicate weights, present only when one of them carries weight.
+    /// Decided once when the terms are resolved, so a scheduling decision
+    /// answers "is there anything to prefer" without reading the weights and
+    /// cannot be handed a set of weights that disagrees with the answer.
+    source: Option<[f64; TERMS]>,
 }
 
 impl Default for ResolvedTerms {
@@ -181,7 +191,7 @@ impl Default for ResolvedTerms {
             novelty: default_novelty(),
             priority: default_priority(),
             recover_crashed: LEGACY_RECOVER_CRASHED,
-            weights: [0.0; TERMS],
+            source: None,
         }
     }
 }
@@ -191,18 +201,31 @@ impl ResolvedTerms {
     /// scoring consults the run's state at all.
     #[inline]
     pub fn any_predicate(&self) -> bool {
-        self.weights.iter().any(|&w| w > 0.0)
+        self.source.is_some()
     }
 
     #[inline]
     pub fn weight(&self, t: Term) -> f64 {
-        self.weights[t.index()]
+        match &self.source {
+            Some(w) => w[t.index()],
+            None => 0.0,
+        }
     }
 
     /// The same terms with another recover multiplier.
     pub fn with_recover_crashed(self, recover_crashed: f64) -> Self {
         Self {
             recover_crashed,
+            ..self
+        }
+    }
+
+    /// The same novelty, priority and recover weighting with no predicate
+    /// carrying weight, i.e. the score a run would produce if the terms block
+    /// were left out.
+    pub fn without_predicates(self) -> Self {
+        Self {
+            source: None,
             ..self
         }
     }
@@ -291,6 +314,10 @@ mod tests {
         assert!(t.resolve(5.0).is_err());
         t.stale_late = 2.33;
         assert!(t.resolve(5.0).unwrap().any_predicate());
+        assert_eq!(t.resolve(5.0).unwrap().weight(Term::StaleLate), 2.33);
+        let unbound = t.resolve(5.0).unwrap().without_predicates();
+        assert!(!unbound.any_predicate());
+        assert_eq!(unbound.weight(Term::StaleLate), 0.0);
         let z = SteerTerms {
             novelty: 0.0,
             priority: 0.0,

@@ -118,15 +118,13 @@ fn score_with_terms<H: HashPolicy, F: Feedback>(
     let novelty = F::runnable_novelty(feedback, r, snapshot);
     let priority = r.priority();
     let quick_fire = is_quick_fire(r, &state.crash_info.currently_crashed);
-    let mask = if want_mask || terms.any_predicate() {
-        state.term_mask(r)
+    let (mask, bonus) = if terms.any_predicate() {
+        let mask = state.term_mask(r);
+        (mask, bonus_of(terms, mask))
+    } else if want_mask {
+        (state.term_mask(r), 0.0)
     } else {
-        0
-    };
-    let bonus = if terms.any_predicate() {
-        bonus_of(terms, mask)
-    } else {
-        0.0
+        (0, 0.0)
     };
     (blend(terms, novelty, priority, quick_fire, bonus), mask)
 }
@@ -448,10 +446,7 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
             let k = (*k).max(1);
             // The choice the score makes without predicate weights, kept
             // beside the real one so a flip can be counted.
-            let unweighted = ResolvedTerms {
-                weights: [0.0; TERMS],
-                ..*terms
-            };
+            let unweighted = terms.without_predicates();
             let mut best_idx = eligible[rng.random_range(0..eligible.len())];
             let (mut best_score, mut best_mask) =
                 score_with_terms::<H, F>(&queue[best_idx], feedback, snapshot, state, terms, count_terms);
@@ -1304,6 +1299,7 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulator::core::steer_terms::{LEGACY_RECOVER_CRASHED, SteerTerms};
     use crate::simulator::feedback::NoFeedback;
     use crate::simulator::hash_utils::NoHashing;
     use rand::rngs::StdRng;
@@ -1571,10 +1567,12 @@ mod tests {
             timer_queue_size: 0,
             step: 0,
         };
-        let terms = ResolvedTerms {
-            weights: [0.0, 2.33, 0.0, 0.0],
-            ..ResolvedTerms::default()
-        };
+        let terms = SteerTerms {
+            crash_after_delivery_sends: 2.33,
+            ..SteerTerms::default()
+        }
+        .resolve(LEGACY_RECOVER_CRASHED)
+        .expect("the weights are valid");
         let mut rng = StdRng::seed_from_u64(11);
         let trials = 20_000;
         let mut local = 0usize;

@@ -59,6 +59,8 @@ const REQUIRED: &[&str] = &[
     "preference_honored",
     "preference_consulted",
     "preference_source_absent",
+    "source_bound_sessions",
+    "source_unbound_sessions",
 ];
 
 fn scratch(name: &str) -> PathBuf {

@@ -294,6 +294,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
+    util_stats::record_preference_source(terms.any_predicate());
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();

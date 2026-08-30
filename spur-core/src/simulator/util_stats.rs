@@ -32,6 +32,8 @@ static SA_PREFERENCE_EXPRESSED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_HONORED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_CONSULTED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_SOURCE_ABSENT: AtomicU64 = AtomicU64::new(0);
+static SA_SOURCE_BOUND_SESSIONS: AtomicU64 = AtomicU64::new(0);
+static SA_SOURCE_UNBOUND_SESSIONS: AtomicU64 = AtomicU64::new(0);
 static SA_HONORED: AtomicU64 = AtomicU64::new(0);
 static SA_NO_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static SA_BLOCKED_BY_ORDER: AtomicU64 = AtomicU64::new(0);
@@ -262,6 +264,8 @@ pub fn set_enabled(on: bool) {
             &SA_PREFERENCE_HONORED,
             &SA_PREFERENCE_CONSULTED,
             &SA_PREFERENCE_SOURCE_ABSENT,
+            &SA_SOURCE_BOUND_SESSIONS,
+            &SA_SOURCE_UNBOUND_SESSIONS,
             &SA_HONORED,
             &SA_NO_ELIGIBLE,
             &SA_BLOCKED_BY_ORDER,
@@ -710,6 +714,24 @@ pub fn record_preference_consultation(source_present: bool) {
     if !source_present {
         SA_PREFERENCE_SOURCE_ABSENT.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// One run resolved the preference source it will score with. `bound` is
+/// false when no predicate carries weight, so no scheduling decision in the
+/// run can express a preference and every other counter in this block is
+/// zero by construction rather than for want of the sites running.
+///
+/// Recorded whether or not the audit is on: this is the one fact that says
+/// how to read the rest of the block, and a session that left the audit off
+/// still has to be able to report it.
+#[inline]
+pub fn record_preference_source(bound: bool) {
+    let counter = if bound {
+        &SA_SOURCE_BOUND_SESSIONS
+    } else {
+        &SA_SOURCE_UNBOUND_SESSIONS
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// One scheduling point had its preference resolved. `expressed` means the
@@ -1730,6 +1752,12 @@ pub struct SteerAuthorityStats {
     /// have a preference. Equal to `preference_consulted` means the sites all
     /// ran and every one of them had no source to read.
     pub preference_source_absent: u64,
+    /// Runs whose weights let some predicate change a score. The two session
+    /// counters sum to the runs the session executed, and a zero here says
+    /// every other steering counter in this block is zero because nothing
+    /// could be preferred, not because the sites were never reached.
+    pub source_bound_sessions: u64,
+    pub source_unbound_sessions: u64,
     pub honored: u64,
     pub no_eligible_candidates: u64,
     pub blocked_by_order: u64,
@@ -2364,6 +2392,8 @@ pub fn snapshot() -> UtilizationSnapshot {
             preference_honored: SA_PREFERENCE_HONORED.load(Ordering::Relaxed),
             preference_consulted: SA_PREFERENCE_CONSULTED.load(Ordering::Relaxed),
             preference_source_absent: SA_PREFERENCE_SOURCE_ABSENT.load(Ordering::Relaxed),
+            source_bound_sessions: SA_SOURCE_BOUND_SESSIONS.load(Ordering::Relaxed),
+            source_unbound_sessions: SA_SOURCE_UNBOUND_SESSIONS.load(Ordering::Relaxed),
             honored: SA_HONORED.load(Ordering::Relaxed),
             no_eligible_candidates: SA_NO_ELIGIBLE.load(Ordering::Relaxed),
             blocked_by_order: SA_BLOCKED_BY_ORDER.load(Ordering::Relaxed),
