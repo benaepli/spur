@@ -58,6 +58,7 @@ static CURRICULUM_SERVERS_SUM: AtomicU64 = AtomicU64::new(0);
 static CR_RUNS: AtomicU64 = AtomicU64::new(0);
 static CR_CRASHES: AtomicU64 = AtomicU64::new(0);
 static CR_RECOVERS: AtomicU64 = AtomicU64::new(0);
+static CR_RECOVERS_WITH_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static CR_HELD_AT_CRASH: AtomicU64 = AtomicU64::new(0);
 static CR_DROPPED_AT_CRASH: AtomicU64 = AtomicU64::new(0);
 static CR_CROSSING_DELIVERIES: AtomicU64 = AtomicU64::new(0);
@@ -283,6 +284,7 @@ pub fn set_enabled(on: bool) {
             &CR_RUNS,
             &CR_CRASHES,
             &CR_RECOVERS,
+            &CR_RECOVERS_WITH_INFLIGHT,
             &CR_HELD_AT_CRASH,
             &CR_DROPPED_AT_CRASH,
             &CR_CROSSING_DELIVERIES,
@@ -1165,11 +1167,18 @@ pub fn record_message_entry(node_index: usize, step: i32) {
 /// it at this point, so each one is a delivery that crosses the node's own
 /// crash/recover boundary. Messages that arrived while the node was down are
 /// requeued too but are not counted: they were sent to an already-dead node.
-pub fn record_recover(node_index: usize, step: i32) {
+///
+/// `own_sends_inflight` means the node still had messages of its own
+/// undelivered when it came back, so those messages are now stale-incarnation
+/// deliveries waiting to happen.
+pub fn record_recover(node_index: usize, step: i32, own_sends_inflight: bool) {
     if !enabled() {
         return;
     }
     CR_RECOVERS.fetch_add(1, Ordering::Relaxed);
+    if own_sends_inflight {
+        CR_RECOVERS_WITH_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+    }
     let first_crossing_of_run = RUN_CROSSING.with(|c| {
         let mut c = c.borrow_mut();
         c.fault_events += 1;
@@ -2012,6 +2021,14 @@ impl AcceptanceDistanceStats {
 /// state, split by which perturbation the message was carrying. A bias whose
 /// `acted_fraction` is near zero is being delivered but ignored, which is a
 /// different failure than one whose `deliveries` is near zero.
+///
+/// The five flat fault tallies are the base rates of the crash-and-recover
+/// predicates the delivery buckets are read against: how often a crash lands on
+/// a node that still has a message of its own undelivered, how often a node
+/// comes back with such a message still outstanding, and how many deliveries
+/// then arrive from an incarnation that no longer exists. They are carried here
+/// rather than beside the other fault counters so that a reader holding only
+/// this block can compute them.
 #[derive(Serialize)]
 pub struct DeliveryEffectStats {
     pub all: DeliveryEffect,
@@ -2020,6 +2037,11 @@ pub struct DeliveryEffectStats {
     pub sender_restarted: DeliveryEffect,
     pub receiver_restarted: DeliveryEffect,
     pub acceptance_distance: AcceptanceDistanceStats,
+    pub crashes_total: u64,
+    pub crashes_with_own_sends_inflight: u64,
+    pub recoveries_total: u64,
+    pub recoveries_with_own_prior_sends_inflight: u64,
+    pub stale_sender_deliveries_after_recovery: u64,
 }
 
 /// How often a crash could be, and actually was, scheduled at the moment its
@@ -2370,6 +2392,13 @@ pub fn snapshot() -> UtilizationSnapshot {
             sender_restarted: DeliveryEffect::read(DELIVERY_SENDER_RESTARTED),
             receiver_restarted: DeliveryEffect::read(DELIVERY_RECEIVER_RESTARTED),
             acceptance_distance: AcceptanceDistanceStats::read(),
+            crashes_total: CA_CRASHES_TAKEN.load(Ordering::Relaxed),
+            crashes_with_own_sends_inflight: CA_APPLIED.load(Ordering::Relaxed),
+            recoveries_total: CR_RECOVERS.load(Ordering::Relaxed),
+            recoveries_with_own_prior_sends_inflight: CR_RECOVERS_WITH_INFLIGHT
+                .load(Ordering::Relaxed),
+            stale_sender_deliveries_after_recovery: DELIVERIES[DELIVERY_SENDER_RESTARTED]
+                .load(Ordering::Relaxed),
         },
         timer_effects: TimerEffectStats::read(),
         timer_steer: TimerSteerStats::read(),
@@ -2473,6 +2502,36 @@ mod tests {
         assert!(
             s.acceptance_distance.all.iter().all(|b| b.deliveries == 0),
             "census stays empty while its own switch is off"
+        );
+    }
+
+    #[test]
+    fn fault_tallies_ride_along_with_the_delivery_effects() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        set_acted_fraction_enabled(true);
+
+        begin_run();
+        record_crash_anchor_apply(true);
+        record_crash(0, 0, 0);
+        record_recover(0, 4, true);
+        record_crash_anchor_apply(false);
+        record_crash(1, 0, 0);
+        record_recover(1, 9, false);
+        record_delivery(DeliveryBias::SENDER_RESTARTED, true, 1);
+        record_delivery(DeliveryBias::NONE, true, 1);
+
+        let s = snapshot().delivery_effects;
+        set_enabled(false);
+
+        assert_eq!(s.crashes_total, 2);
+        assert_eq!(s.crashes_with_own_sends_inflight, 1);
+        assert_eq!(s.recoveries_total, 2);
+        assert_eq!(s.recoveries_with_own_prior_sends_inflight, 1);
+        assert_eq!(s.stale_sender_deliveries_after_recovery, 1);
+        assert_eq!(
+            s.stale_sender_deliveries_after_recovery,
+            s.sender_restarted.deliveries
         );
     }
 
@@ -2707,12 +2766,12 @@ mod tests {
 
         begin_run();
         record_crash(0, 0, 0);
-        record_recover(0, 10);
+        record_recover(0, 10, true);
         // A message to a node with no open window leaves the tallies alone.
         record_message_entry(1, 12);
         record_message_entry(0, 14);
         record_crash(1, 0, 0);
-        record_recover(1, 20);
+        record_recover(1, 20, false);
 
         begin_run();
 
@@ -2739,9 +2798,9 @@ mod tests {
 
         begin_run();
         record_crash(0, 0, 0);
-        record_recover(0, 5);
+        record_recover(0, 5, false);
         record_crash(1, 0, 0);
-        record_recover(1, 9);
+        record_recover(1, 9, false);
         record_message_entry(0, 11);
         begin_run();
 
