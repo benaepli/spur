@@ -26,6 +26,7 @@ static ES_CANDIDATE_MASK: AtomicU64 = AtomicU64::new(0);
 static ES_RANKING_PASS: AtomicU64 = AtomicU64::new(0);
 static ES_QUEUE_AUDIT: AtomicU64 = AtomicU64::new(0);
 static SA_STEPS: AtomicU64 = AtomicU64::new(0);
+static SA_STEPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SA_AUDITED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_EXPRESSED: AtomicU64 = AtomicU64::new(0);
 static SA_PREFERENCE_HONORED: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +256,7 @@ pub fn set_enabled(on: bool) {
             &STEER_EVALUATIONS,
             &STEER_DIVERGENT_PICKS,
             &SA_STEPS,
+            &SA_STEPS_TOTAL,
             &SA_AUDITED,
             &SA_PREFERENCE_EXPRESSED,
             &SA_PREFERENCE_HONORED,
@@ -665,9 +667,23 @@ pub enum SteerOutcome {
     SamplerChoseOther,
 }
 
-/// One scheduling point was reached. Counted for every step-selection call
-/// whatever the scoring weights are, so `steps` is the denominator the audited
-/// steps are a subset of, and a session that ran steps can never report zero.
+/// One step of the run's budget was taken. Counted once per budget step
+/// whether or not that step went on to select anything, so it is the
+/// denominator `steps` is a subset of, and a session that ran steps can never
+/// report zero.
+#[inline]
+pub fn record_steer_step_total() {
+    if !steer_audit_enabled() {
+        return;
+    }
+    SA_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One budget step reached the point where the run's preference is read and
+/// the ranking can change what runs. Counted whatever the scoring weights are,
+/// so `steps` is the denominator the audited steps are a subset of. Short of
+/// `steps_total` by the steps that stop before that point, which is what
+/// separates an independent count from an alias of the budget.
 #[inline]
 pub fn record_steer_step() {
     if !steer_audit_enabled() {
@@ -1334,7 +1350,7 @@ pub fn record_run_termination(s: &RunTermination) {
         return;
     }
     debug_assert!(
-        !(steer_audit_enabled() && s.steps_used > 0 && SA_STEPS.load(Ordering::Relaxed) == 0),
+        !(steer_audit_enabled() && s.steps_used > 0 && SA_STEPS_TOTAL.load(Ordering::Relaxed) == 0),
         "a run took {} scheduling steps and none was counted; the steer-authority \
          counters are not reaching the scheduler",
         s.steps_used
@@ -1687,8 +1703,13 @@ pub struct EmptySliceStats {
 /// stood in the way, so all six sum to `audited`.
 #[derive(Serialize)]
 pub struct SteerAuthorityStats {
-    /// Every scheduling point the session reached, audited or not. Zero here
-    /// with steps used in the session means the counter is not wired up.
+    /// Every budget step the session took, whether or not it went on to
+    /// select anything. Zero here with steps used in the session means the
+    /// counters are not wired up.
+    pub steps_total: u64,
+    /// The subset of `steps_total` that reached the point where the run's
+    /// preference is read, audited or not. Equal to `steps_total` means no
+    /// step stops before that point, so the decision site is on every step.
     pub steps: u64,
     /// The subset of `steps` where the ranking was resolved against what the
     /// step ran. Short of `steps` by the points the audit skipped, which
@@ -2329,6 +2350,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             queue_audit_skipped: ES_QUEUE_AUDIT.load(Ordering::Relaxed),
         },
         steer_authority: SteerAuthorityStats {
+            steps_total: SA_STEPS_TOTAL.load(Ordering::Relaxed),
             steps: SA_STEPS.load(Ordering::Relaxed),
             audited: SA_AUDITED.load(Ordering::Relaxed),
             preference_expressed: SA_PREFERENCE_EXPRESSED.load(Ordering::Relaxed),
@@ -2651,6 +2673,9 @@ mod tests {
         set_enabled(true);
         set_steer_audit_enabled(true);
 
+        for _ in 0..12 {
+            record_steer_step_total();
+        }
         for _ in 0..9 {
             record_steer_step();
         }
@@ -2666,7 +2691,7 @@ mod tests {
         set_steer_audit_enabled(false);
         set_enabled(false);
 
-        assert_eq!(s.steps, 9);
+        assert_eq!((s.steps_total, s.steps), (12, 9));
         assert_eq!(s.audited, 7);
         assert_eq!(s.preference_expressed, 3);
         assert_eq!(s.preference_honored, 1);
@@ -2687,6 +2712,7 @@ mod tests {
         set_enabled(true);
         set_steer_audit_enabled(false);
 
+        record_steer_step_total();
         record_steer_step();
         record_steer_authority(true, SteerOutcome::Honored);
         record_preference_consultation(true);
@@ -2694,7 +2720,10 @@ mod tests {
         let s = snapshot().steer_authority;
         set_enabled(false);
 
-        assert_eq!((s.steps, s.audited, s.preference_consulted), (0, 0, 0));
+        assert_eq!(
+            (s.steps_total, s.steps, s.audited, s.preference_consulted),
+            (0, 0, 0, 0)
+        );
     }
 
     #[test]

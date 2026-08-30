@@ -7,7 +7,9 @@ use spur_core::compiler;
 use spur_core::simulator::config_override;
 use spur_core::simulator::explorer::run_explorer;
 use spur_core::simulator::history::LogBackend;
-use spur_core::simulator::util_stats::{self, EmptySliceStats, SteerAuthorityStats};
+use spur_core::simulator::util_stats::{
+    self, EmptySliceStats, PrefixExtensionStats, SteerAuthorityStats,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +30,7 @@ const CONFIG: &str = r#"{
   "rng_stream_isolation": true,
   "strict_config_keys": true,
   "stats": true,
+  "emit_prefix_extension": true,
   "feedback": {"mode": "timeline", "steer": true, "steer_audit": true{{ALWAYS}}}
 }"#;
 
@@ -41,8 +44,12 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// Runs one session with no predicate carrying weight and returns the
-/// authority counters, the skip counters, and the steps the runs consumed.
-fn session(name: &str, always: bool) -> (SteerAuthorityStats, EmptySliceStats, u64) {
+/// authority counters, the skip counters, the steps the runs consumed, and the
+/// per-step census that says how many of those steps had nothing queued.
+fn session(
+    name: &str,
+    always: bool,
+) -> (SteerAuthorityStats, EmptySliceStats, u64, PrefixExtensionStats) {
     let program = compiler::compile(SPEC, "relay.spur")
         .into_program()
         .expect("spec compiles");
@@ -71,6 +78,7 @@ fn session(name: &str, always: bool) -> (SteerAuthorityStats, EmptySliceStats, u
         snapshot.steer_authority,
         snapshot.steer_empty_slice,
         snapshot.termination.all.steps_used_sum,
+        snapshot.prefix_extension,
     )
 }
 
@@ -87,7 +95,7 @@ fn a_session_that_used_steps_reports_them() {
 fn check() {
     let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
 
-    let (skipped, skips, steps_used) = session("skipped", false);
+    let (skipped, skips, steps_used, skipped_census) = session("skipped", false);
     assert!(steps_used > 0, "the session consumed no scheduling steps");
     assert!(
         skipped.steps > 0,
@@ -95,6 +103,7 @@ fn check() {
         (skipped.steps, skipped.audited),
         skips
     );
+    check_step_provenance(&skipped, &skipped_census);
     assert_eq!(
         (skipped.audited, skipped.honored),
         (0, 0),
@@ -110,9 +119,10 @@ fn check() {
         "a session with no weighted predicate read a preference source anyway"
     );
 
-    let (always, always_skips, always_steps_used) = session("always", true);
+    let (always, always_skips, always_steps_used, always_census) = session("always", true);
     assert!(always_steps_used > 0);
     assert!(always.steps > 0);
+    check_step_provenance(&always, &always_census);
     assert!(
         always.audited > 0,
         "the audit was asked for and never ran: {}",
@@ -143,6 +153,33 @@ fn check() {
     check_consultation(&always);
 
     let _ = fs::remove_dir_all(std::env::temp_dir().join("spur_steer_authority_wiring"));
+}
+
+/// `steps` counts the budget steps that reached the point where the run's
+/// preference is read; `steps_total` counts every budget step. The two are
+/// separate counts, so the first can never exceed the second, and a session
+/// with steps that had nothing queued must show a strict gap - equality there
+/// would mean `steps` is following the budget rather than the decision site.
+fn check_step_provenance(s: &SteerAuthorityStats, census: &PrefixExtensionStats) {
+    assert!(
+        s.steps <= s.steps_total,
+        "more steps reached the decision site than were taken: {} of {}",
+        s.steps,
+        s.steps_total
+    );
+    let idle = census.all.steps_idle_sum;
+    assert!(
+        idle == 0 || s.steps < s.steps_total,
+        "{idle} steps had nothing to schedule and yet every one of the {} steps \
+         taken reached the decision site",
+        s.steps_total
+    );
+    assert!(
+        s.audited <= s.steps,
+        "more steps were audited than reached the decision site: {} of {}",
+        s.audited,
+        s.steps
+    );
 }
 
 /// A session that reached scheduling points must report that the decision

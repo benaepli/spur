@@ -393,6 +393,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         }
 
         path_state.state.crash_info.current_step = step;
+        util_stats::record_steer_step_total();
 
         // Release delayed messages whose time has come
         path_state.state.release_from_purgatory(step);

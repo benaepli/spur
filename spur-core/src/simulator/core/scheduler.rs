@@ -599,7 +599,6 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     reservations: &[Reservation],
     rng: &mut impl StreamRng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
-    util_stats::record_steer_step();
     if state.all_queues_empty() {
         return Ok(ScheduleResult::None);
     }
@@ -632,6 +631,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // every runnable in every queue, and with no predicate carrying weight the
     // ranking is novelty and priority alone, which is worth resolving only when
     // the session asks for it; otherwise it is skipped and the skip is counted.
+    util_stats::record_steer_step();
     util_stats::record_preference_consultation(terms.any_predicate());
     let audit_wanted = util_stats::steer_audit_enabled();
     let resolvable = terms.any_predicate() || util_stats::steer_audit_always();
