@@ -134,6 +134,20 @@ impl Range {
     }
 }
 
+/// Switches over how the scheduler treats crashes and the recoveries that
+/// follow them.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct FaultsConfig {
+    /// Evaluate a recovery-reweighting term at every within-queue selection
+    /// with its factor held at the identity: the predicate is read, the
+    /// candidates are re-ranked and the outcome is counted under
+    /// `recovery_weight_placebo`, but no candidate's score can move. What a
+    /// term at this site costs is then measurable apart from what its
+    /// reweighting does. Off by default.
+    #[serde(default)]
+    pub recovery_weight_placebo: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExplorerConfig {
     #[serde(rename = "num_servers")]
@@ -212,6 +226,9 @@ pub struct ExplorerConfig {
     /// which is the unbiased acceptance.
     #[serde(default)]
     pub partial_fanout_crash_bias: f64,
+
+    #[serde(default)]
+    pub faults: FaultsConfig,
 
     #[serde(default)]
     pub feedback: FeedbackConfig,
@@ -332,6 +349,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "steer_terms",
     "purgatory",
     "partial_fanout_crash_bias",
+    "faults",
     "feedback",
     "stats",
     "emit_acted_fraction",
@@ -1121,6 +1139,7 @@ pub fn run_explorer(
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
+    util_stats::set_recovery_weight_placebo(config.faults.recovery_weight_placebo);
     dispatch_feedback!(config.feedback, F => run_explorer_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1512,6 +1531,7 @@ pub fn run_explorer_genetic(
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
+    util_stats::set_recovery_weight_placebo(config.faults.recovery_weight_placebo);
     dispatch_feedback!(config.feedback, F => run_explorer_genetic_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -1948,6 +1968,7 @@ pub fn run_explorer_aos(
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
+    util_stats::set_recovery_weight_placebo(config.faults.recovery_weight_placebo);
     dispatch_feedback!(config.feedback, F => run_explorer_aos_impl::<F>(program, config, output_path, backend, cancelled))
 }
 
@@ -2594,6 +2615,7 @@ pub fn run_explorer_continuous(
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.envelope.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.envelope.emit_multiplier_authority);
+    util_stats::set_recovery_weight_placebo(config.envelope.faults.recovery_weight_placebo);
     dispatch_feedback!(config.envelope.feedback, F => run_explorer_continuous_impl::<F>(program, config, output_path, backend, cancelled))
 }
 

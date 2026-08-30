@@ -209,6 +209,101 @@ fn audit_multiplier_authority<H: HashPolicy, F: Feedback>(
     );
 }
 
+/// The factor the identity-weighted recovery term applies to a candidate its
+/// predicate holds of. Fixed at the identity, so multiplying by it cannot move
+/// a single bit of a candidate's score and the term cannot change any ranking.
+const RECOVERY_PLACEBO_FACTOR: f64 = 1.0;
+
+/// A cheap integer mix, used only to turn two small numbers into a parity that
+/// neither of them biases.
+#[inline]
+fn mix(a: u64, b: u64) -> u64 {
+    let mut x = a
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(b.wrapping_mul(0xbf58_476d_1ce4_e5b9));
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x
+}
+
+/// A predicate over a candidate the recovery weighting applies to that carries
+/// no information about the run: the parity of a mix of the node's index, how
+/// many times it has come back, and how much undelivered traffic the run is
+/// holding. All three are read only to make the parity vary from one selection
+/// to the next, so the predicate holds of roughly half the candidates and which
+/// half is unrelated to anything the protocol did.
+fn uninformative_recovery_predicate<H: HashPolicy>(r: &Runnable<H>, state: &State<H>) -> bool {
+    match r {
+        Runnable::Recover { node_id, .. } => {
+            let incarnation = state
+                .incarnations
+                .get(node_id.index)
+                .copied()
+                .unwrap_or_default();
+            let undelivered = state.network_queue.len() as u64;
+            mix(node_id.index as u64, mix(u64::from(incarnation), undelivered)) & 1 == 1
+        }
+        _ => false,
+    }
+}
+
+/// Walk the eligible candidates the way a recovery-reweighting term would,
+/// evaluating its predicate, re-ranking under its factor and reporting what it
+/// preferred, with the factor held at the identity so nothing it computes can
+/// reach the selection. This separates what such a term costs in code path and
+/// throughput from what its reweighting does. Consumes no RNG.
+fn walk_recovery_placebo<H: HashPolicy, F: Feedback>(
+    queue: &[Runnable<H>],
+    eligible: &[usize],
+    feedback: &F::Local,
+    snapshot: &F::Snapshot,
+    state: &State<H>,
+    terms: &ResolvedTerms,
+) {
+    if eligible.is_empty() {
+        return;
+    }
+    let currently_crashed = &state.crash_info.currently_crashed;
+    let weighted_terms = terms.with_recover_crashed(terms.recover_crashed * RECOVERY_PLACEBO_FACTOR);
+    let mut evaluated = 0u64;
+    let mut best = (f64::NEG_INFINITY, usize::MAX);
+    let mut best_carries = false;
+    let mut plain = (f64::NEG_INFINITY, usize::MAX);
+    for &i in eligible {
+        let novelty = F::runnable_novelty(feedback, &queue[i], snapshot);
+        let priority = queue[i].priority();
+        let quick_fire = is_quick_fire(&queue[i], currently_crashed);
+        let bonus = if terms.any_predicate() {
+            bonus_of(terms, state.term_mask(&queue[i]))
+        } else {
+            0.0
+        };
+        let carries = quick_fire && uninformative_recovery_predicate(&queue[i], state);
+        if carries {
+            evaluated += 1;
+        }
+        let with_term = if carries { &weighted_terms } else { terms };
+        let s = blend(with_term, novelty, priority, quick_fire, bonus);
+        if s > best.0 {
+            best = (s, i);
+            best_carries = carries;
+        }
+        let without_term = blend(terms, novelty, priority, quick_fire, bonus);
+        if without_term > plain.0 {
+            plain = (without_term, i);
+        }
+    }
+    let present = evaluated > 0;
+    util_stats::record_recovery_placebo(
+        evaluated,
+        present,
+        present && eligible.len() > 1,
+        best_carries,
+        best.1 != plain.1,
+    );
+}
+
 /// The priority-only share of `score_runnable` (novelty zeroed out, same
 /// quick-fire weighting). Only used by the opt-in utilization probe below.
 fn priority_component<H: HashPolicy>(
@@ -386,6 +481,9 @@ fn select_within_queue<H: HashPolicy, F: Feedback>(
     util_stats::record_preference_consultation(terms.any_predicate());
     if util_stats::multiplier_audit_enabled() {
         audit_multiplier_authority::<H, F>(queue, eligible, feedback, snapshot, state, terms);
+    }
+    if util_stats::recovery_weight_placebo_enabled() {
+        walk_recovery_placebo::<H, F>(queue, eligible, feedback, snapshot, state, terms);
     }
     // The term counters can only separate candidates a predicate is true of
     // from the rest when some predicate carries weight. With none carrying
@@ -1380,6 +1478,84 @@ mod tests {
 
     fn empty_state() -> State<NoHashing> {
         State::new(&[(crate::analysis::resolver::NameId(0), 1)], 1)
+    }
+
+    /// Four crashed nodes with distinct incarnations, each with a recover
+    /// waiting for it, plus a runnable the recovery weighting does not apply
+    /// to.
+    fn crashed_state_with_recovers() -> (State<NoHashing>, Vec<Runnable<NoHashing>>) {
+        let mut state = State::<NoHashing>::new(&[(crate::analysis::resolver::NameId(0), 4)], 1);
+        let mut queue = Vec::new();
+        for index in 0..4usize {
+            let node_id = NodeId {
+                role: crate::analysis::resolver::NameId(0),
+                index,
+            };
+            state.crash_info.currently_crashed.insert(node_id);
+            state.incarnations[index] = index as u32;
+            queue.push(Runnable::Recover {
+                node_id,
+                priority: 0.2 * (index as f64 + 1.0),
+            });
+        }
+        queue.push(heal(0.5));
+        (state, queue)
+    }
+
+    /// The identity-weighted recovery term reads its predicate and reports
+    /// what it preferred without being able to reach the selection: the same
+    /// seed draws the same candidates with the term on and off, and the term
+    /// never reports a flip.
+    #[test]
+    fn the_recovery_placebo_walk_cannot_change_a_selection() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        let (state, queue) = crashed_state_with_recovers();
+        let eligible: Vec<usize> = (0..queue.len()).collect();
+        let selector = WithinQueueSelector::Proportional { exponent: 1.0 };
+        let terms = terms_with(5.0);
+        let trials = 500usize;
+
+        let carriers = eligible
+            .iter()
+            .filter(|&&i| {
+                is_quick_fire(&queue[i], &state.crash_info.currently_crashed)
+                    && uninformative_recovery_predicate(&queue[i], &state)
+            })
+            .count() as u64;
+        assert!(carriers > 0, "the predicate holds of no candidate");
+
+        let draw = |placebo: bool| {
+            util_stats::set_enabled(true);
+            util_stats::set_recovery_weight_placebo(placebo);
+            let mut rng = StdRng::seed_from_u64(7);
+            (0..trials)
+                .map(|_| {
+                    select_within_queue::<NoHashing, NoFeedback>(
+                        &queue,
+                        &eligible,
+                        &(),
+                        &(),
+                        &state,
+                        &terms,
+                        &selector,
+                        &mut rng,
+                    )
+                    .0
+                })
+                .collect::<Vec<usize>>()
+        };
+        let with_term = draw(true);
+        let stats = util_stats::snapshot().recovery_weight_placebo;
+        let without_term = draw(false);
+        util_stats::set_recovery_weight_placebo(false);
+        util_stats::set_enabled(false);
+
+        assert_eq!(with_term, without_term);
+        assert_eq!(stats.decisions, trials as u64);
+        assert_eq!(stats.evaluated, carriers * trials as u64);
+        assert_eq!(stats.present, trials as u64);
+        assert_eq!(stats.contested, trials as u64);
+        assert_eq!(stats.flipped, 0);
     }
 
     /// The fixed blend the scheduler scored with before its terms had
