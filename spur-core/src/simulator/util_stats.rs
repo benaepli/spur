@@ -39,6 +39,12 @@ static SA_BLOCKED_BY_ORDER: AtomicU64 = AtomicU64::new(0);
 static SA_BLOCKED_BY_TIMER_GATE: AtomicU64 = AtomicU64::new(0);
 static SA_OTHER_QUEUE: AtomicU64 = AtomicU64::new(0);
 static SA_SAMPLER_CHOSE_OTHER: AtomicU64 = AtomicU64::new(0);
+static SR_NO_SCHEDULE_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+static SR_AUDIT_DISABLED: AtomicU64 = AtomicU64::new(0);
+static SR_NO_WEIGHTED_PREDICATE: AtomicU64 = AtomicU64::new(0);
+static SR_SINGLE_CANDIDATE: AtomicU64 = AtomicU64::new(0);
+static SR_RANKING_AGREED: AtomicU64 = AtomicU64::new(0);
+static SR_PREFERENCE_EXPRESSED: AtomicU64 = AtomicU64::new(0);
 static PURGATORY_DELAYED_SENDS: AtomicU64 = AtomicU64::new(0);
 static PURGATORY_HOLDS_DOWN_RECEIVER: AtomicU64 = AtomicU64::new(0);
 static PURGATORY_HOLDS_UP_RECEIVER: AtomicU64 = AtomicU64::new(0);
@@ -279,6 +285,12 @@ pub fn set_enabled(on: bool) {
             &SA_BLOCKED_BY_TIMER_GATE,
             &SA_OTHER_QUEUE,
             &SA_SAMPLER_CHOSE_OTHER,
+            &SR_NO_SCHEDULE_ATTEMPT,
+            &SR_AUDIT_DISABLED,
+            &SR_NO_WEIGHTED_PREDICATE,
+            &SR_SINGLE_CANDIDATE,
+            &SR_RANKING_AGREED,
+            &SR_PREFERENCE_EXPRESSED,
             &PURGATORY_DELAYED_SENDS,
             &PURGATORY_HOLDS_DOWN_RECEIVER,
             &PURGATORY_HOLDS_UP_RECEIVER,
@@ -750,6 +762,48 @@ pub fn record_steer_authority(expressed: bool, outcome: SteerOutcome) {
         SteerOutcome::BlockedByTimerGate => &SA_BLOCKED_BY_TIMER_GATE,
         SteerOutcome::OtherQueue => &SA_OTHER_QUEUE,
         SteerOutcome::SamplerChoseOther => &SA_SAMPLER_CHOSE_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How far one step got along the path that ends in the scoring function
+/// naming a runnable that priority alone would not have named. The variants
+/// are ordered by how far the step travelled, and exactly one is recorded per
+/// step, so a zero at the end can be read against where the steps stopped
+/// instead of standing on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteerReach {
+    /// Nothing was queued, so the step never reached the scheduling point.
+    NoScheduleAttempt,
+    /// The scheduling point was reached with the queue-ranking switch off.
+    AuditDisabled,
+    /// The switch was on and no predicate carried weight, so the ranking was
+    /// not resolved.
+    NoWeightedPredicate,
+    /// The ranking ran and was offered a single candidate, which leaves no
+    /// ordering for the score to disagree with.
+    SingleCandidate,
+    /// The ranking ran over competing candidates and put the same one on top
+    /// as priority alone.
+    RankingAgreedWithPriority,
+    /// The ranking ran over competing candidates and put a different one on
+    /// top than priority alone.
+    PreferenceExpressed,
+}
+
+/// Record where one step stopped on the way to expressing a preference.
+#[inline]
+pub fn record_steer_reach(reach: SteerReach) {
+    if !enabled() {
+        return;
+    }
+    let counter = match reach {
+        SteerReach::NoScheduleAttempt => &SR_NO_SCHEDULE_ATTEMPT,
+        SteerReach::AuditDisabled => &SR_AUDIT_DISABLED,
+        SteerReach::NoWeightedPredicate => &SR_NO_WEIGHTED_PREDICATE,
+        SteerReach::SingleCandidate => &SR_SINGLE_CANDIDATE,
+        SteerReach::RankingAgreedWithPriority => &SR_RANKING_AGREED,
+        SteerReach::PreferenceExpressed => &SR_PREFERENCE_EXPRESSED,
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -1786,6 +1840,29 @@ pub struct SteerAuthorityStats {
     pub sampler_chose_other: u64,
 }
 
+/// Where the steps of a session stopped on the way to the point where the
+/// scoring function can name a runnable priority alone would not have named.
+/// The six buckets partition the steps that got as far as asking whether
+/// anything was queued, so the last three summed are the steps that reached
+/// that point and `preference_expressed` alone is the steps that used it.
+#[derive(Serialize, Debug, Default, PartialEq, Eq)]
+pub struct SteerReachStats {
+    pub no_schedule_attempt: u64,
+    pub audit_disabled: u64,
+    pub no_weighted_predicate: u64,
+    pub single_candidate: u64,
+    pub ranking_agreed_with_priority: u64,
+    pub preference_expressed: u64,
+}
+
+impl SteerReachStats {
+    /// The steps that got far enough for the score and priority rankings to be
+    /// compared, whatever the comparison then found.
+    pub fn reached_decision(&self) -> u64 {
+        self.single_candidate + self.ranking_agreed_with_priority + self.preference_expressed
+    }
+}
+
 #[derive(Serialize)]
 pub struct PurgatoryStats {
     pub delayed_sends: u64,
@@ -2337,6 +2414,7 @@ pub struct UtilizationSnapshot {
     pub steer: SteerStats,
     pub steer_empty_slice: EmptySliceStats,
     pub steer_authority: SteerAuthorityStats,
+    pub steer_reach: SteerReachStats,
     pub multiplier_authority: MultiplierAuthorityStats,
     pub purgatory: PurgatoryStats,
     pub aos: AosStats,
@@ -2452,6 +2530,14 @@ pub fn snapshot() -> UtilizationSnapshot {
             blocked_by_timer_gate: SA_BLOCKED_BY_TIMER_GATE.load(Ordering::Relaxed),
             other_queue: SA_OTHER_QUEUE.load(Ordering::Relaxed),
             sampler_chose_other: SA_SAMPLER_CHOSE_OTHER.load(Ordering::Relaxed),
+        },
+        steer_reach: SteerReachStats {
+            no_schedule_attempt: SR_NO_SCHEDULE_ATTEMPT.load(Ordering::Relaxed),
+            audit_disabled: SR_AUDIT_DISABLED.load(Ordering::Relaxed),
+            no_weighted_predicate: SR_NO_WEIGHTED_PREDICATE.load(Ordering::Relaxed),
+            single_candidate: SR_SINGLE_CANDIDATE.load(Ordering::Relaxed),
+            ranking_agreed_with_priority: SR_RANKING_AGREED.load(Ordering::Relaxed),
+            preference_expressed: SR_PREFERENCE_EXPRESSED.load(Ordering::Relaxed),
         },
         multiplier_authority: MultiplierAuthorityStats::read(),
         purgatory: PurgatoryStats {

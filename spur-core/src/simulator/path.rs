@@ -557,6 +557,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 
         if path_state.state.all_queues_empty() {
             census.idle();
+            util_stats::record_steer_reach(util_stats::SteerReach::NoScheduleAttempt);
         } else {
             let result = schedule_runnable::<H, _, _, F>(
                 &mut path_state.state,

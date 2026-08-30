@@ -346,6 +346,13 @@ fn audit_steer_preference<H: HashPolicy, F: Feedback>(
 
     util_stats::record_audit_candidates(candidates as usize);
     let expressed = candidates > 1 && best_slot.map(|(s, _)| s) != best_priority_slot;
+    util_stats::record_steer_reach(if candidates <= 1 {
+        util_stats::SteerReach::SingleCandidate
+    } else if expressed {
+        util_stats::SteerReach::PreferenceExpressed
+    } else {
+        util_stats::SteerReach::RankingAgreedWithPriority
+    });
     let preferred = match best_slot {
         _ if !any_eligible => PreferredSlot::NoneEligible,
         Some((_, Some(reason))) => PreferredSlot::Blocked(reason),
@@ -600,6 +607,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     rng: &mut impl StreamRng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     if state.all_queues_empty() {
+        util_stats::record_steer_reach(util_stats::SteerReach::NoScheduleAttempt);
         return Ok(ScheduleResult::None);
     }
 
@@ -647,6 +655,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     let resolvable = terms.any_predicate() || util_stats::steer_audit_always();
     if audit_wanted && !resolvable {
         util_stats::record_empty_slice_skip(util_stats::EmptySliceStage::QueueAudit);
+    }
+    if !audit_wanted {
+        util_stats::record_steer_reach(util_stats::SteerReach::AuditDisabled);
+    } else if !resolvable {
+        util_stats::record_steer_reach(util_stats::SteerReach::NoWeightedPredicate);
     }
     let audit = (audit_wanted && resolvable).then(|| {
         audit_steer_preference::<H, F>(
