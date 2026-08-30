@@ -244,6 +244,7 @@ impl StepCensus {
 /// still queued at that moment. Observation only.
 fn record_termination<H: HashPolicy>(
     end: RunEnd,
+    run_id: i64,
     state: &State<H>,
     engine: &PlanEngine,
     steps_used: i32,
@@ -254,6 +255,7 @@ fn record_termination<H: HashPolicy>(
     if !util_stats::enabled() {
         return;
     }
+    util_stats::record_quiet_stretch(run_id, end);
     let pending = state.total_runnable_count() + state.purgatory.len();
     let steps_used = steps_used.max(0) as u64;
     util_stats::record_run_termination(&RunTermination {
@@ -383,6 +385,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             info!("Plan {} completed in {} steps", run_id, step);
             record_termination(
                 RunEnd::PlanComplete,
+                run_id,
                 &path_state.state,
                 &engine,
                 step,
@@ -416,6 +419,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             );
             record_termination(
                 RunEnd::Deadlock,
+                run_id,
                 &path_state.state,
                 &engine,
                 step,
@@ -764,6 +768,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     );
     record_termination(
         RunEnd::IterationsExhausted,
+        run_id,
         &path_state.state,
         &engine,
         max_iterations,

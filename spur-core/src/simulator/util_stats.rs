@@ -18,6 +18,7 @@ static CRASH_CENSUS_ENABLED: AtomicBool = AtomicBool::new(false);
 static STEER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static STEER_AUDIT_ALWAYS: AtomicBool = AtomicBool::new(false);
 static MULTIPLIER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
+static QUIET_STRETCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static RNG_ISOLATED_RUNS: AtomicU64 = AtomicU64::new(0);
 static RNG_SHARED_RUNS: AtomicU64 = AtomicU64::new(0);
@@ -168,6 +169,13 @@ static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new()
 
 static PREFIX_EXTENSION: Mutex<PrefixExtensionStats> = Mutex::new(PrefixExtensionStats::new());
 static PREFIX_EXTENSION_ENABLED: AtomicBool = AtomicBool::new(false);
+
+static QUIET_STRETCH: Mutex<QuietStretchState> = Mutex::new(QuietStretchState::new());
+
+/// Per-run quiet-stretch rows a session keeps before it stops adding them. A
+/// row is one finished run, so the cap bounds the size of the output rather
+/// than the number of runs a session may do.
+const QUIET_PER_RUN_CAP: usize = 500_000;
 
 /// Per-term counters, laid out as `TERM_*` rows by `Term::index`: how many
 /// within-queue candidates were scored with the term true (`evaluated`),
@@ -366,6 +374,9 @@ pub fn set_enabled(on: bool) {
         }
         if let Ok(mut p) = PREFIX_EXTENSION.lock() {
             *p = PrefixExtensionStats::new();
+        }
+        if let Ok(mut q) = QUIET_STRETCH.lock() {
+            *q = QuietStretchState::new();
         }
         if let Ok(mut g) = TIMELINE_KEYS.lock() {
             *g = TimelineKeyGrowth::new();
@@ -584,6 +595,19 @@ pub fn set_prefix_extension_enabled(on: bool) {
 #[inline]
 pub fn prefix_extension_enabled() -> bool {
     enabled() && PREFIX_EXTENSION_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the per-run record of how long a run went without a
+/// delivery changing anything. It rides the delivery-effect probe, so it also
+/// requires `set_acted_fraction_enabled(true)`.
+pub fn set_quiet_stretch_enabled(on: bool) {
+    QUIET_STRETCH_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a finished run should contribute a quiet-stretch row.
+#[inline]
+pub fn quiet_stretch_enabled() -> bool {
+    acted_fraction_enabled() && QUIET_STRETCH_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Enable or disable the steer-authority audit for this session. It also
@@ -896,6 +920,18 @@ pub fn record_delivery(bias: DeliveryBias, acted: bool, receiver_distance: u32) 
             DELIVERIES_ACTED[b].fetch_add(1, Ordering::Relaxed);
         }
     }
+    if QUIET_STRETCH_ENABLED.load(Ordering::Relaxed) {
+        RUN_CROSSING.with(|c| {
+            let mut c = c.borrow_mut();
+            c.deliveries = c.deliveries.saturating_add(1);
+            if acted {
+                c.quiet_current = 0;
+            } else {
+                c.quiet_current = c.quiet_current.saturating_add(1);
+                c.quiet_longest = c.quiet_longest.max(c.quiet_current);
+            }
+        });
+    }
     if !ACCEPT_DIST_ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -1088,6 +1124,13 @@ struct RunCrossingState {
     /// client work that outlived every fault.
     client_ops_since_last_recover: u64,
     any_recover: bool,
+    /// Deliveries measured for their effect in this run, and the current and
+    /// longest span of consecutive ones that changed nothing. A long span is
+    /// a stretch of the run in which messages kept arriving and no node's
+    /// state moved.
+    deliveries: u32,
+    quiet_current: u32,
+    quiet_longest: u32,
     finalized: bool,
 }
 
@@ -1102,6 +1145,9 @@ impl Default for RunCrossingState {
             crash_inside_recovery_window: false,
             client_ops_since_last_recover: 0,
             any_recover: false,
+            deliveries: 0,
+            quiet_current: 0,
+            quiet_longest: 0,
             // Nothing has been recorded yet, so there is no run to flush.
             finalized: true,
         }
@@ -1174,6 +1220,9 @@ pub fn begin_run() {
         c.crash_inside_recovery_window = false;
         c.client_ops_since_last_recover = 0;
         c.any_recover = false;
+        c.deliveries = 0;
+        c.quiet_current = 0;
+        c.quiet_longest = 0;
         c.finalized = false;
     });
 }
@@ -1632,6 +1681,98 @@ pub fn record_run_extension(x: &RunExtension) {
     if let Ok(mut p) = PREFIX_EXTENSION.lock() {
         p.all.add(x);
         p.by_recovered_nodes[bucket].add(x);
+    }
+}
+
+/// One finished run's quiet stretch. `longest_quiet_stretch` counts the
+/// consecutive deliveries whose handler left the receiving node's state
+/// unchanged, at the longest such span of the run; `deliveries` is how many
+/// deliveries the span was drawn from, so a short run is not read as a quiet
+/// one. `run_id` is the key a per-run measurement taken outside the simulator,
+/// such as a grader's prefix depth, is joined on.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct QuietStretchRun {
+    pub run_id: i64,
+    pub longest_quiet_stretch: u32,
+    pub deliveries: u32,
+}
+
+struct QuietStretchState {
+    /// Longest-stretch histograms indexed by how the run ended, in the order
+    /// `RunEnd` is declared.
+    by_end: [[u64; HIST_BUCKETS]; 3],
+    per_run: Vec<QuietStretchRun>,
+    dropped: u64,
+}
+
+impl QuietStretchState {
+    const fn new() -> Self {
+        Self {
+            by_end: [[0; HIST_BUCKETS]; 3],
+            per_run: Vec::new(),
+            dropped: 0,
+        }
+    }
+}
+
+/// How long runs go without a delivery having an effect, as log2 buckets of
+/// the longest such stretch (0, 1, 2, 3-4, 5-8, ...) split by how the run
+/// ended, and as one row per run. The simulator has no view of a run's prefix
+/// depth, so the rows carry the run id that depth is keyed by and the two
+/// axes are crossed by whoever holds both. `per_run_dropped` counts the runs
+/// that finished after the row cap was reached.
+#[derive(Serialize)]
+pub struct QuietStretchStats {
+    pub runs: u64,
+    pub plan_complete: Vec<u64>,
+    pub iterations_exhausted: Vec<u64>,
+    pub deadlock: Vec<u64>,
+    pub per_run: Vec<QuietStretchRun>,
+    pub per_run_dropped: u64,
+}
+
+impl QuietStretchStats {
+    fn read() -> Self {
+        let q = QUIET_STRETCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            runs: q.by_end.iter().flatten().sum(),
+            plan_complete: q.by_end[0].to_vec(),
+            iterations_exhausted: q.by_end[1].to_vec(),
+            deadlock: q.by_end[2].to_vec(),
+            per_run: q.per_run.clone(),
+            per_run_dropped: q.dropped,
+        }
+    }
+}
+
+/// One plan execution finished. Called once per run, off the scheduling hot
+/// path.
+pub fn record_quiet_stretch(run_id: i64, end: RunEnd) {
+    if !quiet_stretch_enabled() {
+        return;
+    }
+    let (longest, deliveries) = RUN_CROSSING.with(|c| {
+        let c = c.borrow();
+        (c.quiet_longest, c.deliveries)
+    });
+    let row = match end {
+        RunEnd::PlanComplete => 0,
+        RunEnd::IterationsExhausted => 1,
+        RunEnd::Deadlock => 2,
+    };
+    if let Ok(mut q) = QUIET_STRETCH.lock() {
+        q.by_end[row][hist_bucket(longest as usize)] += 1;
+        if q.per_run.len() < QUIET_PER_RUN_CAP {
+            q.per_run.push(QuietStretchRun {
+                run_id,
+                longest_quiet_stretch: longest,
+                deliveries,
+            });
+        } else {
+            q.dropped += 1;
+        }
     }
 }
 
@@ -2454,6 +2595,7 @@ pub struct UtilizationSnapshot {
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
     pub prefix_extension: PrefixExtensionStats,
+    pub quiet_stretch: QuietStretchStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
 }
@@ -2639,6 +2781,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             .lock()
             .map(|p| *p)
             .unwrap_or_else(|p| *p.into_inner()),
+        quiet_stretch: QuietStretchStats::read(),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),
     }
@@ -2970,6 +3113,47 @@ mod tests {
 
         assert_eq!(s.preference_consulted, 3);
         assert_eq!(s.preference_source_absent, 2);
+    }
+
+    #[test]
+    fn quiet_stretch_measures_the_longest_run_of_deliveries_without_an_effect() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        set_acted_fraction_enabled(true);
+        set_quiet_stretch_enabled(true);
+
+        begin_run();
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_delivery(DeliveryBias::NONE, true, 0);
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_quiet_stretch(7, RunEnd::IterationsExhausted);
+
+        begin_run();
+        record_delivery(DeliveryBias::NONE, true, 0);
+        record_quiet_stretch(8, RunEnd::PlanComplete);
+
+        let s = snapshot().quiet_stretch;
+        set_quiet_stretch_enabled(false);
+        // The switch alone gates the block: recording stays off with the
+        // delivery-effect probe on.
+        begin_run();
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_quiet_stretch(9, RunEnd::Deadlock);
+        let after_off = snapshot().quiet_stretch;
+        set_enabled(false);
+
+        assert_eq!(s.runs, 2);
+        assert_eq!(s.per_run.len(), 2);
+        assert_eq!(s.per_run[0].run_id, 7);
+        assert_eq!(s.per_run[0].longest_quiet_stretch, 3);
+        assert_eq!(s.per_run[0].deliveries, 5);
+        assert_eq!(s.per_run[1].longest_quiet_stretch, 0);
+        assert_eq!(s.iterations_exhausted[hist_bucket(3)], 1);
+        assert_eq!(s.plan_complete[hist_bucket(0)], 1);
+        assert_eq!(after_off.runs, 2);
+        assert_eq!(after_off.deadlock.iter().sum::<u64>(), 0);
     }
 
     #[test]
