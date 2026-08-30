@@ -134,6 +134,21 @@ impl Range {
     }
 }
 
+/// How faults are placed within a generated workload.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct FaultConfig {
+    /// When a generated workload calls for a crash, pick the node it lands on
+    /// by least-visited fault context instead of taking the node the workload
+    /// named. The paired restart follows the crash to the node it chose.
+    ///
+    /// The contexts are shared by every run of an arm and counted across the
+    /// session, so a run is steered towards damaging the system in a way the
+    /// arm has done least often. Off by default, which is the node the
+    /// workload named.
+    #[serde(default)]
+    pub coverage_guided_placement: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExplorerConfig {
     #[serde(rename = "num_servers")]
@@ -203,6 +218,9 @@ pub struct ExplorerConfig {
 
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
+
+    #[serde(default)]
+    pub faults: FaultConfig,
 
     #[serde(default)]
     pub feedback: FeedbackConfig,
@@ -296,6 +314,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "quick_fire_multiplier",
     "steer_terms",
     "purgatory",
+    "faults",
     "feedback",
     "stats",
     "emit_acted_fraction",
@@ -444,6 +463,9 @@ impl ExplorerConfig {
                                                     .clone(),
                                                 steer_terms: self.steer_terms_resolved(),
                                                 purgatory: self.purgatory.clone(),
+                                                coverage_guided_fault_placement: self
+                                                    .faults
+                                                    .coverage_guided_placement,
                                                 timeline_key_granularity: self
                                                     .feedback
                                                     .key_granularity(),
@@ -545,6 +567,7 @@ pub struct SingleRunConfig {
     pub within_queue_selector: WithinQueueSelector,
     pub steer_terms: ResolvedTerms,
     pub purgatory: PurgatoryConfig,
+    pub coverage_guided_fault_placement: bool,
     pub timeline_key_granularity: TimelineKeyGranularity,
     pub rng_stream_isolation: bool,
 }
@@ -608,6 +631,7 @@ impl SingleRunConfig {
             within_queue_selector: constraints.within_queue_selector.clone(),
             steer_terms: constraints.steer_terms_resolved(),
             purgatory: constraints.purgatory.clone(),
+            coverage_guided_fault_placement: constraints.faults.coverage_guided_placement,
             timeline_key_granularity: constraints.feedback.key_granularity(),
             rng_stream_isolation: constraints.rng_stream_isolation,
         }
@@ -1002,6 +1026,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &config.within_queue_selector,
         &config.steer_terms,
         &config.purgatory,
+        config.coverage_guided_fault_placement,
         &mut rec,
     )?;
 
@@ -1304,6 +1329,9 @@ fn run_single_plan<F: Feedback>(
         within_queue,
         terms,
         purgatory_config,
+        // A supplied plan names the node each crash lands on, so nothing here
+        // may move it.
+        false,
         &mut rng,
     )?;
 

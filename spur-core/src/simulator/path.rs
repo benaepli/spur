@@ -7,17 +7,18 @@ use crate::simulator::core::{
     RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, WithinQueueSelector,
     make_local_env, schedule_runnable,
 };
-use crate::simulator::coverage::GlobalState;
+use crate::simulator::coverage::{FaultCoverage, GlobalState};
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
-use crate::simulator::rng::StreamRng;
+use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunExtension, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
+use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub mod generator;
@@ -276,6 +277,95 @@ fn record_termination<H: HashPolicy>(
     });
 }
 
+/// How a node looks as a place to put a fault, as a small integer.
+///
+/// Built only from how many times the node has restarted, whether it has a send
+/// nobody has received yet, and how many of its peers are down, each clamped, so
+/// the tag names a situation any message-passing specification can be in and has
+/// tens of values rather than one per state.
+fn fault_context_tag<H: HashPolicy>(state: &State<H>, node: NodeId) -> u16 {
+    let restarts = state.incarnation(node).min(2) as u16;
+    let unreceived_send = state
+        .send_ledger
+        .get(node.index)
+        .is_some_and(|l| l.in_flight > 0) as u16;
+    let peers_down = state
+        .crash_info
+        .currently_crashed
+        .iter()
+        .filter(|n| n.index != node.index)
+        .count()
+        .min(2) as u16;
+    restarts * 6 + unreceived_send * 3 + peers_down
+}
+
+/// Which node a crash lands on, given the contexts faults have already been
+/// placed in.
+///
+/// The candidates are the server nodes that are up and have no crash
+/// outstanding; among those, the ones whose context the table has seen least
+/// often, so a fault goes where this arm has damaged the system least. `fallback`
+/// is used when nothing is eligible, which is what the workload asked for.
+///
+/// The tie is broken with the one draw a uniform choice among the candidates
+/// would have taken, so the fault stream advances by the same amount either way
+/// and the pick replays from it.
+fn place_crash<H: HashPolicy>(
+    state: &State<H>,
+    coverage: &FaultCoverage,
+    server_role: NameId,
+    num_servers: usize,
+    taken: &HashSet<usize>,
+    fallback: NodeId,
+    rng: &mut impl StreamRng,
+) -> NodeId {
+    let candidates: Vec<NodeId> = (0..num_servers)
+        .filter(|i| {
+            !taken.contains(i)
+                && !state
+                    .crash_info
+                    .currently_crashed
+                    .iter()
+                    .any(|n| n.index == *i)
+        })
+        .map(|index| NodeId {
+            role: server_role,
+            index,
+        })
+        .collect();
+
+    rng.use_stream(Stream::FaultPriority);
+    let draw: usize = rng.random_range(0..candidates.len().max(1));
+
+    if candidates.is_empty() {
+        util_stats::record_fault_placement(0, false, 0, 0);
+        return fallback;
+    }
+
+    let visits: Vec<u64> = candidates
+        .iter()
+        .map(|&c| coverage.visits(fault_context_tag(state, c)))
+        .collect();
+    let fewest = visits.iter().copied().min().unwrap_or(0);
+    let least_visited: Vec<NodeId> = candidates
+        .iter()
+        .zip(&visits)
+        .filter(|&(_, &v)| v == fewest)
+        .map(|(&c, _)| c)
+        .collect();
+
+    let chosen = least_visited[draw % least_visited.len()];
+    let uniform = candidates[draw % candidates.len()];
+    let (distinct_tags, max_visits) = coverage.visit(fault_context_tag(state, chosen));
+    util_stats::record_fault_placement(
+        candidates.len(),
+        chosen.index != uniform.index,
+        distinct_tags,
+        max_visits,
+    );
+    chosen
+}
+
 pub fn exec_plan<H: HashPolicy, F: Feedback>(
     path_state: &mut PathState<H, F>,
     program: Program,
@@ -291,6 +381,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     within_queue: &WithinQueueSelector,
     terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
+    coverage_guided_fault_placement: bool,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
@@ -340,6 +431,13 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     // Nodes observed crashing, and the subset that later recovered.
     let mut crashed_nodes: HashSet<usize> = HashSet::new();
     let mut recovered_nodes: HashSet<usize> = HashSet::new();
+
+    // Where a chosen fault placement was actually put, so the restart follows
+    // its crash. Keyed by the node the workload named, which the generator
+    // serializes one crash/restart pair at a time. `taken` holds the nodes with
+    // a crash outstanding, which no other placement may choose.
+    let mut placement: HashMap<i32, NodeId> = HashMap::new();
+    let mut taken: HashSet<usize> = HashSet::new();
 
     let mut census = StepCensus::default();
 
@@ -491,8 +589,24 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     )?;
                 }
                 EventAction::CrashNode(node_id) => {
-                    let nid =
+                    let named =
                         validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
+                    let nid = if coverage_guided_fault_placement {
+                        let chosen = place_crash(
+                            &path_state.state,
+                            &global_state.fault_coverage,
+                            server_role,
+                            topology.num_servers as usize,
+                            &taken,
+                            named,
+                            rng,
+                        );
+                        placement.insert(*node_id, chosen);
+                        taken.insert(chosen.index);
+                        chosen
+                    } else {
+                        named
+                    };
                     path_state.state.push_runnable(Runnable::Crash {
                         node_id: nid,
                         priority: policy.sample(rng, RunnableCategory::Crash),
@@ -500,8 +614,15 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     pending_crash_recover.insert(nid.index, node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
-                    let nid =
-                        validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
+                    let nid = match placement.remove(node_id) {
+                        Some(placed) => {
+                            taken.remove(&placed.index);
+                            placed
+                        }
+                        None => {
+                            validate_node(&path_state.state, *node_id as usize, server_role, "Node")?
+                        }
+                    };
                     path_state.state.push_runnable(Runnable::Recover {
                         node_id: nid,
                         priority: policy.sample(rng, RunnableCategory::Recover),
@@ -770,4 +891,89 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     Ok(RunOutcome::IterationsExhausted {
         outstanding_events: engine.outstanding_count(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulator::hash_utils::NoHashing;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    const SERVER: NameId = NameId(0);
+
+    fn server(index: usize) -> NodeId {
+        NodeId {
+            role: SERVER,
+            index,
+        }
+    }
+
+    fn state() -> State<NoHashing> {
+        State::new(&[(SERVER, 3)], 2)
+    }
+
+    #[test]
+    fn tag_clamps_restarts_and_peers_down() {
+        let mut st = state();
+        assert_eq!(fault_context_tag(&st, server(0)), 0);
+
+        st.crash_info.currently_crashed.insert(server(1));
+        st.crash_info.currently_crashed.insert(server(2));
+        assert_eq!(fault_context_tag(&st, server(0)), 2, "both peers down");
+        assert_eq!(fault_context_tag(&st, server(1)), 1, "does not count itself");
+
+        st.incarnations[0] = 9;
+        st.send_ledger[0].in_flight = 1;
+        assert_eq!(fault_context_tag(&st, server(0)), 2 * 6 + 3 + 2);
+    }
+
+    #[test]
+    fn placement_avoids_down_and_reserved_nodes() {
+        let mut st = state();
+        st.crash_info.currently_crashed.insert(server(0));
+        let coverage = FaultCoverage::default();
+        let taken: HashSet<usize> = [1].into_iter().collect();
+        let mut rng = SmallRng::seed_from_u64(4);
+        for _ in 0..16 {
+            let chosen = place_crash(&st, &coverage, SERVER, 3, &taken, server(0), &mut rng);
+            assert_eq!(chosen.index, 2, "only node 2 is up and unreserved");
+        }
+    }
+
+    #[test]
+    fn placement_falls_back_when_nothing_is_eligible() {
+        let mut st = state();
+        for i in 0..3 {
+            st.crash_info.currently_crashed.insert(server(i));
+        }
+        let coverage = FaultCoverage::default();
+        let mut rng = SmallRng::seed_from_u64(1);
+        let chosen = place_crash(
+            &st,
+            &coverage,
+            SERVER,
+            3,
+            &HashSet::new(),
+            server(1),
+            &mut rng,
+        );
+        assert_eq!(chosen.index, 1, "the workload's own node");
+    }
+
+    #[test]
+    fn placement_prefers_the_context_seen_least() {
+        let mut st = state();
+        // Node 0 waits on a send nobody has received, which is a context the
+        // other two are not in.
+        st.send_ledger[0].in_flight = 1;
+        for seed in 0..8u64 {
+            let coverage = FaultCoverage::default();
+            coverage.visit(fault_context_tag(&st, server(1)));
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let chosen =
+                place_crash(&st, &coverage, SERVER, 3, &HashSet::new(), server(1), &mut rng);
+            assert_eq!(chosen.index, 0, "the only unvisited context, seed {}", seed);
+        }
+    }
 }

@@ -238,12 +238,46 @@ impl GlobalCoverage {
     }
 }
 
+/// How often a fault has been placed in each fault context, shared by the runs
+/// that share a `GlobalState`.
+///
+/// The context is a small tag with tens of possible values rather than a
+/// per-state key, so the counts still separate contexts late in a session
+/// instead of every value having been seen.
+#[derive(Debug, Default)]
+pub struct FaultCoverage {
+    visits: DashMap<u16, u64>,
+    max_visits: AtomicU64,
+}
+
+impl FaultCoverage {
+    pub fn visits(&self, tag: u16) -> u64 {
+        self.visits.get(&tag).map(|v| *v).unwrap_or(0)
+    }
+
+    /// Count one fault placed in `tag`'s context. Returns how many distinct
+    /// contexts the table holds and the largest count in it afterwards.
+    pub fn visit(&self, tag: u16) -> (u64, u64) {
+        let count = {
+            let mut entry = self.visits.entry(tag).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        let max = self
+            .max_visits
+            .fetch_max(count, Ordering::Relaxed)
+            .max(count);
+        (self.visits.len() as u64, max)
+    }
+}
+
 /// Global feedback state shared across all simulation runs.
 ///
 /// Generic over the feedback strategy `F`: the per-session feedback store lives
 /// in `feedback`.
 pub struct GlobalState<F: Feedback> {
     pub feedback: F::Global,
+    pub fault_coverage: FaultCoverage,
 }
 
 impl<F: Feedback> Default for GlobalState<F> {
@@ -262,6 +296,7 @@ impl<F: Feedback> GlobalState<F> {
     pub fn new() -> Self {
         Self {
             feedback: F::Global::default(),
+            fault_coverage: FaultCoverage::default(),
         }
     }
 }

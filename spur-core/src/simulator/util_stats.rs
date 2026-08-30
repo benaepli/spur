@@ -63,6 +63,11 @@ static CA_STEPS_WITH_CRASH_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static CA_OFFERED: AtomicU64 = AtomicU64::new(0);
 static CA_CRASHES_TAKEN: AtomicU64 = AtomicU64::new(0);
 static CA_APPLIED: AtomicU64 = AtomicU64::new(0);
+static FC_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static FC_CANDIDATES_GE2: AtomicU64 = AtomicU64::new(0);
+static FC_DIVERGED: AtomicU64 = AtomicU64::new(0);
+static FC_DISTINCT_TAGS: AtomicU64 = AtomicU64::new(0);
+static FC_MAX_TAG_VISITS: AtomicU64 = AtomicU64::new(0);
 static RW_CLOSED: AtomicU64 = AtomicU64::new(0);
 static RW_WIDTH_SUM: AtomicU64 = AtomicU64::new(0);
 static RW_MAX: AtomicU64 = AtomicU64::new(0);
@@ -263,6 +268,11 @@ pub fn set_enabled(on: bool) {
             &CA_OFFERED,
             &CA_CRASHES_TAKEN,
             &CA_APPLIED,
+            &FC_DECISIONS,
+            &FC_CANDIDATES_GE2,
+            &FC_DIVERGED,
+            &FC_DISTINCT_TAGS,
+            &FC_MAX_TAG_VISITS,
             &RW_CLOSED,
             &RW_WIDTH_SUM,
             &RW_MAX,
@@ -821,6 +831,26 @@ pub fn record_rng_isolation(isolated: bool) {
     } else {
         RNG_SHARED_RUNS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// One crash was placed by the coverage-guided chooser. `candidates` is how
+/// many nodes could have taken it, `diverged` whether the context-guided pick
+/// differs from the uniform pick the same draw would have made, and the last
+/// two are the visit table's size and largest count after the placement.
+#[inline]
+pub fn record_fault_placement(candidates: usize, diverged: bool, distinct_tags: u64, max_visits: u64) {
+    if !enabled() {
+        return;
+    }
+    FC_DECISIONS.fetch_add(1, Ordering::Relaxed);
+    if candidates >= 2 {
+        FC_CANDIDATES_GE2.fetch_add(1, Ordering::Relaxed);
+    }
+    if diverged {
+        FC_DIVERGED.fetch_add(1, Ordering::Relaxed);
+    }
+    FC_DISTINCT_TAGS.fetch_max(distinct_tags, Ordering::Relaxed);
+    FC_MAX_TAG_VISITS.fetch_max(max_visits, Ordering::Relaxed);
 }
 
 /// A record/ChannelSend was moved into purgatory instead of being enqueued.
@@ -1613,6 +1643,22 @@ pub struct PurgatoryStats {
     pub delayed_sends: u64,
 }
 
+/// Fault placements the coverage-guided chooser decided, and how much room it
+/// had. `decisions` counts every placement the mechanism handled, so it is
+/// comparable with `crash_recovery.crashes`; `candidates_ge2` is the subset
+/// where more than one node could take the fault, which is the only subset the
+/// choice can move. `distinct_tags` and `max_tag_visits` are the high-water
+/// marks of the visit table: a `max_tag_visits` far above `decisions /
+/// distinct_tags` is the table concentrating rather than spreading.
+#[derive(Serialize)]
+pub struct FaultCoverageStats {
+    pub decisions: u64,
+    pub candidates_ge2: u64,
+    pub diverged_from_uniform: u64,
+    pub distinct_tags: u64,
+    pub max_tag_visits: u64,
+}
+
 #[derive(Serialize)]
 pub struct AosStats {
     pub tape_wins: u64,
@@ -2057,6 +2103,7 @@ pub struct UtilizationSnapshot {
     pub steer_authority: SteerAuthorityStats,
     pub multiplier_authority: MultiplierAuthorityStats,
     pub purgatory: PurgatoryStats,
+    pub fault_coverage: FaultCoverageStats,
     pub aos: AosStats,
     pub dedup: DedupStats,
     pub feedback: FeedbackStats,
@@ -2166,6 +2213,13 @@ pub fn snapshot() -> UtilizationSnapshot {
         multiplier_authority: MultiplierAuthorityStats::read(),
         purgatory: PurgatoryStats {
             delayed_sends: PURGATORY_DELAYED_SENDS.load(Ordering::Relaxed),
+        },
+        fault_coverage: FaultCoverageStats {
+            decisions: FC_DECISIONS.load(Ordering::Relaxed),
+            candidates_ge2: FC_CANDIDATES_GE2.load(Ordering::Relaxed),
+            diverged_from_uniform: FC_DIVERGED.load(Ordering::Relaxed),
+            distinct_tags: FC_DISTINCT_TAGS.load(Ordering::Relaxed),
+            max_tag_visits: FC_MAX_TAG_VISITS.load(Ordering::Relaxed),
         },
         aos: AosStats {
             tape_wins: AOS_TAPE_WINS.load(Ordering::Relaxed),
