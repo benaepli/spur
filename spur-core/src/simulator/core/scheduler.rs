@@ -942,7 +942,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         if r.origin_incarnation != state.incarnation(record_origin) {
                             bias.insert(DeliveryBias::SENDER_RESTARTED);
                         }
-                        (bias, state.node_state_token(record_dest))
+                        (
+                            bias,
+                            state.node_state_token(record_dest),
+                            state.entries_since_restart(record_dest.index),
+                        )
                     });
                     // The segment a timer firing woke, measured the same way
                     // as a delivery: the token counts state writes, so a
@@ -974,9 +978,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         purgatory_config,
                         rng,
                     )?;
-                    if let Some((bias, before)) = probe {
+                    if let Some((bias, before, distance)) = probe {
                         let acted = state.node_state_token(record_dest) != before;
-                        util_stats::record_delivery(bias, acted);
+                        util_stats::record_delivery(bias, acted, distance);
                         util_stats::record_term_acted(chosen_mask, acted);
                     }
                     if let Some((pc, key, inflight, before)) = timer_probe {
