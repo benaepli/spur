@@ -13,8 +13,9 @@
 
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
-    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, DeliveryEffect, DeliveryEffectStats,
-    SteerAuthorityStats, TerminationStats, TerminationTally, UtilizationSnapshot,
+    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, DeliveryEffect,
+    DeliveryEffectStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    UtilizationSnapshot,
 };
 use std::collections::BTreeMap;
 
@@ -268,7 +269,49 @@ fn delivery_effects(m: &mut Marks) -> DeliveryEffectStats {
         recoveries_total: m.int(),
         recoveries_with_own_prior_sends_inflight: m.int(),
         stale_sender_deliveries_after_recovery: m.int(),
+        crash_census: crash_census(m),
     }
+}
+
+fn crash_census(m: &mut Marks) -> CrashCensusStats {
+    CrashCensusStats {
+        decisions: m.int(),
+        victim_had_inflight_sends: m.int(),
+        any_candidate_had_inflight_sends: m.int(),
+        inflight_bucket_0: m.int(),
+        inflight_bucket_1: m.int(),
+        inflight_bucket_2: m.int(),
+        inflight_bucket_3plus: m.int(),
+    }
+}
+
+fn crash_census_leaves(prefix: &str, c: &CrashCensusStats) -> Vec<(String, Value)> {
+    let CrashCensusStats {
+        decisions,
+        victim_had_inflight_sends,
+        any_candidate_had_inflight_sends,
+        inflight_bucket_0,
+        inflight_bucket_1,
+        inflight_bucket_2,
+        inflight_bucket_3plus,
+    } = c;
+    vec![
+        leaf(prefix, "decisions", *decisions),
+        leaf(
+            prefix,
+            "victim_had_inflight_sends",
+            *victim_had_inflight_sends,
+        ),
+        leaf(
+            prefix,
+            "any_candidate_had_inflight_sends",
+            *any_candidate_had_inflight_sends,
+        ),
+        leaf(prefix, "inflight_bucket_0", *inflight_bucket_0),
+        leaf(prefix, "inflight_bucket_1", *inflight_bucket_1),
+        leaf(prefix, "inflight_bucket_2", *inflight_bucket_2),
+        leaf(prefix, "inflight_bucket_3plus", *inflight_bucket_3plus),
+    ]
 }
 
 fn delivery_effects_leaves(prefix: &str, d: &DeliveryEffectStats) -> Vec<(String, Value)> {
@@ -284,6 +327,7 @@ fn delivery_effects_leaves(prefix: &str, d: &DeliveryEffectStats) -> Vec<(String
         recoveries_total,
         recoveries_with_own_prior_sends_inflight,
         stale_sender_deliveries_after_recovery,
+        crash_census,
     } = d;
     let mut out = Vec::new();
     for (name, effect) in [
@@ -318,6 +362,10 @@ fn delivery_effects_leaves(prefix: &str, d: &DeliveryEffectStats) -> Vec<(String
             *stale_sender_deliveries_after_recovery,
         ),
     ]);
+    out.extend(crash_census_leaves(
+        &format!("{prefix}.crash_census"),
+        crash_census,
+    ));
     out
 }
 
