@@ -840,6 +840,7 @@ pub fn run_explorer_campaign(
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.envelope.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.envelope.emit_multiplier_authority);
+    util_stats::set_recovery_weight_placebo(config.envelope.faults.recovery_weight_placebo);
     run_campaign_impl(
         program,
         config,

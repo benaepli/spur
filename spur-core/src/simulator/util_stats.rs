@@ -98,6 +98,13 @@ static MA_QUICK_FIRE_OFFERS: AtomicU64 = AtomicU64::new(0);
 static MA_QUICK_FIRE_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static MA_FLIPPED_CONFIGURED: AtomicU64 = AtomicU64::new(0);
 static MA_CONFIGURED_SUM: AtomicU64 = AtomicU64::new(0);
+static RWP_ENABLED: AtomicBool = AtomicBool::new(false);
+static RWP_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static RWP_EVALUATED: AtomicU64 = AtomicU64::new(0);
+static RWP_PRESENT: AtomicU64 = AtomicU64::new(0);
+static RWP_CONTESTED: AtomicU64 = AtomicU64::new(0);
+static RWP_WON: AtomicU64 = AtomicU64::new(0);
+static RWP_FLIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Multiplier magnitudes the authority probe ranks candidates under. Index 0 is
 /// the identity weighting, which every other entry is compared against, so its
@@ -350,6 +357,12 @@ pub fn set_enabled(on: bool) {
             &MA_QUICK_FIRE_DECISIONS,
             &MA_FLIPPED_CONFIGURED,
             &MA_CONFIGURED_SUM,
+            &RWP_DECISIONS,
+            &RWP_EVALUATED,
+            &RWP_PRESENT,
+            &RWP_CONTESTED,
+            &RWP_WON,
+            &RWP_FLIPPED,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -650,6 +663,53 @@ pub fn set_multiplier_audit_enabled(on: bool) {
 #[inline]
 pub fn multiplier_audit_enabled() -> bool {
     enabled() && MULTIPLIER_AUDIT_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the identity-weighted recovery term for this session.
+/// Unlike the counters, the term's candidate walk is paid whether or not
+/// `set_enabled` is on, so the throughput it costs can be read on its own.
+pub fn set_recovery_weight_placebo(on: bool) {
+    RWP_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a within-queue selection should be walked by the identity-weighted
+/// recovery term.
+#[inline]
+pub fn recovery_weight_placebo_enabled() -> bool {
+    RWP_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The outcome of one selection walked by the identity-weighted recovery term.
+/// `evaluated` is how many eligible candidates the term's predicate was true
+/// of, `present` whether that was any of them, `contested` whether it was among
+/// more than one eligible candidate, `won` whether the top-ranked candidate was
+/// one of them, and `flipped` whether the top-ranked candidate differs from the
+/// one the same score without the term ranks first. The term's multiplier is
+/// the identity, so `flipped` is zero in a correct build and reads as the
+/// check that the term is inert.
+#[inline]
+pub fn record_recovery_placebo(
+    evaluated: u64,
+    present: bool,
+    contested: bool,
+    won: bool,
+    flipped: bool,
+) {
+    if !recovery_weight_placebo_enabled() {
+        return;
+    }
+    RWP_DECISIONS.fetch_add(1, Ordering::Relaxed);
+    RWP_EVALUATED.fetch_add(evaluated, Ordering::Relaxed);
+    for (flag, counter) in [
+        (present, &RWP_PRESENT),
+        (contested, &RWP_CONTESTED),
+        (won, &RWP_WON),
+        (flipped, &RWP_FLIPPED),
+    ] {
+        if flag {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// One within-queue selection was seen by the multiplier-authority probe.
@@ -2571,6 +2631,34 @@ impl MultiplierAuthorityStats {
     }
 }
 
+/// What a recovery-reweighting term whose multiplier is the identity would
+/// have preferred, counted the same way a weighted term is. `decisions` is
+/// every selection the term walked; the rest are the term's own counters.
+/// `flipped` cannot exceed zero while the multiplier is the identity, so a
+/// nonzero value means the walk is not the inert copy it claims to be.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryPlaceboStats {
+    pub decisions: u64,
+    pub evaluated: u64,
+    pub present: u64,
+    pub contested: u64,
+    pub won: u64,
+    pub flipped: u64,
+}
+
+impl RecoveryPlaceboStats {
+    fn read() -> Self {
+        Self {
+            decisions: RWP_DECISIONS.load(Ordering::Relaxed),
+            evaluated: RWP_EVALUATED.load(Ordering::Relaxed),
+            present: RWP_PRESENT.load(Ordering::Relaxed),
+            contested: RWP_CONTESTED.load(Ordering::Relaxed),
+            won: RWP_WON.load(Ordering::Relaxed),
+            flipped: RWP_FLIPPED.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
@@ -2580,6 +2668,7 @@ pub struct UtilizationSnapshot {
     pub steer_authority: SteerAuthorityStats,
     pub steer_reach: SteerReachStats,
     pub multiplier_authority: MultiplierAuthorityStats,
+    pub recovery_weight_placebo: RecoveryPlaceboStats,
     pub purgatory: PurgatoryStats,
     pub aos: AosStats,
     pub dedup: DedupStats,
@@ -2705,6 +2794,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             preference_expressed: SR_PREFERENCE_EXPRESSED.load(Ordering::Relaxed),
         },
         multiplier_authority: MultiplierAuthorityStats::read(),
+        recovery_weight_placebo: RecoveryPlaceboStats::read(),
         purgatory: PurgatoryStats {
             delayed_sends: PURGATORY_DELAYED_SENDS.load(Ordering::Relaxed),
             holds_down_receiver: PURGATORY_HOLDS_DOWN_RECEIVER.load(Ordering::Relaxed),
