@@ -91,6 +91,7 @@ static OH3_WITH_OVERLAP: AtomicU64 = AtomicU64::new(0);
 static PFO_PAIRS_SEEN: AtomicU64 = AtomicU64::new(0);
 static PFO_EDGES_ADDED: AtomicU64 = AtomicU64::new(0);
 static PFO_OPS_AFTER_LAST_RECOVER: AtomicU64 = AtomicU64::new(0);
+static PFO_PAIRS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static NOVELTY_ABLATED_RUNS: AtomicU64 = AtomicU64::new(0);
 static MA_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static MA_CONTESTED_DECISIONS: AtomicU64 = AtomicU64::new(0);
@@ -343,6 +344,7 @@ pub fn set_enabled(on: bool) {
             &PFO_PAIRS_SEEN,
             &PFO_EDGES_ADDED,
             &PFO_OPS_AFTER_LAST_RECOVER,
+            &PFO_PAIRS_SKIPPED,
             &NOVELTY_ABLATED_RUNS,
             &MA_DECISIONS,
             &MA_CONTESTED_DECISIONS,
@@ -1227,15 +1229,18 @@ pub fn begin_run() {
     });
 }
 
-/// The plan generator examined one crash-and-recover pair for post-fault client
-/// work and added `edges_added` mandatory recover-before-request edges for it.
+/// The plan generator examined `pairs_seen` crash-and-recover pairs for
+/// post-fault client work, added `edges_added` mandatory recover-before-request
+/// edges, and left `pairs_skipped` pairs unreserved because the per-pair
+/// probability draw declined them.
 #[inline]
-pub fn record_post_fault_ops(pairs_seen: u64, edges_added: u64) {
+pub fn record_post_fault_ops(pairs_seen: u64, edges_added: u64, pairs_skipped: u64) {
     if !enabled() {
         return;
     }
     PFO_PAIRS_SEEN.fetch_add(pairs_seen, Ordering::Relaxed);
     PFO_EDGES_ADDED.fetch_add(edges_added, Ordering::Relaxed);
+    PFO_PAIRS_SKIPPED.fetch_add(pairs_skipped, Ordering::Relaxed);
 }
 
 /// A planned client operation was handed to a client node. Only invocations
@@ -2510,11 +2515,15 @@ impl OrderedH3Stats {
 /// `pairs_seen` times the configured count means the graph had no client
 /// request left that could be ordered after a recover without closing a cycle;
 /// `ops_invoked_after_last_recover` at zero means no run ever got there.
+/// `pairs_skipped` counts pairs the per-pair probability declined, so it is
+/// zero whenever that probability is 1 and rises toward `pairs_seen` as it
+/// falls.
 #[derive(Serialize)]
 pub struct PostFaultOpsStats {
     pub pairs_seen: u64,
     pub edges_added: u64,
     pub ops_invoked_after_last_recover: u64,
+    pub pairs_skipped: u64,
 }
 
 /// Whether raising the weight of the priority term can outvote the random draw
@@ -2746,6 +2755,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             pairs_seen: PFO_PAIRS_SEEN.load(Ordering::Relaxed),
             edges_added: PFO_EDGES_ADDED.load(Ordering::Relaxed),
             ops_invoked_after_last_recover: PFO_OPS_AFTER_LAST_RECOVER.load(Ordering::Relaxed),
+            pairs_skipped: PFO_PAIRS_SKIPPED.load(Ordering::Relaxed),
         },
         delivery_effects: DeliveryEffectStats {
             all: DeliveryEffect::read(DELIVERY_ALL),

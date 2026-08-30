@@ -168,6 +168,13 @@ pub struct ExplorerConfig {
     #[serde(default)]
     pub post_fault_client_ops: i32,
 
+    /// Probability that a given node restart reserves client work at all. 1.0
+    /// reserves for every restart; smaller values place the effective dose
+    /// between two whole reservation counts, which `post_fault_client_ops`
+    /// alone cannot express.
+    #[serde(default = "default_post_fault_client_ops_prob")]
+    pub post_fault_client_ops_prob: f64,
+
     #[serde(default = "default_use_coverage_scheduling")]
     pub use_coverage_scheduling: bool,
     pub num_runs_per_config: i32,
@@ -319,6 +326,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "max_concurrent_writes",
     "dependency_density",
     "post_fault_client_ops",
+    "post_fault_client_ops_prob",
     "use_coverage_scheduling",
     "num_runs_per_config",
     "max_iterations",
@@ -426,6 +434,12 @@ impl ExplorerConfig {
                 ));
             }
         }
+        if !(0.0..=1.0).contains(&self.post_fault_client_ops_prob) {
+            return Err(format!(
+                "post_fault_client_ops_prob must be between 0 and 1 (got {})",
+                self.post_fault_client_ops_prob
+            ));
+        }
         if !self.wall_budget_sec.is_finite() || self.wall_budget_sec < 0.0 {
             return Err(format!(
                 "wall_budget_sec must be a finite number >= 0 (got {})",
@@ -473,6 +487,8 @@ impl ExplorerConfig {
                                                 max_concurrent_writes,
                                                 dependency_density,
                                                 post_fault_client_ops: self.post_fault_client_ops,
+                                                post_fault_client_ops_prob: self
+                                                    .post_fault_client_ops_prob,
                                                 use_coverage_scheduling: self
                                                     .use_coverage_scheduling,
                                                 max_iterations: self.max_iterations,
@@ -563,6 +579,10 @@ fn default_quick_fire_multiplier() -> f64 {
     5.0
 }
 
+fn default_post_fault_client_ops_prob() -> f64 {
+    1.0
+}
+
 fn default_emit_acted_fraction() -> bool {
     true
 }
@@ -579,6 +599,7 @@ pub struct SingleRunConfig {
     pub max_concurrent_writes: Option<i32>,
     pub dependency_density: f64,
     pub post_fault_client_ops: i32,
+    pub post_fault_client_ops_prob: f64,
     pub use_coverage_scheduling: bool,
     pub max_iterations: i32,
     pub schedule_policy: SchedulePolicy,
@@ -643,6 +664,7 @@ impl SingleRunConfig {
                 .choose(rng)
                 .unwrap_or(&0.5),
             post_fault_client_ops: constraints.post_fault_client_ops,
+            post_fault_client_ops_prob: constraints.post_fault_client_ops_prob,
             use_coverage_scheduling: constraints.use_coverage_scheduling,
             max_iterations: constraints.max_iterations,
             schedule_policy: constraints.schedule_policy.clone(),
@@ -961,6 +983,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         dependency_density: config.dependency_density,
         max_concurrent_writes: config.max_concurrent_writes,
         post_fault_client_ops: config.post_fault_client_ops,
+        post_fault_client_ops_prob: config.post_fault_client_ops_prob,
     };
     // Workload RNG: seeded separately from the scheduling RNG so the plan is
     // reproducible from its own seed and uncorrelated with schedule draws.

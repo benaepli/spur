@@ -48,6 +48,11 @@ pub struct GeneratorConfig {
     /// survives the fault instead of all of it becoming eligible up front.
     /// 0 reserves nothing.
     pub post_fault_client_ops: i32,
+    /// Probability that a given crash/recover pair reserves client work at all.
+    /// 1.0 reserves for every pair; a smaller value interpolates between a
+    /// reservation count of 0 and `post_fault_client_ops`, which the integer
+    /// knob alone cannot express. Values outside [0, 1] are clamped.
+    pub post_fault_client_ops_prob: f64,
 }
 
 /// Generates a bag of action stubs based on the config.
@@ -221,8 +226,14 @@ pub fn generate_plan(config: GeneratorConfig, rng: &mut impl Rng) -> ExecutionPl
             .map(|(idx, _)| *idx)
             .collect();
         let wanted = config.post_fault_client_ops as usize;
+        let probability = config.post_fault_client_ops_prob.clamp(0.0, 1.0);
         let mut edges_added = 0u64;
+        let mut pairs_skipped = 0u64;
         for recover in &recover_indices {
+            if probability < 1.0 && !rng.random_bool(probability) {
+                pairs_skipped += 1;
+                continue;
+            }
             let mut candidates = client_indices.clone();
             candidates.shuffle(rng);
             let mut added = 0;
@@ -244,6 +255,7 @@ pub fn generate_plan(config: GeneratorConfig, rng: &mut impl Rng) -> ExecutionPl
         crate::simulator::util_stats::record_post_fault_ops(
             recover_indices.len() as u64,
             edges_added,
+            pairs_skipped,
         );
     }
 
@@ -279,6 +291,13 @@ mod tests {
     use rand::rngs::SmallRng;
 
     fn config(post_fault_client_ops: i32) -> GeneratorConfig {
+        config_with_probability(post_fault_client_ops, 1.0)
+    }
+
+    fn config_with_probability(
+        post_fault_client_ops: i32,
+        post_fault_client_ops_prob: f64,
+    ) -> GeneratorConfig {
         GeneratorConfig {
             num_servers: 3,
             num_write_ops: 3,
@@ -290,6 +309,7 @@ mod tests {
             dependency_density: 0.0,
             max_concurrent_writes: Some(2),
             post_fault_client_ops,
+            post_fault_client_ops_prob,
         }
     }
 
@@ -320,6 +340,36 @@ mod tests {
             assert_eq!(recovers, 2);
             assert_eq!(with_client, 0, "seed {}", seed);
         }
+    }
+
+    #[test]
+    fn probability_zero_matches_reserving_nothing() {
+        for seed in 0..32u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let plan = generate_plan(config_with_probability(1, 0.0), &mut rng);
+            let (recovers, with_client) = recovers_with_a_client_successor(&plan);
+            assert_eq!(recovers, 2);
+            assert_eq!(with_client, 0, "seed {}", seed);
+        }
+    }
+
+    #[test]
+    fn a_fractional_probability_reserves_for_some_restarts_and_not_others() {
+        let mut reserved = 0;
+        let mut total = 0;
+        for seed in 0..64u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let plan = generate_plan(config_with_probability(1, 0.5), &mut rng);
+            let (recovers, with_client) = recovers_with_a_client_successor(&plan);
+            reserved += with_client;
+            total += recovers;
+            assert!(
+                !petgraph::algo::is_cyclic_directed(&plan),
+                "seed {} produced a cyclic plan",
+                seed
+            );
+        }
+        assert!(reserved > 0 && reserved < total, "{}/{}", reserved, total);
     }
 
     #[test]

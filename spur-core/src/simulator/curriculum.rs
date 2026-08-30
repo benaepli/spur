@@ -214,6 +214,7 @@ pub fn lower(knobs: &Knobs, constraints: &ExplorerConfig, _rng: &mut impl Rng) -
         max_concurrent_writes,
         dependency_density,
         post_fault_client_ops: constraints.post_fault_client_ops,
+        post_fault_client_ops_prob: constraints.post_fault_client_ops_prob,
         use_coverage_scheduling: constraints.use_coverage_scheduling,
         max_iterations: constraints.max_iterations,
         schedule_policy,
