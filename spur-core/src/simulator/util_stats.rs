@@ -120,6 +120,9 @@ static DELIVERIES_ACTED: [AtomicU64; DELIVERY_BUCKETS] =
 
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
 
+static PREFIX_EXTENSION: Mutex<PrefixExtensionStats> = Mutex::new(PrefixExtensionStats::new());
+static PREFIX_EXTENSION_ENABLED: AtomicBool = AtomicBool::new(false);
+
 /// Per-term counters, laid out as `TERM_*` rows by `Term::index`: how many
 /// within-queue candidates were scored with the term true (`evaluated`),
 /// how many selections had such a candidate at all (`present`) and among
@@ -295,6 +298,9 @@ pub fn set_enabled(on: bool) {
         }
         if let Ok(mut t) = TERMINATION.lock() {
             *t = TerminationStats::new();
+        }
+        if let Ok(mut p) = PREFIX_EXTENSION.lock() {
+            *p = PrefixExtensionStats::new();
         }
         if let Ok(mut g) = TIMELINE_KEYS.lock() {
             *g = TimelineKeyGrowth::new();
@@ -488,6 +494,18 @@ pub fn set_acted_fraction_enabled(on: bool) {
 #[inline]
 pub fn acted_fraction_enabled() -> bool {
     enabled() && ACTED_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the per-run record of how runs stop extending their
+/// schedule. It also requires `set_enabled(true)`.
+pub fn set_prefix_extension_enabled(on: bool) {
+    PREFIX_EXTENSION_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a finished run should be classified by how it stopped extending.
+#[inline]
+pub fn prefix_extension_enabled() -> bool {
+    enabled() && PREFIX_EXTENSION_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Enable or disable the steer-authority audit for this session. It also
@@ -1220,6 +1238,157 @@ pub fn record_run_termination(s: &RunTermination) {
     }
 }
 
+/// A budget-ended run whose last steps released nothing was not short of
+/// budget, it was short of releasable work. The threshold is long enough that
+/// waiting out one delayed message does not read as stopped.
+const STALLED_TAIL_STEPS: u64 = 100;
+
+/// How one run stopped extending its schedule. A run extends for as long as the
+/// scheduler keeps releasing queued work; it stops when the plan has no event
+/// left to complete, when the step budget ends it, or when nothing that is
+/// queued can be released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixStop {
+    /// The plan finished and nothing was left queued.
+    PlanCompleteQuiescent,
+    /// The plan finished while protocol work was still queued, so the plan,
+    /// not the protocol, is what ended the run.
+    PlanCompletePending,
+    /// The budget ended a run that was still releasing work.
+    BudgetReleasing,
+    /// The budget ended a run whose queued work had stopped being releasable.
+    BudgetBlocked,
+    /// The budget ended a run with nothing queued to release.
+    BudgetIdle,
+    Deadlock,
+}
+
+/// One run's extension facts. `steps_blocked` counts the steps where queued
+/// work existed and the scheduler released none of it, which is an extension
+/// offered at the frontier and refused; `steps_idle` counts the steps that had
+/// nothing queued to offer.
+pub struct RunExtension {
+    pub end: RunEnd,
+    pub steps: u64,
+    pub steps_released: u64,
+    pub steps_blocked: u64,
+    pub steps_idle: u64,
+    /// Steps at the end of the run, up to termination, that released nothing.
+    pub tail_without_release: u64,
+    /// Runnables still queued (including delayed sends) when the run stopped.
+    pub pending_at_exit: u64,
+    pub recovered_nodes: usize,
+}
+
+impl RunExtension {
+    fn stop(&self) -> PrefixStop {
+        match self.end {
+            RunEnd::Deadlock => PrefixStop::Deadlock,
+            RunEnd::PlanComplete if self.pending_at_exit == 0 => PrefixStop::PlanCompleteQuiescent,
+            RunEnd::PlanComplete => PrefixStop::PlanCompletePending,
+            RunEnd::IterationsExhausted => {
+                if self.pending_at_exit == 0 {
+                    PrefixStop::BudgetIdle
+                } else if self.tail_without_release >= STALLED_TAIL_STEPS {
+                    PrefixStop::BudgetBlocked
+                } else {
+                    PrefixStop::BudgetReleasing
+                }
+            }
+        }
+    }
+}
+
+/// Stop counts and running sums over one bucket of runs. The sums are summed
+/// rather than averaged so buckets can be merged; divide by `runs` to read a
+/// mean.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct PrefixExtensionTally {
+    pub runs: u64,
+    pub plan_complete_quiescent: u64,
+    pub plan_complete_pending: u64,
+    pub budget_releasing: u64,
+    pub budget_blocked: u64,
+    pub budget_idle: u64,
+    pub deadlock: u64,
+    pub steps_sum: u64,
+    pub steps_released_sum: u64,
+    pub steps_blocked_sum: u64,
+    pub steps_idle_sum: u64,
+    pub tail_without_release_sum: u64,
+    pub pending_at_exit_sum: u64,
+}
+
+impl PrefixExtensionTally {
+    const fn new() -> Self {
+        Self {
+            runs: 0,
+            plan_complete_quiescent: 0,
+            plan_complete_pending: 0,
+            budget_releasing: 0,
+            budget_blocked: 0,
+            budget_idle: 0,
+            deadlock: 0,
+            steps_sum: 0,
+            steps_released_sum: 0,
+            steps_blocked_sum: 0,
+            steps_idle_sum: 0,
+            tail_without_release_sum: 0,
+            pending_at_exit_sum: 0,
+        }
+    }
+
+    fn add(&mut self, x: &RunExtension) {
+        self.runs += 1;
+        match x.stop() {
+            PrefixStop::PlanCompleteQuiescent => self.plan_complete_quiescent += 1,
+            PrefixStop::PlanCompletePending => self.plan_complete_pending += 1,
+            PrefixStop::BudgetReleasing => self.budget_releasing += 1,
+            PrefixStop::BudgetBlocked => self.budget_blocked += 1,
+            PrefixStop::BudgetIdle => self.budget_idle += 1,
+            PrefixStop::Deadlock => self.deadlock += 1,
+        }
+        self.steps_sum += x.steps;
+        self.steps_released_sum += x.steps_released;
+        self.steps_blocked_sum += x.steps_blocked;
+        self.steps_idle_sum += x.steps_idle;
+        self.tail_without_release_sum += x.tail_without_release;
+        self.pending_at_exit_sum += x.pending_at_exit;
+    }
+}
+
+/// Extension tallies over all runs and split by how many distinct nodes
+/// completed a crash-and-recover cycle (index 0, 1, and 2-or-more), so the
+/// runs that carry the deepest fault interleavings can be read apart from the
+/// shallow ones that dominate the total.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PrefixExtensionStats {
+    pub all: PrefixExtensionTally,
+    pub by_recovered_nodes: [PrefixExtensionTally; 3],
+}
+
+impl PrefixExtensionStats {
+    const fn new() -> Self {
+        Self {
+            all: PrefixExtensionTally::new(),
+            by_recovered_nodes: [PrefixExtensionTally::new(); 3],
+        }
+    }
+}
+
+/// One plan execution finished. Called once per run, off the scheduling hot
+/// path.
+pub fn record_run_extension(x: &RunExtension) {
+    if !prefix_extension_enabled() {
+        return;
+    }
+    let bucket = x.recovered_nodes.min(2);
+    if let Ok(mut p) = PREFIX_EXTENSION.lock() {
+        p.all.add(x);
+        p.by_recovered_nodes[bucket].add(x);
+    }
+}
+
 /// One point on the timeline-key growth curve, covering `runs` consecutive
 /// runs starting at `first_run`. `cumulative_distinct` is the running total of
 /// keys ever inserted as of the last run in the point.
@@ -1901,6 +2070,7 @@ pub struct UtilizationSnapshot {
     pub timer_steer: TimerSteerStats,
     pub crash_anchor: CrashAnchorStats,
     pub termination: TerminationStats,
+    pub prefix_extension: PrefixExtensionStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
 }
@@ -2050,6 +2220,10 @@ pub fn snapshot() -> UtilizationSnapshot {
         termination: TERMINATION
             .lock()
             .map(|t| *t)
+            .unwrap_or_else(|p| *p.into_inner()),
+        prefix_extension: PREFIX_EXTENSION
+            .lock()
+            .map(|p| *p)
             .unwrap_or_else(|p| *p.into_inner()),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),
@@ -2285,6 +2459,50 @@ mod tests {
 
         assert_eq!(s.preference_consulted, 3);
         assert_eq!(s.preference_source_absent, 2);
+    }
+
+    #[test]
+    fn runs_are_split_by_what_stopped_them_from_scheduling_further_work() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        set_prefix_extension_enabled(true);
+
+        let run = |end, tail_without_release, pending_at_exit, recovered_nodes| RunExtension {
+            end,
+            steps: 1_000,
+            steps_released: 900,
+            steps_blocked: 60,
+            steps_idle: 40,
+            tail_without_release,
+            pending_at_exit,
+            recovered_nodes,
+        };
+        record_run_extension(&run(RunEnd::IterationsExhausted, 0, 7, 0));
+        record_run_extension(&run(RunEnd::IterationsExhausted, STALLED_TAIL_STEPS, 7, 2));
+        record_run_extension(&run(RunEnd::IterationsExhausted, 500, 0, 1));
+        record_run_extension(&run(RunEnd::PlanComplete, 0, 3, 2));
+        record_run_extension(&run(RunEnd::PlanComplete, 0, 0, 0));
+
+        let s = snapshot().prefix_extension;
+        set_prefix_extension_enabled(false);
+        // The switch alone gates the block: recording stays off with stats on.
+        record_run_extension(&run(RunEnd::Deadlock, 0, 0, 0));
+        let after_off = snapshot().prefix_extension;
+        set_enabled(false);
+
+        assert_eq!(s.all.runs, 5);
+        assert_eq!(s.all.budget_releasing, 1);
+        assert_eq!(s.all.budget_blocked, 1);
+        assert_eq!(s.all.budget_idle, 1);
+        assert_eq!(s.all.plan_complete_pending, 1);
+        assert_eq!(s.all.plan_complete_quiescent, 1);
+        assert_eq!(s.all.steps_sum, 5_000);
+        assert_eq!(s.all.steps_blocked_sum, 300);
+        assert_eq!(s.by_recovered_nodes[2].runs, 2);
+        assert_eq!(s.by_recovered_nodes[2].budget_blocked, 1);
+        assert_eq!(s.by_recovered_nodes[2].plan_complete_pending, 1);
+        assert_eq!(after_off.all.runs, 5);
+        assert_eq!(after_off.all.deadlock, 0);
     }
 
     #[test]

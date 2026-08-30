@@ -14,7 +14,7 @@ use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
 use crate::simulator::rng::StreamRng;
-use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunTermination};
+use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunExtension, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
@@ -211,6 +211,35 @@ pub enum RunOutcome {
     IterationsExhausted { outstanding_events: usize },
 }
 
+/// How a run spent its steps: how many released a runnable, how many offered
+/// queued work the scheduler released none of, and how many had nothing queued
+/// at all. `tail_without_release` is the run of steps up to the current one
+/// that released nothing.
+#[derive(Default)]
+struct StepCensus {
+    released: u64,
+    blocked: u64,
+    idle: u64,
+    tail_without_release: u64,
+}
+
+impl StepCensus {
+    fn released(&mut self) {
+        self.released += 1;
+        self.tail_without_release = 0;
+    }
+
+    fn blocked(&mut self) {
+        self.blocked += 1;
+        self.tail_without_release += 1;
+    }
+
+    fn idle(&mut self) {
+        self.idle += 1;
+        self.tail_without_release += 1;
+    }
+}
+
 /// Record why one plan execution stopped, together with the work that was
 /// still queued at that moment. Observation only.
 fn record_termination<H: HashPolicy>(
@@ -220,17 +249,29 @@ fn record_termination<H: HashPolicy>(
     steps_used: i32,
     step_budget: i32,
     recovered_nodes: usize,
+    census: &StepCensus,
 ) {
     if !util_stats::enabled() {
         return;
     }
     let pending = state.total_runnable_count() + state.purgatory.len();
+    let steps_used = steps_used.max(0) as u64;
     util_stats::record_run_termination(&RunTermination {
         end,
-        steps_used: steps_used.max(0) as u64,
+        steps_used,
         step_budget: step_budget.max(0) as u64,
         pending_work_at_exit: pending as u64,
         planned_events_outstanding: engine.outstanding_count() as u64,
+        recovered_nodes,
+    });
+    util_stats::record_run_extension(&RunExtension {
+        end,
+        steps: steps_used,
+        steps_released: census.released,
+        steps_blocked: census.blocked,
+        steps_idle: census.idle,
+        tail_without_release: census.tail_without_release,
+        pending_at_exit: pending as u64,
         recovered_nodes,
     });
 }
@@ -300,6 +341,8 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     let mut crashed_nodes: HashSet<usize> = HashSet::new();
     let mut recovered_nodes: HashSet<usize> = HashSet::new();
 
+    let mut census = StepCensus::default();
+
     // Starvation detection: track consecutive no-progress iterations
     let mut no_progress_count: i32 = 0;
     const STARVATION_WARN_THRESHOLD: i32 = 500;
@@ -344,6 +387,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 step,
                 max_iterations,
                 recovered_nodes.len(),
+                &census,
             );
             return Ok(RunOutcome::Completed { steps: step });
         }
@@ -375,6 +419,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 step,
                 max_iterations,
                 recovered_nodes.len(),
+                &census,
             );
             return Ok(RunOutcome::Deadlock {
                 step,
@@ -509,7 +554,9 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 
         let history_start_len = path_state.history.len();
 
-        if !path_state.state.all_queues_empty() {
+        if path_state.state.all_queues_empty() {
+            census.idle();
+        } else {
             let result = schedule_runnable::<H, _, _, F>(
                 &mut path_state.state,
                 &mut path_state.logs,
@@ -527,6 +574,12 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 &reservations,
                 rng,
             )?;
+
+            if matches!(result, ScheduleResult::None) {
+                census.blocked();
+            } else {
+                census.released();
+            }
 
             match result {
                 ScheduleResult::None => {}
@@ -712,6 +765,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         max_iterations,
         max_iterations,
         recovered_nodes.len(),
+        &census,
     );
     Ok(RunOutcome::IterationsExhausted {
         outstanding_events: engine.outstanding_count(),

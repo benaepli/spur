@@ -221,6 +221,13 @@ pub struct ExplorerConfig {
     #[serde(default = "default_emit_acted_fraction")]
     pub emit_acted_fraction: bool,
 
+    /// Classify each finished run by what stopped it from scheduling further
+    /// work: the plan running out of events, the step budget, or a frontier
+    /// that offered nothing releasable. Reported under `prefix_extension` and
+    /// only recorded when `stats` is on. Observation-only; off by default.
+    #[serde(default)]
+    pub emit_prefix_extension: bool,
+
     /// At each within-queue selection, re-rank the eligible candidates under a
     /// fixed sweep of quick-fire magnitudes and count how often the top-ranked
     /// candidate moves away from what the identity weighting ranks first.
@@ -292,6 +299,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "feedback",
     "stats",
     "emit_acted_fraction",
+    "emit_prefix_extension",
     "emit_multiplier_authority",
     "strict_config_keys",
     "rng_stream_isolation",
@@ -1062,6 +1070,7 @@ pub fn run_explorer(
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
+    util_stats::set_prefix_extension_enabled(config.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
@@ -1446,6 +1455,7 @@ pub fn run_explorer_genetic(
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
+    util_stats::set_prefix_extension_enabled(config.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
@@ -1878,6 +1888,7 @@ pub fn run_explorer_aos(
     info!("AOS session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
+    util_stats::set_prefix_extension_enabled(config.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.emit_multiplier_authority);
@@ -2520,6 +2531,7 @@ pub fn run_explorer_continuous(
     info!("Continuous session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
+    util_stats::set_prefix_extension_enabled(config.envelope.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.envelope.feedback.steer_audit_always);
     util_stats::set_multiplier_audit_enabled(config.envelope.emit_multiplier_authority);
