@@ -121,6 +121,28 @@ static DELIVERIES: [AtomicU64; DELIVERY_BUCKETS] =
 static DELIVERIES_ACTED: [AtomicU64; DELIVERY_BUCKETS] =
     [const { AtomicU64::new(0) }; DELIVERY_BUCKETS];
 
+/// The same (total, acted) pairs again, split by how far the receiving node
+/// had progressed past its own most recent restart when the message reached
+/// it, counted in handler entries. A receiver that has not restarted counts
+/// from the start of the run, so its distance says where in the run the
+/// delivery landed rather than where in a recovery it landed.
+const ACCEPT_DIST_BUCKETS: usize = 7;
+const ACCEPT_DIST_LABELS: [&str; ACCEPT_DIST_BUCKETS] =
+    ["0", "1", "2", "3-4", "5-8", "9-16", "17+"];
+
+/// Delivery populations the distance census is kept for. A message that
+/// carries both restarts is counted in both rows.
+const ACCEPT_PATH_ALL: usize = 0;
+const ACCEPT_PATH_SENDER_RESTARTED: usize = 1;
+const ACCEPT_PATH_RECEIVER_RESTARTED: usize = 2;
+const ACCEPT_PATHS: usize = 3;
+
+static ACCEPT_DIST: [[AtomicU64; ACCEPT_DIST_BUCKETS]; ACCEPT_PATHS] =
+    [const { [const { AtomicU64::new(0) }; ACCEPT_DIST_BUCKETS] }; ACCEPT_PATHS];
+static ACCEPT_DIST_ACTED: [[AtomicU64; ACCEPT_DIST_BUCKETS]; ACCEPT_PATHS] =
+    [const { [const { AtomicU64::new(0) }; ACCEPT_DIST_BUCKETS] }; ACCEPT_PATHS];
+static ACCEPT_DIST_ENABLED: AtomicBool = AtomicBool::new(false);
+
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
 
 static PREFIX_EXTENSION: Mutex<PrefixExtensionStats> = Mutex::new(PrefixExtensionStats::new());
@@ -293,6 +315,8 @@ pub fn set_enabled(on: bool) {
             .iter()
             .chain(DELIVERIES_ACTED.iter())
             .chain(MA_FLIPPED.iter())
+            .chain(ACCEPT_DIST.iter().flatten())
+            .chain(ACCEPT_DIST_ACTED.iter().flatten())
         {
             c.store(0, Ordering::Relaxed);
         }
@@ -500,6 +524,19 @@ pub fn set_acted_fraction_enabled(on: bool) {
 #[inline]
 pub fn acted_fraction_enabled() -> bool {
     enabled() && ACTED_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the acceptance-distance census. It rides the
+/// delivery-effect probe, so it also requires `set_acted_fraction_enabled(true)`.
+pub fn set_acceptance_distance_enabled(on: bool) {
+    ACCEPT_DIST_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a delivery's position relative to its receiver's restart should be
+/// recorded.
+#[inline]
+pub fn acceptance_distance_enabled() -> bool {
+    acted_fraction_enabled() && ACCEPT_DIST_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Enable or disable the per-run record of how runs stop extending their
@@ -717,13 +754,29 @@ impl DeliveryBias {
     }
 }
 
+/// Which distance bucket `distance` handler entries past a restart falls in.
+#[inline]
+fn acceptance_distance_bucket(distance: u32) -> usize {
+    match distance {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=4 => 3,
+        5..=8 => 4,
+        9..=16 => 5,
+        _ => 6,
+    }
+}
+
 /// A message reached a handler entry on another node. `acted` means the
 /// handler changed that node's persistent state rather than falling through a
 /// guard, which is the difference between a hazard the protocol saw and one it
 /// ignored. Only the handler's first execution segment is observed: a write
 /// that happens after the handler blocks on a channel is attributed to nothing.
+/// `receiver_distance` is how many handler entries the receiving node had
+/// taken since its own most recent restart, not counting this one.
 #[inline]
-pub fn record_delivery(bias: DeliveryBias, acted: bool) {
+pub fn record_delivery(bias: DeliveryBias, acted: bool, receiver_distance: u32) {
     if !acted_fraction_enabled() {
         return;
     }
@@ -750,6 +803,30 @@ pub fn record_delivery(bias: DeliveryBias, acted: bool) {
         DELIVERIES[b].fetch_add(1, Ordering::Relaxed);
         if acted {
             DELIVERIES_ACTED[b].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if !ACCEPT_DIST_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let slot = acceptance_distance_bucket(receiver_distance);
+    let mut paths = [ACCEPT_PATH_ALL; ACCEPT_PATHS];
+    let mut plen = 1;
+    for (bit, path) in [
+        (DeliveryBias::SENDER_RESTARTED, ACCEPT_PATH_SENDER_RESTARTED),
+        (
+            DeliveryBias::RECEIVER_RESTARTED,
+            ACCEPT_PATH_RECEIVER_RESTARTED,
+        ),
+    ] {
+        if bias.contains(bit) {
+            paths[plen] = path;
+            plen += 1;
+        }
+    }
+    for &p in &paths[..plen] {
+        ACCEPT_DIST[p][slot].fetch_add(1, Ordering::Relaxed);
+        if acted {
+            ACCEPT_DIST_ACTED[p][slot].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1881,6 +1958,56 @@ impl DeliveryEffect {
     }
 }
 
+/// Deliveries and the share of them that changed the receiving node's state,
+/// for one distance-from-restart bucket.
+#[derive(Serialize)]
+pub struct AcceptanceDistanceBucket {
+    pub distance: &'static str,
+    pub deliveries: u64,
+    pub acted: u64,
+    pub acted_fraction: f64,
+}
+
+/// The acted fraction as a function of how far the receiver had moved past its
+/// own restart. A curve that falls off with distance means arrival position
+/// decides whether a stale message is taken or absorbed; a flat curve means it
+/// does not.
+#[derive(Serialize)]
+pub struct AcceptanceDistanceStats {
+    pub all: Vec<AcceptanceDistanceBucket>,
+    pub sender_restarted: Vec<AcceptanceDistanceBucket>,
+    pub receiver_restarted: Vec<AcceptanceDistanceBucket>,
+}
+
+impl AcceptanceDistanceStats {
+    fn read_path(path: usize) -> Vec<AcceptanceDistanceBucket> {
+        (0..ACCEPT_DIST_BUCKETS)
+            .map(|b| {
+                let deliveries = ACCEPT_DIST[path][b].load(Ordering::Relaxed);
+                let acted = ACCEPT_DIST_ACTED[path][b].load(Ordering::Relaxed);
+                AcceptanceDistanceBucket {
+                    distance: ACCEPT_DIST_LABELS[b],
+                    deliveries,
+                    acted,
+                    acted_fraction: if deliveries == 0 {
+                        0.0
+                    } else {
+                        acted as f64 / deliveries as f64
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn read() -> Self {
+        Self {
+            all: Self::read_path(ACCEPT_PATH_ALL),
+            sender_restarted: Self::read_path(ACCEPT_PATH_SENDER_RESTARTED),
+            receiver_restarted: Self::read_path(ACCEPT_PATH_RECEIVER_RESTARTED),
+        }
+    }
+}
+
 /// How often a message that reached a handler actually changed the receiver's
 /// state, split by which perturbation the message was carrying. A bias whose
 /// `acted_fraction` is near zero is being delivered but ignored, which is a
@@ -1892,6 +2019,7 @@ pub struct DeliveryEffectStats {
     pub delayed: DeliveryEffect,
     pub sender_restarted: DeliveryEffect,
     pub receiver_restarted: DeliveryEffect,
+    pub acceptance_distance: AcceptanceDistanceStats,
 }
 
 /// How often a crash could be, and actually was, scheduled at the moment its
@@ -2241,6 +2369,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             delayed: DeliveryEffect::read(DELIVERY_DELAYED),
             sender_restarted: DeliveryEffect::read(DELIVERY_SENDER_RESTARTED),
             receiver_restarted: DeliveryEffect::read(DELIVERY_RECEIVER_RESTARTED),
+            acceptance_distance: AcceptanceDistanceStats::read(),
         },
         timer_effects: TimerEffectStats::read(),
         timer_steer: TimerSteerStats::read(),
@@ -2322,11 +2451,11 @@ mod tests {
         set_enabled(true);
         set_acted_fraction_enabled(true);
 
-        record_delivery(DeliveryBias::NONE, true);
-        record_delivery(DeliveryBias::DELAYED, false);
+        record_delivery(DeliveryBias::NONE, true, 0);
+        record_delivery(DeliveryBias::DELAYED, false, 0);
         let mut both = DeliveryBias::DELAYED;
         both.insert(DeliveryBias::SENDER_RESTARTED);
-        record_delivery(both, true);
+        record_delivery(both, true, 0);
 
         let s = snapshot().delivery_effects;
         set_enabled(false);
@@ -2341,6 +2470,39 @@ mod tests {
         assert_eq!(s.receiver_restarted.deliveries, 0);
         assert_eq!(s.receiver_restarted.acted_fraction, 0.0);
         assert!((s.all.acted_fraction - 2.0 / 3.0).abs() < 1e-9);
+        assert!(
+            s.acceptance_distance.all.iter().all(|b| b.deliveries == 0),
+            "census stays empty while its own switch is off"
+        );
+    }
+
+    #[test]
+    fn acceptance_distance_splits_by_receiver_progress() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        set_acted_fraction_enabled(true);
+        set_acceptance_distance_enabled(true);
+
+        record_delivery(DeliveryBias::SENDER_RESTARTED, true, 0);
+        record_delivery(DeliveryBias::SENDER_RESTARTED, false, 20);
+        record_delivery(DeliveryBias::RECEIVER_RESTARTED, false, 3);
+        record_delivery(DeliveryBias::NONE, true, 6);
+
+        let s = snapshot().delivery_effects.acceptance_distance;
+        set_acceptance_distance_enabled(false);
+        set_enabled(false);
+
+        assert_eq!(s.sender_restarted[0].distance, "0");
+        assert_eq!(s.sender_restarted[0].deliveries, 1);
+        assert_eq!(s.sender_restarted[0].acted, 1);
+        assert_eq!(s.sender_restarted[6].distance, "17+");
+        assert_eq!(s.sender_restarted[6].deliveries, 1);
+        assert_eq!(s.sender_restarted[6].acted, 0);
+        assert_eq!(s.receiver_restarted[3].distance, "3-4");
+        assert_eq!(s.receiver_restarted[3].deliveries, 1);
+        assert_eq!(s.all[4].distance, "5-8");
+        assert_eq!(s.all[4].deliveries, 1);
+        assert_eq!(s.all.iter().map(|b| b.deliveries).sum::<u64>(), 4);
     }
 
     #[test]

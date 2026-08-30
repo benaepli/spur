@@ -614,7 +614,10 @@ pub enum HandlerTrigger {
 /// a delay; `recent` the subset sent by the last handler. `net_records` and
 /// `net_fresh` count the node's remote records in the network queue and the
 /// ones whose origin incarnation is still current. `crash_pending` counts
-/// the crashes of this node waiting in its local queue.
+/// the crashes of this node waiting in its local queue. `entries` counts the
+/// handler entries the node has taken in this run and `entries_at_restart` its
+/// value when the node last came back from a crash, so their difference is how
+/// far the node has moved past that restart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SendLedger {
     pub issued: u32,
@@ -625,6 +628,8 @@ pub struct SendLedger {
     pub net_records: u32,
     pub net_fresh: u32,
     pub crash_pending: u32,
+    pub entries: u32,
+    pub entries_at_restart: u32,
 }
 
 /// Per-run totals of timer firings that woke a waiting record, split by
@@ -950,6 +955,9 @@ impl<H: HashPolicy> State<H> {
             l.floor = l.issued;
             l.recent = 0;
             l.trigger = trigger;
+            if trigger != HandlerTrigger::None {
+                l.entries = l.entries.saturating_add(1);
+            }
         }
     }
 
@@ -959,6 +967,16 @@ impl<H: HashPolicy> State<H> {
         if let Some(l) = self.send_ledger.get_mut(node) {
             self.net_stale_records += l.net_fresh;
             l.net_fresh = 0;
+            l.entries_at_restart = l.entries;
+        }
+    }
+
+    /// Handler entries `node` has taken since it last came back from a crash,
+    /// or since the start of the run if it never crashed.
+    pub fn entries_since_restart(&self, node: usize) -> u32 {
+        match self.send_ledger.get(node) {
+            Some(l) => l.entries.saturating_sub(l.entries_at_restart),
+            None => 0,
         }
     }
 
