@@ -647,7 +647,7 @@ fn write_utilization_counters(output_dir: &Path) -> Result<Vec<PathBuf>> {
     if !util_stats::enabled() {
         return Ok(Vec::new());
     }
-    let json = serde_json::to_string_pretty(&util_stats::snapshot())
+    let json = util_stats::render_snapshot(&util_stats::snapshot())
         .context("Failed to serialize utilization counters")?;
     let inside = output_dir.join("utilization.json");
     fs::write(&inside, &json).context("Failed to write utilization.json")?;

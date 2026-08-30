@@ -2280,6 +2280,13 @@ pub fn snapshot_value() -> serde_json::Value {
     serde_json::to_value(snapshot()).unwrap_or(serde_json::Value::Null)
 }
 
+/// The one rendering of a snapshot that reaches a file. Every writer goes
+/// through this, so a test can hold the bytes a reader will parse rather than
+/// a second serialization that could differ from it.
+pub fn render_snapshot(s: &UtilizationSnapshot) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(s)
+}
+
 /// `after - before` on every integer leaf, keeping the object structure.
 /// Floats, arrays and strings are ratios, curves and labels, not counts, so
 /// they are dropped; a reader recomputes ratios from the integer leaves.
