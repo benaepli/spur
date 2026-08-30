@@ -395,6 +395,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         crash_anchor: _,
         termination: _,
         prefix_extension: _,
+        quiet_stretch: _,
         timeline_keys: _,
         steer_terms: _,
     } = s;
@@ -420,6 +421,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "crash_anchor",
         "termination",
         "prefix_extension",
+        "quiet_stretch",
         "timeline_keys",
         "steer_terms",
     ]

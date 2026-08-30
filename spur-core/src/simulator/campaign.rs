@@ -48,6 +48,7 @@ const SESSION_LEVEL_KEYS: &[&str] = &[
     "stats",
     "strict_config_keys",
     "emit_acted_fraction",
+    "quiet_stretch_telemetry",
     "emit_prefix_extension",
     "emit_multiplier_authority",
     "wall_budget_sec",
@@ -834,6 +835,7 @@ pub fn run_explorer_campaign(
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.envelope.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.envelope.emit_crash_census);
+    util_stats::set_quiet_stretch_enabled(config.envelope.quiet_stretch_telemetry);
     util_stats::set_prefix_extension_enabled(config.envelope.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.envelope.feedback.steer_audit_always);

@@ -247,6 +247,15 @@ pub struct ExplorerConfig {
     #[serde(default)]
     pub emit_crash_census: bool,
 
+    /// Record, per finished run, the longest span of consecutive deliveries
+    /// that changed no node's state, split by how the run ended and keyed by
+    /// run id so a per-run measurement taken outside the simulator can be
+    /// crossed with it. Reported under `quiet_stretch` and only recorded when
+    /// both `stats` and `emit_acted_fraction` are on. Observation-only; off by
+    /// default because it keeps a row per run.
+    #[serde(default)]
+    pub quiet_stretch_telemetry: bool,
+
     /// Classify each finished run by what stopped it from scheduling further
     /// work: the plan running out of events, the step budget, or a frontier
     /// that offered nothing releasable. Reported under `prefix_extension` and
@@ -328,6 +337,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "emit_acted_fraction",
     "emit_acceptance_distance",
     "emit_crash_census",
+    "quiet_stretch_telemetry",
     "emit_prefix_extension",
     "emit_multiplier_authority",
     "strict_config_keys",
@@ -1106,6 +1116,7 @@ pub fn run_explorer(
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
+    util_stats::set_quiet_stretch_enabled(config.quiet_stretch_telemetry);
     util_stats::set_prefix_extension_enabled(config.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
@@ -1496,6 +1507,7 @@ pub fn run_explorer_genetic(
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
+    util_stats::set_quiet_stretch_enabled(config.quiet_stretch_telemetry);
     util_stats::set_prefix_extension_enabled(config.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
@@ -1931,6 +1943,7 @@ pub fn run_explorer_aos(
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
+    util_stats::set_quiet_stretch_enabled(config.quiet_stretch_telemetry);
     util_stats::set_prefix_extension_enabled(config.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.feedback.steer_audit_always);
@@ -2576,6 +2589,7 @@ pub fn run_explorer_continuous(
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.envelope.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.envelope.emit_crash_census);
+    util_stats::set_quiet_stretch_enabled(config.envelope.quiet_stretch_telemetry);
     util_stats::set_prefix_extension_enabled(config.envelope.emit_prefix_extension);
     util_stats::set_steer_audit_enabled(config.envelope.feedback.steer_audit);
     util_stats::set_steer_audit_always(config.envelope.feedback.steer_audit_always);
