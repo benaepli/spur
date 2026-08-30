@@ -626,6 +626,16 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         util_stats::record_crash_anchor_offer(crash_eligible, anchored);
     }
 
+    // Whether any node whose crash was schedulable here was holding an
+    // undelivered message of its own. Read before the pick, while the crash
+    // this step may take is still counted among the candidates.
+    let crash_candidate_with_inflight = util_stats::crash_census_enabled().then(|| {
+        state
+            .send_ledger
+            .iter()
+            .any(|l| l.crash_pending > 0 && l.in_flight > 0)
+    });
+
     // Observation-only steer-authority audit: what the scoring function ranks
     // first here, resolved below against what this step actually runs. It ranks
     // every runnable in every queue, and with no predicate carrying weight the
@@ -807,6 +817,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
                 util_stats::record_crash_anchor_apply(ledger.in_flight > 0);
                 util_stats::record_term_acted(chosen_mask, ledger.recent > 0);
+            }
+            if let Some(any_candidate) = crash_candidate_with_inflight {
+                let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
+                util_stats::record_crash_census(ledger.in_flight, any_candidate);
             }
             crash_node(state, node_id);
             Ok(ScheduleResult::Crash { node_id })

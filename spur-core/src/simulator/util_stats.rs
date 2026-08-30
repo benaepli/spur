@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTED_ENABLED: AtomicBool = AtomicBool::new(true);
+static CRASH_CENSUS_ENABLED: AtomicBool = AtomicBool::new(false);
 static STEER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static STEER_AUDIT_ALWAYS: AtomicBool = AtomicBool::new(false);
 static MULTIPLIER_AUDIT_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -68,6 +69,9 @@ static CA_STEPS_WITH_CRASH_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static CA_OFFERED: AtomicU64 = AtomicU64::new(0);
 static CA_CRASHES_TAKEN: AtomicU64 = AtomicU64::new(0);
 static CA_APPLIED: AtomicU64 = AtomicU64::new(0);
+static CC_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static CC_VICTIM_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+static CC_ANY_CANDIDATE_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static RW_CLOSED: AtomicU64 = AtomicU64::new(0);
 static RW_WIDTH_SUM: AtomicU64 = AtomicU64::new(0);
 static RW_MAX: AtomicU64 = AtomicU64::new(0);
@@ -99,6 +103,13 @@ static MA_FLIPPED: [AtomicU64; MULTIPLIER_SWEEP.len()] =
 /// last slot, which the percentile reader reports as the cap itself.
 const RW_WIDTH_CAP: usize = 1024;
 static RW_WIDTHS: Mutex<[u64; RW_WIDTH_CAP + 1]> = Mutex::new([0; RW_WIDTH_CAP + 1]);
+
+/// Undelivered outbound messages the node a crash lands on was holding, as a
+/// histogram index. The last slot folds in every larger count, so the shape is
+/// "none, one, two, more" rather than a full distribution.
+const CC_INFLIGHT_SLOTS: usize = 4;
+static CC_INFLIGHT: [AtomicU64; CC_INFLIGHT_SLOTS] =
+    [const { AtomicU64::new(0) }; CC_INFLIGHT_SLOTS];
 
 /// Crash and recover events applied in one run, clamped, as the bucket index of
 /// the cross-tab. This is the only ordinal measure of how much fault activity a
@@ -295,6 +306,9 @@ pub fn set_enabled(on: bool) {
             &CA_OFFERED,
             &CA_CRASHES_TAKEN,
             &CA_APPLIED,
+            &CC_DECISIONS,
+            &CC_VICTIM_INFLIGHT,
+            &CC_ANY_CANDIDATE_INFLIGHT,
             &RW_CLOSED,
             &RW_WIDTH_SUM,
             &RW_MAX,
@@ -319,6 +333,7 @@ pub fn set_enabled(on: bool) {
             .iter()
             .chain(DELIVERIES_ACTED.iter())
             .chain(MA_FLIPPED.iter())
+            .chain(CC_INFLIGHT.iter())
             .chain(ACCEPT_DIST.iter().flatten())
             .chain(ACCEPT_DIST_ACTED.iter().flatten())
         {
@@ -1249,6 +1264,39 @@ pub fn record_crash_anchor_apply(anchored: bool) {
     }
 }
 
+/// Enable or disable the census of what a crash lands on. It also requires
+/// `set_enabled(true)`.
+pub fn set_crash_census_enabled(on: bool) {
+    CRASH_CENSUS_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a crash should be censused. Callers must check this before reading
+/// the candidate set, which walks every node's send bookkeeping.
+#[inline]
+pub fn crash_census_enabled() -> bool {
+    enabled() && CRASH_CENSUS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// A crash was applied to a node holding `victim_inflight` undelivered messages
+/// of its own. `any_candidate_inflight` means some node whose crash was
+/// schedulable at that same point held one, which is the same question asked of
+/// the choice rather than of the node it fell on.
+#[inline]
+pub fn record_crash_census(victim_inflight: u32, any_candidate_inflight: bool) {
+    if !crash_census_enabled() {
+        return;
+    }
+    CC_DECISIONS.fetch_add(1, Ordering::Relaxed);
+    if victim_inflight > 0 {
+        CC_VICTIM_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+    }
+    if any_candidate_inflight {
+        CC_ANY_CANDIDATE_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+    }
+    let slot = (victim_inflight as usize).min(CC_INFLIGHT_SLOTS - 1);
+    CC_INFLIGHT[slot].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Why a single plan execution stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunEnd {
@@ -2063,6 +2111,40 @@ pub struct DeliveryEffectStats {
     pub recoveries_total: u64,
     pub recoveries_with_own_prior_sends_inflight: u64,
     pub stale_sender_deliveries_after_recovery: u64,
+    pub crash_census: CrashCensusStats,
+}
+
+/// What a crash lands on, counted over the crashes actually applied.
+/// `decisions` is the denominator. `victim_had_inflight_sends` over it is how
+/// often the node being crashed was already holding a message of its own that
+/// nobody had received yet; `any_candidate_had_inflight_sends` asks the same of
+/// the whole set of nodes whose crash was schedulable at that point, so the two
+/// together bound what choosing the victim differently could buy. The histogram
+/// gives the shape behind the first of those rates, since one undelivered
+/// message and several are different situations.
+#[derive(Serialize)]
+pub struct CrashCensusStats {
+    pub decisions: u64,
+    pub victim_had_inflight_sends: u64,
+    pub any_candidate_had_inflight_sends: u64,
+    pub inflight_bucket_0: u64,
+    pub inflight_bucket_1: u64,
+    pub inflight_bucket_2: u64,
+    pub inflight_bucket_3plus: u64,
+}
+
+impl CrashCensusStats {
+    fn read() -> Self {
+        Self {
+            decisions: CC_DECISIONS.load(Ordering::Relaxed),
+            victim_had_inflight_sends: CC_VICTIM_INFLIGHT.load(Ordering::Relaxed),
+            any_candidate_had_inflight_sends: CC_ANY_CANDIDATE_INFLIGHT.load(Ordering::Relaxed),
+            inflight_bucket_0: CC_INFLIGHT[0].load(Ordering::Relaxed),
+            inflight_bucket_1: CC_INFLIGHT[1].load(Ordering::Relaxed),
+            inflight_bucket_2: CC_INFLIGHT[2].load(Ordering::Relaxed),
+            inflight_bucket_3plus: CC_INFLIGHT[3].load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// How often a crash could be, and actually was, scheduled at the moment its
@@ -2428,6 +2510,7 @@ pub fn snapshot() -> UtilizationSnapshot {
                 .load(Ordering::Relaxed),
             stale_sender_deliveries_after_recovery: DELIVERIES[DELIVERY_SENDER_RESTARTED]
                 .load(Ordering::Relaxed),
+            crash_census: CrashCensusStats::read(),
         },
         timer_effects: TimerEffectStats::read(),
         timer_steer: TimerSteerStats::read(),
@@ -2532,6 +2615,33 @@ mod tests {
             s.acceptance_distance.all.iter().all(|b| b.deliveries == 0),
             "census stays empty while its own switch is off"
         );
+    }
+
+    #[test]
+    fn crash_census_needs_its_own_switch() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+
+        record_crash_census(2, true);
+        let off = snapshot().delivery_effects.crash_census;
+
+        set_crash_census_enabled(true);
+        record_crash_census(0, true);
+        record_crash_census(1, true);
+        record_crash_census(7, false);
+        let s = snapshot().delivery_effects.crash_census;
+
+        set_crash_census_enabled(false);
+        set_enabled(false);
+
+        assert_eq!(off.decisions, 0);
+        assert_eq!(s.decisions, 3);
+        assert_eq!(s.victim_had_inflight_sends, 2);
+        assert_eq!(s.any_candidate_had_inflight_sends, 2);
+        assert_eq!(s.inflight_bucket_0, 1);
+        assert_eq!(s.inflight_bucket_1, 1);
+        assert_eq!(s.inflight_bucket_2, 0);
+        assert_eq!(s.inflight_bucket_3plus, 1);
     }
 
     #[test]
