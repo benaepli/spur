@@ -221,6 +221,7 @@ pub fn lower(knobs: &Knobs, constraints: &ExplorerConfig, _rng: &mut impl Rng) -
         within_queue_selector,
         steer_terms,
         purgatory: constraints.purgatory.clone(),
+        partial_fanout_crash_bias: constraints.partial_fanout_crash_bias,
         timeline_key_granularity: constraints.feedback.key_granularity(),
         rng_stream_isolation: constraints.rng_stream_isolation,
     }

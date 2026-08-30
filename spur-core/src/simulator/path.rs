@@ -291,6 +291,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     within_queue: &WithinQueueSelector,
     terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
+    partial_fanout_crash_bias: f64,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
@@ -573,6 +574,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 within_queue,
                 terms,
                 purgatory_config,
+                partial_fanout_crash_bias,
                 &reservations,
                 rng,
             )?;
