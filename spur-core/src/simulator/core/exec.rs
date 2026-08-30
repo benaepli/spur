@@ -51,6 +51,39 @@ enum StepOutcome<H: HashPolicy> {
     Return(Value<H>),
 }
 
+/// Decide how long a remote send waits in purgatory before it is enqueued.
+/// `None` means enqueue it now. The selection roll and the duration draw are
+/// made before the destination's liveness is consulted, so suppressing a hold
+/// for one destination leaves the draws seen by every other send unchanged.
+fn purgatory_hold_steps<H: HashPolicy>(
+    state: &State<H>,
+    purgatory_config: &PurgatoryConfig,
+    dest: NodeId,
+    rng: &mut impl StreamRng,
+) -> Option<i32> {
+    rng.use_stream(Stream::SendDelay);
+    if purgatory_config.delay_probability <= 0.0
+        || rng.random::<f64>() >= purgatory_config.delay_probability
+    {
+        return None;
+    }
+    let (min, max) = purgatory_config.delay_duration_range;
+    let duration = if min >= max {
+        min
+    } else {
+        let ln_min = (min as f64).ln();
+        let ln_max = (max as f64).ln();
+        rng.random_range(ln_min..=ln_max).exp().round() as i32
+    };
+    let receiver_down = state.crash_info.currently_crashed.contains(&dest);
+    if receiver_down && !purgatory_config.hold_down_receivers {
+        util_stats::record_purgatory_passthrough_down_receiver();
+        return None;
+    }
+    util_stats::record_purgatory_delay(receiver_down);
+    Some(duration)
+}
+
 fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
     label: &Label,
     state: &mut State<H>,
@@ -181,24 +214,13 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     receiver_token_at_send: state.node_state_token(target_node),
                 };
 
-                rng.use_stream(Stream::SendDelay);
-                if purgatory_config.delay_probability > 0.0
-                    && rng.random::<f64>() < purgatory_config.delay_probability
-                {
-                    let (min, max) = purgatory_config.delay_duration_range;
-                    let duration = if min >= max {
-                        min
-                    } else {
-                        let ln_min = (min as f64).ln();
-                        let ln_max = (max as f64).ln();
-                        rng.random_range(ln_min..=ln_max).exp().round() as i32
-                    };
-                    let release_step = state.crash_info.current_step + duration;
-                    util_stats::record_purgatory_delay();
-                    new_record.bias.insert(DeliveryBias::DELAYED);
-                    state.delay_runnable(release_step, Runnable::Record(new_record));
-                } else {
-                    state.push_runnable(Runnable::Record(new_record));
+                match purgatory_hold_steps(state, purgatory_config, target_node, rng) {
+                    Some(duration) => {
+                        let release_step = state.crash_info.current_step + duration;
+                        new_record.bias.insert(DeliveryBias::DELAYED);
+                        state.delay_runnable(release_step, Runnable::Record(new_record));
+                    }
+                    None => state.push_runnable(Runnable::Record(new_record)),
                 }
                 Ok(Some(StepOutcome::Continue(*next)))
             }
@@ -556,23 +578,12 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                         pc: *next,
                         priority: policy.sample(rng, RunnableCategory::ChannelSend),
                     };
-                    rng.use_stream(Stream::SendDelay);
-                    if purgatory_config.delay_probability > 0.0
-                        && rng.random::<f64>() < purgatory_config.delay_probability
-                    {
-                        let (min, max) = purgatory_config.delay_duration_range;
-                        let duration = if min >= max {
-                            min
-                        } else {
-                            let ln_min = (min as f64).ln();
-                            let ln_max = (max as f64).ln();
-                            rng.random_range(ln_min..=ln_max).exp().round() as i32
-                        };
-                        let release_step = state.crash_info.current_step + duration;
-                        util_stats::record_purgatory_delay();
-                        state.delay_runnable(release_step, cs);
-                    } else {
-                        state.push_runnable(cs);
+                    match purgatory_hold_steps(state, purgatory_config, cid.node, rng) {
+                        Some(duration) => {
+                            let release_step = state.crash_info.current_step + duration;
+                            state.delay_runnable(release_step, cs);
+                        }
+                        None => state.push_runnable(cs),
                     }
                     // Non-blocking, proceed
                     record.pc = *next;

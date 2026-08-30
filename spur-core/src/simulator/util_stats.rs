@@ -38,6 +38,9 @@ static SA_BLOCKED_BY_TIMER_GATE: AtomicU64 = AtomicU64::new(0);
 static SA_OTHER_QUEUE: AtomicU64 = AtomicU64::new(0);
 static SA_SAMPLER_CHOSE_OTHER: AtomicU64 = AtomicU64::new(0);
 static PURGATORY_DELAYED_SENDS: AtomicU64 = AtomicU64::new(0);
+static PURGATORY_HOLDS_DOWN_RECEIVER: AtomicU64 = AtomicU64::new(0);
+static PURGATORY_HOLDS_UP_RECEIVER: AtomicU64 = AtomicU64::new(0);
+static PURGATORY_PASSTHROUGH_DOWN_RECEIVER: AtomicU64 = AtomicU64::new(0);
 static AOS_TAPE_WINS: AtomicU64 = AtomicU64::new(0);
 static AOS_CONFIG_WINS: AtomicU64 = AtomicU64::new(0);
 static DEDUP_CHECKS: AtomicU64 = AtomicU64::new(0);
@@ -241,6 +244,9 @@ pub fn set_enabled(on: bool) {
             &SA_OTHER_QUEUE,
             &SA_SAMPLER_CHOSE_OTHER,
             &PURGATORY_DELAYED_SENDS,
+            &PURGATORY_HOLDS_DOWN_RECEIVER,
+            &PURGATORY_HOLDS_UP_RECEIVER,
+            &PURGATORY_PASSTHROUGH_DOWN_RECEIVER,
             &AOS_TAPE_WINS,
             &AOS_CONFIG_WINS,
             &DEDUP_CHECKS,
@@ -824,12 +830,29 @@ pub fn record_rng_isolation(isolated: bool) {
 }
 
 /// A record/ChannelSend was moved into purgatory instead of being enqueued.
+/// `receiver_down` splits the held population by whether the destination node
+/// was crashed at the moment of the send.
 #[inline]
-pub fn record_purgatory_delay() {
+pub fn record_purgatory_delay(receiver_down: bool) {
     if !enabled() {
         return;
     }
     PURGATORY_DELAYED_SENDS.fetch_add(1, Ordering::Relaxed);
+    if receiver_down {
+        PURGATORY_HOLDS_DOWN_RECEIVER.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PURGATORY_HOLDS_UP_RECEIVER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A send that purgatory selected for a hold was enqueued undelayed because its
+/// destination node was crashed and holds into crashed receivers are disabled.
+#[inline]
+pub fn record_purgatory_passthrough_down_receiver() {
+    if !enabled() {
+        return;
+    }
+    PURGATORY_PASSTHROUGH_DOWN_RECEIVER.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The AOS bandit chose an arm (`tape` = TapeMutate, else ConfigMutate).
@@ -1611,6 +1634,12 @@ pub struct SteerAuthorityStats {
 #[derive(Serialize)]
 pub struct PurgatoryStats {
     pub delayed_sends: u64,
+    /// Held sends whose destination node was crashed when the send was made.
+    pub holds_down_receiver: u64,
+    /// Held sends whose destination node was running when the send was made.
+    pub holds_up_receiver: u64,
+    /// Sends selected for a hold into a crashed destination and let through.
+    pub passthrough_down_receiver: u64,
 }
 
 #[derive(Serialize)]
@@ -2166,6 +2195,10 @@ pub fn snapshot() -> UtilizationSnapshot {
         multiplier_authority: MultiplierAuthorityStats::read(),
         purgatory: PurgatoryStats {
             delayed_sends: PURGATORY_DELAYED_SENDS.load(Ordering::Relaxed),
+            holds_down_receiver: PURGATORY_HOLDS_DOWN_RECEIVER.load(Ordering::Relaxed),
+            holds_up_receiver: PURGATORY_HOLDS_UP_RECEIVER.load(Ordering::Relaxed),
+            passthrough_down_receiver: PURGATORY_PASSTHROUGH_DOWN_RECEIVER
+                .load(Ordering::Relaxed),
         },
         aos: AosStats {
             tape_wins: AOS_TAPE_WINS.load(Ordering::Relaxed),

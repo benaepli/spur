@@ -131,6 +131,12 @@ pub struct PurgatoryConfig {
     /// (min_steps, max_steps) for log-uniform delay sampling.
     #[serde(default = "default_delay_range")]
     pub delay_duration_range: (i32, i32),
+    /// When false, a send selected for a delay is enqueued undelayed if its
+    /// destination node is currently crashed. The selection roll and the
+    /// duration draw still happen, so the sends that stay eligible for a hold
+    /// see the same random stream either way.
+    #[serde(default = "default_hold_down_receivers")]
+    pub hold_down_receivers: bool,
 }
 
 impl Default for PurgatoryConfig {
@@ -138,12 +144,17 @@ impl Default for PurgatoryConfig {
         Self {
             delay_probability: 0.0,
             delay_duration_range: (5, 50),
+            hold_down_receivers: true,
         }
     }
 }
 
 fn default_delay_range() -> (i32, i32) {
     (5, 50)
+}
+
+fn default_hold_down_receivers() -> bool {
+    true
 }
 
 impl SchedulePolicy {
