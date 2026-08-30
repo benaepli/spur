@@ -75,6 +75,8 @@ static CA_STEPS_WITH_CRASH_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static CA_OFFERED: AtomicU64 = AtomicU64::new(0);
 static CA_CRASHES_TAKEN: AtomicU64 = AtomicU64::new(0);
 static CA_APPLIED: AtomicU64 = AtomicU64::new(0);
+static CA_TIMING_BIAS_EXAMINED: AtomicU64 = AtomicU64::new(0);
+static CA_TIMING_BIAS_WITHHELD: AtomicU64 = AtomicU64::new(0);
 static CC_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static CC_VICTIM_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static CC_ANY_CANDIDATE_INFLIGHT: AtomicU64 = AtomicU64::new(0);
@@ -318,6 +320,8 @@ pub fn set_enabled(on: bool) {
             &CA_OFFERED,
             &CA_CRASHES_TAKEN,
             &CA_APPLIED,
+            &CA_TIMING_BIAS_EXAMINED,
+            &CA_TIMING_BIAS_WITHHELD,
             &CC_DECISIONS,
             &CC_VICTIM_INFLIGHT,
             &CC_ANY_CANDIDATE_INFLIGHT,
@@ -1318,6 +1322,21 @@ pub fn record_crash_anchor_apply(anchored: bool) {
     }
 }
 
+/// The crash-timing bias looked at one pending crash whose node was not in the
+/// middle of its own fan-out, and either withheld it from this step or let it
+/// stand. Both counts stay zero while the bias is off, which is what separates
+/// "the mechanism did nothing" from "the mechanism was never on".
+#[inline]
+pub fn record_crash_timing_bias(withheld: bool) {
+    if !enabled() {
+        return;
+    }
+    CA_TIMING_BIAS_EXAMINED.fetch_add(1, Ordering::Relaxed);
+    if withheld {
+        CA_TIMING_BIAS_WITHHELD.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Enable or disable the census of what a crash lands on. It also requires
 /// `set_enabled(true)`.
 pub fn set_crash_census_enabled(on: bool) {
@@ -2228,13 +2247,17 @@ impl CrashCensusStats {
 /// node had an undelivered message in the network. `offered` over
 /// `steps_with_crash_eligible` says how often the situation arises at all;
 /// `applied` over `crashes_taken` says how often the scheduler lands on it
-/// without being pushed.
+/// without being pushed. `timing_bias_withheld` over `timing_bias_examined` is
+/// the rate at which the crash-timing bias held a crash back from a step,
+/// against the number of pending crashes it looked at.
 #[derive(Serialize)]
 pub struct CrashAnchorStats {
     pub steps_with_crash_eligible: u64,
     pub offered: u64,
     pub crashes_taken: u64,
     pub applied: u64,
+    pub timing_bias_examined: u64,
+    pub timing_bias_withheld: u64,
 }
 
 /// How wide the interval between a node's restart and the first message handed
@@ -2605,6 +2628,8 @@ pub fn snapshot() -> UtilizationSnapshot {
             offered: CA_OFFERED.load(Ordering::Relaxed),
             crashes_taken: CA_CRASHES_TAKEN.load(Ordering::Relaxed),
             applied: CA_APPLIED.load(Ordering::Relaxed),
+            timing_bias_examined: CA_TIMING_BIAS_EXAMINED.load(Ordering::Relaxed),
+            timing_bias_withheld: CA_TIMING_BIAS_WITHHELD.load(Ordering::Relaxed),
         },
         termination: TERMINATION
             .lock()

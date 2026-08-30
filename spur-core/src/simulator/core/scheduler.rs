@@ -603,6 +603,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     within_queue: &WithinQueueSelector,
     terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
+    partial_fanout_crash_bias: f64,
     reservations: &[Reservation],
     rng: &mut impl StreamRng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
@@ -611,10 +612,43 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         return Ok(ScheduleResult::None);
     }
 
+    // Crash-timing bias: a pending crash for a node that is not in the middle of
+    // its own fan-out - it has no undelivered send of its own, or more than one -
+    // may be withheld from this step, so the crash is more likely to be taken at
+    // a point where exactly one of the node's peers is still uninformed of its
+    // last action. Withholding is not cancelling: the crash stays queued and is
+    // offered again at the next step, which keeps the number of crashes a run
+    // takes the same and moves only when they land. Nodes past the width of the
+    // mask are never withheld.
+    let crash_defer_mask: u64 = if partial_fanout_crash_bias > 0.0 {
+        let mut mask = 0u64;
+        for (n, ledger) in state.send_ledger.iter().enumerate().take(u64::BITS as usize) {
+            if ledger.crash_pending == 0 || ledger.in_flight == 1 {
+                continue;
+            }
+            rng.use_stream(Stream::FaultPriority);
+            let withhold = rng.random::<f64>() < partial_fanout_crash_bias;
+            util_stats::record_crash_timing_bias(withhold);
+            if withhold {
+                mask |= 1u64 << n;
+            }
+        }
+        mask
+    } else {
+        0
+    };
+
     // Helper: check if a runnable is reserved OR FIFO-blocked. Both exclude the
     // item from scheduling via the same plumbing, so combine them here.
     let link_deliver_seq = state.link_deliver_seq.clone();
     let is_ineligible = |r: &Runnable<H>| {
+        if crash_defer_mask != 0
+            && let Runnable::Crash { node_id, .. } = r
+            && node_id.index < u64::BITS as usize
+            && crash_defer_mask & (1u64 << node_id.index) != 0
+        {
+            return true;
+        }
         reservations.iter().any(|res| res.matches(r)) || is_fifo_blocked(r, &link_deliver_seq)
     };
 

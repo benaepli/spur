@@ -204,6 +204,15 @@ pub struct ExplorerConfig {
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
 
+    /// Probability that a scheduling step withholds a pending crash whose node
+    /// is not in the middle of its own fan-out, meaning it has no undelivered
+    /// send of its own or more than one. The crash keeps its place in the queue
+    /// and is offered again, so this shifts where crashes land in a node's send
+    /// burst without changing how many a run takes. 0.0 withholds nothing,
+    /// which is the unbiased acceptance.
+    #[serde(default)]
+    pub partial_fanout_crash_bias: f64,
+
     #[serde(default)]
     pub feedback: FeedbackConfig,
 
@@ -313,6 +322,7 @@ pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
     "quick_fire_multiplier",
     "steer_terms",
     "purgatory",
+    "partial_fanout_crash_bias",
     "feedback",
     "stats",
     "emit_acted_fraction",
@@ -463,6 +473,8 @@ impl ExplorerConfig {
                                                     .clone(),
                                                 steer_terms: self.steer_terms_resolved(),
                                                 purgatory: self.purgatory.clone(),
+                                                partial_fanout_crash_bias: self
+                                                    .partial_fanout_crash_bias,
                                                 timeline_key_granularity: self
                                                     .feedback
                                                     .key_granularity(),
@@ -564,6 +576,7 @@ pub struct SingleRunConfig {
     pub within_queue_selector: WithinQueueSelector,
     pub steer_terms: ResolvedTerms,
     pub purgatory: PurgatoryConfig,
+    pub partial_fanout_crash_bias: f64,
     pub timeline_key_granularity: TimelineKeyGranularity,
     pub rng_stream_isolation: bool,
 }
@@ -627,6 +640,7 @@ impl SingleRunConfig {
             within_queue_selector: constraints.within_queue_selector.clone(),
             steer_terms: constraints.steer_terms_resolved(),
             purgatory: constraints.purgatory.clone(),
+            partial_fanout_crash_bias: constraints.partial_fanout_crash_bias,
             timeline_key_granularity: constraints.feedback.key_granularity(),
             rng_stream_isolation: constraints.rng_stream_isolation,
         }
@@ -1021,6 +1035,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &config.within_queue_selector,
         &config.steer_terms,
         &config.purgatory,
+        config.partial_fanout_crash_bias,
         &mut rec,
     )?;
 
@@ -1253,6 +1268,7 @@ fn run_single_plan<F: Feedback>(
     within_queue: &WithinQueueSelector,
     terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
+    partial_fanout_crash_bias: f64,
     weights: &CoverageConfig,
     key_granularity: TimelineKeyGranularity,
     attribution: &RunAttribution,
@@ -1325,6 +1341,7 @@ fn run_single_plan<F: Feedback>(
         within_queue,
         terms,
         purgatory_config,
+        partial_fanout_crash_bias,
         &mut rng,
     )?;
 
@@ -1425,6 +1442,7 @@ fn run_plan_impl<F: Feedback>(
             &config.within_queue_selector,
             &plan_terms,
             &config.purgatory,
+            config.partial_fanout_crash_bias,
             &weights,
             config.feedback.key_granularity(),
             &RunAttribution::mode("plan"),

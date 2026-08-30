@@ -217,6 +217,12 @@ pub struct PlanFileConfig {
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
 
+    /// Probability that a scheduling step withholds a pending crash whose node
+    /// is not in the middle of its own fan-out. See the explorer config field of
+    /// the same name; 0.0 withholds nothing.
+    #[serde(default)]
+    pub partial_fanout_crash_bias: f64,
+
     #[serde(default)]
     pub feedback: FeedbackConfig,
 }
