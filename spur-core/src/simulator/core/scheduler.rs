@@ -1124,9 +1124,17 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
     if let Some(inc) = state.incarnations.get_mut(node_id.index) {
         *inc = inc.saturating_add(1);
     }
+    let own_sends_inflight = state
+        .send_ledger
+        .get(node_id.index)
+        .is_some_and(|l| l.in_flight > 0);
     state.note_incarnation_bump(node_id.index);
     state.note_handler_entry(node_id.index, HandlerTrigger::None);
-    util_stats::record_recover(node_id.index, state.crash_info.current_step);
+    util_stats::record_recover(
+        node_id.index,
+        state.crash_info.current_step,
+        own_sends_inflight,
+    );
     F::note_recovery(feedback, node_id);
 
     state.nodes[node_id.index] = Env::<H>::default();
