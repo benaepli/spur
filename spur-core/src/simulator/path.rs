@@ -15,6 +15,7 @@ use crate::simulator::path::plan::{
 };
 use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
+use crate::simulator::timer_context;
 use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunExtension, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
@@ -308,6 +309,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     } else {
         run_cap::effective_cap(backup)
     };
+    let timer_ctx_mode = timer_context::run_mode(run_id);
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
@@ -596,6 +598,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 terms,
                 purgatory_config,
                 partial_fanout_crash_bias,
+                timer_ctx_mode,
                 &reservations,
                 rng,
             )?;

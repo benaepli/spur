@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, DeliveryEffect,
     DeliveryEffectStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
-    UtilizationSnapshot,
+    TimerContextStats, UtilizationSnapshot,
 };
 use std::collections::BTreeMap;
 
@@ -399,6 +399,39 @@ fn run_cap_leaves(prefix: &str, r: &RunCapStats) -> Vec<(String, Value)> {
     ]
 }
 
+fn timer_context(m: &mut Marks) -> TimerContextStats {
+    TimerContextStats {
+        probe_firings: m.int(),
+        probe_acted: m.int(),
+        biased_steps: m.int(),
+        biased_steps_promoted: m.int(),
+        biased_steps_suppressed: m.int(),
+        steps_excluded_selector: m.int(),
+        cells_engaged: m.int(),
+    }
+}
+
+fn timer_context_leaves(prefix: &str, t: &TimerContextStats) -> Vec<(String, Value)> {
+    let TimerContextStats {
+        probe_firings,
+        probe_acted,
+        biased_steps,
+        biased_steps_promoted,
+        biased_steps_suppressed,
+        steps_excluded_selector,
+        cells_engaged,
+    } = t;
+    vec![
+        leaf(prefix, "probe_firings", *probe_firings),
+        leaf(prefix, "probe_acted", *probe_acted),
+        leaf(prefix, "biased_steps", *biased_steps),
+        leaf(prefix, "biased_steps_promoted", *biased_steps_promoted),
+        leaf(prefix, "biased_steps_suppressed", *biased_steps_suppressed),
+        leaf(prefix, "steps_excluded_selector", *steps_excluded_selector),
+        leaf(prefix, "cells_engaged", *cells_engaged),
+    ]
+}
+
 /// The blocks the snapshot is made of. Destructured without a rest pattern, so
 /// a block added to the snapshot does not compile until it is named, which is
 /// what keeps a whole block from going unexported.
@@ -428,6 +461,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         prefix_extension: _,
         quiet_stretch: _,
         run_cap: _,
+        timer_context: _,
         timeline_keys: _,
         steer_terms: _,
     } = s;
@@ -456,6 +490,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "prefix_extension",
         "quiet_stretch",
         "run_cap",
+        "timer_context",
         "timeline_keys",
         "steer_terms",
     ]
@@ -519,6 +554,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.termination = termination(&mut m);
     s.delivery_effects = delivery_effects(&mut m);
     s.run_cap = run_cap(&mut m);
+    s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
     expected.extend(delivery_effects_leaves(
@@ -526,6 +562,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
         &s.delivery_effects,
     ));
     expected.extend(run_cap_leaves("run_cap", &s.run_cap));
+    expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
 }
 
@@ -554,7 +591,13 @@ fn every_counter_field_reaches_the_written_json() {
         "the written JSON does not carry the snapshot's blocks"
     );
 
-    for block in ["steer_authority", "termination", "delivery_effects", "run_cap"] {
+    for block in [
+        "steer_authority",
+        "termination",
+        "delivery_effects",
+        "run_cap",
+        "timer_context",
+    ] {
         let mut actual = BTreeMap::new();
         leaves(&parsed[block], block, &mut actual);
         let want: Vec<(String, Value)> = expected

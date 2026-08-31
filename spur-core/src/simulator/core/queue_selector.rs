@@ -29,6 +29,23 @@ impl QueueInfo {
 
 pub trait QueueSelector {
     fn select(&mut self, info: &QueueInfo, rng: &mut impl Rng) -> Option<QueueSelection>;
+
+    /// Whether `select_timer_biased` applies its bias rather than ignoring it.
+    fn supports_timer_bias(&self) -> bool {
+        false
+    }
+
+    /// Select with the timer's share of the roll multiplied by `timer_bias`.
+    /// A selector that does not support the bias makes the stock selection,
+    /// drawing exactly what `select` would draw.
+    fn select_timer_biased(
+        &mut self,
+        info: &QueueInfo,
+        _timer_bias: f64,
+        rng: &mut impl Rng,
+    ) -> Option<QueueSelection> {
+        self.select(info, rng)
+    }
 }
 
 /// Pick a non-empty local queue index, weighted by queue size.
@@ -105,6 +122,34 @@ impl QueueSelector for ProbabilisticSelector {
         };
         self.try_select(primary, info, rng)
     }
+
+    fn supports_timer_bias(&self) -> bool {
+        true
+    }
+
+    fn select_timer_biased(
+        &mut self,
+        info: &QueueInfo,
+        timer_bias: f64,
+        rng: &mut impl Rng,
+    ) -> Option<QueueSelection> {
+        if info.total() == 0 {
+            return None;
+        }
+        // The bias trades timer mass against the network share only: the
+        // local share is untouched, and the cap keeps the effective timer
+        // probability inside the unit interval when p_local is large.
+        let p_timer_eff = (self.p_timer * timer_bias).min((1.0 - self.p_local).max(0.0));
+        let roll: f64 = rng.random();
+        let primary = if roll < self.p_local {
+            0 // local
+        } else if roll < self.p_local + p_timer_eff {
+            2 // timer
+        } else {
+            1 // network
+        };
+        self.try_select(primary, info, rng)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +214,22 @@ impl QueueSelector for AnySelector {
     fn select(&mut self, info: &QueueInfo, rng: &mut impl Rng) -> Option<QueueSelection> {
         match self {
             AnySelector::Probabilistic(s) => s.select(info, rng),
+            AnySelector::Preemptive(s) => s.select(info, rng),
+        }
+    }
+
+    fn supports_timer_bias(&self) -> bool {
+        matches!(self, AnySelector::Probabilistic(_))
+    }
+
+    fn select_timer_biased(
+        &mut self,
+        info: &QueueInfo,
+        timer_bias: f64,
+        rng: &mut impl Rng,
+    ) -> Option<QueueSelection> {
+        match self {
+            AnySelector::Probabilistic(s) => s.select_timer_biased(info, timer_bias, rng),
             AnySelector::Preemptive(s) => s.select(info, rng),
         }
     }
@@ -246,5 +307,85 @@ impl Default for WithinQueueSelector {
         WithinQueueSelector::Tournament {
             k: default_tournament_k(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn contested_info() -> QueueInfo {
+        QueueInfo {
+            local_queue_sizes: vec![1],
+            network_queue_size: 1,
+            timer_queue_size: 1,
+            step: 0,
+        }
+    }
+
+    fn frequency(selector: &mut ProbabilisticSelector, bias: Option<f64>, draws: u32) -> f64 {
+        let mut rng = StdRng::seed_from_u64(7);
+        let info = contested_info();
+        let mut timers = 0u32;
+        for _ in 0..draws {
+            let sel = match bias {
+                Some(b) => selector.select_timer_biased(&info, b, &mut rng),
+                None => selector.select(&info, &mut rng),
+            };
+            if matches!(sel, Some(QueueSelection::Timer)) {
+                timers += 1;
+            }
+        }
+        f64::from(timers) / f64::from(draws)
+    }
+
+    #[test]
+    fn identity_bias_matches_the_stock_roll_and_draw_counts_agree() {
+        let mut a = ProbabilisticSelector { p_local: 0.80, p_timer: 0.03 };
+        let mut b = a.clone();
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(42);
+        let info = contested_info();
+        for _ in 0..10_000 {
+            let sa = a.select(&info, &mut rng_a);
+            let sb = b.select_timer_biased(&info, 1.0, &mut rng_b);
+            assert_eq!(format!("{sa:?}"), format!("{sb:?}"));
+        }
+        // Equal draws so far imply the next draw agrees; a path that drew
+        // more or less would desynchronize here.
+        assert_eq!(rng_a.random::<u64>(), rng_b.random::<u64>());
+    }
+
+    #[test]
+    fn draw_count_parity_holds_for_a_non_identity_bias() {
+        let mut s = ProbabilisticSelector { p_local: 0.80, p_timer: 0.03 };
+        let mut rng_a = StdRng::seed_from_u64(9);
+        let mut rng_b = StdRng::seed_from_u64(9);
+        let info = contested_info();
+        for _ in 0..10_000 {
+            s.select(&info, &mut rng_a);
+            s.select_timer_biased(&info, 4.0, &mut rng_b);
+        }
+        assert_eq!(rng_a.random::<u64>(), rng_b.random::<u64>());
+    }
+
+    #[test]
+    fn bias_scales_the_timer_share_of_the_roll() {
+        let mut s = ProbabilisticSelector { p_local: 0.80, p_timer: 0.03 };
+        let stock = frequency(&mut s, None, 200_000);
+        assert!((stock - 0.03).abs() < 0.005, "stock timer share was {stock}");
+        let promoted = frequency(&mut s, Some(4.0), 200_000);
+        assert!((promoted - 0.12).abs() < 0.005, "promoted share was {promoted}");
+        let suppressed = frequency(&mut s, Some(0.25), 200_000);
+        assert!((suppressed - 0.0075).abs() < 0.002, "suppressed share was {suppressed}");
+    }
+
+    #[test]
+    fn effective_timer_probability_is_capped_by_the_non_local_mass() {
+        let mut s = ProbabilisticSelector { p_local: 0.95, p_timer: 0.2 };
+        let f = frequency(&mut s, Some(4.0), 200_000);
+        assert!((f - 0.05).abs() < 0.005, "capped share was {f}");
     }
 }

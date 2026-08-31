@@ -18,6 +18,7 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::Topology;
 use crate::simulator::path::TopologyInfo;
 use crate::simulator::rng::{Stream, StreamRng};
+use crate::simulator::timer_context;
 use crate::simulator::util_stats;
 use crate::simulator::util_stats::DeliveryBias;
 use imbl::OrdSet;
@@ -702,6 +703,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
     partial_fanout_crash_bias: f64,
+    timer_ctx_mode: timer_context::RunMode,
     reservations: &[Reservation],
     rng: &mut impl StreamRng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
@@ -849,13 +851,64 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     rng.use_stream(Stream::QueueChoice);
     let selection = match routed {
         Some(s) => s,
-        None => match selector.select(&info, rng) {
-            Some(s) => s,
-            None => {
-                record_unscheduled(&audit);
-                return Ok(ScheduleResult::None);
+        None => {
+            // Steer-off probe runs and steps with no eligible timer take the
+            // stock roll. The learned multiplier is read for the context of
+            // the first eligible timer in queue order; the features are
+            // copied into owned locals because the selector call below must
+            // not overlap a borrow of `state`.
+            let bias: Option<f64> = if timer_ctx_mode == timer_context::RunMode::Steered
+                && info.timer_queue_size > 0
+            {
+                let head_timer_node = state.timer_queue.iter().find_map(|r| {
+                    if is_ineligible(r) {
+                        return None;
+                    }
+                    if let Runnable::Timer(t) = r {
+                        if strict_timers
+                            && let Some(l) = &t.label
+                            && !state.allowed_timers.contains(&(t.node.index, l.clone()))
+                        {
+                            return None;
+                        }
+                        Some(t.node)
+                    } else {
+                        None
+                    }
+                });
+                head_timer_node.and_then(|node| {
+                    let ledger = state.send_ledger.get(node.index).copied().unwrap_or_default();
+                    let cell = timer_context::cell_key(
+                        state.pending_deliveries_to(node),
+                        ledger.in_flight,
+                        state.max_timer_inert_streak(node.index),
+                        state.incarnation(node) > 0
+                            && state.entries_since_restart(node.index) < 8,
+                    );
+                    timer_context::multiplier(cell)
+                })
+            } else {
+                None
+            };
+            let picked = match bias {
+                Some(m) if selector.supports_timer_bias() => {
+                    util_stats::record_timer_context_bias(m);
+                    selector.select_timer_biased(&info, m, rng)
+                }
+                Some(_) => {
+                    util_stats::record_timer_context_excluded();
+                    selector.select(&info, rng)
+                }
+                None => selector.select(&info, rng),
+            };
+            match picked {
+                Some(s) => s,
+                None => {
+                    record_unscheduled(&audit);
+                    return Ok(ScheduleResult::None);
+                }
             }
-        },
+        }
     };
 
     let (runnable, chosen_slot, chosen_mask) = match selection {
@@ -1112,14 +1165,27 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     // segment that only sends reads as inert.
                     let timer_entry = r.timer_entry == Some(r.pc);
                     let timer_probe = (util_stats::acted_fraction_enabled() && timer_entry).then(|| {
-                        let inflight = state.pending_deliveries_to(record_dest) > 0;
+                        let pending = state.pending_deliveries_to(record_dest);
+                        let inflight = pending > 0;
                         let key = util_stats::TimerKey::new(
                             r.pc,
                             inflight,
                             state.incarnation(record_dest),
                             state.timer_inert_streak(record_dest.index, r.pc),
                         );
-                        (r.pc, key, inflight, state.node_state_token(record_dest))
+                        let ledger = state
+                            .send_ledger
+                            .get(record_dest.index)
+                            .copied()
+                            .unwrap_or_default();
+                        let cell = timer_context::cell_key(
+                            pending,
+                            ledger.in_flight,
+                            state.max_timer_inert_streak(record_dest.index),
+                            state.incarnation(record_dest) > 0
+                                && state.entries_since_restart(record_dest.index) < 8,
+                        );
+                        (r.pc, key, inflight, cell, state.node_state_token(record_dest))
                     });
                     if message_entry {
                         state.note_handler_entry(record_dest.index, HandlerTrigger::Delivery);
@@ -1142,10 +1208,15 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         util_stats::record_delivery(bias, acted, distance);
                         util_stats::record_term_acted(chosen_mask, acted);
                     }
-                    if let Some((pc, key, inflight, before)) = timer_probe {
+                    if let Some((pc, key, inflight, cell, before)) = timer_probe {
                         let acted = state.node_state_token(record_dest) != before;
                         state.note_timer_effect(record_dest.index, pc, inflight, acted);
                         util_stats::record_timer(key, acted);
+                        // Only steer-off probe runs feed the learner, so the
+                        // learned rates carry no imprint of the bias.
+                        if timer_ctx_mode == timer_context::RunMode::Probe {
+                            timer_context::record_firing(cell, acted);
+                        }
                     }
                     if message_entry {
                         util_stats::record_message_entry(record_dest.index, entry_step);

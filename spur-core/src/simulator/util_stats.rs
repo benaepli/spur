@@ -279,6 +279,14 @@ static RUN_CAP_PROBE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_OVER_CAP_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_SCOPES_LEARNED: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_CURRENT_CAP_MAX_SCOPE: AtomicU64 = AtomicU64::new(0);
+
+static TIMER_CONTEXT_PROBE_FIRINGS: AtomicU64 = AtomicU64::new(0);
+static TIMER_CONTEXT_PROBE_ACTED: AtomicU64 = AtomicU64::new(0);
+static TIMER_CONTEXT_BIASED_STEPS: AtomicU64 = AtomicU64::new(0);
+static TIMER_CONTEXT_BIASED_STEPS_PROMOTED: AtomicU64 = AtomicU64::new(0);
+static TIMER_CONTEXT_BIASED_STEPS_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+static TIMER_CONTEXT_STEPS_EXCLUDED_SELECTOR: AtomicU64 = AtomicU64::new(0);
+static TIMER_CONTEXT_CELLS_ENGAGED: AtomicU64 = AtomicU64::new(0);
 static TIMELINE_KEYS: Mutex<TimelineKeyGrowth> = Mutex::new(TimelineKeyGrowth::new());
 
 /// Runs per point on the timeline-key growth curve, and the most points a
@@ -413,6 +421,13 @@ pub fn set_enabled(on: bool) {
             &RUN_CAP_OVER_CAP_COMPLETIONS,
             &RUN_CAP_SCOPES_LEARNED,
             &RUN_CAP_CURRENT_CAP_MAX_SCOPE,
+            &TIMER_CONTEXT_PROBE_FIRINGS,
+            &TIMER_CONTEXT_PROBE_ACTED,
+            &TIMER_CONTEXT_BIASED_STEPS,
+            &TIMER_CONTEXT_BIASED_STEPS_PROMOTED,
+            &TIMER_CONTEXT_BIASED_STEPS_SUPPRESSED,
+            &TIMER_CONTEXT_STEPS_EXCLUDED_SELECTOR,
+            &TIMER_CONTEXT_CELLS_ENGAGED,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -1884,6 +1899,51 @@ pub fn set_run_cap_learned(scopes: u64, cap_max_scope: u64) {
     RUN_CAP_CURRENT_CAP_MAX_SCOPE.store(cap_max_scope, Ordering::Relaxed);
 }
 
+/// One steer-off probe-run timer firing was folded into the timer-context
+/// learner; `acted` marks the subset that changed the node's state.
+#[inline]
+pub fn record_timer_context_probe(acted: bool) {
+    if !enabled() {
+        return;
+    }
+    TIMER_CONTEXT_PROBE_FIRINGS.fetch_add(1, Ordering::Relaxed);
+    if acted {
+        TIMER_CONTEXT_PROBE_ACTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One steered-run queue-selection roll applied an engaged context cell's
+/// `multiplier` to the timer share.
+#[inline]
+pub fn record_timer_context_bias(multiplier: f64) {
+    if !enabled() {
+        return;
+    }
+    TIMER_CONTEXT_BIASED_STEPS.fetch_add(1, Ordering::Relaxed);
+    if multiplier > 1.0 {
+        TIMER_CONTEXT_BIASED_STEPS_PROMOTED.fetch_add(1, Ordering::Relaxed);
+    } else if multiplier < 1.0 {
+        TIMER_CONTEXT_BIASED_STEPS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An engaged context cell produced a multiplier but the step's queue
+/// selector does not support the bias, so the stock roll ran instead.
+#[inline]
+pub fn record_timer_context_excluded() {
+    if !enabled() {
+        return;
+    }
+    TIMER_CONTEXT_STEPS_EXCLUDED_SELECTOR.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Gauge, not a counter: overwritten with the timer-context learner's count
+/// of cells at or over its sample floor, ungated so it is visible with
+/// stats off.
+pub fn set_timer_context_cells_engaged(cells: u64) {
+    TIMER_CONTEXT_CELLS_ENGAGED.store(cells, Ordering::Relaxed);
+}
+
 /// One point on the timeline-key growth curve, covering `runs` consecutive
 /// runs starting at `first_run`. `cumulative_distinct` is the running total of
 /// keys ever inserted as of the last run in the point.
@@ -2730,6 +2790,37 @@ impl RunCapStats {
     }
 }
 
+/// The timer-context block: the learner's probe traffic, the steered rolls
+/// that applied a learned multiplier, the rolls an unsupported selector
+/// excluded, and a gauge of the cells currently engaged. `cells_engaged` is
+/// a gauge and must be read from a raw snapshot, not a difference of two.
+#[derive(Serialize)]
+pub struct TimerContextStats {
+    pub probe_firings: u64,
+    pub probe_acted: u64,
+    pub biased_steps: u64,
+    pub biased_steps_promoted: u64,
+    pub biased_steps_suppressed: u64,
+    pub steps_excluded_selector: u64,
+    pub cells_engaged: u64,
+}
+
+impl TimerContextStats {
+    fn read() -> Self {
+        Self {
+            probe_firings: TIMER_CONTEXT_PROBE_FIRINGS.load(Ordering::Relaxed),
+            probe_acted: TIMER_CONTEXT_PROBE_ACTED.load(Ordering::Relaxed),
+            biased_steps: TIMER_CONTEXT_BIASED_STEPS.load(Ordering::Relaxed),
+            biased_steps_promoted: TIMER_CONTEXT_BIASED_STEPS_PROMOTED.load(Ordering::Relaxed),
+            biased_steps_suppressed: TIMER_CONTEXT_BIASED_STEPS_SUPPRESSED
+                .load(Ordering::Relaxed),
+            steps_excluded_selector: TIMER_CONTEXT_STEPS_EXCLUDED_SELECTOR
+                .load(Ordering::Relaxed),
+            cells_engaged: TIMER_CONTEXT_CELLS_ENGAGED.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
@@ -2757,6 +2848,7 @@ pub struct UtilizationSnapshot {
     pub prefix_extension: PrefixExtensionStats,
     pub quiet_stretch: QuietStretchStats,
     pub run_cap: RunCapStats,
+    pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
 }
@@ -2945,6 +3037,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             .unwrap_or_else(|p| *p.into_inner()),
         quiet_stretch: QuietStretchStats::read(),
         run_cap: RunCapStats::read(),
+        timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),
     }

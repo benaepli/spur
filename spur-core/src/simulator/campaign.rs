@@ -833,6 +833,7 @@ pub fn run_explorer_campaign(
     info!("campaign session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
     crate::simulator::run_cap::reset();
+    crate::simulator::timer_context::reset();
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.envelope.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.envelope.emit_crash_census);

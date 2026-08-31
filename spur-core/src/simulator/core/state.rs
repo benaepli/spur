@@ -719,6 +719,19 @@ impl<H: HashPolicy> State<H> {
             .unwrap_or(0)
     }
 
+    /// The node's largest current consecutive inert-firing streak across
+    /// vertices. Streaks are keyed by the vertex the woken record resumes
+    /// at, which differs from the vertex a queued timer carries, so a
+    /// reader that only holds the queued timer aggregates over the node.
+    pub fn max_timer_inert_streak(&self, node: usize) -> u32 {
+        self.timer_inert_streaks
+            .iter()
+            .filter(|(n, _, _)| *n == node)
+            .map(|(_, _, s)| *s)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Account one timer firing that woke a record at `pc` on node `node`.
     pub fn note_timer_effect(&mut self, node: usize, pc: Vertex, inflight: bool, acted: bool) {
         let t = &mut self.timer_stats;
