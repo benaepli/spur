@@ -5,11 +5,12 @@ use crate::simulator::core::{
     Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
     Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
 };
-use crate::simulator::coverage::GlobalState;
+pub use crate::simulator::coverage::GlobalState;
 use crate::simulator::curriculum::{Curriculum, lower};
+pub use crate::simulator::feedback::{CoverageConfig, NoFeedback};
 use crate::simulator::feedback::{
-    CfgFeedback, CoverageConfig, Feedback, FeedbackConfig, FeedbackMode, FullFeedback, NoFeedback,
-    TimelineFeedback, TimelineKeyGranularity, TimelineTuple,
+    CfgFeedback, Feedback, FeedbackConfig, FeedbackMode, FullFeedback, TimelineFeedback,
+    TimelineKeyGranularity, TimelineTuple,
 };
 use crate::simulator::hash_utils::compute_hash;
 use crate::simulator::history::{
@@ -17,11 +18,13 @@ use crate::simulator::history::{
 };
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::plan::ExecutionPlan;
-use crate::simulator::path::{PathState, RunOutcome, Topology, TopologyInfo, exec_plan};
+pub use crate::simulator::path::RunOutcome;
+use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
 use crate::simulator::rng::{
     LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, StreamRng,
     StreamSet, WORKLOAD_SALT, derive_seed, mutate_tape,
 };
+use crate::simulator::run_cap;
 use crate::simulator::util_stats;
 use crossbeam::channel;
 use log::{debug, error, info, warn};
@@ -928,6 +931,7 @@ fn run_row(
         RunOutcome::Completed { steps } => (*steps, "plan_complete"),
         RunOutcome::Deadlock { step, .. } => (*step, "deadlock"),
         RunOutcome::IterationsExhausted { .. } => (max_iterations, "iterations_exhausted"),
+        RunOutcome::LearnedCapReached { cap, .. } => (*cap, "learned_cap_reached"),
     };
     crate::simulator::history::PersistableRun {
         run_id,
@@ -1131,6 +1135,7 @@ pub fn run_explorer(
 
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    run_cap::reset();
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
@@ -1523,6 +1528,7 @@ pub fn run_explorer_genetic(
 
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    run_cap::reset();
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
@@ -1960,6 +1966,7 @@ pub fn run_explorer_aos(
 
     info!("AOS session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
+    run_cap::reset();
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
@@ -2285,6 +2292,7 @@ impl<F: Feedback> Strategy<F> for CurriculumExplorer<F> {
         // so this cannot race the per-run merges.
         if self.decay_factor < 1.0 {
             F::decay(&self.global_state.feedback, self.decay_factor);
+            run_cap::decay(self.decay_factor);
         }
 
         StepReport {
@@ -2607,6 +2615,7 @@ pub fn run_explorer_continuous(
 
     info!("Continuous session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
+    run_cap::reset();
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.envelope.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.envelope.emit_crash_census);

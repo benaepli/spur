@@ -273,6 +273,12 @@ static TIMER_STREAK_ACTED: [AtomicU64; STREAK_BUCKETS] =
 static TIMER_STEER_EVALUATED: AtomicU64 = AtomicU64::new(0);
 static TIMER_STEER_RAISED: AtomicU64 = AtomicU64::new(0);
 static TIMER_STEER_LOWERED: AtomicU64 = AtomicU64::new(0);
+
+static RUN_CAP_PROBES: AtomicU64 = AtomicU64::new(0);
+static RUN_CAP_PROBE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static RUN_CAP_OVER_CAP_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static RUN_CAP_SCOPES_LEARNED: AtomicU64 = AtomicU64::new(0);
+static RUN_CAP_CURRENT_CAP_MAX_SCOPE: AtomicU64 = AtomicU64::new(0);
 static TIMELINE_KEYS: Mutex<TimelineKeyGrowth> = Mutex::new(TimelineKeyGrowth::new());
 
 /// Runs per point on the timeline-key growth curve, and the most points a
@@ -402,6 +408,11 @@ pub fn set_enabled(on: bool) {
             &TIMER_STEER_EVALUATED,
             &TIMER_STEER_RAISED,
             &TIMER_STEER_LOWERED,
+            &RUN_CAP_PROBES,
+            &RUN_CAP_PROBE_COMPLETIONS,
+            &RUN_CAP_OVER_CAP_COMPLETIONS,
+            &RUN_CAP_SCOPES_LEARNED,
+            &RUN_CAP_CURRENT_CAP_MAX_SCOPE,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -1488,6 +1499,9 @@ pub enum RunEnd {
     IterationsExhausted,
     /// No runnable work and no planned event able to become ready.
     Deadlock,
+    /// The learned step cap, short of the configured budget, ended the run
+    /// while planned events were outstanding.
+    LearnedCapReached,
 }
 
 /// Termination counts and running sums over one bucket of runs. `steps_used`
@@ -1502,6 +1516,7 @@ pub struct TerminationTally {
     pub plan_complete_with_pending_work: u64,
     pub iterations_exhausted: u64,
     pub deadlock: u64,
+    pub learned_cap_reached: u64,
     pub steps_used_sum: u64,
     pub step_budget_sum: u64,
     pub pending_work_at_exit_sum: u64,
@@ -1516,6 +1531,7 @@ impl TerminationTally {
             plan_complete_with_pending_work: 0,
             iterations_exhausted: 0,
             deadlock: 0,
+            learned_cap_reached: 0,
             steps_used_sum: 0,
             step_budget_sum: 0,
             pending_work_at_exit_sum: 0,
@@ -1534,6 +1550,7 @@ impl TerminationTally {
             }
             RunEnd::IterationsExhausted => self.iterations_exhausted += 1,
             RunEnd::Deadlock => self.deadlock += 1,
+            RunEnd::LearnedCapReached => self.learned_cap_reached += 1,
         }
         self.steps_used_sum += s.steps_used;
         self.step_budget_sum += s.step_budget;
@@ -1641,7 +1658,7 @@ impl RunExtension {
             RunEnd::Deadlock => PrefixStop::Deadlock,
             RunEnd::PlanComplete if self.pending_at_exit == 0 => PrefixStop::PlanCompleteQuiescent,
             RunEnd::PlanComplete => PrefixStop::PlanCompletePending,
-            RunEnd::IterationsExhausted => {
+            RunEnd::IterationsExhausted | RunEnd::LearnedCapReached => {
                 if self.pending_at_exit == 0 {
                     PrefixStop::BudgetIdle
                 } else if self.tail_without_release >= STALLED_TAIL_STEPS {
@@ -1760,7 +1777,7 @@ pub struct QuietStretchRun {
 struct QuietStretchState {
     /// Longest-stretch histograms indexed by how the run ended, in the order
     /// `RunEnd` is declared.
-    by_end: [[u64; HIST_BUCKETS]; 3],
+    by_end: [[u64; HIST_BUCKETS]; 4],
     per_run: Vec<QuietStretchRun>,
     dropped: u64,
 }
@@ -1768,7 +1785,7 @@ struct QuietStretchState {
 impl QuietStretchState {
     const fn new() -> Self {
         Self {
-            by_end: [[0; HIST_BUCKETS]; 3],
+            by_end: [[0; HIST_BUCKETS]; 4],
             per_run: Vec::new(),
             dropped: 0,
         }
@@ -1787,6 +1804,7 @@ pub struct QuietStretchStats {
     pub plan_complete: Vec<u64>,
     pub iterations_exhausted: Vec<u64>,
     pub deadlock: Vec<u64>,
+    pub learned_cap_reached: Vec<u64>,
     pub per_run: Vec<QuietStretchRun>,
     pub per_run_dropped: u64,
 }
@@ -1801,6 +1819,7 @@ impl QuietStretchStats {
             plan_complete: q.by_end[0].to_vec(),
             iterations_exhausted: q.by_end[1].to_vec(),
             deadlock: q.by_end[2].to_vec(),
+            learned_cap_reached: q.by_end[3].to_vec(),
             per_run: q.per_run.clone(),
             per_run_dropped: q.dropped,
         }
@@ -1821,6 +1840,7 @@ pub fn record_quiet_stretch(run_id: i64, end: RunEnd) {
         RunEnd::PlanComplete => 0,
         RunEnd::IterationsExhausted => 1,
         RunEnd::Deadlock => 2,
+        RunEnd::LearnedCapReached => 3,
     };
     if let Ok(mut q) = QUIET_STRETCH.lock() {
         q.by_end[row][hist_bucket(longest as usize)] += 1;
@@ -1834,6 +1854,34 @@ pub fn record_quiet_stretch(run_id: i64, end: RunEnd) {
             q.dropped += 1;
         }
     }
+}
+
+/// One probe run finished, of any outcome; `completed` marks the probes
+/// whose length fed the learned-cap distribution.
+pub fn record_run_cap_probe(completed: bool) {
+    if !enabled() {
+        return;
+    }
+    RUN_CAP_PROBES.fetch_add(1, Ordering::Relaxed);
+    if completed {
+        RUN_CAP_PROBE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One completed probe ran longer than the learned cap in effect when it
+/// merged, so a capped run in its place would not have completed.
+pub fn record_run_cap_over_cap_completion() {
+    if !enabled() {
+        return;
+    }
+    RUN_CAP_OVER_CAP_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Gauges, not counters: overwritten with the learner's current view so the
+/// snapshot reads its state, ungated so it is visible with stats off.
+pub fn set_run_cap_learned(scopes: u64, cap_max_scope: u64) {
+    RUN_CAP_SCOPES_LEARNED.store(scopes, Ordering::Relaxed);
+    RUN_CAP_CURRENT_CAP_MAX_SCOPE.store(cap_max_scope, Ordering::Relaxed);
 }
 
 /// One point on the timeline-key growth curve, covering `runs` consecutive
@@ -2659,6 +2707,29 @@ impl RecoveryPlaceboStats {
     }
 }
 
+/// The learned-run-cap block: probe traffic, completions the cap would have
+/// cut off, and gauges of what the learner currently holds.
+#[derive(Serialize)]
+pub struct RunCapStats {
+    pub probes: u64,
+    pub probe_completions: u64,
+    pub over_cap_completions: u64,
+    pub scopes_learned: u64,
+    pub current_cap_max_scope: u64,
+}
+
+impl RunCapStats {
+    fn read() -> Self {
+        Self {
+            probes: RUN_CAP_PROBES.load(Ordering::Relaxed),
+            probe_completions: RUN_CAP_PROBE_COMPLETIONS.load(Ordering::Relaxed),
+            over_cap_completions: RUN_CAP_OVER_CAP_COMPLETIONS.load(Ordering::Relaxed),
+            scopes_learned: RUN_CAP_SCOPES_LEARNED.load(Ordering::Relaxed),
+            current_cap_max_scope: RUN_CAP_CURRENT_CAP_MAX_SCOPE.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// A point-in-time copy of all counters, serializable to `utilization.json`.
 #[derive(Serialize)]
 pub struct UtilizationSnapshot {
@@ -2685,6 +2756,7 @@ pub struct UtilizationSnapshot {
     pub termination: TerminationStats,
     pub prefix_extension: PrefixExtensionStats,
     pub quiet_stretch: QuietStretchStats,
+    pub run_cap: RunCapStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
 }
@@ -2872,6 +2944,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             .map(|p| *p)
             .unwrap_or_else(|p| *p.into_inner()),
         quiet_stretch: QuietStretchStats::read(),
+        run_cap: RunCapStats::read(),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),
     }
@@ -3288,6 +3361,67 @@ mod tests {
         assert_eq!(s.by_recovered_nodes[2].plan_complete_pending, 1);
         assert_eq!(after_off.all.runs, 5);
         assert_eq!(after_off.all.deadlock, 0);
+    }
+
+    #[test]
+    fn a_learned_cap_exit_counts_only_its_own_tally_field() {
+        let mut t = TerminationTally::new();
+        t.add(
+            RunEnd::LearnedCapReached,
+            &RunTermination {
+                end: RunEnd::LearnedCapReached,
+                steps_used: 10,
+                step_budget: 100,
+                pending_work_at_exit: 1,
+                planned_events_outstanding: 2,
+                recovered_nodes: 0,
+            },
+        );
+        assert_eq!(t.runs, 1);
+        assert_eq!(t.learned_cap_reached, 1);
+        assert_eq!(t.plan_complete, 0);
+        assert_eq!(t.iterations_exhausted, 0);
+        assert_eq!(t.deadlock, 0);
+    }
+
+    #[test]
+    fn a_learned_cap_exit_classifies_as_a_budget_stop() {
+        let run = |tail_without_release, pending_at_exit| RunExtension {
+            end: RunEnd::LearnedCapReached,
+            steps: 100,
+            steps_released: 90,
+            steps_blocked: 6,
+            steps_idle: 4,
+            tail_without_release,
+            pending_at_exit,
+            recovered_nodes: 0,
+        };
+        assert_eq!(run(0, 0).stop(), PrefixStop::BudgetIdle);
+        assert_eq!(run(STALLED_TAIL_STEPS, 7).stop(), PrefixStop::BudgetBlocked);
+        assert_eq!(run(0, 7).stop(), PrefixStop::BudgetReleasing);
+    }
+
+    #[test]
+    fn a_learned_cap_exit_lands_in_its_own_quiet_stretch_row() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        set_acted_fraction_enabled(true);
+        set_quiet_stretch_enabled(true);
+
+        begin_run();
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_quiet_stretch(3, RunEnd::LearnedCapReached);
+
+        let s = snapshot().quiet_stretch;
+        set_quiet_stretch_enabled(false);
+        set_enabled(false);
+
+        assert_eq!(s.runs, 1);
+        assert_eq!(s.learned_cap_reached[hist_bucket(2)], 1);
+        assert_eq!(s.plan_complete.iter().sum::<u64>(), 0);
+        assert_eq!(s.iterations_exhausted.iter().sum::<u64>(), 0);
+        assert_eq!(s.deadlock.iter().sum::<u64>(), 0);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, DeliveryEffect,
-    DeliveryEffectStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    DeliveryEffectStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     UtilizationSnapshot,
 };
 use std::collections::BTreeMap;
@@ -107,6 +107,7 @@ fn termination_tally(m: &mut Marks) -> TerminationTally {
         plan_complete_with_pending_work: m.int(),
         iterations_exhausted: m.int(),
         deadlock: m.int(),
+        learned_cap_reached: m.int(),
         steps_used_sum: m.int(),
         step_budget_sum: m.int(),
         pending_work_at_exit_sum: m.int(),
@@ -121,6 +122,7 @@ fn termination_tally_leaves(prefix: &str, t: &TerminationTally) -> Vec<(String, 
         plan_complete_with_pending_work,
         iterations_exhausted,
         deadlock,
+        learned_cap_reached,
         steps_used_sum,
         step_budget_sum,
         pending_work_at_exit_sum,
@@ -136,6 +138,7 @@ fn termination_tally_leaves(prefix: &str, t: &TerminationTally) -> Vec<(String, 
         ),
         leaf(prefix, "iterations_exhausted", *iterations_exhausted),
         leaf(prefix, "deadlock", *deadlock),
+        leaf(prefix, "learned_cap_reached", *learned_cap_reached),
         leaf(prefix, "steps_used_sum", *steps_used_sum),
         leaf(prefix, "step_budget_sum", *step_budget_sum),
         leaf(prefix, "pending_work_at_exit_sum", *pending_work_at_exit_sum),
@@ -369,6 +372,33 @@ fn delivery_effects_leaves(prefix: &str, d: &DeliveryEffectStats) -> Vec<(String
     out
 }
 
+fn run_cap(m: &mut Marks) -> RunCapStats {
+    RunCapStats {
+        probes: m.int(),
+        probe_completions: m.int(),
+        over_cap_completions: m.int(),
+        scopes_learned: m.int(),
+        current_cap_max_scope: m.int(),
+    }
+}
+
+fn run_cap_leaves(prefix: &str, r: &RunCapStats) -> Vec<(String, Value)> {
+    let RunCapStats {
+        probes,
+        probe_completions,
+        over_cap_completions,
+        scopes_learned,
+        current_cap_max_scope,
+    } = r;
+    vec![
+        leaf(prefix, "probes", *probes),
+        leaf(prefix, "probe_completions", *probe_completions),
+        leaf(prefix, "over_cap_completions", *over_cap_completions),
+        leaf(prefix, "scopes_learned", *scopes_learned),
+        leaf(prefix, "current_cap_max_scope", *current_cap_max_scope),
+    ]
+}
+
 /// The blocks the snapshot is made of. Destructured without a rest pattern, so
 /// a block added to the snapshot does not compile until it is named, which is
 /// what keeps a whole block from going unexported.
@@ -397,6 +427,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         termination: _,
         prefix_extension: _,
         quiet_stretch: _,
+        run_cap: _,
         timeline_keys: _,
         steer_terms: _,
     } = s;
@@ -424,6 +455,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "termination",
         "prefix_extension",
         "quiet_stretch",
+        "run_cap",
         "timeline_keys",
         "steer_terms",
     ]
@@ -486,12 +518,14 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.steer_authority = steer_authority(&mut m);
     s.termination = termination(&mut m);
     s.delivery_effects = delivery_effects(&mut m);
+    s.run_cap = run_cap(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
     expected.extend(delivery_effects_leaves(
         "delivery_effects",
         &s.delivery_effects,
     ));
+    expected.extend(run_cap_leaves("run_cap", &s.run_cap));
     (s, expected)
 }
 
@@ -520,7 +554,7 @@ fn every_counter_field_reaches_the_written_json() {
         "the written JSON does not carry the snapshot's blocks"
     );
 
-    for block in ["steer_authority", "termination", "delivery_effects"] {
+    for block in ["steer_authority", "termination", "delivery_effects", "run_cap"] {
         let mut actual = BTreeMap::new();
         leaves(&parsed[block], block, &mut actual);
         let want: Vec<(String, Value)> = expected

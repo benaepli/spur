@@ -14,6 +14,7 @@ use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
 use crate::simulator::rng::StreamRng;
+use crate::simulator::run_cap;
 use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunExtension, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
@@ -209,6 +210,9 @@ pub enum RunOutcome {
     Deadlock { step: i32, pending_ops: usize },
     /// The step budget ran out with planned events still outstanding.
     IterationsExhausted { outstanding_events: usize },
+    /// The run reached the learned step cap, short of the configured budget,
+    /// with planned events still outstanding.
+    LearnedCapReached { cap: i32, outstanding_events: usize },
 }
 
 /// How a run spent its steps: how many released a runnable, how many offered
@@ -297,6 +301,13 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
+    let backup = max_iterations;
+    let is_probe = run_cap::is_probe(run_id);
+    let effective_cap = if is_probe {
+        backup
+    } else {
+        run_cap::effective_cap(backup)
+    };
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
@@ -380,7 +391,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         Ok(node_id)
     };
 
-    for step in 0..max_iterations {
+    for step in 0..effective_cap {
         if engine.is_complete() {
             info!("Plan {} completed in {} steps", run_id, step);
             record_termination(
@@ -393,6 +404,9 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 recovered_nodes.len(),
                 &census,
             );
+            if is_probe {
+                run_cap::merge_probe(backup, run_cap::Outcome::Completed, step);
+            }
             return Ok(RunOutcome::Completed { steps: step });
         }
 
@@ -427,6 +441,9 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 recovered_nodes.len(),
                 &census,
             );
+            if is_probe {
+                run_cap::merge_probe(backup, run_cap::Outcome::Deadlocked, step);
+            }
             return Ok(RunOutcome::Deadlock {
                 step,
                 pending_ops: in_progress.len(),
@@ -762,6 +779,22 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         }
     }
 
+    if effective_cap < backup {
+        record_termination(
+            RunEnd::LearnedCapReached,
+            run_id,
+            &path_state.state,
+            &engine,
+            effective_cap,
+            backup,
+            recovered_nodes.len(),
+            &census,
+        );
+        return Ok(RunOutcome::LearnedCapReached {
+            cap: effective_cap,
+            outstanding_events: engine.outstanding_count(),
+        });
+    }
     warn!(
         "Hit max iterations ({}) before plan {} completion",
         max_iterations, run_id
@@ -776,6 +809,9 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         recovered_nodes.len(),
         &census,
     );
+    if is_probe {
+        run_cap::merge_probe(backup, run_cap::Outcome::Exhausted, backup);
+    }
     Ok(RunOutcome::IterationsExhausted {
         outstanding_events: engine.outstanding_count(),
     })
