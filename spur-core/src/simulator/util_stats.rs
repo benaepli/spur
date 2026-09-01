@@ -277,6 +277,7 @@ static TIMER_STEER_LOWERED: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_PROBES: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_PROBE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_OVER_CAP_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static RUN_CAP_CAP_RECOMPUTES: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_SCOPES_LEARNED: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_CURRENT_CAP_MAX_SCOPE: AtomicU64 = AtomicU64::new(0);
 
@@ -419,6 +420,7 @@ pub fn set_enabled(on: bool) {
             &RUN_CAP_PROBES,
             &RUN_CAP_PROBE_COMPLETIONS,
             &RUN_CAP_OVER_CAP_COMPLETIONS,
+            &RUN_CAP_CAP_RECOMPUTES,
             &RUN_CAP_SCOPES_LEARNED,
             &RUN_CAP_CURRENT_CAP_MAX_SCOPE,
             &TIMER_CONTEXT_PROBE_FIRINGS,
@@ -1892,6 +1894,15 @@ pub fn record_run_cap_over_cap_completion() {
     RUN_CAP_OVER_CAP_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The learned cap for one scope was recomputed at a completed-count
+/// checkpoint and now governs that scope's runs.
+pub fn record_run_cap_recompute() {
+    if !enabled() {
+        return;
+    }
+    RUN_CAP_CAP_RECOMPUTES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Gauges, not counters: overwritten with the learner's current view so the
 /// snapshot reads its state, ungated so it is visible with stats off.
 pub fn set_run_cap_learned(scopes: u64, cap_max_scope: u64) {
@@ -2774,6 +2785,7 @@ pub struct RunCapStats {
     pub probes: u64,
     pub probe_completions: u64,
     pub over_cap_completions: u64,
+    pub cap_recomputes: u64,
     pub scopes_learned: u64,
     pub current_cap_max_scope: u64,
 }
@@ -2784,6 +2796,7 @@ impl RunCapStats {
             probes: RUN_CAP_PROBES.load(Ordering::Relaxed),
             probe_completions: RUN_CAP_PROBE_COMPLETIONS.load(Ordering::Relaxed),
             over_cap_completions: RUN_CAP_OVER_CAP_COMPLETIONS.load(Ordering::Relaxed),
+            cap_recomputes: RUN_CAP_CAP_RECOMPUTES.load(Ordering::Relaxed),
             scopes_learned: RUN_CAP_SCOPES_LEARNED.load(Ordering::Relaxed),
             current_cap_max_scope: RUN_CAP_CURRENT_CAP_MAX_SCOPE.load(Ordering::Relaxed),
         }

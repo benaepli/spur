@@ -377,6 +377,7 @@ fn run_cap(m: &mut Marks) -> RunCapStats {
         probes: m.int(),
         probe_completions: m.int(),
         over_cap_completions: m.int(),
+        cap_recomputes: m.int(),
         scopes_learned: m.int(),
         current_cap_max_scope: m.int(),
     }
@@ -387,6 +388,7 @@ fn run_cap_leaves(prefix: &str, r: &RunCapStats) -> Vec<(String, Value)> {
         probes,
         probe_completions,
         over_cap_completions,
+        cap_recomputes,
         scopes_learned,
         current_cap_max_scope,
     } = r;
@@ -394,6 +396,7 @@ fn run_cap_leaves(prefix: &str, r: &RunCapStats) -> Vec<(String, Value)> {
         leaf(prefix, "probes", *probes),
         leaf(prefix, "probe_completions", *probe_completions),
         leaf(prefix, "over_cap_completions", *over_cap_completions),
+        leaf(prefix, "cap_recomputes", *cap_recomputes),
         leaf(prefix, "scopes_learned", *scopes_learned),
         leaf(prefix, "current_cap_max_scope", *current_cap_max_scope),
     ]

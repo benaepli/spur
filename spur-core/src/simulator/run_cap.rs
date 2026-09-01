@@ -4,7 +4,10 @@
 //! the only kind of run that feeds the learner. Every other run is capped at
 //! a high quantile of the lengths of probes that completed, with headroom,
 //! so step budget is not spent on runs whose plans would have finished far
-//! earlier or never.
+//! earlier or never. The cap is recomputed only when a scope's completed
+//! count crosses a doubling checkpoint (200, 400, 800, ...) and is constant
+//! in between, so it is a deterministic function of the sample sequence
+//! rather than of when run starts happen to read the histogram.
 
 use crate::simulator::util_stats;
 use dashmap::DashMap;
@@ -50,6 +53,12 @@ struct ScopeAccum {
     /// Completed probes whose length exceeded the cap in effect when they
     /// merged. A large share means the cap is cutting off completions.
     over_cap: u64,
+    /// The cap set at the last checkpoint, governing every run until the
+    /// next one; None until the first checkpoint is crossed.
+    current: Option<i32>,
+    /// Completed count at which the cap is next recomputed; doubles after
+    /// each recompute.
+    next_checkpoint: u64,
 }
 
 impl ScopeAccum {
@@ -60,13 +69,21 @@ impl ScopeAccum {
             hist: [0; HIST_CELLS],
             completed: 0,
             over_cap: 0,
+            current: None,
+            next_checkpoint: MIN_COMPLETED_SAMPLES,
         }
     }
 
-    /// The learned cap for this scope, or None while it is below the sample
-    /// floor. The quantile is Laplace-smoothed and read at the winning
-    /// cell's upper edge, so bucketing only ever rounds the cap up.
-    fn cap(&self, backup: i32) -> Option<i32> {
+    /// The cap governing this scope's runs, or None while no checkpoint has
+    /// been crossed.
+    fn cap(&self) -> Option<i32> {
+        self.current
+    }
+
+    /// The cap the histogram supports right now, or None while it is below
+    /// the sample floor. The quantile is Laplace-smoothed and read at the
+    /// winning cell's upper edge, so bucketing only ever rounds the cap up.
+    fn estimate(&self, backup: i32) -> Option<i32> {
         if self.completed < MIN_COMPLETED_SAMPLES {
             return None;
         }
@@ -99,10 +116,7 @@ pub fn is_probe(run_id: i64) -> bool {
 /// cap when the scope is past the floor, otherwise the budget unchanged.
 /// Read once at run start so the bound is frozen for the whole run.
 pub fn effective_cap(backup: i32) -> i32 {
-    TABLE
-        .get(&backup)
-        .and_then(|acc| acc.cap(backup))
-        .unwrap_or(backup)
+    TABLE.get(&backup).and_then(|acc| acc.cap()).unwrap_or(backup)
 }
 
 /// Fold one probe run into its scope. Only a completed probe contributes a
@@ -116,7 +130,7 @@ pub fn merge_probe(backup: i32, outcome: Outcome, steps: i32) {
     }
     {
         let mut acc = TABLE.entry(backup).or_insert_with(|| ScopeAccum::new(backup));
-        if let Some(cap) = acc.cap(backup) {
+        if let Some(cap) = acc.cap() {
             if cap < backup && steps > cap {
                 acc.over_cap += 1;
                 util_stats::record_run_cap_over_cap_completion();
@@ -125,12 +139,20 @@ pub fn merge_probe(backup: i32, outcome: Outcome, steps: i32) {
         let cell = ((steps.max(0) as u32) / acc.bucket_width).min(HIST_CELLS as u32 - 1);
         acc.hist[cell as usize] = acc.hist[cell as usize].saturating_add(1);
         acc.completed += 1;
+        if acc.completed >= acc.next_checkpoint {
+            acc.current = acc.estimate(backup);
+            acc.next_checkpoint = acc.next_checkpoint.saturating_mul(2);
+            util_stats::record_run_cap_recompute();
+        }
     }
     publish_gauges();
 }
 
 /// Scale every scope's mass by `factor`, dropping scopes that reach zero,
-/// so stale phases of a long exploration lose their vote.
+/// so stale phases of a long exploration lose their vote. The cap and the
+/// next checkpoint are left alone: shrinking the completed count delays the
+/// next crossing, and the recompute there reads the decay-weighted
+/// histogram, so the cap leans toward recent phases.
 pub fn decay(factor: f64) {
     let factor = factor.clamp(0.0, 1.0);
     TABLE.retain(|_, acc| {
@@ -139,7 +161,7 @@ pub fn decay(factor: f64) {
         }
         acc.completed = ((acc.completed as f64) * factor).floor() as u64;
         acc.over_cap = ((acc.over_cap as f64) * factor).floor() as u64;
-        acc.completed > 0 || acc.hist.iter().any(|&n| n > 0)
+        acc.current.is_some() || acc.completed > 0 || acc.hist.iter().any(|&n| n > 0)
     });
     publish_gauges();
 }
@@ -155,7 +177,7 @@ fn publish_gauges() {
     let mut max_scope: Option<(i32, i32)> = None;
     for e in TABLE.iter() {
         let backup = *e.key();
-        if let Some(cap) = e.value().cap(backup) {
+        if let Some(cap) = e.value().cap() {
             learned += 1;
             if max_scope.map_or(true, |(k, _)| backup > k) {
                 max_scope = Some((backup, cap));
@@ -237,27 +259,94 @@ mod tests {
     }
 
     #[test]
-    fn decay_drops_a_scope_back_to_identity_and_reset_empties() {
+    fn decay_delays_the_next_checkpoint_and_reset_empties() {
         let _serial = config_override::exclusive_session();
         reset();
         for _ in 0..200 {
             merge_probe(6000, Outcome::Completed, 100);
         }
-        assert!(effective_cap(6000) < 6000);
+        let engaged = effective_cap(6000);
+        assert!(engaged < 6000);
         decay(0.5);
-        assert_eq!(effective_cap(6000), 6000, "100 samples fall under the floor");
-        for _ in 0..20 {
-            decay(0.5);
+        assert_eq!(effective_cap(6000), engaged, "the cap survives decay unchanged");
+        assert!(!TABLE.is_empty(), "an engaged scope is retained through decay");
+        // Decay halved the completed count to 100; 300 more completions
+        // re-cross the 400 checkpoint and the recompute reads the mixed,
+        // decay-weighted histogram.
+        for _ in 0..300 {
+            merge_probe(6000, Outcome::Completed, 1200);
         }
-        assert!(TABLE.is_empty(), "repeated decay drops the scope");
-
-        for _ in 0..200 {
-            merge_probe(6000, Outcome::Completed, 100);
-        }
-        assert!(effective_cap(6000) < 6000);
+        assert_eq!(effective_cap(6000), 1835, "the recompute follows the fresher lengths");
         reset();
         assert!(TABLE.is_empty());
         assert_eq!(effective_cap(6000), 6000);
+    }
+
+    #[test]
+    fn cap_is_constant_between_checkpoints() {
+        let _serial = config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        reset();
+        for _ in 0..200 {
+            merge_probe(6000, Outcome::Completed, 1200);
+        }
+        assert_eq!(effective_cap(6000), 1835);
+        let before = util_stats::snapshot().run_cap;
+        for _ in 0..150 {
+            merge_probe(6000, Outcome::Completed, 4000);
+        }
+        let after = util_stats::snapshot().run_cap;
+        assert_eq!(effective_cap(6000), 1835, "350 completions sit between checkpoints");
+        assert_eq!(
+            after.over_cap_completions,
+            before.over_cap_completions + 150,
+            "completions above the standing cap are counted while it holds"
+        );
+        for _ in 0..50 {
+            merge_probe(6000, Outcome::Completed, 4000);
+        }
+        util_stats::set_enabled(false);
+        // The p99 of the mixture lands in the 4000-length cell, whose upper
+        // edge with headroom exceeds the budget, so the cap opens back up.
+        assert_eq!(effective_cap(6000), 6000);
+        reset();
+    }
+
+    #[test]
+    fn recompute_fires_once_per_checkpoint() {
+        let _serial = config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        reset();
+        let base = util_stats::snapshot().run_cap.cap_recomputes;
+        for _ in 0..200 {
+            merge_probe(6000, Outcome::Completed, 1200);
+        }
+        assert_eq!(util_stats::snapshot().run_cap.cap_recomputes, base + 1);
+        for _ in 0..200 {
+            merge_probe(6000, Outcome::Completed, 1200);
+        }
+        assert_eq!(util_stats::snapshot().run_cap.cap_recomputes, base + 2);
+        for _ in 0..400 {
+            merge_probe(6000, Outcome::Completed, 1200);
+        }
+        assert_eq!(util_stats::snapshot().run_cap.cap_recomputes, base + 3);
+        util_stats::set_enabled(false);
+        reset();
+    }
+
+    #[test]
+    fn disengaged_scope_recomputes_at_backup() {
+        let _serial = config_override::exclusive_session();
+        reset();
+        for _ in 0..200 {
+            merge_probe(1500, Outcome::Completed, 1400);
+        }
+        assert_eq!(effective_cap(1500), 1500, "the estimate clamps to the budget");
+        for _ in 0..200 {
+            merge_probe(1500, Outcome::Completed, 1400);
+        }
+        assert_eq!(effective_cap(1500), 1500);
+        reset();
     }
 
     #[test]
