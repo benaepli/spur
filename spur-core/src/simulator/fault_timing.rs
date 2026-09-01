@@ -6,12 +6,11 @@
 //! share defaults to half.
 //!
 //! The span's upper bound is the median completed-run length, learned per
-//! backup-budget scope from the subset of run-cap probes that fall in the
-//! stock posture. Run-cap probes land in both postures; only the
-//! stock-posture subset feeds this learner, so the lengths it reads carry
-//! neither a cap nor a placement imprint. The bound is also kept under
-//! three quarters of the run's frozen step cap, reserving the last quarter
-//! for the recovery tail.
+//! backup-budget scope from the run-cap probes. Probes are exempt from
+//! placement at every fraction, so every probe feeds the learner and the
+//! lengths it reads carry neither a cap nor a placement imprint. The bound
+//! is also kept under three quarters of the run's frozen step cap,
+//! reserving the last quarter for the recovery tail.
 
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::run_cap;
@@ -49,9 +48,9 @@ pub const DEFAULT_FRACTION: f64 = 0.5;
 /// downward from the top phase and phase 0 is the last one it would reach.
 static PLACED_FROM: AtomicI64 = AtomicI64::new(run_cap::PROBE_PERIOD);
 
-/// The phase a fraction admits. Never zero: phase 0 is the learner's feed,
-/// and a placed run's length carries a placement imprint the span must not
-/// read back, so a fraction of one still leaves that phase stock.
+/// The phase a fraction admits. Never zero, so a fraction of one still
+/// leaves one posture phase stock; run-cap probes are exempt separately,
+/// which is what keeps the learner's feed clear of placed lengths.
 fn placed_from(fraction: f64) -> i64 {
     let covered = (fraction.clamp(0.0, 1.0) * POSTURE_PERIOD as f64).round() as i64;
     (POSTURE_PERIOD - covered).clamp(1, POSTURE_PERIOD)
@@ -65,16 +64,20 @@ pub fn set_fraction(fraction: f64) {
 }
 
 /// Whether this run draws crash holds. The complementary runs are left
-/// exactly stock, including their random-stream draw counts.
+/// exactly stock, including their random-stream draw counts. Run-cap
+/// probes are never placed: their lengths are what the span is learned
+/// from, so a placement imprint on them would feed back into the bound.
 pub fn is_placed(run_id: i64) -> bool {
-    run_phase::phase(run_id, POSTURE_PERIOD) >= PLACED_FROM.load(Ordering::Relaxed)
+    !run_cap::is_probe(run_id)
+        && run_phase::phase(run_id, POSTURE_PERIOD) >= PLACED_FROM.load(Ordering::Relaxed)
 }
 
-/// Whether this run's completed length may feed the learner: a run-cap
-/// probe (uncapped) in the stock posture. Phase 0 is stock at every
-/// fraction, so the feed never dries up and never reads a placed length.
+/// Whether this run's completed length may feed the learner. Every run-cap
+/// probe does, since none of them is placed - so the feed is one run in
+/// `run_cap::PROBE_PERIOD` rather than one in `POSTURE_PERIOD`, and the
+/// scope crosses its sample floor in half the runs it used to take.
 fn feeds_learner(run_id: i64) -> bool {
-    run_phase::phase(run_id, POSTURE_PERIOD) == 0
+    run_cap::is_probe(run_id)
 }
 
 struct ScopeAccum {
@@ -249,6 +252,7 @@ mod tests {
 
     fn feed(n: usize, backup: i32, steps: i32) {
         let feeder = id_at_phase(0);
+        debug_assert!(run_cap::is_probe(feeder), "the feed must come from a probe");
         for _ in 0..n {
             merge_stock_probe(feeder, backup, run_cap::Outcome::Completed, steps);
         }
@@ -268,14 +272,30 @@ mod tests {
     }
 
     #[test]
-    fn the_posture_splits_the_run_ids_in_half_including_negative_ones() {
+    fn the_posture_splits_the_run_ids_in_half_less_the_exempt_probes() {
         let _serial = config_override::exclusive_session();
         reset();
+        // Half the posture phases, less the one probe phase inside them.
+        let want = 0.5 - 1.0 / POSTURE_PERIOD as f64;
         let share = placed_share();
-        assert!((share - 0.5).abs() < 0.01, "placed share {share} is not about half");
+        assert!((share - want).abs() < 0.01, "placed share {share} is not about {want}");
         assert!(is_placed(id_at_phase(POSTURE_PERIOD - 1)), "the top phase is placed");
         assert!(!is_placed(id_at_phase(0)), "phase 0 is stock");
         assert!((-64_000..0).any(is_placed), "negative ids reach the placed posture");
+    }
+
+    #[test]
+    fn no_run_cap_probe_is_ever_placed_at_any_fraction() {
+        let _serial = config_override::exclusive_session();
+        reset();
+        for f in [0.0, 0.5, 0.97, 1.0] {
+            set_fraction(f);
+            let placed_probes = (-64_000..64_000i64)
+                .filter(|&id| run_cap::is_probe(id) && is_placed(id))
+                .count();
+            assert_eq!(placed_probes, 0, "a probe was placed at fraction {f}");
+        }
+        reset();
     }
 
     #[test]
@@ -285,33 +305,35 @@ mod tests {
         set_fraction(0.0);
         assert_eq!(placed_share(), 0.0, "zero places nothing");
         set_fraction(1.0);
-        assert!(!is_placed(id_at_phase(0)), "phase 0 stays stock so the learner keeps its feed");
+        assert!(!is_placed(id_at_phase(0)), "phase 0 stays stock");
         for phase in 1..POSTURE_PERIOD {
-            assert!(is_placed(id_at_phase(phase)), "phase {phase} should be placed at one");
+            let id = id_at_phase(phase);
+            assert_eq!(is_placed(id), !run_cap::is_probe(id), "phase {phase} at fraction one");
         }
         set_fraction(0.97);
         // 0.97 of 64 phases rounds to 62, so the two lowest stay stock.
         assert!(!is_placed(id_at_phase(0)) && !is_placed(id_at_phase(1)));
         assert!(is_placed(id_at_phase(2)));
+        // 62 of 64 phases, less the one probe phase among them.
+        let want = 62.0 / 64.0 - 1.0 / POSTURE_PERIOD as f64;
         let share = placed_share();
-        assert!((share - 62.0 / 64.0).abs() < 0.01, "share {share} is not 62 of 64");
+        assert!((share - want).abs() < 0.01, "share {share} is not about {want}");
         reset();
-        assert!((placed_share() - 0.5).abs() < 0.01, "reset restores the default half");
+        let half = 0.5 - 1.0 / POSTURE_PERIOD as f64;
+        assert!((placed_share() - half).abs() < 0.01, "reset restores the default half");
     }
 
     #[test]
     fn only_stock_posture_completed_probes_feed_the_learner() {
         let _serial = config_override::exclusive_session();
         reset();
-        let placed_probe = id_at_phase(run_cap::PROBE_PERIOD);
-        assert!(run_cap::is_probe(placed_probe) && is_placed(placed_probe));
         let ordinary = id_at_phase(1);
-        assert!(!run_cap::is_probe(ordinary));
+        assert!(!run_cap::is_probe(ordinary), "phase 1 of the posture period is no probe");
         let feeder = id_at_phase(0);
+        assert!(run_cap::is_probe(feeder));
         for _ in 0..200 {
-            // A placed-posture run-cap probe, a non-probe run, and every
-            // non-completed outcome all stay out of the histogram.
-            merge_stock_probe(placed_probe, 6000, run_cap::Outcome::Completed, 1200);
+            // A non-probe run and every non-completed outcome stay out of
+            // the histogram.
             merge_stock_probe(ordinary, 6000, run_cap::Outcome::Completed, 1200);
             merge_stock_probe(feeder, 6000, run_cap::Outcome::Exhausted, 6000);
             merge_stock_probe(feeder, 6000, run_cap::Outcome::Deadlocked, 40);

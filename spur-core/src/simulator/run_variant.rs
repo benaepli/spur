@@ -8,8 +8,10 @@
 //! run was inert. The tag records both, so a consumer groups by the column
 //! and never by the id.
 //!
-//! Bits are independent: a run can be selected by more than one mechanism,
-//! and a run-cap probe is also placed at fractions of one half and above.
+//! Bits are independent: a run can be selected by more than one mechanism.
+//! A timer-context probe is placed like any other run, and whether a placed
+//! run acted is a separate fact from whether it was selected, so no single
+//! label could name what a run was.
 
 use crate::simulator::fault_timing;
 use crate::simulator::run_cap;
@@ -75,16 +77,21 @@ mod tests {
     fn the_populations_overlap_so_a_single_label_could_not_name_them() {
         let _serial = config_override::exclusive_session();
         fault_timing::reset();
-        let mut both = 0;
-        let mut probe_only = 0;
+        let mut timer_probe_placed = 0;
+        let mut timer_probe_stock = 0;
+        let mut cap_probe_placed = 0;
         for id in 0..64_000i64 {
             let v = from_run_id(id);
-            if v & RUN_CAP_PROBE == 0 {
+            if v & RUN_CAP_PROBE != 0 && v & CRASH_PLACED != 0 {
+                cap_probe_placed += 1;
+            }
+            if v & TIMER_STEER_OFF == 0 {
                 continue;
             }
-            if v & CRASH_PLACED != 0 { both += 1 } else { probe_only += 1 }
+            if v & CRASH_PLACED != 0 { timer_probe_placed += 1 } else { timer_probe_stock += 1 }
         }
-        assert!(both > 0, "no run is both a probe and placed");
-        assert!(probe_only > 0, "no probe is stock, so the learner has no feed");
+        assert!(timer_probe_placed > 0, "no timer probe is placed, so the bits never overlap");
+        assert!(timer_probe_stock > 0, "every timer probe is placed");
+        assert_eq!(cap_probe_placed, 0, "a run-cap probe must never be placed");
     }
 }
