@@ -835,6 +835,9 @@ pub fn run_explorer_campaign(
     crate::simulator::run_cap::reset();
     crate::simulator::fault_timing::reset();
     crate::simulator::timer_context::reset();
+    crate::simulator::fault_timing::set_fraction(
+        config.envelope.faults.crash_placement_fraction,
+    );
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.envelope.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.envelope.emit_crash_census);

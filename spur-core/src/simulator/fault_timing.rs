@@ -1,8 +1,9 @@
-//! Learned crash placement, shared across a session. Runs are split by a
-//! posture bit: half of all runs draw a target step for each planned crash
-//! uniformly over the span completed runs actually cover and hold the crash
-//! until that step; the other half stay byte-identical to stock behavior,
-//! so the two halves form an internal placed-versus-stock contrast.
+//! Learned crash placement, shared across a session. Runs are split by
+//! posture: a settable share of them draw a target step for each planned
+//! crash uniformly over the span completed runs actually cover and hold the
+//! crash until that step; the rest stay byte-identical to stock behavior, so
+//! the two populations form an internal placed-versus-stock contrast. The
+//! share defaults to half.
 //!
 //! The span's upper bound is the median completed-run length, learned per
 //! backup-budget scope from the subset of run-cap probes that fall in the
@@ -17,6 +18,7 @@ use crate::simulator::run_cap;
 use crate::simulator::util_stats;
 use dashmap::DashMap;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Run ids repeat their posture-and-probe phase with this period: twice the
 /// run-cap probe period, so the probe population splits evenly across the
@@ -38,14 +40,38 @@ const MIN_COMPLETED_SAMPLES: u64 = 200;
 /// budget fits.
 const HIST_CELLS: usize = 256;
 
+/// Share of runs the placed posture covers when nothing sets it.
+pub const DEFAULT_FRACTION: f64 = 0.5;
+
+/// Lowest phase in the placed posture: phases at or above it are placed,
+/// phases below it are stock. Set from the fraction, so the placed set grows
+/// downward from the top phase and phase 0 is the last one it would reach.
+static PLACED_FROM: AtomicI64 = AtomicI64::new(run_cap::PROBE_PERIOD);
+
+/// The phase a fraction admits. Never zero: phase 0 is the learner's feed,
+/// and a placed run's length carries a placement imprint the span must not
+/// read back, so a fraction of one still leaves that phase stock.
+fn placed_from(fraction: f64) -> i64 {
+    let covered = (fraction.clamp(0.0, 1.0) * POSTURE_PERIOD as f64).round() as i64;
+    (POSTURE_PERIOD - covered).clamp(1, POSTURE_PERIOD)
+}
+
+/// Set the share of runs the placed posture covers. The default reproduces
+/// the phase split the mechanism shipped with, so a session that sets
+/// nothing behaves as before.
+pub fn set_fraction(fraction: f64) {
+    PLACED_FROM.store(placed_from(fraction), Ordering::Relaxed);
+}
+
 /// Whether this run draws crash holds. The complementary runs are left
 /// exactly stock, including their random-stream draw counts.
 pub fn is_placed(run_id: i64) -> bool {
-    run_id.rem_euclid(POSTURE_PERIOD) >= run_cap::PROBE_PERIOD
+    run_id.rem_euclid(POSTURE_PERIOD) >= PLACED_FROM.load(Ordering::Relaxed)
 }
 
 /// Whether this run's completed length may feed the learner: a run-cap
-/// probe (uncapped) in the stock posture.
+/// probe (uncapped) in the stock posture. Phase 0 is stock at every
+/// fraction, so the feed never dries up and never reads a placed length.
 fn feeds_learner(run_id: i64) -> bool {
     run_id.rem_euclid(POSTURE_PERIOD) == 0
 }
@@ -172,9 +198,12 @@ pub fn decay(factor: f64) {
     });
 }
 
-/// Clear the table so explorer sessions in one process do not share spans.
+/// Clear the table so explorer sessions in one process do not share spans,
+/// and restore the default fraction. A session that forgets to push its own
+/// then inherits the default rather than the previous session's value.
 pub fn reset() {
     TABLE.clear();
+    set_fraction(DEFAULT_FRACTION);
 }
 
 #[cfg(test)]
@@ -225,6 +254,8 @@ mod tests {
 
     #[test]
     fn posture_splits_run_ids_by_bit_five_with_negative_ids_sane() {
+        let _serial = config_override::exclusive_session();
+        reset();
         for id in 0..32 {
             assert!(!is_placed(id), "id {id} is stock");
         }
@@ -234,6 +265,27 @@ mod tests {
         assert!(!is_placed(64));
         assert!(is_placed(-32), "-32 wraps to phase 32");
         assert!(!is_placed(-64), "-64 wraps to phase 0");
+    }
+
+    #[test]
+    fn the_fraction_grows_the_placed_set_downward_and_never_takes_phase_zero() {
+        let _serial = config_override::exclusive_session();
+        reset();
+        set_fraction(0.0);
+        assert!((0..64).all(|id| !is_placed(id)), "zero places nothing");
+        set_fraction(1.0);
+        assert!(!is_placed(0), "phase 0 stays stock so the learner keeps its feed");
+        assert!((1..64).all(is_placed), "every other phase is placed");
+        set_fraction(0.97);
+        let placed = (0..64).filter(|&id| is_placed(id)).count();
+        assert_eq!(placed, 62, "0.97 of 64 phases rounds to 62");
+        assert!(!is_placed(0) && !is_placed(1), "the two lowest phases stay stock");
+        reset();
+        assert_eq!(
+            (0..64).filter(|&id| is_placed(id)).count(),
+            32,
+            "reset restores the default half"
+        );
     }
 
     #[test]

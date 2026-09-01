@@ -12,5 +12,6 @@ mod path;
 pub mod plan_config;
 pub mod rng;
 pub mod run_cap;
+pub mod run_variant;
 pub mod timer_context;
 pub mod util_stats;

@@ -141,7 +141,7 @@ impl Range {
 
 /// Switches over how the scheduler treats crashes and the recoveries that
 /// follow them.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FaultsConfig {
     /// Evaluate a recovery-reweighting term at every within-queue selection
     /// with its factor held at the identity: the predicate is read, the
@@ -151,6 +151,29 @@ pub struct FaultsConfig {
     /// reweighting does. Off by default.
     #[serde(default)]
     pub recovery_weight_placebo: bool,
+
+    /// Share of runs the learned crash placement acts on; the rest stay
+    /// byte-identical to stock, so the two populations are an internal
+    /// contrast within one session. A value of one leaves no stock
+    /// population to compare against, and the phase that feeds the span
+    /// learner stays stock at every value regardless.
+    #[serde(default = "default_crash_placement_fraction")]
+    pub crash_placement_fraction: f64,
+}
+
+/// Written out rather than derived: the derived zero would place no crashes
+/// at all in a config that omits the `faults` block.
+impl Default for FaultsConfig {
+    fn default() -> Self {
+        Self {
+            recovery_weight_placebo: false,
+            crash_placement_fraction: default_crash_placement_fraction(),
+        }
+    }
+}
+
+fn default_crash_placement_fraction() -> f64 {
+    crate::simulator::fault_timing::DEFAULT_FRACTION
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -448,6 +471,13 @@ impl ExplorerConfig {
                     r.min
                 ));
             }
+        }
+        let f = self.faults.crash_placement_fraction;
+        if !f.is_finite() || !(0.0..=1.0).contains(&f) {
+            return Err(format!(
+                "faults.crash_placement_fraction must be in [0, 1] (got {})",
+                f
+            ));
         }
         if !self.wall_budget_sec.is_finite() || self.wall_budget_sec < 0.0 {
             return Err(format!(
@@ -928,6 +958,7 @@ fn run_row(
     max_iterations: i32,
     wall: std::time::Duration,
     timers: crate::simulator::core::state::TimerRunStats,
+    crash_hold_drawn: bool,
 ) -> crate::simulator::history::PersistableRun {
     let (steps_used, end_reason) = match outcome {
         RunOutcome::Completed { steps } => (*steps, "plan_complete"),
@@ -953,6 +984,7 @@ fn run_row(
         timers_idle_fired: timers.idle_fired as i32,
         timers_idle_acted: timers.idle_acted as i32,
         max_inert_streak: timers.max_inert_streak as i32,
+        variant: crate::simulator::run_variant::of(run_id, crash_hold_drawn),
     }
 }
 
@@ -1102,6 +1134,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         config.max_iterations,
         started.elapsed(),
         path_state.state.timer_stats,
+        path_state.state.crash_hold_drawn,
     ));
 
     Ok(RunResult {
@@ -1140,6 +1173,7 @@ pub fn run_explorer(
     run_cap::reset();
     fault_timing::reset();
     timer_context::reset();
+    fault_timing::set_fraction(config.faults.crash_placement_fraction);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
@@ -1407,6 +1441,7 @@ fn run_single_plan<F: Feedback>(
         max_iterations,
         started.elapsed(),
         path_state.state.timer_stats,
+        path_state.state.crash_hold_drawn,
     ));
 
     Ok(plan_score)
@@ -1535,6 +1570,7 @@ pub fn run_explorer_genetic(
     run_cap::reset();
     fault_timing::reset();
     timer_context::reset();
+    fault_timing::set_fraction(config.faults.crash_placement_fraction);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
@@ -1975,6 +2011,7 @@ pub fn run_explorer_aos(
     run_cap::reset();
     fault_timing::reset();
     timer_context::reset();
+    fault_timing::set_fraction(config.faults.crash_placement_fraction);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.emit_crash_census);
@@ -2628,6 +2665,7 @@ pub fn run_explorer_continuous(
     run_cap::reset();
     fault_timing::reset();
     timer_context::reset();
+    fault_timing::set_fraction(config.envelope.faults.crash_placement_fraction);
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.envelope.emit_acceptance_distance);
     util_stats::set_crash_census_enabled(config.envelope.emit_crash_census);

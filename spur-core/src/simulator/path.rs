@@ -530,10 +530,13 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     // runs draw nothing and behave exactly as before.
                     if let Some(target) =
                         fault_timing::draw_hold(run_id, backup, effective_cap, step, rng)
-                        && let Some(hold) =
-                            path_state.state.crash_hold_until.get_mut(nid.index)
                     {
-                        *hold = target;
+                        path_state.state.crash_hold_drawn = true;
+                        if let Some(hold) =
+                            path_state.state.crash_hold_until.get_mut(nid.index)
+                        {
+                            *hold = target;
+                        }
                     }
                     pending_crash_recover.insert(nid.index, node_idx);
                 }

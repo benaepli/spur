@@ -119,6 +119,9 @@ pub struct PersistableRun {
     pub timers_idle_acted: i32,
     /// Longest run of inert firings at one resume point on one node.
     pub max_inert_streak: i32,
+    /// Bitfield naming the session-global mechanisms that selected this run
+    /// and whether placed crashes acted; see `run_variant`.
+    pub variant: i32,
 }
 
 fn json_of_value<H: crate::simulator::hash_utils::HashPolicy>(v: &Value<H>) -> JsonValue {
@@ -491,6 +494,7 @@ fn runs_schema() -> Arc<Schema> {
         Field::new("timers_idle_fired", DataType::Int32, false),
         Field::new("timers_idle_acted", DataType::Int32, false),
         Field::new("max_inert_streak", DataType::Int32, false),
+        Field::new("variant", DataType::Int32, false),
     ]))
 }
 
@@ -517,6 +521,7 @@ fn append_runs_batch(
     let timers_idle_fired = timer_col(|r| r.timers_idle_fired);
     let timers_idle_acted = timer_col(|r| r.timers_idle_acted);
     let max_inert_streak = timer_col(|r| r.max_inert_streak);
+    let variants = timer_col(|r| r.variant);
     let batch = RecordBatch::try_new(
         runs_schema(),
         vec![
@@ -537,6 +542,7 @@ fn append_runs_batch(
             Arc::new(timers_idle_fired),
             Arc::new(timers_idle_acted),
             Arc::new(max_inert_streak),
+            Arc::new(variants),
         ],
     )?;
     writer.write(&batch)?;
@@ -906,6 +912,7 @@ mod parquet_writer_tests {
                 timers_idle_fired: 0,
                 timers_idle_acted: 0,
                 max_inert_streak: 0,
+                variant: 0,
             });
         }
         writer.shutdown();

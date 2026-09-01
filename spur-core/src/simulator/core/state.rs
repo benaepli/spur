@@ -594,6 +594,11 @@ pub struct State<H: HashPolicy> {
     /// zero means no hold. Scheduling bookkeeping like `send_ledger`,
     /// excluded from `signature()` so it cannot change deduplication.
     pub crash_hold_until: Vec<i32>,
+    /// Whether this run drew at least one crash hold. A placed run whose
+    /// scope is below its sample floor draws none, so being selected and
+    /// having acted are different facts and the run row reports both.
+    /// Observation only, excluded from `signature()`.
+    pub crash_hold_drawn: bool,
     /// Remote records in the network queue whose origin has restarted since
     /// sending them: the sum over nodes of `net_records - net_fresh`.
     pub net_stale_records: u32,
@@ -695,6 +700,7 @@ impl<H: HashPolicy> State<H> {
             timer_inert_streaks: Vec::new(),
             send_ledger: vec![SendLedger::default(); num_nodes],
             crash_hold_until: vec![0; num_nodes],
+            crash_hold_drawn: false,
             net_stale_records: 0,
             net_requests: 0,
         }
