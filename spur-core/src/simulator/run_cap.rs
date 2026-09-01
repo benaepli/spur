@@ -9,6 +9,7 @@
 //! in between, so it is a deterministic function of the sample sequence
 //! rather than of when run starts happen to read the histogram.
 
+use crate::simulator::run_phase;
 use crate::simulator::util_stats;
 use dashmap::DashMap;
 use std::sync::LazyLock;
@@ -107,9 +108,12 @@ impl ScopeAccum {
 
 static TABLE: LazyLock<DashMap<i32, ScopeAccum>> = LazyLock::new(DashMap::new);
 
-/// Whether this run is a probe that must run to the full budget.
+/// Whether this run is a probe that must run to the full budget. Read from
+/// the run's mixed phase, not the id itself: a phase taken straight off the
+/// id shares the id's factors with the configuration grid's width, and the
+/// probe stream then misses whole configurations (`run_phase`).
 pub fn is_probe(run_id: i64) -> bool {
-    run_id.rem_euclid(PROBE_PERIOD) == 0
+    run_phase::phase(run_id, PROBE_PERIOD) == 0
 }
 
 /// The step cap for a run whose configured budget is `backup`: the learned
@@ -350,14 +354,25 @@ mod tests {
     }
 
     #[test]
-    fn probe_designation_is_periodic_and_safe_for_negative_ids() {
+    fn probes_are_one_run_in_the_period_and_spread_over_every_grid_width() {
         let _serial = config_override::exclusive_session();
-        assert!(is_probe(0));
-        assert!(is_probe(32));
-        for id in 1..32 {
-            assert!(!is_probe(id));
+        let n = 64_000i64;
+        let probes: Vec<i64> = (0..n).filter(|&id| is_probe(id)).collect();
+        let want = n / PROBE_PERIOD;
+        assert!(
+            (probes.len() as i64 - want).abs() < want / 10,
+            "{} probes in {n} runs, expected about {want}",
+            probes.len()
+        );
+        // The reason the phase is mixed: against a grid walked in order, a
+        // probe stream that misses a residue never sees those configs.
+        for width in [2i64, 6, 27, 54] {
+            let mut seen = vec![false; width as usize];
+            for &id in &probes {
+                seen[id.rem_euclid(width) as usize] = true;
+            }
+            assert!(seen.iter().all(|&s| s), "probes miss a position of a {width}-wide grid");
         }
-        assert!(is_probe(-32));
-        assert!(!is_probe(-1));
+        assert!((-64_000..0).any(is_probe), "negative ids designate probes too");
     }
 }

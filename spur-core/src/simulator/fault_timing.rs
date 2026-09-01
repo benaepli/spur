@@ -15,6 +15,7 @@
 
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::run_cap;
+use crate::simulator::run_phase;
 use crate::simulator::util_stats;
 use dashmap::DashMap;
 use std::sync::LazyLock;
@@ -66,14 +67,14 @@ pub fn set_fraction(fraction: f64) {
 /// Whether this run draws crash holds. The complementary runs are left
 /// exactly stock, including their random-stream draw counts.
 pub fn is_placed(run_id: i64) -> bool {
-    run_id.rem_euclid(POSTURE_PERIOD) >= PLACED_FROM.load(Ordering::Relaxed)
+    run_phase::phase(run_id, POSTURE_PERIOD) >= PLACED_FROM.load(Ordering::Relaxed)
 }
 
 /// Whether this run's completed length may feed the learner: a run-cap
 /// probe (uncapped) in the stock posture. Phase 0 is stock at every
 /// fraction, so the feed never dries up and never reads a placed length.
 fn feeds_learner(run_id: i64) -> bool {
-    run_id.rem_euclid(POSTURE_PERIOD) == 0
+    run_phase::phase(run_id, POSTURE_PERIOD) == 0
 }
 
 struct ScopeAccum {
@@ -247,24 +248,34 @@ mod tests {
     impl StreamRng for CountingRng {}
 
     fn feed(n: usize, backup: i32, steps: i32) {
+        let feeder = id_at_phase(0);
         for _ in 0..n {
-            merge_stock_probe(0, backup, run_cap::Outcome::Completed, steps);
+            merge_stock_probe(feeder, backup, run_cap::Outcome::Completed, steps);
         }
     }
 
+    /// A run id whose posture phase is `want`.
+    fn id_at_phase(want: i64) -> i64 {
+        (0..1_000_000i64)
+            .find(|&id| run_phase::phase(id, POSTURE_PERIOD) == want)
+            .expect("every phase is reachable")
+    }
+
+    /// Share of a long id range in the placed posture.
+    fn placed_share() -> f64 {
+        let n = 64_000i64;
+        (-n..n).filter(|&id| is_placed(id)).count() as f64 / (2 * n) as f64
+    }
+
     #[test]
-    fn posture_splits_run_ids_by_bit_five_with_negative_ids_sane() {
+    fn the_posture_splits_the_run_ids_in_half_including_negative_ones() {
         let _serial = config_override::exclusive_session();
         reset();
-        for id in 0..32 {
-            assert!(!is_placed(id), "id {id} is stock");
-        }
-        for id in 32..64 {
-            assert!(is_placed(id), "id {id} is placed");
-        }
-        assert!(!is_placed(64));
-        assert!(is_placed(-32), "-32 wraps to phase 32");
-        assert!(!is_placed(-64), "-64 wraps to phase 0");
+        let share = placed_share();
+        assert!((share - 0.5).abs() < 0.01, "placed share {share} is not about half");
+        assert!(is_placed(id_at_phase(POSTURE_PERIOD - 1)), "the top phase is placed");
+        assert!(!is_placed(id_at_phase(0)), "phase 0 is stock");
+        assert!((-64_000..0).any(is_placed), "negative ids reach the placed posture");
     }
 
     #[test]
@@ -272,33 +283,38 @@ mod tests {
         let _serial = config_override::exclusive_session();
         reset();
         set_fraction(0.0);
-        assert!((0..64).all(|id| !is_placed(id)), "zero places nothing");
+        assert_eq!(placed_share(), 0.0, "zero places nothing");
         set_fraction(1.0);
-        assert!(!is_placed(0), "phase 0 stays stock so the learner keeps its feed");
-        assert!((1..64).all(is_placed), "every other phase is placed");
+        assert!(!is_placed(id_at_phase(0)), "phase 0 stays stock so the learner keeps its feed");
+        for phase in 1..POSTURE_PERIOD {
+            assert!(is_placed(id_at_phase(phase)), "phase {phase} should be placed at one");
+        }
         set_fraction(0.97);
-        let placed = (0..64).filter(|&id| is_placed(id)).count();
-        assert_eq!(placed, 62, "0.97 of 64 phases rounds to 62");
-        assert!(!is_placed(0) && !is_placed(1), "the two lowest phases stay stock");
+        // 0.97 of 64 phases rounds to 62, so the two lowest stay stock.
+        assert!(!is_placed(id_at_phase(0)) && !is_placed(id_at_phase(1)));
+        assert!(is_placed(id_at_phase(2)));
+        let share = placed_share();
+        assert!((share - 62.0 / 64.0).abs() < 0.01, "share {share} is not 62 of 64");
         reset();
-        assert_eq!(
-            (0..64).filter(|&id| is_placed(id)).count(),
-            32,
-            "reset restores the default half"
-        );
+        assert!((placed_share() - 0.5).abs() < 0.01, "reset restores the default half");
     }
 
     #[test]
     fn only_stock_posture_completed_probes_feed_the_learner() {
         let _serial = config_override::exclusive_session();
         reset();
+        let placed_probe = id_at_phase(run_cap::PROBE_PERIOD);
+        assert!(run_cap::is_probe(placed_probe) && is_placed(placed_probe));
+        let ordinary = id_at_phase(1);
+        assert!(!run_cap::is_probe(ordinary));
+        let feeder = id_at_phase(0);
         for _ in 0..200 {
             // A placed-posture run-cap probe, a non-probe run, and every
             // non-completed outcome all stay out of the histogram.
-            merge_stock_probe(32, 6000, run_cap::Outcome::Completed, 1200);
-            merge_stock_probe(1, 6000, run_cap::Outcome::Completed, 1200);
-            merge_stock_probe(0, 6000, run_cap::Outcome::Exhausted, 6000);
-            merge_stock_probe(0, 6000, run_cap::Outcome::Deadlocked, 40);
+            merge_stock_probe(placed_probe, 6000, run_cap::Outcome::Completed, 1200);
+            merge_stock_probe(ordinary, 6000, run_cap::Outcome::Completed, 1200);
+            merge_stock_probe(feeder, 6000, run_cap::Outcome::Exhausted, 6000);
+            merge_stock_probe(feeder, 6000, run_cap::Outcome::Deadlocked, 40);
         }
         assert_eq!(median(6000), None, "nothing above reaches the floor");
         feed(200, 6000, 1200);
@@ -345,8 +361,10 @@ mod tests {
         reset();
         feed(200, 6000, 1200);
         let mut rng = CountingRng::new(7);
-        assert_eq!(draw_hold(0, 6000, 6000, 10, &mut rng), None);
-        assert_eq!(draw_hold(1, 6000, 6000, 10, &mut rng), None);
+        for phase in 0..run_cap::PROBE_PERIOD {
+            let id = id_at_phase(phase);
+            assert_eq!(draw_hold(id, 6000, 6000, 10, &mut rng), None, "run {id} is stock");
+        }
         assert_eq!(rng.draws, 0, "stock posture must not touch the stream");
         reset();
     }
@@ -357,16 +375,17 @@ mod tests {
         reset();
         feed(200, 6000, 1200);
         let mut rng = CountingRng::new(7);
+        let placed = id_at_phase(POSTURE_PERIOD - 1);
         for _ in 0..100 {
-            let t = draw_hold(32, 6000, 6000, 10, &mut rng).expect("engaged scope draws");
+            let t = draw_hold(placed, 6000, 6000, 10, &mut rng).expect("engaged scope draws");
             assert!((10..1223).contains(&t), "target {t} escapes [t_ready, U)");
         }
         assert_eq!(
-            draw_hold(32, 6000, 6000, 1223, &mut rng),
+            draw_hold(placed, 6000, 6000, 1223, &mut rng),
             None,
             "a spent span draws nothing"
         );
-        assert_eq!(draw_hold(32, 1500, 6000, 10, &mut rng), None, "unengaged scope");
+        assert_eq!(draw_hold(placed, 1500, 6000, 10, &mut rng), None, "unengaged scope");
         reset();
     }
 
@@ -378,12 +397,13 @@ mod tests {
         feed(200, 6000, 1200);
         let before = util_stats::snapshot().crash_place;
         let mut rng = CountingRng::new(3);
+        let placed = id_at_phase(POSTURE_PERIOD - 1);
         // Three quarters of a 400-step cap is 300, under the 1223 median.
         for _ in 0..50 {
-            let t = draw_hold(32, 6000, 400, 0, &mut rng).expect("capped span still draws");
+            let t = draw_hold(placed, 6000, 400, 0, &mut rng).expect("capped span still draws");
             assert!((0..300).contains(&t), "target {t} escapes the reserve bound");
         }
-        let t = draw_hold(32, 6000, 6000, 0, &mut rng).expect("uncapped draw");
+        let t = draw_hold(placed, 6000, 6000, 0, &mut rng).expect("uncapped draw");
         assert!((0..1223).contains(&t));
         let after = util_stats::snapshot().crash_place;
         util_stats::set_enabled(false);

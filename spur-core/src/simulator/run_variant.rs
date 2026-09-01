@@ -72,14 +72,19 @@ mod tests {
     }
 
     #[test]
-    fn a_run_cap_probe_is_placed_at_the_default_fraction() {
+    fn the_populations_overlap_so_a_single_label_could_not_name_them() {
         let _serial = config_override::exclusive_session();
         fault_timing::reset();
-        assert_eq!(from_run_id(0), RUN_CAP_PROBE, "phase 0 stays the stock probe");
-        assert_eq!(
-            from_run_id(32),
-            CRASH_PLACED | RUN_CAP_PROBE,
-            "phase 32 is both, so a single label could not name it"
-        );
+        let mut both = 0;
+        let mut probe_only = 0;
+        for id in 0..64_000i64 {
+            let v = from_run_id(id);
+            if v & RUN_CAP_PROBE == 0 {
+                continue;
+            }
+            if v & CRASH_PLACED != 0 { both += 1 } else { probe_only += 1 }
+        }
+        assert!(both > 0, "no run is both a probe and placed");
+        assert!(probe_only > 0, "no probe is stock, so the learner has no feed");
     }
 }

@@ -12,15 +12,14 @@
 //! while the session records acted fractions (`emit_acted_fraction`).
 
 use crate::simulator::run_cap;
+use crate::simulator::run_phase;
 use crate::simulator::util_stats;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The run-id phase, modulo `run_cap::PROBE_PERIOD`, that marks a steer-off
-/// probe run. Sharing run_cap's period with a different phase keeps the two
-/// probe populations disjoint. When run ids are dealt round-robin across N
-/// interleaved configs, a config sees this phase at a rate scaled by
-/// gcd(PROBE_PERIOD, N); campaign mode draws run ids from one shared counter
-/// and is unaffected.
+/// The phase, modulo `run_cap::PROBE_PERIOD`, that marks a steer-off probe
+/// run. Sharing run_cap's period with a different phase keeps the two probe
+/// populations disjoint. The phase is read from the run's mixed id
+/// (`run_phase`), so it does not align with the configuration grid's width.
 pub const PROBE_PHASE: i64 = 16;
 
 /// Firings a cell must accumulate before its multiplier engages.
@@ -44,7 +43,7 @@ pub enum RunMode {
 /// The mode a run id designates. Probe runs take the stock roll and are the
 /// only runs whose firings the learner counts.
 pub fn run_mode(run_id: i64) -> RunMode {
-    if run_id.rem_euclid(run_cap::PROBE_PERIOD) == PROBE_PHASE {
+    if run_phase::phase(run_id, run_cap::PROBE_PERIOD) == PROBE_PHASE {
         RunMode::Probe
     } else {
         RunMode::Steered
@@ -253,17 +252,21 @@ mod tests {
     #[test]
     fn probe_phase_is_disjoint_from_run_cap_probes() {
         let _serial = config_override::exclusive_session();
-        for phase in 0..run_cap::PROBE_PERIOD {
-            assert!(
-                !(run_mode(phase) == RunMode::Probe && run_cap::is_probe(phase)),
-                "phase {phase} is a probe for both learners"
-            );
+        let n = 64_000i64;
+        let mut probes = 0i64;
+        for id in -n..n {
+            let both = run_mode(id) == RunMode::Probe && run_cap::is_probe(id);
+            assert!(!both, "run {id} is a probe for both learners");
+            if run_mode(id) == RunMode::Probe {
+                probes += 1;
+            }
         }
-        assert_eq!(run_mode(16), RunMode::Probe);
-        assert_eq!(run_mode(48), RunMode::Probe);
-        assert_eq!(run_mode(-16), RunMode::Probe);
-        assert_eq!(run_mode(0), RunMode::Steered);
-        assert_eq!(run_mode(-1), RunMode::Steered);
+        let want = 2 * n / run_cap::PROBE_PERIOD;
+        assert!(
+            (probes - want).abs() < want / 10,
+            "{probes} steer-off probes in {} runs, expected about {want}",
+            2 * n
+        );
     }
 
     #[test]
