@@ -78,20 +78,22 @@ mod tests {
         let _serial = config_override::exclusive_session();
         fault_timing::reset();
         let mut timer_probe_placed = 0;
-        let mut timer_probe_stock = 0;
         let mut cap_probe_placed = 0;
+        let mut ordinary_stock = 0;
         for id in 0..64_000i64 {
             let v = from_run_id(id);
+            if v & TIMER_STEER_OFF != 0 && v & CRASH_PLACED != 0 {
+                timer_probe_placed += 1;
+            }
             if v & RUN_CAP_PROBE != 0 && v & CRASH_PLACED != 0 {
                 cap_probe_placed += 1;
             }
-            if v & TIMER_STEER_OFF == 0 {
-                continue;
+            if v & RUN_CAP_PROBE == 0 && v & CRASH_PLACED == 0 {
+                ordinary_stock += 1;
             }
-            if v & CRASH_PLACED != 0 { timer_probe_placed += 1 } else { timer_probe_stock += 1 }
         }
         assert!(timer_probe_placed > 0, "no timer probe is placed, so the bits never overlap");
-        assert!(timer_probe_stock > 0, "every timer probe is placed");
         assert_eq!(cap_probe_placed, 0, "a run-cap probe must never be placed");
+        assert!(ordinary_stock > 0, "no stock run that is not a probe, so there is no control");
     }
 }

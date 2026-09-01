@@ -2,8 +2,7 @@
 //! posture: a settable share of them draw a target step for each planned
 //! crash uniformly over the span completed runs actually cover and hold the
 //! crash until that step; the rest stay byte-identical to stock behavior, so
-//! the two populations form an internal placed-versus-stock contrast. The
-//! share defaults to half.
+//! the two populations form an internal placed-versus-stock contrast.
 //!
 //! The span's upper bound is the median completed-run length, learned per
 //! backup-budget scope from the run-cap probes. Probes are exempt from
@@ -40,8 +39,11 @@ const MIN_COMPLETED_SAMPLES: u64 = 200;
 /// budget fits.
 const HIST_CELLS: usize = 256;
 
-/// Share of runs the placed posture covers when nothing sets it.
-pub const DEFAULT_FRACTION: f64 = 0.5;
+/// Share of runs the placed posture covers when nothing sets it. Held below
+/// one so ordinary capped runs stay stock: run-cap probes are exempt
+/// anyway, and a session whose only unplaced runs were probes would have no
+/// control that differs from the rest by placement alone.
+pub const DEFAULT_FRACTION: f64 = 0.9;
 
 /// Lowest phase in the placed posture: phases at or above it are placed,
 /// phases below it are stock. Set from the fraction, so the placed set grows
@@ -271,14 +273,31 @@ mod tests {
         (-n..n).filter(|&id| is_placed(id)).count() as f64 / (2 * n) as f64
     }
 
+    /// The share a fraction should produce: the phases it admits, less the
+    /// one probe phase among them, since probes are never placed.
+    fn expected_share(fraction: f64) -> f64 {
+        let from = placed_from(fraction);
+        let phases = POSTURE_PERIOD - from;
+        let probe_phases = (from..POSTURE_PERIOD)
+            .filter(|p| p.rem_euclid(run_cap::PROBE_PERIOD) == 0)
+            .count() as i64;
+        (phases - probe_phases) as f64 / POSTURE_PERIOD as f64
+    }
+
     #[test]
-    fn the_posture_splits_the_run_ids_in_half_less_the_exempt_probes() {
+    fn the_default_places_its_share_and_leaves_ordinary_runs_stock() {
         let _serial = config_override::exclusive_session();
         reset();
-        // Half the posture phases, less the one probe phase inside them.
-        let want = 0.5 - 1.0 / POSTURE_PERIOD as f64;
+        let want = expected_share(DEFAULT_FRACTION);
         let share = placed_share();
         assert!((share - want).abs() < 0.01, "placed share {share} is not about {want}");
+        assert!(share < 1.0 - 1.0 / POSTURE_PERIOD as f64, "the default leaves no stock control");
+        // The stock remainder must contain runs that are not probes, or the
+        // only control differs from the rest by capping as well as placement.
+        let ordinary_stock = (0..64_000i64)
+            .filter(|&id| !is_placed(id) && !run_cap::is_probe(id))
+            .count();
+        assert!(ordinary_stock > 0, "every stock run is a probe");
         assert!(is_placed(id_at_phase(POSTURE_PERIOD - 1)), "the top phase is placed");
         assert!(!is_placed(id_at_phase(0)), "phase 0 is stock");
         assert!((-64_000..0).any(is_placed), "negative ids reach the placed posture");
@@ -314,13 +333,12 @@ mod tests {
         // 0.97 of 64 phases rounds to 62, so the two lowest stay stock.
         assert!(!is_placed(id_at_phase(0)) && !is_placed(id_at_phase(1)));
         assert!(is_placed(id_at_phase(2)));
-        // 62 of 64 phases, less the one probe phase among them.
-        let want = 62.0 / 64.0 - 1.0 / POSTURE_PERIOD as f64;
         let share = placed_share();
+        let want = expected_share(0.97);
         assert!((share - want).abs() < 0.01, "share {share} is not about {want}");
         reset();
-        let half = 0.5 - 1.0 / POSTURE_PERIOD as f64;
-        assert!((placed_share() - half).abs() < 0.01, "reset restores the default half");
+        let d = expected_share(DEFAULT_FRACTION);
+        assert!((placed_share() - d).abs() < 0.01, "reset restores the default share");
     }
 
     #[test]
@@ -383,10 +401,15 @@ mod tests {
         reset();
         feed(200, 6000, 1200);
         let mut rng = CountingRng::new(7);
-        for phase in 0..run_cap::PROBE_PERIOD {
+        let stock_phases = placed_from(DEFAULT_FRACTION);
+        for phase in 0..stock_phases {
             let id = id_at_phase(phase);
+            assert!(!is_placed(id), "phase {phase} should be below the placed threshold");
             assert_eq!(draw_hold(id, 6000, 6000, 10, &mut rng), None, "run {id} is stock");
         }
+        // A probe is stock at every fraction, wherever its phase falls.
+        let probe = (0..1_000_000i64).find(|&id| run_cap::is_probe(id)).unwrap();
+        assert_eq!(draw_hold(probe, 6000, 6000, 10, &mut rng), None, "a probe is never placed");
         assert_eq!(rng.draws, 0, "stock posture must not touch the stream");
         reset();
     }
