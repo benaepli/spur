@@ -4,6 +4,7 @@ mod coverage;
 mod curriculum;
 pub mod campaign;
 pub mod explorer;
+pub mod fault_timing;
 mod feedback;
 mod hash_utils;
 pub mod history;

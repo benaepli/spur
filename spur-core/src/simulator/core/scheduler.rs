@@ -688,6 +688,32 @@ fn route_by_terms<H: HashPolicy>(
     routed
 }
 
+/// Bitmask over the first 64 nodes of pending crashes an active
+/// crash-placement hold withholds from this step. A hold expires
+/// unconditionally at its target step; past it, the ordinary crash
+/// admission applies unchanged. Each withheld offer is counted per node
+/// per step.
+fn crash_hold_mask<H: HashPolicy>(state: &State<H>) -> u64 {
+    let step_now = state.crash_info.current_step;
+    let mut mask = 0u64;
+    for (n, &hold) in state
+        .crash_hold_until
+        .iter()
+        .enumerate()
+        .take(u64::BITS as usize)
+    {
+        if step_now >= hold {
+            continue;
+        }
+        if state.send_ledger.get(n).is_none_or(|l| l.crash_pending == 0) {
+            continue;
+        }
+        mask |= 1u64 << n;
+        util_stats::record_crash_place_hold();
+    }
+    mask
+}
+
 pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
@@ -720,6 +746,8 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // offered again at the next step, which keeps the number of crashes a run
     // takes the same and moves only when they land. Nodes past the width of the
     // mask are never withheld.
+    let crash_hold_mask = crash_hold_mask(state);
+
     let crash_defer_mask: u64 = if partial_fanout_crash_bias > 0.0 {
         let mut mask = 0u64;
         for (n, ledger) in state.send_ledger.iter().enumerate().take(u64::BITS as usize) {
@@ -741,11 +769,12 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // Helper: check if a runnable is reserved OR FIFO-blocked. Both exclude the
     // item from scheduling via the same plumbing, so combine them here.
     let link_deliver_seq = state.link_deliver_seq.clone();
+    let crash_block_mask = crash_defer_mask | crash_hold_mask;
     let is_ineligible = |r: &Runnable<H>| {
-        if crash_defer_mask != 0
+        if crash_block_mask != 0
             && let Runnable::Crash { node_id, .. } = r
             && node_id.index < u64::BITS as usize
-            && crash_defer_mask & (1u64 << node_id.index) != 0
+            && crash_block_mask & (1u64 << node_id.index) != 0
         {
             return true;
         }
@@ -1571,6 +1600,39 @@ mod tests {
         }
         queue.push(heal(0.5));
         (state, queue)
+    }
+
+    /// A pending crash is withheld while its node's hold has not expired,
+    /// counted once per withheld offer, and released the moment the target
+    /// step arrives; a hold on a node with no queued crash withholds
+    /// nothing.
+    #[test]
+    fn a_crash_hold_withholds_a_pending_crash_until_its_target_step() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let mut state = State::<NoHashing>::new(&[(crate::analysis::resolver::NameId(0), 2)], 1);
+        let node = NodeId {
+            role: crate::analysis::resolver::NameId(0),
+            index: 1,
+        };
+        state.push_runnable(Runnable::Crash {
+            node_id: node,
+            priority: 0.5,
+        });
+        state.crash_hold_until[1] = 10;
+
+        state.crash_info.current_step = 4;
+        assert_eq!(crash_hold_mask(&state), 1u64 << 1);
+        state.crash_info.current_step = 10;
+        assert_eq!(crash_hold_mask(&state), 0, "the hold expires at its target step");
+
+        state.crash_info.current_step = 4;
+        state.crash_hold_until[0] = 10;
+        assert_eq!(crash_hold_mask(&state), 1u64 << 1, "node 0 has no pending crash");
+
+        let holds = util_stats::snapshot().crash_place.holds;
+        util_stats::set_enabled(false);
+        assert_eq!(holds, 2, "one count per withheld offer");
     }
 
     /// The identity-weighted recovery term reads its predicate and reports

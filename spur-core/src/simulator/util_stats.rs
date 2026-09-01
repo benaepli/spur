@@ -281,6 +281,11 @@ static RUN_CAP_CAP_RECOMPUTES: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_SCOPES_LEARNED: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_CURRENT_CAP_MAX_SCOPE: AtomicU64 = AtomicU64::new(0);
 
+static CRASH_PLACE_DRAWS: AtomicU64 = AtomicU64::new(0);
+static CRASH_PLACE_CAPPED_DRAWS: AtomicU64 = AtomicU64::new(0);
+static CRASH_PLACE_HOLDS: AtomicU64 = AtomicU64::new(0);
+static CRASH_PLACE_HELD_STEPS_SUM: AtomicU64 = AtomicU64::new(0);
+
 static TIMER_CONTEXT_PROBE_FIRINGS: AtomicU64 = AtomicU64::new(0);
 static TIMER_CONTEXT_PROBE_ACTED: AtomicU64 = AtomicU64::new(0);
 static TIMER_CONTEXT_BIASED_STEPS: AtomicU64 = AtomicU64::new(0);
@@ -423,6 +428,10 @@ pub fn set_enabled(on: bool) {
             &RUN_CAP_CAP_RECOMPUTES,
             &RUN_CAP_SCOPES_LEARNED,
             &RUN_CAP_CURRENT_CAP_MAX_SCOPE,
+            &CRASH_PLACE_DRAWS,
+            &CRASH_PLACE_CAPPED_DRAWS,
+            &CRASH_PLACE_HOLDS,
+            &CRASH_PLACE_HELD_STEPS_SUM,
             &TIMER_CONTEXT_PROBE_FIRINGS,
             &TIMER_CONTEXT_PROBE_ACTED,
             &TIMER_CONTEXT_BIASED_STEPS,
@@ -1910,6 +1919,31 @@ pub fn set_run_cap_learned(scopes: u64, cap_max_scope: u64) {
     RUN_CAP_CURRENT_CAP_MAX_SCOPE.store(cap_max_scope, Ordering::Relaxed);
 }
 
+/// One placed-posture run drew a crash hold `held_steps` past the crash's
+/// readiness; `capped` marks the draws whose span bound came from the step
+/// cap's recovery reserve rather than the learned median.
+#[inline]
+pub fn record_crash_place_draw(capped: bool, held_steps: u64) {
+    if !enabled() {
+        return;
+    }
+    CRASH_PLACE_DRAWS.fetch_add(1, Ordering::Relaxed);
+    if capped {
+        CRASH_PLACE_CAPPED_DRAWS.fetch_add(1, Ordering::Relaxed);
+    }
+    CRASH_PLACE_HELD_STEPS_SUM.fetch_add(held_steps, Ordering::Relaxed);
+}
+
+/// One step offered a schedulable crash that an active crash-placement hold
+/// excluded, counted per withheld node per step.
+#[inline]
+pub fn record_crash_place_hold() {
+    if !enabled() {
+        return;
+    }
+    CRASH_PLACE_HOLDS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// One steer-off probe-run timer firing was folded into the timer-context
 /// learner; `acted` marks the subset that changed the node's state.
 #[inline]
@@ -2803,6 +2837,29 @@ impl RunCapStats {
     }
 }
 
+/// The crash-placement block: holds drawn by placed-posture runs, the
+/// subset whose span bound came from the step cap's recovery reserve, the
+/// per-step offers an active hold excluded, and the summed displacement of
+/// the drawn holds.
+#[derive(Serialize)]
+pub struct CrashPlaceStats {
+    pub draws: u64,
+    pub capped_draws: u64,
+    pub holds: u64,
+    pub held_steps_sum: u64,
+}
+
+impl CrashPlaceStats {
+    fn read() -> Self {
+        Self {
+            draws: CRASH_PLACE_DRAWS.load(Ordering::Relaxed),
+            capped_draws: CRASH_PLACE_CAPPED_DRAWS.load(Ordering::Relaxed),
+            holds: CRASH_PLACE_HOLDS.load(Ordering::Relaxed),
+            held_steps_sum: CRASH_PLACE_HELD_STEPS_SUM.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The timer-context block: the learner's probe traffic, the steered rolls
 /// that applied a learned multiplier, the rolls an unsupported selector
 /// excluded, and a gauge of the cells currently engaged. `cells_engaged` is
@@ -2861,6 +2918,7 @@ pub struct UtilizationSnapshot {
     pub prefix_extension: PrefixExtensionStats,
     pub quiet_stretch: QuietStretchStats,
     pub run_cap: RunCapStats,
+    pub crash_place: CrashPlaceStats,
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
@@ -3050,6 +3108,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             .unwrap_or_else(|p| *p.into_inner()),
         quiet_stretch: QuietStretchStats::read(),
         run_cap: RunCapStats::read(),
+        crash_place: CrashPlaceStats::read(),
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),

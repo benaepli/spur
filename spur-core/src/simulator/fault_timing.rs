@@ -1,0 +1,343 @@
+//! Learned crash placement, shared across a session. Runs are split by a
+//! posture bit: half of all runs draw a target step for each planned crash
+//! uniformly over the span completed runs actually cover and hold the crash
+//! until that step; the other half stay byte-identical to stock behavior,
+//! so the two halves form an internal placed-versus-stock contrast.
+//!
+//! The span's upper bound is the median completed-run length, learned per
+//! backup-budget scope from the subset of run-cap probes that fall in the
+//! stock posture. Run-cap probes land in both postures; only the
+//! stock-posture subset feeds this learner, so the lengths it reads carry
+//! neither a cap nor a placement imprint. The bound is also kept under
+//! three quarters of the run's frozen step cap, reserving the last quarter
+//! for the recovery tail.
+
+use crate::simulator::rng::{Stream, StreamRng};
+use crate::simulator::run_cap;
+use crate::simulator::util_stats;
+use dashmap::DashMap;
+use std::sync::LazyLock;
+
+/// Run ids repeat their posture-and-probe phase with this period: twice the
+/// run-cap probe period, so the probe population splits evenly across the
+/// two postures.
+const POSTURE_PERIOD: i64 = 2 * run_cap::PROBE_PERIOD;
+
+/// Quantile of the completed-length distribution the span bound is read from.
+const QUANTILE: f64 = 0.5;
+
+/// Share of the run's frozen step cap the span bound may not exceed.
+const CAP_RESERVE_NUM: i64 = 3;
+const CAP_RESERVE_DEN: i64 = 4;
+
+/// Completed stock-posture probes a scope must accumulate before its median
+/// takes effect. Below the floor no hold is ever drawn.
+const MIN_COMPLETED_SAMPLES: u64 = 200;
+
+/// Histogram cells per scope, bucketed by a per-scope width so the full
+/// budget fits.
+const HIST_CELLS: usize = 256;
+
+/// Whether this run draws crash holds. The complementary runs are left
+/// exactly stock, including their random-stream draw counts.
+pub fn is_placed(run_id: i64) -> bool {
+    run_id.rem_euclid(POSTURE_PERIOD) >= run_cap::PROBE_PERIOD
+}
+
+/// Whether this run's completed length may feed the learner: a run-cap
+/// probe (uncapped) in the stock posture.
+fn feeds_learner(run_id: i64) -> bool {
+    run_id.rem_euclid(POSTURE_PERIOD) == 0
+}
+
+struct ScopeAccum {
+    /// Steps per histogram cell, fixed when the scope is created.
+    bucket_width: u32,
+    /// Cell `c` counts the completed probes whose length fell in
+    /// `[c * bucket_width, (c + 1) * bucket_width)`.
+    hist: [u32; HIST_CELLS],
+    /// Completed stock-posture probes folded into the histogram.
+    completed: u64,
+    /// The median set at the last checkpoint, governing every draw until the
+    /// next one; None until the first checkpoint is crossed.
+    current: Option<i32>,
+    /// Completed count at which the median is next recomputed; doubles after
+    /// each recompute.
+    next_checkpoint: u64,
+}
+
+impl ScopeAccum {
+    fn new(backup: i32) -> Self {
+        Self {
+            bucket_width: ((backup.max(1) + HIST_CELLS as i32 - 1) / HIST_CELLS as i32).max(1)
+                as u32,
+            hist: [0; HIST_CELLS],
+            completed: 0,
+            current: None,
+            next_checkpoint: MIN_COMPLETED_SAMPLES,
+        }
+    }
+
+    /// The median the histogram supports right now, or None while it is
+    /// below the sample floor. Laplace-smoothed and read at the winning
+    /// cell's upper edge, so bucketing only ever rounds the median up.
+    fn estimate(&self, backup: i32) -> Option<i32> {
+        if self.completed < MIN_COMPLETED_SAMPLES {
+            return None;
+        }
+        let samples: u64 = self.hist.iter().map(|&n| n as u64).sum();
+        if samples == 0 {
+            return None;
+        }
+        let denom = (samples + 2) as f64;
+        let mut cum: u64 = 0;
+        for (c, &n) in self.hist.iter().enumerate() {
+            cum += n as u64;
+            if (cum + 1) as f64 / denom >= QUANTILE {
+                let upper = (c as i64 + 1) * self.bucket_width as i64 - 1;
+                return Some(upper.min(backup as i64) as i32);
+            }
+        }
+        None
+    }
+}
+
+static TABLE: LazyLock<DashMap<i32, ScopeAccum>> = LazyLock::new(DashMap::new);
+
+/// The learned median completed-run length for a scope, or None while the
+/// scope is below its sample floor. Constant between checkpoints.
+pub fn median(backup: i32) -> Option<i32> {
+    TABLE.get(&backup).and_then(|acc| acc.current)
+}
+
+/// Fold one run-cap probe's ending into the learner. Only a completed probe
+/// in the stock posture contributes a length; every other call returns
+/// without touching the table, so the sites mirror `run_cap::merge_probe`.
+pub fn merge_stock_probe(run_id: i64, backup: i32, outcome: run_cap::Outcome, steps: i32) {
+    if !feeds_learner(run_id) || outcome != run_cap::Outcome::Completed {
+        return;
+    }
+    let mut acc = TABLE.entry(backup).or_insert_with(|| ScopeAccum::new(backup));
+    let cell = ((steps.max(0) as u32) / acc.bucket_width).min(HIST_CELLS as u32 - 1);
+    acc.hist[cell as usize] = acc.hist[cell as usize].saturating_add(1);
+    acc.completed += 1;
+    if acc.completed >= acc.next_checkpoint {
+        acc.current = acc.estimate(backup);
+        acc.next_checkpoint = acc.next_checkpoint.saturating_mul(2);
+    }
+}
+
+/// Draw the step a placed run holds a crash until: uniform over
+/// `[t_ready, U)` where `U` is the learned median bounded by three quarters
+/// of the run's frozen step cap. Returns None, drawing nothing from any
+/// random stream, when the run is in the stock posture, the scope is below
+/// its floor, or the span is already spent.
+pub fn draw_hold(
+    run_id: i64,
+    backup: i32,
+    effective_cap: i32,
+    t_ready: i32,
+    rng: &mut impl StreamRng,
+) -> Option<i32> {
+    if !is_placed(run_id) {
+        return None;
+    }
+    let l50 = median(backup)?;
+    let reserve = (effective_cap as i64 * CAP_RESERVE_NUM / CAP_RESERVE_DEN) as i32;
+    let capped = reserve < l50;
+    let upper = l50.min(reserve);
+    if t_ready >= upper {
+        return None;
+    }
+    rng.use_stream(Stream::FaultPriority);
+    let span = (upper - t_ready) as u64;
+    let target = t_ready + (rng.next_u64() % span) as i32;
+    util_stats::record_crash_place_draw(capped, (target - t_ready) as u64);
+    Some(target)
+}
+
+/// Scale every scope's mass by `factor`, dropping scopes that reach zero,
+/// so stale phases of a long exploration lose their vote. The median and
+/// the next checkpoint are left alone: shrinking the completed count delays
+/// the next crossing, and the recompute there reads the decay-weighted
+/// histogram.
+pub fn decay(factor: f64) {
+    let factor = factor.clamp(0.0, 1.0);
+    TABLE.retain(|_, acc| {
+        for n in acc.hist.iter_mut() {
+            *n = ((*n as f64) * factor).floor() as u32;
+        }
+        acc.completed = ((acc.completed as f64) * factor).floor() as u64;
+        acc.current.is_some() || acc.completed > 0 || acc.hist.iter().any(|&n| n > 0)
+    });
+}
+
+/// Clear the table so explorer sessions in one process do not share spans.
+pub fn reset() {
+    TABLE.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulator::config_override;
+    use rand::RngCore;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    /// Counts draws so a test can assert a path consumed none.
+    struct CountingRng {
+        inner: SmallRng,
+        draws: u64,
+    }
+
+    impl CountingRng {
+        fn new(seed: u64) -> Self {
+            Self {
+                inner: SmallRng::seed_from_u64(seed),
+                draws: 0,
+            }
+        }
+    }
+
+    impl RngCore for CountingRng {
+        fn next_u32(&mut self) -> u32 {
+            self.draws += 1;
+            self.inner.next_u32()
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.draws += 1;
+            self.inner.next_u64()
+        }
+        fn fill_bytes(&mut self, dst: &mut [u8]) {
+            self.draws += 1;
+            self.inner.fill_bytes(dst)
+        }
+    }
+
+    impl StreamRng for CountingRng {}
+
+    fn feed(n: usize, backup: i32, steps: i32) {
+        for _ in 0..n {
+            merge_stock_probe(0, backup, run_cap::Outcome::Completed, steps);
+        }
+    }
+
+    #[test]
+    fn posture_splits_run_ids_by_bit_five_with_negative_ids_sane() {
+        for id in 0..32 {
+            assert!(!is_placed(id), "id {id} is stock");
+        }
+        for id in 32..64 {
+            assert!(is_placed(id), "id {id} is placed");
+        }
+        assert!(!is_placed(64));
+        assert!(is_placed(-32), "-32 wraps to phase 32");
+        assert!(!is_placed(-64), "-64 wraps to phase 0");
+    }
+
+    #[test]
+    fn only_stock_posture_completed_probes_feed_the_learner() {
+        let _serial = config_override::exclusive_session();
+        reset();
+        for _ in 0..200 {
+            // A placed-posture run-cap probe, a non-probe run, and every
+            // non-completed outcome all stay out of the histogram.
+            merge_stock_probe(32, 6000, run_cap::Outcome::Completed, 1200);
+            merge_stock_probe(1, 6000, run_cap::Outcome::Completed, 1200);
+            merge_stock_probe(0, 6000, run_cap::Outcome::Exhausted, 6000);
+            merge_stock_probe(0, 6000, run_cap::Outcome::Deadlocked, 40);
+        }
+        assert_eq!(median(6000), None, "nothing above reaches the floor");
+        feed(200, 6000, 1200);
+        assert!(median(6000).is_some(), "stock completions engage the scope");
+        reset();
+    }
+
+    #[test]
+    fn median_is_the_upper_cell_edge_and_constant_between_checkpoints() {
+        let _serial = config_override::exclusive_session();
+        reset();
+        feed(199, 6000, 1200);
+        assert_eq!(median(6000), None, "199 samples are under the floor");
+        feed(1, 6000, 1200);
+        // Width 24, so 1200 lands in cell 50 with upper edge 1223.
+        assert_eq!(median(6000), Some(1223));
+        feed(150, 6000, 100);
+        assert_eq!(median(6000), Some(1223), "350 samples sit between checkpoints");
+        feed(50, 6000, 100);
+        // At 400 the recompute reads the mixture; its median falls in the
+        // 100-length cell, upper edge 119.
+        assert_eq!(median(6000), Some(119));
+        assert_eq!(median(1500), None, "another scope stays unengaged");
+        reset();
+    }
+
+    #[test]
+    fn decay_delays_the_next_checkpoint_and_reset_empties() {
+        let _serial = config_override::exclusive_session();
+        reset();
+        feed(200, 6000, 1200);
+        assert_eq!(median(6000), Some(1223));
+        decay(0.5);
+        assert_eq!(median(6000), Some(1223), "the median survives decay unchanged");
+        feed(300, 6000, 100);
+        assert_eq!(median(6000), Some(119), "the delayed recompute follows fresher lengths");
+        reset();
+        assert_eq!(median(6000), None);
+    }
+
+    #[test]
+    fn a_stock_run_draws_no_hold_and_consumes_no_randomness() {
+        let _serial = config_override::exclusive_session();
+        reset();
+        feed(200, 6000, 1200);
+        let mut rng = CountingRng::new(7);
+        assert_eq!(draw_hold(0, 6000, 6000, 10, &mut rng), None);
+        assert_eq!(draw_hold(1, 6000, 6000, 10, &mut rng), None);
+        assert_eq!(rng.draws, 0, "stock posture must not touch the stream");
+        reset();
+    }
+
+    #[test]
+    fn a_placed_run_draws_inside_the_span_and_not_past_it() {
+        let _serial = config_override::exclusive_session();
+        reset();
+        feed(200, 6000, 1200);
+        let mut rng = CountingRng::new(7);
+        for _ in 0..100 {
+            let t = draw_hold(32, 6000, 6000, 10, &mut rng).expect("engaged scope draws");
+            assert!((10..1223).contains(&t), "target {t} escapes [t_ready, U)");
+        }
+        assert_eq!(
+            draw_hold(32, 6000, 6000, 1223, &mut rng),
+            None,
+            "a spent span draws nothing"
+        );
+        assert_eq!(draw_hold(32, 1500, 6000, 10, &mut rng), None, "unengaged scope");
+        reset();
+    }
+
+    #[test]
+    fn the_cap_reserve_bounds_the_span_and_counts_as_capped() {
+        let _serial = config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        reset();
+        feed(200, 6000, 1200);
+        let before = util_stats::snapshot().crash_place;
+        let mut rng = CountingRng::new(3);
+        // Three quarters of a 400-step cap is 300, under the 1223 median.
+        for _ in 0..50 {
+            let t = draw_hold(32, 6000, 400, 0, &mut rng).expect("capped span still draws");
+            assert!((0..300).contains(&t), "target {t} escapes the reserve bound");
+        }
+        let t = draw_hold(32, 6000, 6000, 0, &mut rng).expect("uncapped draw");
+        assert!((0..1223).contains(&t));
+        let after = util_stats::snapshot().crash_place;
+        util_stats::set_enabled(false);
+        assert_eq!(after.draws, before.draws + 51);
+        assert_eq!(after.capped_draws, before.capped_draws + 50);
+        assert!(after.held_steps_sum > before.held_steps_sum);
+        reset();
+    }
+}

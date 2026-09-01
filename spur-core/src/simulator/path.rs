@@ -13,6 +13,7 @@ use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
+use crate::simulator::fault_timing;
 use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
@@ -408,6 +409,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             );
             if is_probe {
                 run_cap::merge_probe(backup, run_cap::Outcome::Completed, step);
+                fault_timing::merge_stock_probe(run_id, backup, run_cap::Outcome::Completed, step);
             }
             return Ok(RunOutcome::Completed { steps: step });
         }
@@ -445,6 +447,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             );
             if is_probe {
                 run_cap::merge_probe(backup, run_cap::Outcome::Deadlocked, step);
+                fault_timing::merge_stock_probe(run_id, backup, run_cap::Outcome::Deadlocked, step);
             }
             return Ok(RunOutcome::Deadlock {
                 step,
@@ -522,6 +525,16 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         node_id: nid,
                         priority: policy.sample(rng, RunnableCategory::Crash),
                     });
+                    // Placed-posture runs hold the crash until a step drawn
+                    // uniformly over the learned completed-run span; stock
+                    // runs draw nothing and behave exactly as before.
+                    if let Some(target) =
+                        fault_timing::draw_hold(run_id, backup, effective_cap, step, rng)
+                        && let Some(hold) =
+                            path_state.state.crash_hold_until.get_mut(nid.index)
+                    {
+                        *hold = target;
+                    }
                     pending_crash_recover.insert(nid.index, node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
@@ -814,6 +827,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     );
     if is_probe {
         run_cap::merge_probe(backup, run_cap::Outcome::Exhausted, backup);
+        fault_timing::merge_stock_probe(run_id, backup, run_cap::Outcome::Exhausted, backup);
     }
     Ok(RunOutcome::IterationsExhausted {
         outstanding_events: engine.outstanding_count(),

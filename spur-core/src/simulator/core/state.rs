@@ -590,6 +590,10 @@ pub struct State<H: HashPolicy> {
     /// `nodes`. Kept exact by the queue hooks below and excluded from
     /// `signature()`, so it cannot change deduplication.
     pub send_ledger: Vec<SendLedger>,
+    /// Per-node step a queued crash is held until, indexed like `nodes`;
+    /// zero means no hold. Scheduling bookkeeping like `send_ledger`,
+    /// excluded from `signature()` so it cannot change deduplication.
+    pub crash_hold_until: Vec<i32>,
     /// Remote records in the network queue whose origin has restarted since
     /// sending them: the sum over nodes of `net_records - net_fresh`.
     pub net_stale_records: u32,
@@ -690,6 +694,7 @@ impl<H: HashPolicy> State<H> {
             timer_stats: TimerRunStats::default(),
             timer_inert_streaks: Vec::new(),
             send_ledger: vec![SendLedger::default(); num_nodes],
+            crash_hold_until: vec![0; num_nodes],
             net_stale_records: 0,
             net_requests: 0,
         }
@@ -784,6 +789,7 @@ impl<H: HashPolicy> State<H> {
         self.incarnations.push(0);
         self.local_queues.push(Vec::new());
         self.send_ledger.push(SendLedger::default());
+        self.crash_hold_until.push(0);
         node_id
     }
 

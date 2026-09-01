@@ -24,6 +24,7 @@ use crate::simulator::rng::{
     LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, StreamRng,
     StreamSet, WORKLOAD_SALT, derive_seed, mutate_tape,
 };
+use crate::simulator::fault_timing;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
 use crate::simulator::util_stats;
@@ -1137,6 +1138,7 @@ pub fn run_explorer(
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     run_cap::reset();
+    fault_timing::reset();
     timer_context::reset();
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
@@ -1531,6 +1533,7 @@ pub fn run_explorer_genetic(
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     run_cap::reset();
+    fault_timing::reset();
     timer_context::reset();
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
@@ -1970,6 +1973,7 @@ pub fn run_explorer_aos(
     info!("AOS session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     run_cap::reset();
+    fault_timing::reset();
     timer_context::reset();
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.emit_acceptance_distance);
@@ -2297,6 +2301,7 @@ impl<F: Feedback> Strategy<F> for CurriculumExplorer<F> {
         if self.decay_factor < 1.0 {
             F::decay(&self.global_state.feedback, self.decay_factor);
             run_cap::decay(self.decay_factor);
+            fault_timing::decay(self.decay_factor);
             timer_context::decay(self.decay_factor);
         }
 
@@ -2621,6 +2626,7 @@ pub fn run_explorer_continuous(
     info!("Continuous session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
     run_cap::reset();
+    fault_timing::reset();
     timer_context::reset();
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);
     util_stats::set_acceptance_distance_enabled(config.envelope.emit_acceptance_distance);

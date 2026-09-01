@@ -13,9 +13,9 @@
 
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
-    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, DeliveryEffect,
-    DeliveryEffectStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
-    TimerContextStats, UtilizationSnapshot,
+    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, CrashPlaceStats,
+    DeliveryEffect, DeliveryEffectStats, RunCapStats, SteerAuthorityStats, TerminationStats,
+    TerminationTally, TimerContextStats, UtilizationSnapshot,
 };
 use std::collections::BTreeMap;
 
@@ -402,6 +402,30 @@ fn run_cap_leaves(prefix: &str, r: &RunCapStats) -> Vec<(String, Value)> {
     ]
 }
 
+fn crash_place(m: &mut Marks) -> CrashPlaceStats {
+    CrashPlaceStats {
+        draws: m.int(),
+        capped_draws: m.int(),
+        holds: m.int(),
+        held_steps_sum: m.int(),
+    }
+}
+
+fn crash_place_leaves(prefix: &str, c: &CrashPlaceStats) -> Vec<(String, Value)> {
+    let CrashPlaceStats {
+        draws,
+        capped_draws,
+        holds,
+        held_steps_sum,
+    } = c;
+    vec![
+        leaf(prefix, "draws", *draws),
+        leaf(prefix, "capped_draws", *capped_draws),
+        leaf(prefix, "holds", *holds),
+        leaf(prefix, "held_steps_sum", *held_steps_sum),
+    ]
+}
+
 fn timer_context(m: &mut Marks) -> TimerContextStats {
     TimerContextStats {
         probe_firings: m.int(),
@@ -464,6 +488,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         prefix_extension: _,
         quiet_stretch: _,
         run_cap: _,
+        crash_place: _,
         timer_context: _,
         timeline_keys: _,
         steer_terms: _,
@@ -493,6 +518,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "prefix_extension",
         "quiet_stretch",
         "run_cap",
+        "crash_place",
         "timer_context",
         "timeline_keys",
         "steer_terms",
@@ -557,6 +583,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.termination = termination(&mut m);
     s.delivery_effects = delivery_effects(&mut m);
     s.run_cap = run_cap(&mut m);
+    s.crash_place = crash_place(&mut m);
     s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
@@ -565,6 +592,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
         &s.delivery_effects,
     ));
     expected.extend(run_cap_leaves("run_cap", &s.run_cap));
+    expected.extend(crash_place_leaves("crash_place", &s.crash_place));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
 }
@@ -599,6 +627,7 @@ fn every_counter_field_reaches_the_written_json() {
         "termination",
         "delivery_effects",
         "run_cap",
+        "crash_place",
         "timer_context",
     ] {
         let mut actual = BTreeMap::new();
