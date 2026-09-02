@@ -1,0 +1,69 @@
+// A node that answers a write, and every timer firing, by telling all of its
+// peers, so more than one message of the same handler is in the air at once.
+// Fixtures that send to a single peer cannot reach a partly delivered
+// fan-out, which is the situation this one exists to produce.
+//
+// The peer list carries the node itself, and a message a node sends to
+// itself is never in flight, so the loops skip it.
+
+role Node {
+    var db: map<string, int> = {};
+    var ticks: int = 0;
+    var me: int = 0;
+    var peers: list<Node> = [];
+
+    fn Init(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Heartbeat();
+    }
+
+    async fn RecoverInit(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Heartbeat();
+    }
+
+    async fn Heartbeat() {
+        for ;; {
+            <- set_timer("beat");
+            ticks = ticks + 1;
+            for var i = 0; i < len(peers); i = i + 1 {
+                if (i != me) {
+                    peers[i]->Note(ticks);
+                }
+            }
+        }
+    }
+
+    async fn Note(n: int) {
+        ticks = n;
+    }
+
+    async fn Write(key: string, uid: int): bool {
+        for var i = 0; i < len(peers); i = i + 1 {
+            if (i != me) {
+                peers[i]->Note(uid);
+            }
+        }
+        db = db[key] := uid;
+        return true;
+    }
+
+    async fn Read(key: string): int {
+        if (exists(db, key)) {
+            return db[key];
+        }
+        return 0;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        <-dest->Write(key, uid);
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

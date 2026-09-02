@@ -12,6 +12,7 @@ use crate::simulator::core::state::{
 };
 use crate::simulator::core::steer_terms::{ResolvedTerms, Term, TERMS};
 use crate::simulator::core::values::{Env, Value};
+use crate::simulator::crash_phase;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
@@ -688,28 +689,37 @@ fn route_by_terms<H: HashPolicy>(
     routed
 }
 
-/// Bitmask over the first 64 nodes of pending crashes an active
-/// crash-placement hold withholds from this step. A hold expires
-/// unconditionally at its target step; past it, the ordinary crash
-/// admission applies unchanged. Each withheld offer is counted per node
-/// per step.
-fn crash_hold_mask<H: HashPolicy>(state: &State<H>) -> u64 {
+/// Bitmask over the first 64 nodes of pending crashes a crash-placement hold
+/// withholds from this step. The drawn target step expires the hold
+/// unconditionally; on a run that anchors, the crash then waits further for a
+/// drawn phase of its victim's own fan-out, bounded by a window. Past both,
+/// the ordinary crash admission applies unchanged. Each offer the target step
+/// excludes is counted per node per step; the anchor's waiting is counted in
+/// its own block, so the placement counters keep meaning the step hold alone.
+fn crash_hold_mask<H: HashPolicy>(state: &mut State<H>, rng: &mut impl StreamRng) -> u64 {
     let step_now = state.crash_info.current_step;
     let mut mask = 0u64;
-    for (n, &hold) in state
-        .crash_hold_until
-        .iter()
-        .enumerate()
-        .take(u64::BITS as usize)
-    {
-        if step_now >= hold {
+    let width = state.crash_hold_until.len().min(u64::BITS as usize);
+    for n in 0..width {
+        let Some(ledger) = state.send_ledger.get(n) else {
+            continue;
+        };
+        if ledger.crash_pending == 0 {
             continue;
         }
-        if state.send_ledger.get(n).is_none_or(|l| l.crash_pending == 0) {
+        let fanout = crash_phase::Fanout {
+            segment_sends: ledger.issued.saturating_sub(ledger.floor),
+            undelivered: ledger.recent,
+            in_flight: ledger.in_flight,
+        };
+        if step_now < state.crash_hold_until[n] {
+            mask |= 1u64 << n;
+            util_stats::record_crash_place_hold();
             continue;
         }
-        mask |= 1u64 << n;
-        util_stats::record_crash_place_hold();
+        if state.crash_phase.hold(n, fanout, step_now, rng) {
+            mask |= 1u64 << n;
+        }
     }
     mask
 }
@@ -746,7 +756,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // offered again at the next step, which keeps the number of crashes a run
     // takes the same and moves only when they land. Nodes past the width of the
     // mask are never withheld.
-    let crash_hold_mask = crash_hold_mask(state);
+    let crash_hold_mask = crash_hold_mask(state, rng);
 
     let crash_defer_mask: u64 = if partial_fanout_crash_bias > 0.0 {
         let mut mask = 0u64;
@@ -1048,6 +1058,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             if let Some(any_candidate) = crash_candidate_with_inflight {
                 let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
                 util_stats::record_crash_census(ledger.in_flight, any_candidate);
+            }
+            if let Some(arm) = state.crash_phase.arm_of(node_id.index) {
+                let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
+                util_stats::record_crash_phase_apply(arm, ledger.in_flight);
             }
             crash_node(state, node_id);
             Ok(ScheduleResult::Crash { node_id })
@@ -1620,19 +1634,82 @@ mod tests {
             priority: 0.5,
         });
         state.crash_hold_until[1] = 10;
+        let mut rng = StdRng::seed_from_u64(5);
 
         state.crash_info.current_step = 4;
-        assert_eq!(crash_hold_mask(&state), 1u64 << 1);
+        assert_eq!(crash_hold_mask(&mut state, &mut rng), 1u64 << 1);
         state.crash_info.current_step = 10;
-        assert_eq!(crash_hold_mask(&state), 0, "the hold expires at its target step");
+        assert_eq!(
+            crash_hold_mask(&mut state, &mut rng),
+            0,
+            "the hold expires at its target step"
+        );
 
         state.crash_info.current_step = 4;
         state.crash_hold_until[0] = 10;
-        assert_eq!(crash_hold_mask(&state), 1u64 << 1, "node 0 has no pending crash");
+        assert_eq!(
+            crash_hold_mask(&mut state, &mut rng),
+            1u64 << 1,
+            "node 0 has no pending crash"
+        );
 
         let holds = util_stats::snapshot().crash_place.holds;
         util_stats::set_enabled(false);
         assert_eq!(holds, 2, "one count per withheld offer");
+    }
+
+    /// On a run that anchors, the expiring step hold hands the crash to the
+    /// fan-out wait, which keeps withholding it until the victim's segment
+    /// shows the drawn phase. The withheld steps stay out of the placement
+    /// counters, whose equality is what says the step hold is the only gate
+    /// they describe.
+    #[test]
+    fn an_anchored_crash_keeps_waiting_past_its_target_step() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_place;
+        let mut state = State::<NoHashing>::new(&[(crate::analysis::resolver::NameId(0), 2)], 1);
+        let node = NodeId {
+            role: crate::analysis::resolver::NameId(0),
+            index: 1,
+        };
+        state.push_runnable(Runnable::Crash {
+            node_id: node,
+            priority: 0.5,
+        });
+        state.crash_hold_until[1] = 10;
+        state.crash_phase.arm_node(1, 0);
+        // A segment with nothing issued meets no waiting arm's phase.
+        state.send_ledger[1].floor = state.send_ledger[1].issued;
+        let mut rng = StdRng::seed_from_u64(9);
+
+        state.crash_info.current_step = 10;
+        let mut waited = 0;
+        for step in 10..10 + crash_phase::WINDOW {
+            state.crash_info.current_step = step;
+            if crash_hold_mask(&mut state, &mut rng) != 0 {
+                waited += 1;
+            }
+        }
+        let arm = state.crash_phase.arm_of(1);
+        let place = util_stats::snapshot().crash_place;
+        util_stats::set_enabled(false);
+        match arm {
+            Some(util_stats::CrashPhaseArm::Stock) => {
+                assert_eq!(waited, 0, "a stock draw must not withhold anything")
+            }
+            Some(_) => assert_eq!(
+                waited,
+                crash_phase::WINDOW,
+                "a waiting arm must withhold every step of its window"
+            ),
+            None => panic!("an armed node drew no arm"),
+        }
+        assert_eq!(
+            place.holds - before.holds,
+            0,
+            "the fan-out wait must not count as a placement hold"
+        );
     }
 
     /// The identity-weighted recovery term reads its predicate and reports

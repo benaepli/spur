@@ -13,9 +13,10 @@
 
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
-    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, CrashPlaceStats,
-    DeliveryEffect, DeliveryEffectStats, RunCapStats, SteerAuthorityStats, TerminationStats,
-    TerminationTally, TimerContextStats, UtilizationSnapshot,
+    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, CrashPhaseArmStats,
+    CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, RunCapStats,
+    SteerAuthorityStats, TerminationStats, TerminationTally, TimerContextStats,
+    UtilizationSnapshot,
 };
 use std::collections::BTreeMap;
 
@@ -426,6 +427,103 @@ fn crash_place_leaves(prefix: &str, c: &CrashPlaceStats) -> Vec<(String, Value)>
     ]
 }
 
+fn crash_phase_arm(m: &mut Marks) -> CrashPhaseArmStats {
+    CrashPhaseArmStats {
+        runs: m.int(),
+        armed: m.int(),
+        released_on_condition: m.int(),
+        expired: m.int(),
+        wait_steps_sum: m.int(),
+        release_decisions: m.int(),
+        release_victim_had_inflight: m.int(),
+        expired_victim_had_inflight: m.int(),
+        apply_decisions: m.int(),
+        apply_victim_had_inflight: m.int(),
+        crashes_applied: m.int(),
+        inflight_bucket_0: m.int(),
+        inflight_bucket_1: m.int(),
+        inflight_bucket_2: m.int(),
+        inflight_bucket_3plus: m.int(),
+    }
+}
+
+fn crash_phase_arm_leaves(prefix: &str, a: &CrashPhaseArmStats) -> Vec<(String, Value)> {
+    let CrashPhaseArmStats {
+        runs,
+        armed,
+        released_on_condition,
+        expired,
+        wait_steps_sum,
+        release_decisions,
+        release_victim_had_inflight,
+        expired_victim_had_inflight,
+        apply_decisions,
+        apply_victim_had_inflight,
+        crashes_applied,
+        inflight_bucket_0,
+        inflight_bucket_1,
+        inflight_bucket_2,
+        inflight_bucket_3plus,
+    } = a;
+    vec![
+        leaf(prefix, "runs", *runs),
+        leaf(prefix, "armed", *armed),
+        leaf(prefix, "released_on_condition", *released_on_condition),
+        leaf(prefix, "expired", *expired),
+        leaf(prefix, "wait_steps_sum", *wait_steps_sum),
+        leaf(prefix, "release_decisions", *release_decisions),
+        leaf(
+            prefix,
+            "release_victim_had_inflight",
+            *release_victim_had_inflight,
+        ),
+        leaf(
+            prefix,
+            "expired_victim_had_inflight",
+            *expired_victim_had_inflight,
+        ),
+        leaf(prefix, "apply_decisions", *apply_decisions),
+        leaf(
+            prefix,
+            "apply_victim_had_inflight",
+            *apply_victim_had_inflight,
+        ),
+        leaf(prefix, "crashes_applied", *crashes_applied),
+        leaf(prefix, "inflight_bucket_0", *inflight_bucket_0),
+        leaf(prefix, "inflight_bucket_1", *inflight_bucket_1),
+        leaf(prefix, "inflight_bucket_2", *inflight_bucket_2),
+        leaf(prefix, "inflight_bucket_3plus", *inflight_bucket_3plus),
+    ]
+}
+
+fn crash_phase(m: &mut Marks) -> CrashPhaseStats {
+    CrashPhaseStats {
+        armed: m.int(),
+        stock_releases: m.int(),
+        early: crash_phase_arm(m),
+        mid: crash_phase_arm(m),
+        stock: crash_phase_arm(m),
+    }
+}
+
+fn crash_phase_leaves(prefix: &str, c: &CrashPhaseStats) -> Vec<(String, Value)> {
+    let CrashPhaseStats {
+        armed,
+        stock_releases,
+        early,
+        mid,
+        stock,
+    } = c;
+    let mut out = vec![
+        leaf(prefix, "armed", *armed),
+        leaf(prefix, "stock_releases", *stock_releases),
+    ];
+    for (name, arm) in [("early", early), ("mid", mid), ("stock", stock)] {
+        out.extend(crash_phase_arm_leaves(&format!("{prefix}.{name}"), arm));
+    }
+    out
+}
+
 fn timer_context(m: &mut Marks) -> TimerContextStats {
     TimerContextStats {
         probe_firings: m.int(),
@@ -489,6 +587,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         quiet_stretch: _,
         run_cap: _,
         crash_place: _,
+        crash_phase: _,
         timer_context: _,
         timeline_keys: _,
         steer_terms: _,
@@ -519,6 +618,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "quiet_stretch",
         "run_cap",
         "crash_place",
+        "crash_phase",
         "timer_context",
         "timeline_keys",
         "steer_terms",
@@ -584,6 +684,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.delivery_effects = delivery_effects(&mut m);
     s.run_cap = run_cap(&mut m);
     s.crash_place = crash_place(&mut m);
+    s.crash_phase = crash_phase(&mut m);
     s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
@@ -593,6 +694,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     ));
     expected.extend(run_cap_leaves("run_cap", &s.run_cap));
     expected.extend(crash_place_leaves("crash_place", &s.crash_place));
+    expected.extend(crash_phase_leaves("crash_phase", &s.crash_phase));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
 }
@@ -628,6 +730,7 @@ fn every_counter_field_reaches_the_written_json() {
         "delivery_effects",
         "run_cap",
         "crash_place",
+        "crash_phase",
         "timer_context",
     ] {
         let mut actual = BTreeMap::new();

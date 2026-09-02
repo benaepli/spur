@@ -46,10 +46,12 @@ pub enum Stream {
     PartitionPriority,
     /// Whether a remote send is held back, and for how long.
     SendDelay,
+    /// Which fan-out phase of its victim a placed crash waits for.
+    CrashPhase,
 }
 
 impl Stream {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     #[inline]
     fn index(self) -> usize {
@@ -61,6 +63,7 @@ impl Stream {
             Stream::FaultPriority => 4,
             Stream::PartitionPriority => 5,
             Stream::SendDelay => 6,
+            Stream::CrashPhase => 7,
         }
     }
 }
@@ -428,6 +431,7 @@ mod tests {
             Stream::FaultPriority,
             Stream::PartitionPriority,
             Stream::SendDelay,
+            Stream::CrashPhase,
         ];
         let mixed: Vec<u64> = (0..8)
             .map(|i| {

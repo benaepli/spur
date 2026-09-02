@@ -18,14 +18,22 @@
 /// The run's phase in `[0, period)`. `period` must be positive.
 pub fn phase(run_id: i64, period: i64) -> i64 {
     debug_assert!(period > 0, "a phase period must be positive");
-    (mix(run_id) % period as u64) as i64
+    (mix(run_id as u64) % period as u64) as i64
+}
+
+/// The run's phase under a domain salt. Two mechanisms that split a session
+/// at the same period must not select the same runs, so each passes its own
+/// salt and gets a split independent of every other one.
+pub fn salted_phase(run_id: i64, salt: u64, period: i64) -> i64 {
+    debug_assert!(period > 0, "a phase period must be positive");
+    (mix(run_id as u64 ^ salt) % period as u64) as i64
 }
 
 /// SplitMix64's finalizer over the id. Chosen for avalanche: every input
 /// bit reaches every output bit, which is what breaks the correlation with
 /// the grid width.
-fn mix(run_id: i64) -> u64 {
-    let mut z = (run_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+fn mix(run_id: u64) -> u64 {
+    let mut z = run_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -66,6 +74,34 @@ mod tests {
         }
         for (p, &n) in counts.iter().enumerate() {
             assert!((900..1100).contains(&n), "phase {p} drew {n} of an expected 1000");
+        }
+    }
+
+    #[test]
+    fn a_salt_gives_an_even_split_independent_of_the_unsalted_one() {
+        const A: u64 = 0x_1122_3344_5566_7788;
+        const B: u64 = 0x_99AA_BBCC_DDEE_FF00;
+        let n = 20_000i64;
+        let mut ones = 0i64;
+        let mut agree_other_salt = 0i64;
+        let mut agree_unsalted = 0i64;
+        for id in 0..n {
+            let a = salted_phase(id, A, 2);
+            assert!((0..2).contains(&a), "id {id} gave phase {a}");
+            assert_eq!(a, salted_phase(id, A, 2), "a salted phase must not vary");
+            ones += a;
+            if a == salted_phase(id, B, 2) {
+                agree_other_salt += 1;
+            }
+            if a == phase(id, 2) {
+                agree_unsalted += 1;
+            }
+        }
+        let share = ones as f64 / n as f64;
+        assert!((share - 0.5).abs() < 0.02, "one salt takes {share} of the runs");
+        for (what, agree) in [("another salt", agree_other_salt), ("no salt", agree_unsalted)] {
+            let overlap = agree as f64 / n as f64;
+            assert!((overlap - 0.5).abs() < 0.02, "the split agrees with {what} on {overlap}");
         }
     }
 

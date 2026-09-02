@@ -5,6 +5,7 @@ use crate::simulator::core::eval::store;
 use crate::simulator::core::partition::{PartitionInfo, PartitionType};
 use crate::simulator::core::steer_terms::Term;
 use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
+use crate::simulator::crash_phase;
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats::DeliveryBias;
@@ -594,6 +595,10 @@ pub struct State<H: HashPolicy> {
     /// zero means no hold. Scheduling bookkeeping like `send_ledger`,
     /// excluded from `signature()` so it cannot change deduplication.
     pub crash_hold_until: Vec<i32>,
+    /// Where each node's placed crash stands in the wait for a phase of the
+    /// node's own fan-out, on the runs that anchor. Scheduling bookkeeping
+    /// like `crash_hold_until`, excluded from `signature()`.
+    pub crash_phase: crash_phase::RunAnchor,
     /// Whether this run drew at least one crash hold. A placed run whose
     /// scope is below its sample floor draws none, so being selected and
     /// having acted are different facts and the run row reports both.
@@ -700,6 +705,7 @@ impl<H: HashPolicy> State<H> {
             timer_inert_streaks: Vec::new(),
             send_ledger: vec![SendLedger::default(); num_nodes],
             crash_hold_until: vec![0; num_nodes],
+            crash_phase: crash_phase::RunAnchor::with_nodes(num_nodes),
             crash_hold_drawn: false,
             net_stale_records: 0,
             net_requests: 0,
@@ -796,6 +802,7 @@ impl<H: HashPolicy> State<H> {
         self.local_queues.push(Vec::new());
         self.send_ledger.push(SendLedger::default());
         self.crash_hold_until.push(0);
+        self.crash_phase.push_node();
         node_id
     }
 

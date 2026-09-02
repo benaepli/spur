@@ -286,6 +286,22 @@ static CRASH_PLACE_CAPPED_DRAWS: AtomicU64 = AtomicU64::new(0);
 static CRASH_PLACE_HOLDS: AtomicU64 = AtomicU64::new(0);
 static CRASH_PLACE_HELD_STEPS_SUM: AtomicU64 = AtomicU64::new(0);
 
+/// One column per arm of the fan-out anchor, indexed by `CrashPhaseArm`.
+const CP_ARMS: usize = 3;
+static CP_RUNS: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_ARMED: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_ON_CONDITION: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_EXPIRED: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_WAIT_STEPS_SUM: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_RELEASE_DECISIONS: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_RELEASE_INFLIGHT: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_EXPIRED_INFLIGHT: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_APPLY_DECISIONS: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_APPLY_INFLIGHT: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_CRASHES_APPLIED: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_INFLIGHT: [[AtomicU64; CC_INFLIGHT_SLOTS]; CP_ARMS] =
+    [const { [const { AtomicU64::new(0) }; CC_INFLIGHT_SLOTS] }; CP_ARMS];
+
 static TIMER_CONTEXT_PROBE_FIRINGS: AtomicU64 = AtomicU64::new(0);
 static TIMER_CONTEXT_PROBE_ACTED: AtomicU64 = AtomicU64::new(0);
 static TIMER_CONTEXT_BIASED_STEPS: AtomicU64 = AtomicU64::new(0);
@@ -443,6 +459,22 @@ pub fn set_enabled(on: bool) {
             c.store(0, Ordering::Relaxed);
         }
         for c in TIMER_STREAK_FIRED.iter().chain(TIMER_STREAK_ACTED.iter()) {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in CP_RUNS
+            .iter()
+            .chain(CP_ARMED.iter())
+            .chain(CP_ON_CONDITION.iter())
+            .chain(CP_EXPIRED.iter())
+            .chain(CP_WAIT_STEPS_SUM.iter())
+            .chain(CP_RELEASE_DECISIONS.iter())
+            .chain(CP_RELEASE_INFLIGHT.iter())
+            .chain(CP_EXPIRED_INFLIGHT.iter())
+            .chain(CP_APPLY_DECISIONS.iter())
+            .chain(CP_APPLY_INFLIGHT.iter())
+            .chain(CP_CRASHES_APPLIED.iter())
+            .chain(CP_INFLIGHT.iter().flatten())
+        {
             c.store(0, Ordering::Relaxed);
         }
         if let Ok(mut t) = TIMER_EFFECTS.lock() {
@@ -1944,6 +1976,117 @@ pub fn record_crash_place_hold() {
     CRASH_PLACE_HOLDS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Which phase of its victim's fan-out a placed crash's release waits for.
+/// `Stock` waits for nothing and releases where it would have without the
+/// anchor, so it is the control the other two are read against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrashPhaseArm {
+    /// Every send the victim's current handler segment issued is still
+    /// undelivered.
+    Early,
+    /// The segment issued at least two sends, some delivered and some not.
+    Mid,
+    /// No wait.
+    Stock,
+}
+
+impl CrashPhaseArm {
+    /// Equal-mass arms, in the order a draw indexes them.
+    pub const ALL: [CrashPhaseArm; 3] =
+        [CrashPhaseArm::Early, CrashPhaseArm::Mid, CrashPhaseArm::Stock];
+
+    #[inline]
+    pub fn index(self) -> usize {
+        match self {
+            CrashPhaseArm::Early => 0,
+            CrashPhaseArm::Mid => 1,
+            CrashPhaseArm::Stock => 2,
+        }
+    }
+}
+
+/// One counter column per arm, or an arm would share another's column.
+const _: () = assert!(CrashPhaseArm::ALL.len() == CP_ARMS);
+
+/// How an anchored crash stopped being withheld.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrashPhaseRelease {
+    /// The arm asks for no wait, so the release is the draw.
+    Immediate,
+    /// The victim's fan-out reached the arm's phase.
+    Condition,
+    /// The window ran out with the phase unmet.
+    Expired,
+}
+
+/// One crash drew `arm`; `first_in_run` marks the first draw of that arm in
+/// its run, which is what the per-arm run count counts.
+#[inline]
+pub fn record_crash_phase_arm(arm: CrashPhaseArm, first_in_run: bool) {
+    if !enabled() {
+        return;
+    }
+    CP_ARMED[arm.index()].fetch_add(1, Ordering::Relaxed);
+    if first_in_run {
+        CP_RUNS[arm.index()].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One anchored crash's mask came off after `wait_steps` steps, with the
+/// victim holding `victim_inflight` undelivered messages of its own at that
+/// step. An immediate release waited for nothing, so it counts only as a
+/// release decision.
+#[inline]
+pub fn record_crash_phase_release(
+    arm: CrashPhaseArm,
+    kind: CrashPhaseRelease,
+    wait_steps: u64,
+    victim_inflight: u32,
+) {
+    if !enabled() {
+        return;
+    }
+    let i = arm.index();
+    CP_RELEASE_DECISIONS[i].fetch_add(1, Ordering::Relaxed);
+    if victim_inflight > 0 {
+        CP_RELEASE_INFLIGHT[i].fetch_add(1, Ordering::Relaxed);
+    }
+    match kind {
+        CrashPhaseRelease::Immediate => return,
+        CrashPhaseRelease::Condition => {
+            CP_ON_CONDITION[i].fetch_add(1, Ordering::Relaxed);
+        }
+        CrashPhaseRelease::Expired => {
+            CP_EXPIRED[i].fetch_add(1, Ordering::Relaxed);
+            if victim_inflight > 0 {
+                CP_EXPIRED_INFLIGHT[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    CP_WAIT_STEPS_SUM[i].fetch_add(wait_steps, Ordering::Relaxed);
+}
+
+/// One crash whose release carried `arm` was applied to a node holding
+/// `victim_inflight` undelivered messages of its own. The census half needs
+/// the crash census switched on, the same gate the unsplit census reads.
+#[inline]
+pub fn record_crash_phase_apply(arm: CrashPhaseArm, victim_inflight: u32) {
+    if !enabled() {
+        return;
+    }
+    let i = arm.index();
+    CP_CRASHES_APPLIED[i].fetch_add(1, Ordering::Relaxed);
+    if !crash_census_enabled() {
+        return;
+    }
+    CP_APPLY_DECISIONS[i].fetch_add(1, Ordering::Relaxed);
+    if victim_inflight > 0 {
+        CP_APPLY_INFLIGHT[i].fetch_add(1, Ordering::Relaxed);
+    }
+    let slot = (victim_inflight as usize).min(CC_INFLIGHT_SLOTS - 1);
+    CP_INFLIGHT[i][slot].fetch_add(1, Ordering::Relaxed);
+}
+
 /// One steer-off probe-run timer firing was folded into the timer-context
 /// learner; `acted` marks the subset that changed the node's state.
 #[inline]
@@ -2860,6 +3003,90 @@ impl CrashPlaceStats {
     }
 }
 
+/// One arm of the fan-out anchor. `armed` is the crashes the arm was drawn
+/// for and `runs` the runs at least one of those draws fell in.
+/// `released_on_condition` and `expired` split how the wait ended, and
+/// `wait_steps_sum` over their sum is how long a wait lasted; all three stay
+/// zero for an arm that waits for nothing. The release pair counts what the
+/// victim held at the step its mask came off, the apply pair and the
+/// histogram what it held at the step the crash was taken, which are
+/// different questions whenever anything runs in between.
+/// `expired_victim_had_inflight` is the part of the release pair that came
+/// from a wait that ran out rather than one that reached its phase, so the
+/// two kinds of release can be read apart: a wait that reached its phase
+/// always ends with the victim holding something, since the segment sends it
+/// counts are a subset of the sends still in flight.
+#[derive(Serialize, Debug)]
+pub struct CrashPhaseArmStats {
+    pub runs: u64,
+    pub armed: u64,
+    pub released_on_condition: u64,
+    pub expired: u64,
+    pub wait_steps_sum: u64,
+    pub release_decisions: u64,
+    pub release_victim_had_inflight: u64,
+    pub expired_victim_had_inflight: u64,
+    pub apply_decisions: u64,
+    pub apply_victim_had_inflight: u64,
+    pub crashes_applied: u64,
+    pub inflight_bucket_0: u64,
+    pub inflight_bucket_1: u64,
+    pub inflight_bucket_2: u64,
+    pub inflight_bucket_3plus: u64,
+}
+
+impl CrashPhaseArmStats {
+    fn read(arm: CrashPhaseArm) -> Self {
+        let i = arm.index();
+        Self {
+            runs: CP_RUNS[i].load(Ordering::Relaxed),
+            armed: CP_ARMED[i].load(Ordering::Relaxed),
+            released_on_condition: CP_ON_CONDITION[i].load(Ordering::Relaxed),
+            expired: CP_EXPIRED[i].load(Ordering::Relaxed),
+            wait_steps_sum: CP_WAIT_STEPS_SUM[i].load(Ordering::Relaxed),
+            release_decisions: CP_RELEASE_DECISIONS[i].load(Ordering::Relaxed),
+            release_victim_had_inflight: CP_RELEASE_INFLIGHT[i].load(Ordering::Relaxed),
+            expired_victim_had_inflight: CP_EXPIRED_INFLIGHT[i].load(Ordering::Relaxed),
+            apply_decisions: CP_APPLY_DECISIONS[i].load(Ordering::Relaxed),
+            apply_victim_had_inflight: CP_APPLY_INFLIGHT[i].load(Ordering::Relaxed),
+            crashes_applied: CP_CRASHES_APPLIED[i].load(Ordering::Relaxed),
+            inflight_bucket_0: CP_INFLIGHT[i][0].load(Ordering::Relaxed),
+            inflight_bucket_1: CP_INFLIGHT[i][1].load(Ordering::Relaxed),
+            inflight_bucket_2: CP_INFLIGHT[i][2].load(Ordering::Relaxed),
+            inflight_bucket_3plus: CP_INFLIGHT[i][3].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The fan-out anchor block: how many placed crashes were made to wait for a
+/// phase of their victim's fan-out, and what they landed on. `armed` is the
+/// two waiting arms together, the number this mechanism is read as having
+/// fired; `stock_releases` is the third arm, drawn on the same runs and
+/// released where it would have been anyway.
+#[derive(Serialize, Debug)]
+pub struct CrashPhaseStats {
+    pub armed: u64,
+    pub stock_releases: u64,
+    pub early: CrashPhaseArmStats,
+    pub mid: CrashPhaseArmStats,
+    pub stock: CrashPhaseArmStats,
+}
+
+impl CrashPhaseStats {
+    fn read() -> Self {
+        let early = CrashPhaseArmStats::read(CrashPhaseArm::Early);
+        let mid = CrashPhaseArmStats::read(CrashPhaseArm::Mid);
+        let stock = CrashPhaseArmStats::read(CrashPhaseArm::Stock);
+        Self {
+            armed: early.armed + mid.armed,
+            stock_releases: stock.armed,
+            early,
+            mid,
+            stock,
+        }
+    }
+}
+
 /// The timer-context block: the learner's probe traffic, the steered rolls
 /// that applied a learned multiplier, the rolls an unsupported selector
 /// excluded, and a gauge of the cells currently engaged. `cells_engaged` is
@@ -2919,6 +3146,7 @@ pub struct UtilizationSnapshot {
     pub quiet_stretch: QuietStretchStats,
     pub run_cap: RunCapStats,
     pub crash_place: CrashPlaceStats,
+    pub crash_phase: CrashPhaseStats,
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
@@ -3109,6 +3337,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         quiet_stretch: QuietStretchStats::read(),
         run_cap: RunCapStats::read(),
         crash_place: CrashPlaceStats::read(),
+        crash_phase: CrashPhaseStats::read(),
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),

@@ -7,6 +7,7 @@ use crate::simulator::core::{
     RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, WithinQueueSelector,
     make_local_env, schedule_runnable,
 };
+use crate::simulator::crash_phase;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
@@ -536,6 +537,15 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                             path_state.state.crash_hold_until.get_mut(nid.index)
                         {
                             *hold = target;
+                        }
+                        // On the anchored half of the placed runs the crash
+                        // waits further, for a drawn phase of the victim's
+                        // own fan-out, once that target step arrives.
+                        if crash_phase::is_anchored(run_id) {
+                            path_state.state.crash_phase.arm_node(
+                                nid.index,
+                                fault_timing::cap_reserve(effective_cap),
+                            );
                         }
                     }
                     pending_crash_recover.insert(nid.index, node_idx);

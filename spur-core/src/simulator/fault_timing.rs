@@ -159,6 +159,12 @@ pub fn merge_stock_probe(run_id: i64, backup: i32, outcome: run_cap::Outcome, st
     }
 }
 
+/// The step past which a run's crash timing must not reach: the share of the
+/// frozen step cap left for the recovery tail.
+pub fn cap_reserve(effective_cap: i32) -> i32 {
+    (effective_cap as i64 * CAP_RESERVE_NUM / CAP_RESERVE_DEN) as i32
+}
+
 /// Draw the step a placed run holds a crash until: uniform over
 /// `[t_ready, U)` where `U` is the learned median bounded by three quarters
 /// of the run's frozen step cap. Returns None, drawing nothing from any
@@ -175,7 +181,7 @@ pub fn draw_hold(
         return None;
     }
     let l50 = median(backup)?;
-    let reserve = (effective_cap as i64 * CAP_RESERVE_NUM / CAP_RESERVE_DEN) as i32;
+    let reserve = cap_reserve(effective_cap);
     let capped = reserve < l50;
     let upper = l50.min(reserve);
     if t_ready >= upper {
