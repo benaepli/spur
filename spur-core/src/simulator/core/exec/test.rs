@@ -16,6 +16,54 @@ fn slot(idx: u32) -> VarSlot {
     VarSlot::Local(idx, NameId(idx as usize))
 }
 
+#[test]
+fn json_string_array_matches_serde_vec_of_strings() {
+    let cases: Vec<Vec<&str>> = vec![
+        vec![],
+        vec![""],
+        vec!["", ""],
+        vec!["0"],
+        vec!["\"quoted\"", "back\\slash"],
+        vec!["new\nline", "tab\t", "cr\r", "bell\u{7}", "nul\0", "esc\u{1b}", "del\u{7f}"],
+        vec!["unicode \u{e9}\u{1f600} \u{2028}", "</script>", "a/b"],
+        vec!["[node(NameId(10)#0), node(NameId(10)#1)]", "{  }", "Some(\"x\")", "()"],
+    ];
+    for items in cases {
+        let mut text = String::new();
+        let mut ends = Vec::new();
+        for item in &items {
+            text.push_str(item);
+            ends.push(text.len());
+        }
+        let expected = serde_json::to_string(
+            &items
+                .iter()
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(json_string_array(&text, &ends), expected, "items {items:?}");
+    }
+}
+
+#[test]
+fn trace_payload_formats_values_and_errors() {
+    let values: Vec<Result<Value<WithHashing>, RuntimeError>> = vec![
+        Ok(Value::int(-7)),
+        Err(RuntimeError::TypeError {
+            expected: "int",
+            got: "bool",
+        }),
+        Ok(Value::string("q\"s".into())),
+    ];
+    assert_eq!(
+        trace_payload(values.into_iter()),
+        "[\"-7\",\"<error>\",\"\\\"q\\\"s\\\"\"]"
+    );
+    let none: Vec<Result<Value<WithHashing>, RuntimeError>> = vec![];
+    assert_eq!(trace_payload(none.into_iter()), "[]");
+}
+
 fn node_slot(idx: u32) -> VarSlot {
     VarSlot::Node(idx, NameId(1000 + idx as usize))
 }

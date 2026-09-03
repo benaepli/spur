@@ -5,6 +5,7 @@ use ecow::EcoString;
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Serialize a HashMap<NameId, V> with NameId keys as string representations of their inner usize.
 fn serialize_nameid_map<V: Serialize, S: Serializer>(
@@ -149,21 +150,21 @@ pub enum Label {
     Break(Vertex /* break_target_vertex */),
     Continue(Vertex /* continue_target_vertex */),
     TraceDispatch(
-        String,    /* func_name */
+        Arc<str>,  /* func_name */
         Vec<Expr>, /* param exprs */
         Vertex,    /* next */
     ),
     TraceEnter(
-        String,    /* func_name */
+        Arc<str>,  /* func_name */
         Vec<Expr>, /* param exprs */
         Lhs,       /* trace_id_slot */
         Vertex,    /* next */
     ),
     TraceExit(
-        String, /* func_name */
-        Expr,   /* trace_id_expr */
-        Expr,   /* return_val_expr */
-        Vertex, /* next */
+        Arc<str>, /* func_name */
+        Expr,     /* trace_id_expr */
+        Expr,     /* return_val_expr */
+        Vertex,   /* next */
     ),
 }
 

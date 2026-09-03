@@ -34,7 +34,7 @@ spur-ast = { path = "../spur-ast" }
 spur-liquid = { path = "../spur-liquid" }
 phf = "0.13.1"
 phf_macros = "0.13.1"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "2.0.17"
 ecow = { version = "0.2.6", features = ["serde"] }

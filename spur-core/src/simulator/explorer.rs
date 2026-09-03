@@ -1137,8 +1137,8 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     F::merge(&global_state.feedback, &path_state.feedback);
 
     let serialized = serialize_history(&path_state.history);
-    let serialized_logs = serialize_logs(&path_state.logs.entries);
-    let serialized_traces = serialize_traces(&path_state.logs.traces);
+    let serialized_logs = serialize_logs(std::mem::take(&mut path_state.logs.entries));
+    let serialized_traces = serialize_traces(std::mem::take(&mut path_state.logs.traces));
     writer.write(run_id, serialized, serialized_logs, serialized_traces);
     writer.write_run(run_row(
         run_id,
@@ -1446,8 +1446,8 @@ fn run_single_plan<F: Feedback>(
     F::merge(&global_state.feedback, &path_state.feedback);
 
     let serialized = serialize_history(&path_state.history);
-    let serialized_logs = serialize_logs(&path_state.logs.entries);
-    let serialized_traces = serialize_traces(&path_state.logs.traces);
+    let serialized_logs = serialize_logs(std::mem::take(&mut path_state.logs.entries));
+    let serialized_traces = serialize_traces(std::mem::take(&mut path_state.logs.traces));
     writer.write(run_id, serialized, serialized_logs, serialized_traces);
     writer.write_run(run_row(
         run_id,

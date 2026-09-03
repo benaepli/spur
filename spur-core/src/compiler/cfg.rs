@@ -11,6 +11,7 @@ use crate::compiler::lowered::{
 use crate::parser::Span;
 use ecow::EcoString;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Bundles the control-flow targets that are threaded through every
 /// compilation call (break, continue, return, return slot).
@@ -345,6 +346,8 @@ impl Compiler {
             )
         });
         let qualified_name = format!("{}.{}", qualifier, func.original_name);
+        // Both trace labels of the function share one copy of the name.
+        let traced_name: Arc<str> = Arc::from(qualified_name.as_str());
 
         // If traced, allocate a hidden slot for the trace invocation ID.
         let trace_id_slot = if is_traced {
@@ -358,7 +361,7 @@ impl Compiler {
         let effective_return_target = if is_traced {
             let tid_slot = trace_id_slot.unwrap();
             self.add_label(Label::TraceExit(
-                qualified_name.clone(),
+                traced_name.clone(),
                 Expr::Var(tid_slot),
                 Expr::Var(return_slot),
                 final_return_vertex,
@@ -386,7 +389,7 @@ impl Compiler {
                 })
                 .collect();
             self.add_label(Label::TraceEnter(
-                qualified_name.clone(),
+                traced_name,
                 param_exprs,
                 Lhs::Var(tid_slot),
                 body_entry,
@@ -1416,7 +1419,7 @@ impl Compiler {
             .copied()
             .unwrap_or(false)
         {
-            self.add_label(Label::TraceDispatch(func_name, arg_exprs, async_vertex))
+            self.add_label(Label::TraceDispatch(Arc::from(func_name), arg_exprs, async_vertex))
         } else {
             async_vertex
         };

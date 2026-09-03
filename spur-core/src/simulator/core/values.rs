@@ -369,52 +369,135 @@ impl<H: HashPolicy> Hash for Value<H> {
     }
 }
 
-impl<H: HashPolicy> std::fmt::Display for Value<H> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+/// Decimal text of an integer held in a stack buffer, so it can be appended
+/// to a string without formatting machinery or a temporary allocation.
+pub struct Decimal {
+    buf: [u8; 20],
+    start: usize,
+}
+
+impl Decimal {
+    pub fn of_i64(n: i64) -> Self {
+        let mut d = Self::of_u64(n.unsigned_abs());
+        if n < 0 {
+            d.start -= 1;
+            d.buf[d.start] = b'-';
+        }
+        d
+    }
+
+    pub fn of_u64(mut n: u64) -> Self {
+        let mut buf = [0u8; 20];
+        let mut start = buf.len();
+        loop {
+            start -= 1;
+            buf[start] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        Self { buf, start }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // The buffer holds only ASCII digits and an optional leading sign.
+        std::str::from_utf8(&self.buf[self.start..]).unwrap_or("")
+    }
+}
+
+fn write_node_id<W: std::fmt::Write + ?Sized>(out: &mut W, n: &NodeId) -> std::fmt::Result {
+    out.write_str("NameId(")?;
+    out.write_str(Decimal::of_u64(n.role.0 as u64).as_str())?;
+    out.write_str(")#")?;
+    out.write_str(Decimal::of_u64(n.index as u64).as_str())
+}
+
+fn write_seq<H: HashPolicy, W: std::fmt::Write + ?Sized>(
+    out: &mut W,
+    open: &str,
+    items: &ValueSeq<H>,
+    close: &str,
+) -> std::fmt::Result {
+    out.write_str(open)?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        item.write_to(out)?;
+    }
+    out.write_str(close)
+}
+
+impl<H: HashPolicy> Value<H> {
+    /// Appends the textual form of the value to `out`. This is the single
+    /// definition of that text; `Display` forwards here, so appending to a
+    /// `String` and formatting produce the same bytes.
+    pub fn write_to<W: std::fmt::Write + ?Sized>(&self, out: &mut W) -> std::fmt::Result {
         use ValueKind::*;
         match &self.kind {
-            Int(n) => write!(f, "{}", n),
-            Bool(b) => write!(f, "{}", b),
-            String(s) => write!(f, "\"{}\"", s),
-            Node(n) => write!(f, "node({})", n),
-            Unit => write!(f, "()"),
-            Option(None) => write!(f, "None"),
-            Option(Some(v)) => write!(f, "Some({})", v),
-            Channel(ch) => write!(f, "channel({}, {})", ch.node, ch.id),
-            FifoLink(link_id, peer) => write!(f, "fifo_link({}, {})", link_id.0, peer),
-            Tuple(items) => {
-                write!(f, "(")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", item)?;
-                }
-                write!(f, ")")
+            Int(n) => out.write_str(Decimal::of_i64(*n).as_str()),
+            Bool(true) => out.write_str("true"),
+            Bool(false) => out.write_str("false"),
+            String(s) => {
+                out.write_char('"')?;
+                out.write_str(s)?;
+                out.write_char('"')
             }
-            List(items) => {
-                write!(f, "[")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", item)?;
-                }
-                write!(f, "]")
+            Node(n) => {
+                out.write_str("node(")?;
+                write_node_id(out, n)?;
+                out.write_char(')')
             }
+            Unit => out.write_str("()"),
+            Option(None) => out.write_str("None"),
+            Option(Some(v)) => {
+                out.write_str("Some(")?;
+                v.write_to(out)?;
+                out.write_char(')')
+            }
+            Channel(ch) => {
+                out.write_str("channel(")?;
+                write_node_id(out, &ch.node)?;
+                out.write_str(", ")?;
+                out.write_str(Decimal::of_u64(ch.id as u64).as_str())?;
+                out.write_char(')')
+            }
+            FifoLink(link_id, peer) => {
+                out.write_str("fifo_link(")?;
+                out.write_str(Decimal::of_u64(link_id.0 as u64).as_str())?;
+                out.write_str(", ")?;
+                write_node_id(out, peer)?;
+                out.write_char(')')
+            }
+            Tuple(items) => write_seq(out, "(", items, ")"),
+            List(items) => write_seq(out, "[", items, "]"),
             Map(map) => {
-                write!(f, "{{ ")?;
+                out.write_str("{ ")?;
                 for (i, (k, v)) in map.iter().enumerate() {
                     if i > 0 {
-                        write!(f, ", ")?;
+                        out.write_str(", ")?;
                     }
-                    write!(f, "{}: {}", k, v)?;
+                    k.write_to(out)?;
+                    out.write_str(": ")?;
+                    v.write_to(out)?;
                 }
-                write!(f, " }}")
+                out.write_str(" }")
             }
-            Variant(_, name, None) => write!(f, "{}", name),
-            Variant(_, name, Some(payload)) => write!(f, "{}({})", name, payload),
+            Variant(_, name, None) => out.write_str(name),
+            Variant(_, name, Some(payload)) => {
+                out.write_str(name)?;
+                out.write_char('(')?;
+                payload.write_to(out)?;
+                out.write_char(')')
+            }
         }
+    }
+}
+
+impl<H: HashPolicy> std::fmt::Display for Value<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write_to(f)
     }
 }
 
@@ -654,6 +737,187 @@ impl<H: HashPolicy> Env<H> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// Independent, formatter-based rendering of a value, kept as the
+    /// reference the appending writer must match byte for byte.
+    struct Reference<'a, H: HashPolicy>(&'a Value<H>);
+
+    impl<H: HashPolicy> std::fmt::Display for Reference<'_, H> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            use ValueKind::*;
+            match &self.0.kind {
+                Int(n) => write!(f, "{}", n),
+                Bool(b) => write!(f, "{}", b),
+                String(s) => write!(f, "\"{}\"", s),
+                Node(n) => write!(f, "node({})", n),
+                Unit => write!(f, "()"),
+                Option(None) => write!(f, "None"),
+                Option(Some(v)) => write!(f, "Some({})", Reference(v)),
+                Channel(ch) => write!(f, "channel({}, {})", ch.node, ch.id),
+                FifoLink(link_id, peer) => write!(f, "fifo_link({}, {})", link_id.0, peer),
+                Tuple(items) => {
+                    write!(f, "(")?;
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", Reference(item))?;
+                    }
+                    write!(f, ")")
+                }
+                List(items) => {
+                    write!(f, "[")?;
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", Reference(item))?;
+                    }
+                    write!(f, "]")
+                }
+                Map(map) => {
+                    write!(f, "{{ ")?;
+                    for (i, (k, v)) in map.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}: {}", Reference(k), Reference(v))?;
+                    }
+                    write!(f, " }}")
+                }
+                Variant(_, name, None) => write!(f, "{}", name),
+                Variant(_, name, Some(payload)) => write!(f, "{}({})", name, Reference(payload)),
+            }
+        }
+    }
+
+    fn assert_text_matches_reference(v: &Value<WithHashing>) {
+        let expected = Reference(v).to_string();
+        let mut appended = String::from("prefix|");
+        v.write_to(&mut appended).unwrap();
+        assert_eq!(appended, format!("prefix|{expected}"), "{v:?}");
+        assert_eq!(v.to_string(), expected, "{v:?}");
+        assert_eq!(format!("<{v}>"), format!("<{expected}>"), "{v:?}");
+    }
+
+    #[test]
+    fn decimal_matches_std_formatting() {
+        for n in [
+            i64::MIN,
+            i64::MIN + 1,
+            -1_000_000_000_000,
+            -10,
+            -9,
+            -1,
+            0,
+            1,
+            9,
+            10,
+            99,
+            100,
+            i64::MAX - 1,
+            i64::MAX,
+        ] {
+            assert_eq!(Decimal::of_i64(n).as_str(), n.to_string());
+        }
+        for n in [0u64, 1, 9, 10, 12345, u64::MAX, usize::MAX as u64] {
+            assert_eq!(Decimal::of_u64(n).as_str(), n.to_string());
+        }
+    }
+
+    #[test]
+    fn write_to_matches_reference_on_enumerated_values() {
+        type V = Value<WithHashing>;
+        let node = |role: usize, index: usize| NodeId {
+            role: NameId(role),
+            index,
+        };
+        let s = |t: &str| V::string(EcoString::from(t));
+        let seq = |items: Vec<V>| ValueSeq::from(items);
+        let map = |entries: Vec<(V, V)>| {
+            let mut m = ValueMap::<WithHashing>::default();
+            for (k, v) in entries {
+                m.insert(k, v);
+            }
+            V::map(m)
+        };
+        let leaves: Vec<V> = vec![
+            V::int(i64::MIN),
+            V::int(i64::MAX),
+            V::int(0),
+            V::int(-1),
+            V::int(-42),
+            V::int(7),
+            V::bool(true),
+            V::bool(false),
+            V::unit(),
+            s(""),
+            s("plain"),
+            s("with \"quotes\""),
+            s("back\\slash"),
+            s("new\nline\ttab\r"),
+            s("control \u{0}\u{1}\u{1f}\u{7f}"),
+            s("unicode \u{e9}\u{4e2d}\u{1f600}"),
+            V::node(node(0, 0)),
+            V::node(node(usize::MAX, 17)),
+            V::channel(ChannelId {
+                node: node(3, 1),
+                id: 9,
+            }),
+            V::channel(ChannelId {
+                node: node(0, 0),
+                id: usize::MAX,
+            }),
+            V::fifo_link(LinkId(0), node(2, 5)),
+            V::fifo_link(LinkId(usize::MAX), node(1, 0)),
+            V::option_none(),
+            V::variant(0, EcoString::from("Empty"), None),
+            V::variant(1, EcoString::from("Prepare"), Some(Arc::new(V::int(3)))),
+        ];
+        let mut cases: Vec<V> = leaves.clone();
+        cases.push(V::option_some(V::option_some(s("x"))));
+        cases.push(V::option_some(V::option_none()));
+        cases.push(V::tuple(seq(vec![])));
+        cases.push(V::tuple(seq(vec![V::int(1)])));
+        cases.push(V::tuple(seq(vec![
+            V::int(1),
+            V::tuple(seq(vec![s("a"), V::bool(false)])),
+            V::unit(),
+        ])));
+        cases.push(V::list(seq(vec![])));
+        cases.push(V::list(seq(vec![V::list(seq(vec![]))])));
+        cases.push(V::list(seq(leaves.clone())));
+        cases.push(map(vec![]));
+        cases.push(map(vec![(s("k"), V::int(1))]));
+        cases.push(map(vec![
+            (s("a"), map(vec![])),
+            (V::int(2), V::list(seq(vec![V::int(3), V::int(4)]))),
+            (V::tuple(seq(vec![s("t"), V::int(0)])), V::option_some(s("v"))),
+        ]));
+        cases.push(V::variant(
+            2,
+            EcoString::from("Commit"),
+            Some(Arc::new(V::tuple(seq(vec![
+                V::int(1),
+                map(vec![(s("k"), V::list(seq(leaves.clone())))]),
+            ])))),
+        ));
+        cases.push(V::variant(
+            3,
+            EcoString::from("Wrap"),
+            Some(Arc::new(V::variant(0, EcoString::from("Empty"), None))),
+        ));
+        for v in &cases {
+            assert_text_matches_reference(v);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn write_to_matches_reference_on_arbitrary_values(v in arb_value()) {
+            assert_text_matches_reference(&v);
+        }
+    }
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 

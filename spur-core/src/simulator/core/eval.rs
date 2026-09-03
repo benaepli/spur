@@ -1,7 +1,9 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, VarSlot};
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::core::values::{Env, Value, ValueKind, ValueMap, ValueSeq, hash_map_entry};
+use crate::simulator::core::values::{
+    Decimal, Env, Value, ValueKind, ValueMap, ValueSeq, hash_map_entry,
+};
 use crate::simulator::hash_utils::HashPolicy;
 use ecow::EcoString;
 use std::collections::HashMap;
@@ -149,10 +151,10 @@ pub fn eval<H: HashPolicy>(
             match (&v1.kind, &v2.kind) {
                 (ValueKind::Int(i1), ValueKind::Int(i2)) => Ok(Value::<H>::int(i1 + i2)),
                 (ValueKind::String(s1), ValueKind::String(s2)) => {
-                    let mut result = String::new();
+                    let mut result = EcoString::with_capacity(s1.len() + s2.len());
                     result.push_str(s1.as_str());
                     result.push_str(s2.as_str());
-                    Ok(Value::<H>::string(EcoString::from(result)))
+                    Ok(Value::<H>::string(result))
                 }
                 _ => Err(RuntimeError::TypeError {
                     expected: "int or string",
@@ -358,11 +360,10 @@ pub fn eval<H: HashPolicy>(
                 }),
             }
         }
-        Expr::IntToString(e) => Ok(Value::<H>::string(EcoString::from(
-            eval(local_env, node_env, e, role_names)?
-                .as_int()?
-                .to_string(),
-        ))),
+        Expr::IntToString(e) => {
+            let n = eval(local_env, node_env, e, role_names)?.as_int()?;
+            Ok(Value::<H>::string(EcoString::from(Decimal::of_i64(n).as_str())))
+        }
         Expr::BoolToString(e) => Ok(Value::<H>::string(EcoString::from(
             eval(local_env, node_env, e, role_names)?
                 .as_bool()?

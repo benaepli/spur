@@ -234,9 +234,11 @@ pub enum TraceKind {
 #[derive(Clone, Debug)]
 pub struct TraceEntry {
     pub node: NodeId,
-    pub function_name: String,
+    /// Shared with the label that emitted the entry, so a row costs no copy.
+    pub function_name: Arc<str>,
     pub kind: TraceKind,
-    pub payload: Vec<String>,
+    /// JSON array of the parameter texts, serialized when the entry is made.
+    pub payload: String,
     pub schedulable_count: usize,
     pub step: i32,
     pub trace_id: i64,

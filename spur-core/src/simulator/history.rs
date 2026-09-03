@@ -34,11 +34,12 @@ pub struct PersistableLog {
     pub step: i32,
 }
 
-pub fn serialize_logs(logs: &[LogEntry]) -> Vec<PersistableLog> {
-    logs.par_iter()
+/// Rows keep the order of `logs`; the text moves into each row unchanged.
+pub fn serialize_logs(logs: Vec<LogEntry>) -> Vec<PersistableLog> {
+    logs.into_iter()
         .map(|l| PersistableLog {
             node_id: l.node.index as i64,
-            content: l.content.clone(),
+            content: l.content,
             step: l.step,
         })
         .collect()
@@ -47,42 +48,33 @@ pub fn serialize_logs(logs: &[LogEntry]) -> Vec<PersistableLog> {
 pub struct PersistableTrace {
     pub node_id: i64,
     pub step: i32,
-    pub function_name: String,
+    pub function_name: Arc<str>,
     pub trace_kind: &'static str,
+    /// JSON array of the parameter texts.
     pub payload: String,
     pub schedulable_count: i64,
     pub trace_id: i64,
     pub causal_operation_id: Option<i64>,
 }
 
-pub fn serialize_traces(traces: &[TraceEntry]) -> Vec<PersistableTrace> {
+/// Rows keep the order of `traces`; the name and the already serialized
+/// payload move into each row unchanged.
+pub fn serialize_traces(traces: Vec<TraceEntry>) -> Vec<PersistableTrace> {
     traces
-        .par_iter()
-        .map(|t| {
-            let payload = if t.payload.is_empty() {
-                "[]".to_string()
-            } else {
-                let items: Vec<JsonValue> = t
-                    .payload
-                    .iter()
-                    .map(|s| JsonValue::String(s.clone()))
-                    .collect();
-                serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
-            };
-            PersistableTrace {
-                node_id: t.node.index as i64,
-                step: t.step,
-                function_name: t.function_name.clone(),
-                trace_kind: match t.kind {
-                    TraceKind::Dispatch => "Dispatch",
-                    TraceKind::Enter => "Enter",
-                    TraceKind::Exit => "Exit",
-                },
-                payload,
-                schedulable_count: t.schedulable_count as i64,
-                trace_id: t.trace_id,
-                causal_operation_id: t.causal_operation_id,
-            }
+        .into_iter()
+        .map(|t| PersistableTrace {
+            node_id: t.node.index as i64,
+            step: t.step,
+            function_name: t.function_name,
+            trace_kind: match t.kind {
+                TraceKind::Dispatch => "Dispatch",
+                TraceKind::Enter => "Enter",
+                TraceKind::Exit => "Exit",
+            },
+            payload: t.payload,
+            schedulable_count: t.schedulable_count as i64,
+            trace_id: t.trace_id,
+            causal_operation_id: t.causal_operation_id,
         })
         .collect()
 }
@@ -431,7 +423,7 @@ fn append_traces_batch(
     let steps: Int32Array = traces.iter().map(|t| t.step).collect::<Vec<_>>().into();
     let func_names: StringArray = traces
         .iter()
-        .map(|t| t.function_name.as_str())
+        .map(|t| &*t.function_name)
         .collect::<Vec<_>>()
         .into();
     let kinds: StringArray = traces
@@ -885,7 +877,7 @@ mod parquet_writer_tests {
                 .map(|i| PersistableTrace {
                     node_id: 0,
                     step: i as i32,
-                    function_name: "f".to_string(),
+                    function_name: Arc::from("f"),
                     trace_kind: "enter",
                     payload: "{}".to_string(),
                     schedulable_count: 0,
