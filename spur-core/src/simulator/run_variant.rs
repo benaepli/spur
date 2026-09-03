@@ -17,6 +17,7 @@ use crate::simulator::crash_phase;
 use crate::simulator::fault_timing;
 use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
+use crate::simulator::pair_order;
 use crate::simulator::replay_corpus;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
@@ -36,6 +37,11 @@ pub const CRASH_HOLD_DRAWN: i32 = 1 << 3;
 /// The run's placed crashes wait for a drawn phase of the victim's own
 /// fan-out once their step hold expires, instead of competing at once.
 pub const CRASH_PHASE: i32 = 1 << 9;
+/// At a network step whose pick is a record from a sender that has crashed
+/// at least once, the run takes instead the eligible record from that
+/// sender to the same destination, sent by the same incarnation, with the
+/// lowest send ordinal.
+pub const PAIR_SEND_ORDER: i32 = 1 << 15;
 /// The run's planned crashes move to the live node that last took a
 /// delivery whose sender was down or had restarted since sending.
 pub const GHOST_ABSORBER_RETARGET: i32 = 1 << 19;
@@ -78,6 +84,9 @@ pub fn from_run_id(run_id: i64) -> i32 {
     if fresh_first::is_treated(run_id) {
         v |= FRESH_FIRST_PAIR;
     }
+    if pair_order::is_treated(run_id) {
+        v |= PAIR_SEND_ORDER;
+    }
     v
 }
 
@@ -115,6 +124,7 @@ mod tests {
             assert_eq!(v & CRASH_PHASE != 0, crash_phase::is_anchored(id));
             assert_eq!(v & GHOST_ABSORBER_RETARGET != 0, ghost_absorber::is_treated(id));
             assert_eq!(v & FRESH_FIRST_PAIR != 0, fresh_first::is_treated(id));
+            assert_eq!(v & PAIR_SEND_ORDER != 0, pair_order::is_treated(id));
             assert_eq!(v & CRASH_HOLD_DRAWN, 0, "the acted bit is not an id bit");
             assert_eq!(of(id, true), v | CRASH_HOLD_DRAWN);
             assert_eq!(of(id, false), v);
@@ -198,6 +208,20 @@ mod tests {
             "the fresh-first split leaves no contrast"
         );
         assert_eq!(fresh_first_probes, 0, "a run-cap probe must never prefer fresh records");
+        let pair_order_runs = (0..64_000i64)
+            .filter(|&id| from_run_id(id) & PAIR_SEND_ORDER != 0)
+            .count();
+        let pair_order_probes = (0..64_000i64)
+            .filter(|&id| {
+                let v = from_run_id(id);
+                v & PAIR_SEND_ORDER != 0 && v & (RUN_CAP_PROBE | TIMER_STEER_OFF) != 0
+            })
+            .count();
+        assert!(
+            pair_order_runs > 0 && pair_order_runs < 64_000,
+            "the pair-order split leaves no contrast"
+        );
+        assert_eq!(pair_order_probes, 0, "a probe must never take records in send order");
         assert!(ordinary_stock > 0, "no stock run that is not a probe, so there is no control");
     }
 }

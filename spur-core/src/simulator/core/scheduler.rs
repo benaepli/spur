@@ -15,6 +15,7 @@ use crate::simulator::core::values::{Env, Value};
 use crate::simulator::crash_phase;
 use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
+use crate::simulator::pair_order;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
@@ -1014,6 +1015,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 rng,
             );
             let idx = fresh_first_dispatch(state, &eligible, drawn);
+            let idx = pair_order_dispatch(state, &eligible, idx);
             // The mask names the predicates true of the record the step
             // runs, under the same condition the selection computed it.
             let mask = if idx != drawn && util_stats::enabled() && terms.any_predicate() {
@@ -1252,6 +1254,45 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                             record_origin.index,
                             r.origin_incarnation,
                         );
+                    }
+                    // Whether a message entry from a sender that has crashed
+                    // at least once has a sibling of its class - same sender,
+                    // same destination, same sending incarnation - already
+                    // entered or still in the network queue, and whether a
+                    // queued sibling carries a lower send ordinal. Read on
+                    // census runs only, and the queue only when the sender's
+                    // ledger says it holds a remote record of the sender at
+                    // all.
+                    if message_entry
+                        && state.pair_order.census
+                        && (state.incarnation(record_origin) > 0
+                            || state.crash_info.currently_crashed.contains(&record_origin))
+                    {
+                        let entered_before = state.pair_order.note_entry(
+                            record_origin.index,
+                            record_dest.index,
+                            r.origin_incarnation,
+                        );
+                        let queued = state
+                            .send_ledger
+                            .get(record_origin.index)
+                            .is_some_and(|l| l.net_records > 0);
+                        let scanned: &[Runnable<H>] = if queued { &state.network_queue } else { &[] };
+                        let siblings = scanned.iter().filter_map(|q| match q {
+                            Runnable::Record(s)
+                                if s.origin_node == record_origin
+                                    && s.node == record_dest
+                                    && s.origin_incarnation == r.origin_incarnation =>
+                            {
+                                Some(s.send_ordinal)
+                            }
+                            _ => None,
+                        });
+                        if let Some(inverted) =
+                            pair_order::classify_entry(siblings, r.send_ordinal, entered_before)
+                        {
+                            util_stats::record_pair_order_entry(state.pair_order.enabled, inverted);
+                        }
                     }
                     // A delivery from a sender that is down, or that restarted
                     // since sending, marks its receiver as having absorbed
@@ -1504,6 +1545,67 @@ fn fresh_first_dispatch<H: HashPolicy>(
         util_stats::record_fresh_first_taken(count);
     }
     chosen
+}
+
+/// After the draw and the fresh-incarnation swap have settled on `pick`: on
+/// a treated run, a remote record from a sender that has crashed at least
+/// once in the run gives way to the eligible record from the same sender to
+/// the same destination, sent by the same incarnation, that carries the
+/// lowest send ordinal, when that ordinal is below the pick's. The scan is
+/// gated on the sender's ledger holding at least one other remote record in
+/// the queue. Records of a sender that never crashed, and anything but a
+/// remote record, keep the pick. A pick with an eligible rival of its class
+/// is counted as a contest, with whether the pick already carried the
+/// lowest ordinal: on every treated run, where the scan happens anyway, and
+/// on census runs of the control half; any other untreated run returns
+/// without reading the queue. No random draw is taken.
+fn pair_order_dispatch<H: HashPolicy>(state: &State<H>, eligible: &[usize], pick: usize) -> usize {
+    let treated = state.pair_order.enabled;
+    if !treated && !state.pair_order.census {
+        return pick;
+    }
+    let queue = &state.network_queue;
+    let Some(Runnable::Record(rec)) = queue.get(pick) else {
+        return pick;
+    };
+    if rec.origin_node == rec.node {
+        return pick;
+    }
+    let origin = rec.origin_node;
+    let dest = rec.node;
+    if state.incarnation(origin) == 0 && !state.crash_info.currently_crashed.contains(&origin) {
+        return pick;
+    }
+    if !state
+        .send_ledger
+        .get(origin.index)
+        .is_some_and(|l| l.net_records >= 2)
+    {
+        return pick;
+    }
+    let candidates = eligible.iter().map(|&i| {
+        let item = match &queue[i] {
+            Runnable::Record(r)
+                if r.origin_node == origin && r.node == dest && r.origin_node != r.node =>
+            {
+                Some((r.origin_incarnation, r.send_ordinal))
+            }
+            _ => None,
+        };
+        (i, item)
+    });
+    let contest = pair_order::contest(candidates, pick, rec.origin_incarnation, rec.send_ordinal);
+    if !contest.rivals {
+        return pick;
+    }
+    util_stats::record_pair_order_contest(treated, contest.earliest.is_none());
+    match contest.earliest {
+        Some(earliest) if treated => {
+            util_stats::record_pair_order_corrected();
+            earliest
+        }
+        _ => pick,
+    }
 }
 
 fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
@@ -2454,6 +2556,117 @@ mod tests {
         state.fresh_first.enabled = true;
         assert_ne!(fresh_first_dispatch(&mut state, &eligible, ghost), ghost);
         assert_eq!(probe.next_u64(), untouched.next_u64(), "the swap itself took a draw");
+    }
+
+    /// Three nodes; node 0 has restarted once, so its incarnation is 1. The
+    /// queue holds, in order: two ghosts 0->1 in send order, a fresh 0->1, a
+    /// ghost 0->2, a second fresh 0->1, a channel send 0->1, and two records
+    /// 2->1 from a node that never crashed, in send order.
+    fn ordered_state() -> (State<NoHashing>, Vec<usize>) {
+        let mut state = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        let ghost_a = queue_record(&mut state, 0, 1, 0, 0.9);
+        let ghost_b = queue_record(&mut state, 0, 1, 0, 0.4);
+        state.incarnations[0] = 1;
+        state.note_incarnation_bump(0);
+        let fresh_a = queue_record(&mut state, 0, 1, 1, 0.3);
+        let ghost_other = queue_record(&mut state, 0, 2, 0, 0.5);
+        let fresh_b = queue_record(&mut state, 0, 1, 1, 0.8);
+        let chan = queue_channel_send(&mut state, 0, 1);
+        let quiet_a = queue_record(&mut state, 2, 1, 0, 0.6);
+        let quiet_b = queue_record(&mut state, 2, 1, 0, 0.7);
+        (
+            state,
+            vec![ghost_a, ghost_b, fresh_a, ghost_other, fresh_b, chan, quiet_a, quiet_b],
+        )
+    }
+
+    #[test]
+    fn a_treated_step_takes_the_earliest_send_of_the_pick_s_class_from_a_crashed_sender() {
+        let (mut state, slots) = ordered_state();
+        let [ghost_a, ghost_b, fresh_a, ghost_other, fresh_b, chan, quiet_a, quiet_b] = slots[..] else {
+            unreachable!()
+        };
+        let eligible: Vec<usize> = (0..state.network_queue.len()).collect();
+        for pick in &eligible {
+            assert_eq!(pair_order_dispatch(&state, &eligible, *pick), *pick, "an untreated run keeps the pick");
+        }
+        state.pair_order.census = true;
+        for pick in &eligible {
+            assert_eq!(pair_order_dispatch(&state, &eligible, *pick), *pick, "an untreated census run keeps the pick");
+        }
+        state.pair_order.census = false;
+
+        state.pair_order.enabled = true;
+        assert_eq!(pair_order_dispatch(&state, &eligible, ghost_b), ghost_a, "the later ghost gives way to the earlier one");
+        assert_eq!(pair_order_dispatch(&state, &eligible, fresh_b), fresh_a, "the later fresh record gives way to the earlier one");
+        for pick in [ghost_a, fresh_a] {
+            assert_eq!(pair_order_dispatch(&state, &eligible, pick), pick, "the earliest of its class is kept");
+        }
+        assert_eq!(pair_order_dispatch(&state, &eligible, ghost_other), ghost_other, "another destination has no rival");
+        assert_eq!(pair_order_dispatch(&state, &eligible, chan), chan, "a channel send is never replaced");
+        assert_eq!(pair_order_dispatch(&state, &eligible, quiet_b), quiet_b, "a sender that never crashed keeps the pick");
+        assert_eq!(pair_order_dispatch(&state, &eligible, quiet_a), quiet_a);
+        assert_eq!(state.network_queue.len(), 8, "nothing was taken or masked");
+
+        let without_earliest: Vec<usize> = eligible.iter().copied().filter(|&i| i != ghost_a).collect();
+        assert_eq!(pair_order_dispatch(&state, &without_earliest, ghost_b), ghost_b, "an ineligible earlier sibling is not chosen");
+        let only_fresh_b = vec![ghost_a, fresh_b, chan];
+        assert_eq!(pair_order_dispatch(&state, &only_fresh_b, fresh_b), fresh_b, "no eligible rival keeps the pick");
+
+        state.crash_info.currently_crashed.insert(node(2));
+        assert_eq!(pair_order_dispatch(&state, &eligible, quiet_b), quiet_a, "a sender that is down counts as crashed");
+        state.crash_info.currently_crashed.remove(&node(2));
+
+        let ledger = state.send_ledger[0];
+        state.send_ledger[0].net_records = 1;
+        assert_eq!(pair_order_dispatch(&state, &eligible, ghost_b), ghost_b, "a ledger with a single record closes the gate");
+        state.send_ledger[0] = ledger;
+        assert_eq!(pair_order_dispatch(&state, &eligible, ghost_b), ghost_a);
+    }
+
+    /// The replacement takes no draw: after the within-queue selection a
+    /// treated step and an untreated one leave the generator at the same
+    /// position.
+    #[test]
+    fn the_pair_order_step_reads_the_same_random_sequence_on_both_halves() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        let (state, slots) = ordered_state();
+        let later = [slots[1], slots[4]];
+        let eligible: Vec<usize> = (0..state.network_queue.len()).collect();
+        let selector = WithinQueueSelector::Tournament { k: 3 };
+        let mut positions = Vec::new();
+        for seed in 0..8u64 {
+            for treated in [false, true] {
+                let mut state = state.clone();
+                state.pair_order.enabled = treated;
+                let mut rng = StdRng::seed_from_u64(seed);
+                let (drawn, _) = select_within_queue::<NoHashing, NoFeedback>(
+                    &state.network_queue,
+                    &eligible,
+                    &(),
+                    &(),
+                    &state,
+                    &ResolvedTerms::default(),
+                    &selector,
+                    &mut rng,
+                );
+                let taken = pair_order_dispatch(&state, &eligible, drawn);
+                if later.contains(&drawn) {
+                    assert_eq!(taken != drawn, treated, "only the treated step replaces a later send");
+                } else {
+                    assert_eq!(taken, drawn);
+                }
+                positions.push((seed, drawn, rng.next_u64(), rng.next_u64()));
+            }
+        }
+        assert!(
+            positions.chunks(2).all(|w| w[0] == w[1]),
+            "the halves diverged: {positions:?}"
+        );
+        assert!(
+            positions.iter().any(|p| later.contains(&p.1)),
+            "no draw fell on a later send, so the replacement was never exercised"
+        );
     }
 
     #[test]

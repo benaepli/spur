@@ -8,6 +8,7 @@ use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
 use crate::simulator::crash_phase;
 use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
+use crate::simulator::pair_order;
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats::DeliveryBias;
@@ -617,6 +618,10 @@ pub struct State<H: HashPolicy> {
     /// Same-step preference for a sender's current incarnation at a
     /// contested network step, and the census tables it is read against.
     pub fresh_first: fresh_first::RunState,
+    /// Same-step preference for send order between a sender that has
+    /// crashed and one destination, and the entry table its census is read
+    /// against. Scheduling bookkeeping, excluded from `signature()`.
+    pub pair_order: pair_order::RunState,
     /// Where the once-per-run signal fired, when it did: the step, and the
     /// number of scheduling draws taken by then when the run records its
     /// draws. Observation only, excluded from `signature()`.
@@ -761,6 +766,7 @@ impl<H: HashPolicy> State<H> {
             crash_hold_drawn: false,
             retarget: ghost_absorber::RunState::default(),
             fresh_first: fresh_first::RunState::default(),
+            pair_order: pair_order::RunState::default(),
             replay_cut: None,
             net_stale_records: 0,
             net_requests: 0,

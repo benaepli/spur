@@ -8,6 +8,7 @@ pub mod explorer;
 pub mod fault_timing;
 pub mod fresh_first;
 pub mod ghost_absorber;
+pub mod pair_order;
 mod feedback;
 mod hash_utils;
 pub mod history;

@@ -103,6 +103,15 @@ static FF_STALE_DRAWN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF
 static FF_CONTESTED_DOWN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
 static FF_GHOST_ENTRIES: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
 static FF_OVERTAKEN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
+/// The pair-order census split by its half: index 0 is the control half,
+/// index 1 the treated half.
+const PO_HALVES: usize = 2;
+static PO_CONTESTS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
+static PO_INORDER_DRAWS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
+static PO_PAIR_ENTRIES: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
+static PO_INVERSIONS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
+static PO_SAMPLED_RUNS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
+static PO_CORRECTED: AtomicU64 = AtomicU64::new(0);
 static RP_PARENTS_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -422,6 +431,7 @@ pub fn set_enabled(on: bool) {
             &GS_FIRED_RUNS,
             &FF_SWAPS,
             &FF_REPEAT_SWAPS,
+            &PO_CORRECTED,
             &RW_CLOSED,
             &RW_WIDTH_SUM,
             &RW_MAX,
@@ -462,6 +472,11 @@ pub fn set_enabled(on: bool) {
             .chain(FF_CONTESTED_DOWN.iter())
             .chain(FF_GHOST_ENTRIES.iter())
             .chain(FF_OVERTAKEN.iter())
+            .chain(PO_CONTESTS.iter())
+            .chain(PO_INORDER_DRAWS.iter())
+            .chain(PO_PAIR_ENTRIES.iter())
+            .chain(PO_INVERSIONS.iter())
+            .chain(PO_SAMPLED_RUNS.iter())
             .chain(ACCEPT_DIST.iter().flatten())
             .chain(ACCEPT_DIST_ACTED.iter().flatten())
         {
@@ -1742,6 +1757,62 @@ pub fn record_fresh_first_ghost_entry(treated: bool, overtaken: bool) {
     if overtaken {
         FF_OVERTAKEN[i].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// A network step's pick was a remote record from a sender that has crashed
+/// at least once in the run while an eligible record of the same class -
+/// same sender, same destination, same sending incarnation - was present.
+/// `inorder` says the pick already carried the lowest send ordinal of its
+/// class among the eligible records. Counted on every treated run before
+/// any replacement, and on the census runs of the control half.
+#[inline]
+pub fn record_pair_order_contest(treated: bool, inorder: bool) {
+    if !enabled() {
+        return;
+    }
+    let i = treated as usize;
+    PO_CONTESTS[i].fetch_add(1, Ordering::Relaxed);
+    if inorder {
+        PO_INORDER_DRAWS[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A treated run replaced the pick with the eligible record of its class
+/// carrying the lowest send ordinal.
+#[inline]
+pub fn record_pair_order_corrected() {
+    if !enabled() {
+        return;
+    }
+    PO_CORRECTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A message entry from a sender that has crashed at least once in the run
+/// whose class - same sender, same destination, same sending incarnation -
+/// has a sibling already entered or still in the network queue; `inverted`
+/// says a queued sibling carries a lower send ordinal, so the destination
+/// acts on the later send first. Counted on the census runs of both halves.
+#[inline]
+pub fn record_pair_order_entry(treated: bool, inverted: bool) {
+    if !enabled() {
+        return;
+    }
+    let i = treated as usize;
+    PO_PAIR_ENTRIES[i].fetch_add(1, Ordering::Relaxed);
+    if inverted {
+        PO_INVERSIONS[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A run of the given half is a census run: it maintains the pair-entry
+/// table and reads the network queue at each message entry from a sender
+/// that has crashed.
+#[inline]
+pub fn record_pair_order_census_run(treated: bool) {
+    if !enabled() {
+        return;
+    }
+    PO_SAMPLED_RUNS[treated as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// A fresh grid-arm run that fired the signal entered its arm's replay corpus.
@@ -3490,6 +3561,75 @@ impl FreshFirstStats {
     }
 }
 
+/// One half of the pair-order census. `contests` counts network steps whose
+/// pick was a remote record from a sender that has crashed at least once in
+/// the run while an eligible record of the same class - same sender, same
+/// destination, same sending incarnation - was present; `inorder_draws` the
+/// subset whose pick already carried the lowest send ordinal of its class
+/// among the eligible records, read before any replacement, so its share of
+/// `contests` is the coin the draw flips between send order and its
+/// inversion. `pair_entries` counts message entries from such a sender whose
+/// class has a sibling already entered or still in the network queue;
+/// `inversions` the subset with a queued sibling of a lower send ordinal,
+/// an entry the destination takes ahead of an earlier send.
+///
+/// `sampled_runs` counts the half's census runs. `pair_entries` and
+/// `inversions` come from those runs alone on both halves, as do `contests`
+/// and `inorder_draws` on the control half; the treated half counts its
+/// contests on every treated run, so the counts of the two halves compare
+/// as shares, not as totals.
+#[derive(Serialize, Debug)]
+pub struct PairOrderHalfStats {
+    pub contests: u64,
+    pub inorder_draws: u64,
+    pub pair_entries: u64,
+    pub inversions: u64,
+    pub sampled_runs: u64,
+}
+
+impl PairOrderHalfStats {
+    fn read(treated: bool) -> Self {
+        let i = treated as usize;
+        Self {
+            contests: PO_CONTESTS[i].load(Ordering::Relaxed),
+            inorder_draws: PO_INORDER_DRAWS[i].load(Ordering::Relaxed),
+            pair_entries: PO_PAIR_ENTRIES[i].load(Ordering::Relaxed),
+            inversions: PO_INVERSIONS[i].load(Ordering::Relaxed),
+            sampled_runs: PO_SAMPLED_RUNS[i].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The census on each half of the pair-order split.
+#[derive(Serialize, Debug)]
+pub struct PairOrderCensusStats {
+    pub treated: PairOrderHalfStats,
+    pub control: PairOrderHalfStats,
+}
+
+/// The pair-order dispatch block. `corrected` is the number the mechanism is
+/// read as having fired: treated contests whose pick did not carry the
+/// lowest send ordinal of its class and that took the lowest-ordinal record
+/// instead. It equals the treated half's `contests` less its
+/// `inorder_draws`.
+#[derive(Serialize, Debug)]
+pub struct PairOrderStats {
+    pub corrected: u64,
+    pub census: PairOrderCensusStats,
+}
+
+impl PairOrderStats {
+    fn read() -> Self {
+        Self {
+            corrected: PO_CORRECTED.load(Ordering::Relaxed),
+            census: PairOrderCensusStats {
+                treated: PairOrderHalfStats::read(true),
+                control: PairOrderHalfStats::read(false),
+            },
+        }
+    }
+}
+
 /// The replay corpus of the grid arms. `parents_admitted` counts fresh runs
 /// whose prefix entered a corpus; `children` the slots that ran a child,
 /// split into `children_prefix` and `children_plan_only`; `slots_unfilled`
@@ -3588,6 +3728,7 @@ pub struct UtilizationSnapshot {
     pub victim_swap: VictimSwapStats,
     pub ghost_signal: GhostSignalStats,
     pub fresh_first: FreshFirstStats,
+    pub pair_order: PairOrderStats,
     pub replay: ReplayStats,
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
@@ -3783,6 +3924,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         victim_swap: VictimSwapStats::read(),
         ghost_signal: GhostSignalStats::read(),
         fresh_first: FreshFirstStats::read(),
+        pair_order: PairOrderStats::read(),
         replay: ReplayStats::read(),
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),
@@ -3794,6 +3936,41 @@ pub fn snapshot() -> UtilizationSnapshot {
 mod tests {
     use super::*;
     use crate::simulator::config_override;
+
+    #[test]
+    fn pair_order_counters_land_on_their_half() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        let before = snapshot().pair_order;
+        record_pair_order_contest(true, false);
+        record_pair_order_contest(true, true);
+        record_pair_order_contest(false, false);
+        record_pair_order_corrected();
+        record_pair_order_entry(true, false);
+        record_pair_order_entry(false, true);
+        record_pair_order_entry(false, false);
+        record_pair_order_census_run(true);
+        record_pair_order_census_run(false);
+        record_pair_order_census_run(false);
+        let after = snapshot().pair_order;
+        set_enabled(false);
+        record_pair_order_corrected();
+        assert_eq!(snapshot().pair_order.corrected, after.corrected, "a disabled session counted");
+
+        let (t, c) = (&after.census.treated, &after.census.control);
+        let (bt, bc) = (&before.census.treated, &before.census.control);
+        assert_eq!(t.contests - bt.contests, 2);
+        assert_eq!(t.inorder_draws - bt.inorder_draws, 1);
+        assert_eq!(c.contests - bc.contests, 1);
+        assert_eq!(c.inorder_draws - bc.inorder_draws, 0);
+        assert_eq!(after.corrected - before.corrected, 1);
+        assert_eq!(t.pair_entries - bt.pair_entries, 1);
+        assert_eq!(t.inversions - bt.inversions, 0);
+        assert_eq!(c.pair_entries - bc.pair_entries, 2);
+        assert_eq!(c.inversions - bc.inversions, 1);
+        assert_eq!(t.sampled_runs - bt.sampled_runs, 1);
+        assert_eq!(c.sampled_runs - bc.sampled_runs, 2);
+    }
 
     #[test]
     fn fresh_first_counters_land_on_their_half_and_in_their_bucket() {

@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, CrashPhaseArmStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderHalfStats, PairOrderStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -750,6 +750,52 @@ fn timer_context_leaves(prefix: &str, t: &TimerContextStats) -> Vec<(String, Val
 /// The blocks the snapshot is made of. Destructured without a rest pattern, so
 /// a block added to the snapshot does not compile until it is named, which is
 /// what keeps a whole block from going unexported.
+fn pair_order_half(m: &mut Marks) -> PairOrderHalfStats {
+    PairOrderHalfStats {
+        contests: m.int(),
+        inorder_draws: m.int(),
+        pair_entries: m.int(),
+        inversions: m.int(),
+        sampled_runs: m.int(),
+    }
+}
+
+fn pair_order_half_leaves(prefix: &str, h: &PairOrderHalfStats) -> Vec<(String, Value)> {
+    let PairOrderHalfStats {
+        contests,
+        inorder_draws,
+        pair_entries,
+        inversions,
+        sampled_runs,
+    } = h;
+    vec![
+        leaf(prefix, "contests", *contests),
+        leaf(prefix, "inorder_draws", *inorder_draws),
+        leaf(prefix, "pair_entries", *pair_entries),
+        leaf(prefix, "inversions", *inversions),
+        leaf(prefix, "sampled_runs", *sampled_runs),
+    ]
+}
+
+fn pair_order(m: &mut Marks) -> PairOrderStats {
+    PairOrderStats {
+        corrected: m.int(),
+        census: PairOrderCensusStats {
+            treated: pair_order_half(m),
+            control: pair_order_half(m),
+        },
+    }
+}
+
+fn pair_order_leaves(prefix: &str, p: &PairOrderStats) -> Vec<(String, Value)> {
+    let PairOrderStats { corrected, census } = p;
+    let PairOrderCensusStats { treated, control } = census;
+    let mut out = vec![leaf(prefix, "corrected", *corrected)];
+    out.extend(pair_order_half_leaves(&format!("{prefix}.census.treated"), treated));
+    out.extend(pair_order_half_leaves(&format!("{prefix}.census.control"), control));
+    out
+}
+
 fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
     let UtilizationSnapshot {
         rng_streams: _,
@@ -781,6 +827,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         victim_swap: _,
         ghost_signal: _,
         fresh_first: _,
+        pair_order: _,
         replay: _,
         timer_context: _,
         timeline_keys: _,
@@ -816,6 +863,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "victim_swap",
         "ghost_signal",
         "fresh_first",
+        "pair_order",
         "replay",
         "timer_context",
         "timeline_keys",
@@ -886,6 +934,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.victim_swap = victim_swap(&mut m);
     s.ghost_signal = ghost_signal(&mut m);
     s.fresh_first = fresh_first(&mut m);
+    s.pair_order = pair_order(&mut m);
     s.replay = replay(&mut m);
     s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
@@ -900,6 +949,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
     expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
     expected.extend(fresh_first_leaves("fresh_first", &s.fresh_first));
+    expected.extend(pair_order_leaves("pair_order", &s.pair_order));
     expected.extend(replay_leaves("replay", &s.replay));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
@@ -940,6 +990,7 @@ fn every_counter_field_reaches_the_written_json() {
         "victim_swap",
         "ghost_signal",
         "fresh_first",
+        "pair_order",
         "replay",
         "timer_context",
     ] {

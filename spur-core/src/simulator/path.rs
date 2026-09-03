@@ -15,6 +15,7 @@ use crate::simulator::path::plan::{
     ClientOpSpec, DeliverSpec, EventAction, ExecutionPlan, PlanEngine, PlannedEvent,
 };
 use crate::simulator::fault_timing;
+use crate::simulator::pair_order as pair_order_split;
 use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
@@ -303,11 +304,18 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     partial_fanout_crash_bias: f64,
     retarget_crashes: bool,
     fresh_first: bool,
+    pair_order: bool,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
     path_state.state.retarget.enabled = retarget_crashes;
     path_state.state.fresh_first.enabled = fresh_first;
+    path_state.state.pair_order.enabled = pair_order;
+    let census = util_stats::enabled() && pair_order_split::is_census_run(run_id);
+    path_state.state.pair_order.census = census;
+    if census {
+        util_stats::record_pair_order_census_run(pair_order);
+    }
     let backup = max_iterations;
     let is_probe = run_cap::is_probe(run_id);
     let effective_cap = if is_probe {
