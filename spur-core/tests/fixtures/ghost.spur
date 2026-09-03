@@ -1,0 +1,70 @@
+// A node that tells every peer about each write it takes and about each
+// timer firing, so a crash of the node routinely leaves its own messages in
+// the air; a peer that consumes one of them while the sender is down, or
+// after the sender has come back, has taken a fault-crossing delivery. The
+// peer's handler writes state, so that delivery counts as one that acted.
+//
+// The peer list carries the node itself, and a message a node sends to
+// itself is never in flight, so the loops skip it.
+
+role Node {
+    var db: map<string, int> = {};
+    var seen: int = 0;
+    var me: int = 0;
+    var peers: list<Node> = [];
+
+    fn Init(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Heartbeat();
+    }
+
+    async fn RecoverInit(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Heartbeat();
+    }
+
+    async fn Heartbeat() {
+        for ;; {
+            <- set_timer("beat");
+            seen = seen + 1;
+            for var i = 0; i < len(peers); i = i + 1 {
+                if (i != me) {
+                    peers[i]->Note(seen);
+                }
+            }
+        }
+    }
+
+    async fn Note(n: int) {
+        seen = n;
+    }
+
+    async fn Write(key: string, uid: int): bool {
+        for var i = 0; i < len(peers); i = i + 1 {
+            if (i != me) {
+                peers[i]->Note(uid);
+            }
+        }
+        db = db[key] := uid;
+        return true;
+    }
+
+    async fn Read(key: string): int {
+        if (exists(db, key)) {
+            return db[key];
+        }
+        return 0;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        <-dest->Write(key, uid);
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

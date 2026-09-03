@@ -6,6 +6,7 @@ use crate::simulator::core::partition::{PartitionInfo, PartitionType};
 use crate::simulator::core::steer_terms::Term;
 use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
 use crate::simulator::crash_phase;
+use crate::simulator::ghost_absorber;
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats::DeliveryBias;
@@ -524,8 +525,9 @@ pub enum ScheduleResult<H: HashPolicy> {
     None,
     /// A client operation completed.
     ClientOp(ClientOpResult<H>),
-    /// A crash was executed on the given node.
-    Crash { node_id: NodeId },
+    /// A crash was executed on `node_id`; `planned` is the node the plan
+    /// named, which differs only when the crash was retargeted.
+    Crash { node_id: NodeId, planned: NodeId },
     /// A recovery was executed on the given node.
     Recover { node_id: NodeId },
     /// A labeled timer fired.
@@ -604,6 +606,11 @@ pub struct State<H: HashPolicy> {
     /// having acted are different facts and the run row reports both.
     /// Observation only, excluded from `signature()`.
     pub crash_hold_drawn: bool,
+    /// Where this run stands with crash retargeting: whether it is on, which
+    /// nodes hold an outstanding planned crash or recover, and whether the
+    /// once-per-run signal has been counted. Scheduling bookkeeping like
+    /// `crash_hold_until`, excluded from `signature()`.
+    pub retarget: ghost_absorber::RunState,
     /// Remote records in the network queue whose origin has restarted since
     /// sending them: the sum over nodes of `net_records - net_fresh`.
     pub net_stale_records: u32,
@@ -631,8 +638,11 @@ pub enum HandlerTrigger {
 /// the crashes of this node waiting in its local queue. `entries` counts the
 /// handler entries the node has taken in this run and `entries_at_restart` its
 /// value when the node last came back from a crash, so their difference is how
-/// far the node has moved past that restart.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// far the node has moved past that restart. `last_ghost_step` is the step
+/// of the last delivery this node took whose sender was crashed or had
+/// restarted since sending, -1 when none since the node's own last restart;
+/// `last_ghost_acted` says whether that delivery wrote the node's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendLedger {
     pub issued: u32,
     pub floor: u32,
@@ -644,6 +654,27 @@ pub struct SendLedger {
     pub crash_pending: u32,
     pub entries: u32,
     pub entries_at_restart: u32,
+    pub last_ghost_step: i32,
+    pub last_ghost_acted: bool,
+}
+
+impl Default for SendLedger {
+    fn default() -> Self {
+        Self {
+            issued: 0,
+            floor: 0,
+            trigger: HandlerTrigger::None,
+            in_flight: 0,
+            recent: 0,
+            net_records: 0,
+            net_fresh: 0,
+            crash_pending: 0,
+            entries: 0,
+            entries_at_restart: 0,
+            last_ghost_step: -1,
+            last_ghost_acted: false,
+        }
+    }
 }
 
 /// Per-run totals of timer firings that woke a waiting record, split by
@@ -707,6 +738,7 @@ impl<H: HashPolicy> State<H> {
             crash_hold_until: vec![0; num_nodes],
             crash_phase: crash_phase::RunAnchor::with_nodes(num_nodes),
             crash_hold_drawn: false,
+            retarget: ghost_absorber::RunState::default(),
             net_stale_records: 0,
             net_requests: 0,
         }
@@ -1009,6 +1041,32 @@ impl<H: HashPolicy> State<H> {
         match self.send_ledger.get(node) {
             Some(l) => l.entries.saturating_sub(l.entries_at_restart),
             None => 0,
+        }
+    }
+
+    /// Whether a message sent by `origin` at incarnation `sent_at` crosses a
+    /// fault when delivered now: the sender is down, or it came back from a
+    /// crash since sending.
+    pub fn fault_crossing(&self, origin: NodeId, sent_at: u32) -> bool {
+        self.crash_info.currently_crashed.contains(&origin) || sent_at != self.incarnation(origin)
+    }
+
+    /// `node` took a fault-crossing delivery at `step`; `before` is the
+    /// node's state token from just before the handler ran, so the mark
+    /// records whether the delivery wrote anything.
+    pub fn note_ghost_delivery(&mut self, node: usize, step: i32, before: u64) {
+        let acted = self.nodes.get(node).is_some_and(|env| env.writes != before);
+        if let Some(l) = self.send_ledger.get_mut(node) {
+            l.last_ghost_step = step;
+            l.last_ghost_acted = acted;
+        }
+    }
+
+    /// `node` is going down: whatever it absorbed is lost with its state.
+    pub fn clear_ghost_mark(&mut self, node: usize) {
+        if let Some(l) = self.send_ledger.get_mut(node) {
+            l.last_ghost_step = -1;
+            l.last_ghost_acted = false;
         }
     }
 
@@ -1413,6 +1471,38 @@ mod ledger_tests {
         assert_eq!(state.send_ledger, ledgers, "ledger drifted {when}");
         assert_eq!(state.net_stale_records, stale, "stale count drifted {when}");
         assert_eq!(state.net_requests, requests, "request count drifted {when}");
+    }
+
+    /// Only a delivery whose sender is down or has restarted since sending
+    /// marks its receiver, and the mark says whether the handler wrote state.
+    #[test]
+    fn a_fault_crossing_delivery_marks_its_receiver_with_what_it_did() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        assert_eq!(st.send_ledger[1].last_ghost_step, -1);
+        assert!(!st.fault_crossing(a, st.incarnation(a)), "a live sender at its current incarnation");
+        st.crash_info.currently_crashed.insert(a);
+        assert!(st.fault_crossing(a, st.incarnation(a)), "a sender that is down");
+        st.crash_info.currently_crashed.remove(&a);
+        st.incarnations[0] = 1;
+        assert!(st.fault_crossing(a, 0), "a sender that restarted since sending");
+        assert!(!st.fault_crossing(a, 1));
+
+        let before = st.node_state_token(node(SERVER, 1));
+        st.note_ghost_delivery(1, 17, before);
+        assert_eq!(st.send_ledger[1].last_ghost_step, 17);
+        assert!(!st.send_ledger[1].last_ghost_acted, "no write since the token was taken");
+
+        let before = st.node_state_token(node(SERVER, 1));
+        st.nodes[1].set(1, Value::<NoHashing>::int(5));
+        st.note_ghost_delivery(1, 23, before);
+        assert_eq!(st.send_ledger[1].last_ghost_step, 23);
+        assert!(st.send_ledger[1].last_ghost_acted, "the handler wrote state");
+        assert_eq!(st.send_ledger[0].last_ghost_step, -1, "other nodes are untouched");
+
+        st.clear_ghost_mark(1);
+        assert_eq!(st.send_ledger[1].last_ghost_step, -1);
+        assert!(!st.send_ledger[1].last_ghost_acted);
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod curriculum;
 pub mod campaign;
 pub mod explorer;
 pub mod fault_timing;
+pub mod ghost_absorber;
 mod feedback;
 mod hash_utils;
 pub mod history;

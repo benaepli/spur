@@ -81,6 +81,20 @@ static CA_TIMING_BIAS_WITHHELD: AtomicU64 = AtomicU64::new(0);
 static CC_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static CC_VICTIM_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static CC_ANY_CANDIDATE_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+static VS_APPLIED: AtomicU64 = AtomicU64::new(0);
+static VS_ACTED_ABSORBER: AtomicU64 = AtomicU64::new(0);
+static VS_SAME_VICTIM: AtomicU64 = AtomicU64::new(0);
+static VS_NO_ABSORBER: AtomicU64 = AtomicU64::new(0);
+static VS_SKIPPED_PENDING_PAIR: AtomicU64 = AtomicU64::new(0);
+static VS_VICTIM_CRASHED_HOLDS: AtomicU64 = AtomicU64::new(0);
+static GS_FIRED_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// The crash census split by retarget half: index 0 is the control half,
+/// index 1 the treated half.
+const VS_HALVES: usize = 2;
+static VS_CENSUS_CRASHES: [AtomicU64; VS_HALVES] = [const { AtomicU64::new(0) }; VS_HALVES];
+static VS_CENSUS_ABSORBED: [AtomicU64; VS_HALVES] = [const { AtomicU64::new(0) }; VS_HALVES];
+static VS_CENSUS_INFLIGHT: [AtomicU64; VS_HALVES] = [const { AtomicU64::new(0) }; VS_HALVES];
 static RW_CLOSED: AtomicU64 = AtomicU64::new(0);
 static RW_WIDTH_SUM: AtomicU64 = AtomicU64::new(0);
 static RW_MAX: AtomicU64 = AtomicU64::new(0);
@@ -376,6 +390,13 @@ pub fn set_enabled(on: bool) {
             &CC_DECISIONS,
             &CC_VICTIM_INFLIGHT,
             &CC_ANY_CANDIDATE_INFLIGHT,
+            &VS_APPLIED,
+            &VS_ACTED_ABSORBER,
+            &VS_SAME_VICTIM,
+            &VS_NO_ABSORBER,
+            &VS_SKIPPED_PENDING_PAIR,
+            &VS_VICTIM_CRASHED_HOLDS,
+            &GS_FIRED_RUNS,
             &RW_CLOSED,
             &RW_WIDTH_SUM,
             &RW_MAX,
@@ -407,6 +428,9 @@ pub fn set_enabled(on: bool) {
             .chain(DELIVERIES_ACTED.iter())
             .chain(MA_FLIPPED.iter())
             .chain(CC_INFLIGHT.iter())
+            .chain(VS_CENSUS_CRASHES.iter())
+            .chain(VS_CENSUS_ABSORBED.iter())
+            .chain(VS_CENSUS_INFLIGHT.iter())
             .chain(ACCEPT_DIST.iter().flatten())
             .chain(ACCEPT_DIST_ACTED.iter().flatten())
         {
@@ -1546,6 +1570,83 @@ pub fn record_crash_census(victim_inflight: u32, any_candidate_inflight: bool) {
     }
     let slot = (victim_inflight as usize).min(CC_INFLIGHT_SLOTS - 1);
     CC_INFLIGHT[slot].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Where a released crash landed once the absorber ranking was consulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VictimSwap {
+    /// The crash moved to another node; `acted` is that node's mark.
+    Applied { acted: bool },
+    /// The best absorber was the planned victim.
+    SameVictim,
+    /// No live node carried a usable mark.
+    NoAbsorber,
+}
+
+/// A treated run released a planned crash and consulted the absorber
+/// ranking; `skipped_pending_pair` means a better-ranked node was passed
+/// over because the plan still had a crash or recover outstanding on it.
+#[inline]
+pub fn record_victim_swap(outcome: VictimSwap, skipped_pending_pair: bool) {
+    if !enabled() {
+        return;
+    }
+    match outcome {
+        VictimSwap::Applied { acted } => {
+            VS_APPLIED.fetch_add(1, Ordering::Relaxed);
+            if acted {
+                VS_ACTED_ABSORBER.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        VictimSwap::SameVictim => {
+            VS_SAME_VICTIM.fetch_add(1, Ordering::Relaxed);
+        }
+        VictimSwap::NoAbsorber => {
+            VS_NO_ABSORBER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if skipped_pending_pair {
+        VS_SKIPPED_PENDING_PAIR.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One eligibility test withheld a planned crash because its victim is
+/// already down, which only a prior retarget can bring about.
+#[inline]
+pub fn record_victim_crashed_hold() {
+    if !enabled() {
+        return;
+    }
+    VS_VICTIM_CRASHED_HOLDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A crash was applied on the treated or the control half to a node that
+/// had (`absorbed`) or had not taken a fault-crossing delivery since its
+/// last restart, and was (`inflight`) or was not holding an undelivered
+/// send of its own.
+#[inline]
+pub fn record_victim_swap_census(treated: bool, absorbed: bool, inflight: bool) {
+    if !enabled() {
+        return;
+    }
+    let i = treated as usize;
+    VS_CENSUS_CRASHES[i].fetch_add(1, Ordering::Relaxed);
+    if absorbed {
+        VS_CENSUS_ABSORBED[i].fetch_add(1, Ordering::Relaxed);
+    }
+    if inflight {
+        VS_CENSUS_INFLIGHT[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The first time in a run a fault-crossing delivery entered a node whose
+/// own crash was queued. Called once per run at most.
+#[inline]
+pub fn record_ghost_signal_run() {
+    if !enabled() {
+        return;
+    }
+    GS_FIRED_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Why a single plan execution stopped.
@@ -3087,6 +3188,88 @@ impl CrashPhaseStats {
     }
 }
 
+/// One half of the crash census under the retarget split. `crashes` is the
+/// denominator; `victim_had_absorbed` counts the crashes whose actual victim
+/// had taken a fault-crossing delivery since its last restart, and
+/// `victim_had_inflight_sends` those whose victim was holding an undelivered
+/// send of its own.
+#[derive(Serialize, Debug)]
+pub struct VictimSwapHalfStats {
+    pub crashes: u64,
+    pub victim_had_absorbed: u64,
+    pub victim_had_inflight_sends: u64,
+}
+
+impl VictimSwapHalfStats {
+    fn read(treated: bool) -> Self {
+        let i = treated as usize;
+        Self {
+            crashes: VS_CENSUS_CRASHES[i].load(Ordering::Relaxed),
+            victim_had_absorbed: VS_CENSUS_ABSORBED[i].load(Ordering::Relaxed),
+            victim_had_inflight_sends: VS_CENSUS_INFLIGHT[i].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The crash census on each half of the retarget split.
+#[derive(Serialize, Debug)]
+pub struct VictimSwapCensusStats {
+    pub treated: VictimSwapHalfStats,
+    pub control: VictimSwapHalfStats,
+}
+
+/// The crash retarget block. `applied` is the number the mechanism is read
+/// as having fired: planned crashes that landed on another node than the
+/// plan's victim. `acted_absorber` is the subset whose new victim's mark had
+/// written state. `same_victim` and `no_absorber` are the releases that kept
+/// the victim, `skipped_pending_pair` the releases where a better-ranked
+/// node was passed over for an outstanding pair, and
+/// `victim_crashed_holds` the eligibility tests that withheld a planned
+/// crash whose victim was already down.
+#[derive(Serialize, Debug)]
+pub struct VictimSwapStats {
+    pub applied: u64,
+    pub acted_absorber: u64,
+    pub same_victim: u64,
+    pub no_absorber: u64,
+    pub skipped_pending_pair: u64,
+    pub victim_crashed_holds: u64,
+    pub census: VictimSwapCensusStats,
+}
+
+impl VictimSwapStats {
+    fn read() -> Self {
+        Self {
+            applied: VS_APPLIED.load(Ordering::Relaxed),
+            acted_absorber: VS_ACTED_ABSORBER.load(Ordering::Relaxed),
+            same_victim: VS_SAME_VICTIM.load(Ordering::Relaxed),
+            no_absorber: VS_NO_ABSORBER.load(Ordering::Relaxed),
+            skipped_pending_pair: VS_SKIPPED_PENDING_PAIR.load(Ordering::Relaxed),
+            victim_crashed_holds: VS_VICTIM_CRASHED_HOLDS.load(Ordering::Relaxed),
+            census: VictimSwapCensusStats {
+                treated: VictimSwapHalfStats::read(true),
+                control: VictimSwapHalfStats::read(false),
+            },
+        }
+    }
+}
+
+/// Runs in which a fault-crossing delivery entered a node whose own crash
+/// was queued: the situation the retarget exists to act on, counted on both
+/// halves.
+#[derive(Serialize, Debug)]
+pub struct GhostSignalStats {
+    pub fired_runs: u64,
+}
+
+impl GhostSignalStats {
+    fn read() -> Self {
+        Self {
+            fired_runs: GS_FIRED_RUNS.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The timer-context block: the learner's probe traffic, the steered rolls
 /// that applied a learned multiplier, the rolls an unsupported selector
 /// excluded, and a gauge of the cells currently engaged. `cells_engaged` is
@@ -3147,6 +3330,8 @@ pub struct UtilizationSnapshot {
     pub run_cap: RunCapStats,
     pub crash_place: CrashPlaceStats,
     pub crash_phase: CrashPhaseStats,
+    pub victim_swap: VictimSwapStats,
+    pub ghost_signal: GhostSignalStats,
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
@@ -3338,6 +3523,8 @@ pub fn snapshot() -> UtilizationSnapshot {
         run_cap: RunCapStats::read(),
         crash_place: CrashPlaceStats::read(),
         crash_phase: CrashPhaseStats::read(),
+        victim_swap: VictimSwapStats::read(),
+        ghost_signal: GhostSignalStats::read(),
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),

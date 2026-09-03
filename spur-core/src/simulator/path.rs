@@ -301,9 +301,11 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
     partial_fanout_crash_bias: f64,
+    retarget_crashes: bool,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
+    path_state.state.retarget.enabled = retarget_crashes;
     let backup = max_iterations;
     let is_probe = run_cap::is_probe(run_id);
     let effective_cap = if is_probe {
@@ -315,8 +317,14 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
-    // Map from node_id index to the plan engine NodeIndex for pending crash/recover events
-    let mut pending_crash_recover: HashMap<usize, NodeIndex> = HashMap::new();
+    // Plan engine NodeIndex of the queued crash, and of the queued recover,
+    // per node index. The plan serializes a node's pairs, so each node has at
+    // most one of each outstanding; a retargeted crash leaves its recover
+    // keyed on the node the crash landed on, which `victim_remap` records
+    // from the plan's victim until that recover is issued.
+    let mut pending_crash: HashMap<usize, NodeIndex> = HashMap::new();
+    let mut pending_recover: HashMap<usize, NodeIndex> = HashMap::new();
+    let mut victim_remap: HashMap<usize, NodeId> = HashMap::new();
     // Map from (node_index, label) to the plan engine NodeIndex for pending AllowTimer events
     let mut pending_allow_timer: HashMap<(usize, String), NodeIndex> = HashMap::new();
     let mut pending_partition: Option<NodeIndex> = None;
@@ -548,16 +556,17 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                             );
                         }
                     }
-                    pending_crash_recover.insert(nid.index, node_idx);
+                    pending_crash.insert(nid.index, node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
                     let nid =
                         validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
+                    let target = victim_remap.remove(&nid.index).unwrap_or(nid);
                     path_state.state.push_runnable(Runnable::Recover {
-                        node_id: nid,
+                        node_id: target,
                         priority: policy.sample(rng, RunnableCategory::Recover),
                     });
-                    pending_crash_recover.insert(nid.index, node_idx);
+                    pending_recover.insert(target.index, node_idx);
                 }
                 EventAction::AllowTimer(node_id, label) => {
                     let key = (*node_id as usize, label.clone());
@@ -605,6 +614,16 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 
         let history_start_len = path_state.history.len();
 
+        if retarget_crashes {
+            let mut mask = 0u64;
+            for &n in pending_crash.keys().chain(pending_recover.keys()) {
+                if n < u64::BITS as usize {
+                    mask |= 1u64 << n;
+                }
+            }
+            path_state.state.retarget.pending_pair_mask = mask;
+        }
+
         if path_state.state.all_queues_empty() {
             census.idle();
             util_stats::record_steer_reach(util_stats::SteerReach::NoScheduleAttempt);
@@ -651,7 +670,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         step: path_state.state.crash_info.current_step,
                     });
                 }
-                ScheduleResult::Crash { node_id } => {
+                ScheduleResult::Crash { node_id, planned } => {
                     path_state.history.push(Operation {
                         client_id: -1,
                         op_action: "System.Crash".to_string(),
@@ -661,8 +680,11 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         step: path_state.state.crash_info.current_step,
                     });
                     crashed_nodes.insert(node_id.index);
-                    if let Some(plan_node) = pending_crash_recover.remove(&node_id.index) {
+                    if let Some(plan_node) = pending_crash.remove(&planned.index) {
                         engine.mark_event_completed(plan_node);
+                    }
+                    if node_id != planned {
+                        victim_remap.insert(planned.index, node_id);
                     }
                 }
                 ScheduleResult::Recover { node_id } => {
@@ -677,7 +699,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     if crashed_nodes.contains(&node_id.index) {
                         recovered_nodes.insert(node_id.index);
                     }
-                    if let Some(plan_node) = pending_crash_recover.remove(&node_id.index) {
+                    if let Some(plan_node) = pending_recover.remove(&node_id.index) {
                         engine.mark_event_completed(plan_node);
                     }
                 }

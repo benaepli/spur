@@ -1102,6 +1102,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &config.steer_terms,
         &config.purgatory,
         config.partial_fanout_crash_bias,
+        crate::simulator::ghost_absorber::is_treated(run_id),
         &mut rec,
     )?;
 
@@ -1415,6 +1416,7 @@ fn run_single_plan<F: Feedback>(
         terms,
         purgatory_config,
         partial_fanout_crash_bias,
+        false,
         &mut rng,
     )?;
 

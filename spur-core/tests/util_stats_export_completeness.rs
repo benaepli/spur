@@ -14,9 +14,9 @@
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, CrashPhaseArmStats,
-    CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, RunCapStats,
-    SteerAuthorityStats, TerminationStats, TerminationTally, TimerContextStats,
-    UtilizationSnapshot,
+    CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, GhostSignalStats,
+    RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally, TimerContextStats,
+    UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats, VictimSwapStats,
 };
 use std::collections::BTreeMap;
 
@@ -524,6 +524,83 @@ fn crash_phase_leaves(prefix: &str, c: &CrashPhaseStats) -> Vec<(String, Value)>
     out
 }
 
+fn victim_swap_half(m: &mut Marks) -> VictimSwapHalfStats {
+    VictimSwapHalfStats {
+        crashes: m.int(),
+        victim_had_absorbed: m.int(),
+        victim_had_inflight_sends: m.int(),
+    }
+}
+
+fn victim_swap_half_leaves(prefix: &str, h: &VictimSwapHalfStats) -> Vec<(String, Value)> {
+    let VictimSwapHalfStats {
+        crashes,
+        victim_had_absorbed,
+        victim_had_inflight_sends,
+    } = h;
+    vec![
+        leaf(prefix, "crashes", *crashes),
+        leaf(prefix, "victim_had_absorbed", *victim_had_absorbed),
+        leaf(prefix, "victim_had_inflight_sends", *victim_had_inflight_sends),
+    ]
+}
+
+fn victim_swap(m: &mut Marks) -> VictimSwapStats {
+    VictimSwapStats {
+        applied: m.int(),
+        acted_absorber: m.int(),
+        same_victim: m.int(),
+        no_absorber: m.int(),
+        skipped_pending_pair: m.int(),
+        victim_crashed_holds: m.int(),
+        census: VictimSwapCensusStats {
+            treated: victim_swap_half(m),
+            control: victim_swap_half(m),
+        },
+    }
+}
+
+fn victim_swap_leaves(prefix: &str, v: &VictimSwapStats) -> Vec<(String, Value)> {
+    let VictimSwapStats {
+        applied,
+        acted_absorber,
+        same_victim,
+        no_absorber,
+        skipped_pending_pair,
+        victim_crashed_holds,
+        census,
+    } = v;
+    let VictimSwapCensusStats { treated, control } = census;
+    let mut out = vec![
+        leaf(prefix, "applied", *applied),
+        leaf(prefix, "acted_absorber", *acted_absorber),
+        leaf(prefix, "same_victim", *same_victim),
+        leaf(prefix, "no_absorber", *no_absorber),
+        leaf(prefix, "skipped_pending_pair", *skipped_pending_pair),
+        leaf(prefix, "victim_crashed_holds", *victim_crashed_holds),
+    ];
+    out.extend(victim_swap_half_leaves(
+        &format!("{prefix}.census.treated"),
+        treated,
+    ));
+    out.extend(victim_swap_half_leaves(
+        &format!("{prefix}.census.control"),
+        control,
+    ));
+    out
+}
+
+fn ghost_signal(m: &mut Marks) -> GhostSignalStats {
+    GhostSignalStats {
+        fired_runs: m.int(),
+    }
+}
+
+fn ghost_signal_leaves(prefix: &str, g: &GhostSignalStats) -> Vec<(String, Value)> {
+    let GhostSignalStats { fired_runs } = g;
+    vec![leaf(prefix, "fired_runs", *fired_runs)]
+}
+
 fn timer_context(m: &mut Marks) -> TimerContextStats {
     TimerContextStats {
         probe_firings: m.int(),
@@ -588,6 +665,8 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         run_cap: _,
         crash_place: _,
         crash_phase: _,
+        victim_swap: _,
+        ghost_signal: _,
         timer_context: _,
         timeline_keys: _,
         steer_terms: _,
@@ -619,6 +698,8 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "run_cap",
         "crash_place",
         "crash_phase",
+        "victim_swap",
+        "ghost_signal",
         "timer_context",
         "timeline_keys",
         "steer_terms",
@@ -685,6 +766,8 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.run_cap = run_cap(&mut m);
     s.crash_place = crash_place(&mut m);
     s.crash_phase = crash_phase(&mut m);
+    s.victim_swap = victim_swap(&mut m);
+    s.ghost_signal = ghost_signal(&mut m);
     s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
@@ -695,6 +778,8 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(run_cap_leaves("run_cap", &s.run_cap));
     expected.extend(crash_place_leaves("crash_place", &s.crash_place));
     expected.extend(crash_phase_leaves("crash_phase", &s.crash_phase));
+    expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
+    expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
 }
@@ -731,6 +816,8 @@ fn every_counter_field_reaches_the_written_json() {
         "run_cap",
         "crash_place",
         "crash_phase",
+        "victim_swap",
+        "ghost_signal",
         "timer_context",
     ] {
         let mut actual = BTreeMap::new();

@@ -13,6 +13,7 @@ use crate::simulator::core::state::{
 use crate::simulator::core::steer_terms::{ResolvedTerms, Term, TERMS};
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::crash_phase;
+use crate::simulator::ghost_absorber;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
@@ -780,12 +781,28 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // item from scheduling via the same plumbing, so combine them here.
     let link_deliver_seq = state.link_deliver_seq.clone();
     let crash_block_mask = crash_defer_mask | crash_hold_mask;
+    // A planned crash whose victim is already down waits for that node to
+    // come back. Only a retargeted crash can leave a plan in that position,
+    // so the check is confined to runs that retarget; it holds the crash in
+    // the queue rather than dropping it, so the plan's pair still completes.
+    let crashed_victims: Vec<NodeId> = if state.retarget.enabled {
+        state.crash_info.currently_crashed.iter().copied().collect()
+    } else {
+        Vec::new()
+    };
     let is_ineligible = |r: &Runnable<H>| {
         if crash_block_mask != 0
             && let Runnable::Crash { node_id, .. } = r
             && node_id.index < u64::BITS as usize
             && crash_block_mask & (1u64 << node_id.index) != 0
         {
+            return true;
+        }
+        if !crashed_victims.is_empty()
+            && let Runnable::Crash { node_id, .. } = r
+            && crashed_victims.contains(node_id)
+        {
+            util_stats::record_victim_crashed_hold();
             return true;
         }
         reservations.iter().any(|res| res.matches(r)) || is_fifo_blocked(r, &link_deliver_seq)
@@ -1063,8 +1080,20 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
                 util_stats::record_crash_phase_apply(arm, ledger.in_flight);
             }
-            crash_node(state, node_id);
-            Ok(ScheduleResult::Crash { node_id })
+            let victim = retarget_crash(state, node_id, topology.num_servers.max(0) as usize);
+            if util_stats::enabled() {
+                let ledger = state.send_ledger.get(victim.index).copied().unwrap_or_default();
+                util_stats::record_victim_swap_census(
+                    state.retarget.enabled,
+                    ledger.last_ghost_step >= 0,
+                    ledger.in_flight > 0,
+                );
+            }
+            crash_node(state, victim);
+            Ok(ScheduleResult::Crash {
+                node_id: victim,
+                planned: node_id,
+            })
         }
         Runnable::Recover { node_id, .. } => {
             recover_crashed_node::<H, L, F>(
@@ -1192,6 +1221,22 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     // node counts, not the continuations it is re-queued as.
                     let message_entry = record_origin != record_dest && r.pc == record_entry_pc;
                     let entry_step = state.crash_info.current_step;
+                    // A delivery from a sender that is down, or that restarted
+                    // since sending, marks its receiver as having absorbed
+                    // state from an incarnation that no longer exists.
+                    let ghost = (message_entry
+                        && state.fault_crossing(record_origin, r.origin_incarnation))
+                    .then(|| state.node_state_token(record_dest));
+                    if ghost.is_some()
+                        && !state.retarget.signal_counted
+                        && state
+                            .send_ledger
+                            .get(record_dest.index)
+                            .is_some_and(|l| l.crash_pending > 0)
+                    {
+                        state.retarget.signal_counted = true;
+                        util_stats::record_ghost_signal_run();
+                    }
                     let probe = (util_stats::acted_fraction_enabled() && message_entry).then(|| {
                         let mut bias = r.bias;
                         if r.origin_incarnation != state.incarnation(record_origin) {
@@ -1246,6 +1291,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         purgatory_config,
                         rng,
                     )?;
+                    if let Some(before) = ghost {
+                        state.note_ghost_delivery(record_dest.index, entry_step, before);
+                    }
                     if let Some((bias, before, distance)) = probe {
                         let acted = state.node_state_token(record_dest) != before;
                         util_stats::record_delivery(bias, acted, distance);
@@ -1304,6 +1352,47 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     }
 }
 
+/// Where a released planned crash of `planned` lands. On a run that does
+/// not retarget this is `planned` itself and nothing is read or counted. On
+/// a treated run the crash moves to the live server that most recently took
+/// a fault-crossing delivery, unless the plan still has a crash or recover
+/// outstanding on that server or the best absorber is `planned` itself.
+/// Candidates are the servers, which are the first `servers` nodes; the
+/// clients that follow them are never crashed.
+fn retarget_crash<H: HashPolicy>(state: &State<H>, planned: NodeId, servers: usize) -> NodeId {
+    if !state.retarget.enabled {
+        return planned;
+    }
+    let decision = ghost_absorber::choose(
+        planned.index,
+        &state.send_ledger,
+        servers,
+        |n| {
+            !state.crash_info.currently_crashed.contains(&NodeId {
+                role: planned.role,
+                index: n,
+            })
+        },
+        |n| {
+            state.retarget.has_pending_pair(n)
+                || state.send_ledger.get(n).is_some_and(|l| l.crash_pending > 0)
+        },
+    );
+    let (outcome, victim) = match decision.choice {
+        ghost_absorber::Choice::Retarget { node, acted } => (
+            util_stats::VictimSwap::Applied { acted },
+            NodeId {
+                role: planned.role,
+                index: node,
+            },
+        ),
+        ghost_absorber::Choice::SameVictim => (util_stats::VictimSwap::SameVictim, planned),
+        ghost_absorber::Choice::NoAbsorber => (util_stats::VictimSwap::NoAbsorber, planned),
+    };
+    util_stats::record_victim_swap(outcome, decision.skipped_pending_pair);
+    victim
+}
+
 fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     if state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is already crashed", node_id);
@@ -1311,6 +1400,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     }
     state.crash_info.currently_crashed.insert(node_id);
     state.note_handler_entry(node_id.index, HandlerTrigger::None);
+    state.clear_ghost_mark(node_id.index);
 
     let mut held: u64 = 0;
     let mut dropped: u64 = 0;
@@ -2043,6 +2133,39 @@ mod tests {
         state.send_ledger[0].trigger = HandlerTrigger::Delivery;
         state.send_ledger[0].recent = 0;
         assert!(route_by_terms(&state, &info, &terms, &mut rng).is_none(), "no sends in flight");
+    }
+
+    /// A crash wipes what its node absorbed, so a node that comes back never
+    /// ranks on a mark from a state it no longer holds; a run that does not
+    /// retarget keeps the plan's victim without consulting the marks.
+    #[test]
+    fn a_crash_clears_the_node_s_ghost_mark_and_only_treated_runs_retarget() {
+        let role = crate::analysis::resolver::NameId(0);
+        let mut state = State::<NoHashing>::new(&[(role, 3)], 1);
+        state.send_ledger[1].last_ghost_step = 40;
+        state.send_ledger[1].last_ghost_acted = true;
+        state.send_ledger[2].last_ghost_step = 9;
+        let planned = NodeId { role, index: 0 };
+        assert_eq!(retarget_crash(&state, planned, 3), planned, "an untreated run keeps the victim");
+
+        state.retarget.enabled = true;
+        assert_eq!(retarget_crash(&state, planned, 3), NodeId { role, index: 1 });
+        state.retarget.pending_pair_mask = 1 << 1;
+        assert_eq!(retarget_crash(&state, planned, 3), NodeId { role, index: 2 });
+        state.retarget.pending_pair_mask = 0;
+        state.send_ledger[2].crash_pending = 1;
+        assert_eq!(retarget_crash(&state, NodeId { role, index: 1 }, 3), NodeId { role, index: 1 });
+
+        crash_node(&mut state, NodeId { role, index: 1 });
+        assert_eq!(state.send_ledger[1].last_ghost_step, -1);
+        assert!(!state.send_ledger[1].last_ghost_acted);
+        assert_eq!(state.send_ledger[2].last_ghost_step, 9, "another node's mark stays");
+        state.send_ledger[2].crash_pending = 0;
+        assert_eq!(
+            retarget_crash(&state, planned, 3),
+            NodeId { role, index: 2 },
+            "a node that is down is not a candidate"
+        );
     }
 
     #[test]

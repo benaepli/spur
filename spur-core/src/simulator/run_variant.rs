@@ -15,6 +15,7 @@
 
 use crate::simulator::crash_phase;
 use crate::simulator::fault_timing;
+use crate::simulator::ghost_absorber;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
 
@@ -33,6 +34,9 @@ pub const CRASH_HOLD_DRAWN: i32 = 1 << 3;
 /// The run's placed crashes wait for a drawn phase of the victim's own
 /// fan-out once their step hold expires, instead of competing at once.
 pub const CRASH_PHASE: i32 = 1 << 9;
+/// The run's planned crashes move to the live node that last took a
+/// delivery whose sender was down or had restarted since sending.
+pub const GHOST_ABSORBER_RETARGET: i32 = 1 << 19;
 
 /// The whole tag: what the run id selected, plus what the run did.
 pub fn of(run_id: i64, crash_hold_drawn: bool) -> i32 {
@@ -53,6 +57,9 @@ pub fn from_run_id(run_id: i64) -> i32 {
     }
     if crash_phase::is_anchored(run_id) {
         v |= CRASH_PHASE;
+    }
+    if ghost_absorber::is_treated(run_id) {
+        v |= GHOST_ABSORBER_RETARGET;
     }
     v
 }
@@ -75,6 +82,7 @@ mod tests {
                 timer_context::run_mode(id) == timer_context::RunMode::Probe
             );
             assert_eq!(v & CRASH_PHASE != 0, crash_phase::is_anchored(id));
+            assert_eq!(v & GHOST_ABSORBER_RETARGET != 0, ghost_absorber::is_treated(id));
             assert_eq!(v & CRASH_HOLD_DRAWN, 0, "the acted bit is not an id bit");
             assert_eq!(of(id, true), v | CRASH_HOLD_DRAWN);
             assert_eq!(of(id, false), v);
@@ -110,6 +118,14 @@ mod tests {
         );
         assert!(timer_probe_placed > 0, "no timer probe is placed, so the bits never overlap");
         assert_eq!(cap_probe_placed, 0, "a run-cap probe must never be placed");
+        let retargeted = (0..64_000i64)
+            .filter(|&id| from_run_id(id) & GHOST_ABSORBER_RETARGET != 0)
+            .count();
+        let retargeted_probes = (0..64_000i64)
+            .filter(|&id| from_run_id(id) & (GHOST_ABSORBER_RETARGET | RUN_CAP_PROBE) == GHOST_ABSORBER_RETARGET | RUN_CAP_PROBE)
+            .count();
+        assert!(retargeted > 0 && retargeted < 64_000, "the retarget split leaves no contrast");
+        assert_eq!(retargeted_probes, 0, "a run-cap probe must never be retargeted");
         assert!(ordinary_stock > 0, "no stock run that is not a probe, so there is no control");
     }
 }
