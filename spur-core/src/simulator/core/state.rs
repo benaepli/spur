@@ -6,6 +6,7 @@ use crate::simulator::core::partition::{PartitionInfo, PartitionType};
 use crate::simulator::core::steer_terms::Term;
 use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
 use crate::simulator::crash_phase;
+use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use crate::simulator::rng::{Stream, StreamRng};
@@ -613,6 +614,9 @@ pub struct State<H: HashPolicy> {
     /// once-per-run signal has been counted. Scheduling bookkeeping like
     /// `crash_hold_until`, excluded from `signature()`.
     pub retarget: ghost_absorber::RunState,
+    /// Same-step preference for a sender's current incarnation at a
+    /// contested network step, and the census tables it is read against.
+    pub fresh_first: fresh_first::RunState,
     /// Where the once-per-run signal fired, when it did: the step, and the
     /// number of scheduling draws taken by then when the run records its
     /// draws. Observation only, excluded from `signature()`.
@@ -756,6 +760,7 @@ impl<H: HashPolicy> State<H> {
             crash_phase: crash_phase::RunAnchor::with_nodes(num_nodes),
             crash_hold_drawn: false,
             retarget: ghost_absorber::RunState::default(),
+            fresh_first: fresh_first::RunState::default(),
             replay_cut: None,
             net_stale_records: 0,
             net_requests: 0,

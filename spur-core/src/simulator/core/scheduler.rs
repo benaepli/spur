@@ -13,6 +13,7 @@ use crate::simulator::core::state::{
 use crate::simulator::core::steer_terms::{ResolvedTerms, Term, TERMS};
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::crash_phase;
+use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
@@ -1002,7 +1003,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
-            let (idx, mask) = select_within_queue::<H, F>(
+            let (drawn, drawn_mask) = select_within_queue::<H, F>(
                 queue,
                 &eligible,
                 feedback,
@@ -1012,6 +1013,14 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 within_queue,
                 rng,
             );
+            let idx = fresh_first_dispatch(state, &eligible, drawn);
+            // The mask names the predicates true of the record the step
+            // runs, under the same condition the selection computed it.
+            let mask = if idx != drawn && util_stats::enabled() && terms.any_predicate() {
+                state.term_mask(&state.network_queue[idx])
+            } else {
+                drawn_mask
+            };
             (state.take_network(idx), QueueSlot::Network(idx), mask)
         }
         QueueSelection::Timer => {
@@ -1222,6 +1231,28 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     // node counts, not the continuations it is re-queued as.
                     let message_entry = record_origin != record_dest && r.pc == record_entry_pc;
                     let entry_step = state.crash_info.current_step;
+                    // Whether a ghost reached a destination that had already
+                    // heard from the sender's current incarnation, read off
+                    // the per-destination table before this entry is added.
+                    if message_entry && util_stats::enabled() {
+                        let current = state.incarnation(record_origin);
+                        if r.origin_incarnation != current {
+                            let overtaken = state.fresh_first.heard_from(
+                                record_dest.index,
+                                record_origin.index,
+                                current,
+                            );
+                            util_stats::record_fresh_first_ghost_entry(
+                                state.fresh_first.enabled,
+                                overtaken,
+                            );
+                        }
+                        state.fresh_first.note_entry(
+                            record_dest.index,
+                            record_origin.index,
+                            r.origin_incarnation,
+                        );
+                    }
                     // A delivery from a sender that is down, or that restarted
                     // since sending, marks its receiver as having absorbed
                     // state from an incarnation that no longer exists.
@@ -1398,6 +1429,83 @@ fn retarget_crash<H: HashPolicy>(state: &State<H>, planned: NodeId, servers: usi
     victim
 }
 
+/// The network-queue index a step takes once the within-queue draw has
+/// settled on `drawn`. This is `drawn` itself on a run that does not prefer
+/// fresh records, and at any step where the drawn item is not a remote
+/// record or has no eligible rival of the opposite incarnation class from
+/// the same sender to the same destination. On a treated run whose draw
+/// fell on a ghost - a record whose sender restarted since sending - with a
+/// live destination and such a fresh rival, it is the rival with the highest
+/// priority, the lowest index among equals. The sender's ledger says in
+/// O(1) whether it has both a fresh and a stale record in the queue, and
+/// nothing else is read when it does not. The displaced ghost stays in the
+/// queue and stays eligible. No random draw is taken here, so a treated
+/// step reads the same random sequence as an untreated one.
+fn fresh_first_dispatch<H: HashPolicy>(
+    state: &mut State<H>,
+    eligible: &[usize],
+    drawn: usize,
+) -> usize {
+    let stats = util_stats::enabled();
+    let treated = state.fresh_first.enabled;
+    if !treated && !stats {
+        return drawn;
+    }
+    let queue = &state.network_queue;
+    let chosen = 'pick: {
+        let Some(Runnable::Record(rec)) = queue.get(drawn) else {
+            break 'pick drawn;
+        };
+        if rec.origin_node == rec.node {
+            break 'pick drawn;
+        }
+        let origin = rec.origin_node;
+        let dest = rec.node;
+        let Some(ledger) = state.send_ledger.get(origin.index) else {
+            break 'pick drawn;
+        };
+        if ledger.net_fresh == 0 || ledger.net_records <= ledger.net_fresh {
+            break 'pick drawn;
+        }
+        let current = state.incarnation(origin);
+        let stale_drawn = rec.origin_incarnation != current;
+        let candidates = eligible.iter().map(|&i| {
+            let item = match &queue[i] {
+                Runnable::Record(r)
+                    if r.origin_node == origin && r.node == dest && r.origin_node != r.node =>
+                {
+                    Some((r.origin_incarnation, r.priority))
+                }
+                _ => None,
+            };
+            (i, item)
+        });
+        let (contested, best_fresh) = fresh_first::rival(candidates, drawn, stale_drawn, current);
+        if !contested {
+            break 'pick drawn;
+        }
+        let down = state.crash_info.currently_crashed.contains(&dest);
+        util_stats::record_fresh_first_contest(treated, stale_drawn, down);
+        if !treated || !stale_drawn || down {
+            break 'pick drawn;
+        }
+        let Some(fresh) = best_fresh else {
+            break 'pick drawn;
+        };
+        let times = state.fresh_first.displace((origin.index, rec.send_ordinal));
+        util_stats::record_fresh_first_swap(times > 1);
+        fresh
+    };
+    if treated
+        && let Some(Runnable::Record(r)) = queue.get(chosen)
+        && r.origin_node != r.node
+        && let Some(count) = state.fresh_first.take((r.origin_node.index, r.send_ordinal))
+    {
+        util_stats::record_fresh_first_taken(count);
+    }
+    chosen
+}
+
 fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     if state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is already crashed", node_id);
@@ -1497,6 +1605,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
         .get(node_id.index)
         .is_some_and(|l| l.in_flight > 0);
     state.note_incarnation_bump(node_id.index);
+    state.fresh_first.clear_origin(node_id.index);
     state.note_handler_entry(node_id.index, HandlerTrigger::None);
     util_stats::record_recover(
         node_id.index,
@@ -2171,6 +2280,180 @@ mod tests {
             NodeId { role, index: 2 },
             "a node that is down is not a candidate"
         );
+    }
+
+    const ROLE: crate::analysis::resolver::NameId = crate::analysis::resolver::NameId(0);
+
+    fn node(index: usize) -> NodeId {
+        NodeId { role: ROLE, index }
+    }
+
+    /// A remote record from `origin` to `dest` sent at `incarnation`, queued
+    /// through the ledger hooks so the sender's counts stay exact.
+    fn queue_record(
+        state: &mut State<NoHashing>,
+        origin: usize,
+        dest: usize,
+        incarnation: u32,
+        priority: f64,
+    ) -> usize {
+        let env = Env::<NoHashing>::with_slots(1);
+        let rec = Record {
+            pc: 0,
+            node: node(dest),
+            origin_node: node(origin),
+            continuation: Continuation::Recover,
+            entry_pc: 0,
+            initial_env: env.clone(),
+            env,
+            priority,
+            causal_operation_id: None,
+            trace_id: None,
+            link_seq: None,
+            origin_incarnation: incarnation,
+            bias: DeliveryBias::NONE,
+            timer_entry: None,
+            send_ordinal: state.next_send_ordinal(node(origin)),
+            receiver_token_at_send: state.node_state_token(node(dest)),
+        };
+        state.push_runnable(Runnable::Record(rec));
+        state.network_queue.len() - 1
+    }
+
+    fn queue_channel_send(state: &mut State<NoHashing>, origin: usize, dest: usize) -> usize {
+        state.push_runnable(Runnable::ChannelSend {
+            target: node(dest),
+            channel: crate::simulator::core::values::ChannelId {
+                node: node(dest),
+                id: 0,
+            },
+            message: Value::<NoHashing>::unit(),
+            origin_node: node(origin),
+            pc: 0,
+            priority: 0.5,
+        });
+        state.network_queue.len() - 1
+    }
+
+    /// Three nodes; node 0 has restarted once, so its incarnation is 1. The
+    /// queue holds, in order: a ghost 0->1, a fresh 0->1 at priority 0.3, a
+    /// channel send 0->1, a fresh 0->2, a fresh 0->1 at priority 0.8, and a
+    /// second fresh 0->1 at priority 0.8.
+    fn contested_state() -> (State<NoHashing>, Vec<usize>) {
+        let mut state = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        let ghost = queue_record(&mut state, 0, 1, 0, 0.9);
+        state.incarnations[0] = 1;
+        state.note_incarnation_bump(0);
+        let low = queue_record(&mut state, 0, 1, 1, 0.3);
+        let chan = queue_channel_send(&mut state, 0, 1);
+        let other_dest = queue_record(&mut state, 0, 2, 1, 0.95);
+        let high = queue_record(&mut state, 0, 1, 1, 0.8);
+        let high_later = queue_record(&mut state, 0, 1, 1, 0.8);
+        (state, vec![ghost, low, chan, other_dest, high, high_later])
+    }
+
+    #[test]
+    fn a_treated_step_takes_the_best_fresh_rival_in_place_of_a_drawn_ghost() {
+        let (mut state, slots) = contested_state();
+        let [ghost, low, chan, other_dest, high, high_later] = slots[..] else { unreachable!() };
+        let eligible: Vec<usize> = (0..state.network_queue.len()).collect();
+        assert_eq!(fresh_first_dispatch(&mut state, &eligible, ghost), ghost, "an untreated run keeps the draw");
+
+        state.fresh_first.enabled = true;
+        assert_eq!(
+            fresh_first_dispatch(&mut state, &eligible, ghost),
+            high,
+            "the highest-priority fresh rival wins, the lowest index among equals"
+        );
+        assert_eq!(state.fresh_first.displaced_len(), 1, "the ghost carries a displaced count");
+        for drawn in [low, chan, other_dest, high, high_later] {
+            assert_eq!(fresh_first_dispatch(&mut state, &eligible, drawn), drawn, "a fresh draw or a channel send is never displaced");
+        }
+        assert_eq!(state.network_queue.len(), 6, "nothing was taken or masked");
+
+        let only_high = vec![ghost, low, chan, high_later];
+        assert_eq!(fresh_first_dispatch(&mut state, &only_high, ghost), high_later, "an ineligible rival is not chosen");
+        let ghost_ordinal = match &state.network_queue[ghost] {
+            Runnable::Record(r) => r.send_ordinal,
+            _ => unreachable!(),
+        };
+        let mut peek = state.fresh_first.clone();
+        assert_eq!(peek.take((0, ghost_ordinal)), Some(fresh_first::DisplacedCount::Twice));
+
+        // A step that keeps the ghost takes it, which closes its count.
+        state.crash_info.currently_crashed.insert(node(1));
+        assert_eq!(fresh_first_dispatch(&mut state, &eligible, ghost), ghost, "a crashed destination sees no swap");
+        state.crash_info.currently_crashed.remove(&node(1));
+        assert_eq!(state.fresh_first.displaced_len(), 0, "the taken ghost keeps no count");
+
+        assert_eq!(fresh_first_dispatch(&mut state, &eligible, ghost), high);
+        let ghost_only: Vec<usize> = vec![ghost, chan, other_dest];
+        assert_eq!(fresh_first_dispatch(&mut state, &ghost_only, ghost), ghost, "no eligible fresh rival keeps the ghost");
+        assert_eq!(state.fresh_first.displaced_len(), 0);
+    }
+
+    #[test]
+    fn the_ledger_gate_is_consulted_before_the_queue_is_read() {
+        let (mut state, slots) = contested_state();
+        let ghost = slots[0];
+        let eligible: Vec<usize> = (0..state.network_queue.len()).collect();
+        state.fresh_first.enabled = true;
+        let ledger = state.send_ledger[0];
+        assert!(ledger.net_fresh > 0 && ledger.net_records > ledger.net_fresh, "the fixture holds both classes");
+
+        state.send_ledger[0].net_fresh = 0;
+        assert_eq!(fresh_first_dispatch(&mut state, &eligible, ghost), ghost, "a ledger with no fresh record closes the gate");
+        state.send_ledger[0].net_fresh = ledger.net_records;
+        assert_eq!(fresh_first_dispatch(&mut state, &eligible, ghost), ghost, "a ledger with no stale record closes the gate");
+        state.send_ledger[0] = ledger;
+        assert_ne!(fresh_first_dispatch(&mut state, &eligible, ghost), ghost);
+
+        let mut fresh_only = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        let a = queue_record(&mut fresh_only, 0, 1, 0, 0.9);
+        queue_record(&mut fresh_only, 0, 1, 0, 0.1);
+        fresh_only.fresh_first.enabled = true;
+        assert_eq!(fresh_first_dispatch(&mut fresh_only, &[a, a + 1], a), a, "two fresh records are not a contest");
+    }
+
+    /// The swap takes no draw: after the within-queue selection a treated
+    /// step and an untreated one leave the generator at the same position.
+    #[test]
+    fn the_treated_step_reads_the_same_random_sequence_as_the_untreated_one() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        let (state, slots) = contested_state();
+        let ghost = slots[0];
+        let eligible: Vec<usize> = (0..state.network_queue.len()).collect();
+        let selector = WithinQueueSelector::Tournament { k: 3 };
+        let mut positions = Vec::new();
+        for treated in [false, true, false, true] {
+            let mut state = state.clone();
+            state.fresh_first.enabled = treated;
+            let mut rng = StdRng::seed_from_u64(77);
+            let (drawn, _) = select_within_queue::<NoHashing, NoFeedback>(
+                &state.network_queue,
+                &eligible,
+                &(),
+                &(),
+                &state,
+                &ResolvedTerms::default(),
+                &selector,
+                &mut rng,
+            );
+            let taken = fresh_first_dispatch(&mut state, &eligible, drawn);
+            if drawn == ghost {
+                assert_eq!(taken != drawn, treated, "only the treated step swaps");
+            } else {
+                assert_eq!(taken, drawn);
+            }
+            positions.push((drawn, rng.next_u64(), rng.next_u64()));
+        }
+        assert!(positions.windows(2).all(|w| w[0] == w[1]), "the halves diverged: {positions:?}");
+        let mut untouched = StdRng::seed_from_u64(77);
+        let mut probe = StdRng::seed_from_u64(77);
+        let mut state = state.clone();
+        state.fresh_first.enabled = true;
+        assert_ne!(fresh_first_dispatch(&mut state, &eligible, ghost), ghost);
+        assert_eq!(probe.next_u64(), untouched.next_u64(), "the swap itself took a draw");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! probe is a single relaxed atomic load.
 
 use crate::simulator::core::steer_terms::{Term, TERMS};
+use crate::simulator::fresh_first;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -88,6 +89,20 @@ static VS_NO_ABSORBER: AtomicU64 = AtomicU64::new(0);
 static VS_SKIPPED_PENDING_PAIR: AtomicU64 = AtomicU64::new(0);
 static VS_VICTIM_CRASHED_HOLDS: AtomicU64 = AtomicU64::new(0);
 static GS_FIRED_RUNS: AtomicU64 = AtomicU64::new(0);
+static FF_SWAPS: AtomicU64 = AtomicU64::new(0);
+static FF_REPEAT_SWAPS: AtomicU64 = AtomicU64::new(0);
+/// How many times a ghost was displaced before it was taken: once, twice,
+/// three times, four or more.
+const FF_HIST_SLOTS: usize = 4;
+static FF_SWAP_COUNT_HIST: [AtomicU64; FF_HIST_SLOTS] = [const { AtomicU64::new(0) }; FF_HIST_SLOTS];
+/// The contested-dispatch census split by the fresh-first half: index 0 is
+/// the control half, index 1 the treated half.
+const FF_HALVES: usize = 2;
+static FF_CONTESTED: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
+static FF_STALE_DRAWN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
+static FF_CONTESTED_DOWN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
+static FF_GHOST_ENTRIES: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
+static FF_OVERTAKEN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
 static RP_PARENTS_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -405,6 +420,8 @@ pub fn set_enabled(on: bool) {
             &VS_SKIPPED_PENDING_PAIR,
             &VS_VICTIM_CRASHED_HOLDS,
             &GS_FIRED_RUNS,
+            &FF_SWAPS,
+            &FF_REPEAT_SWAPS,
             &RW_CLOSED,
             &RW_WIDTH_SUM,
             &RW_MAX,
@@ -439,6 +456,12 @@ pub fn set_enabled(on: bool) {
             .chain(VS_CENSUS_CRASHES.iter())
             .chain(VS_CENSUS_ABSORBED.iter())
             .chain(VS_CENSUS_INFLIGHT.iter())
+            .chain(FF_SWAP_COUNT_HIST.iter())
+            .chain(FF_CONTESTED.iter())
+            .chain(FF_STALE_DRAWN.iter())
+            .chain(FF_CONTESTED_DOWN.iter())
+            .chain(FF_GHOST_ENTRIES.iter())
+            .chain(FF_OVERTAKEN.iter())
             .chain(ACCEPT_DIST.iter().flatten())
             .chain(ACCEPT_DIST_ACTED.iter().flatten())
         {
@@ -1655,6 +1678,70 @@ pub fn record_ghost_signal_run() {
         return;
     }
     GS_FIRED_RUNS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A network step took a remote record while an eligible remote record of
+/// the opposite incarnation class - a ghost against a record of the sender's
+/// current incarnation - from the same sender to the same destination was
+/// present. `stale_drawn` says the draw fell on the ghost; `down` that the
+/// destination was crashed at the time, which the preference leaves alone.
+/// Counted on both halves, and on the treated half before any swap.
+#[inline]
+pub fn record_fresh_first_contest(treated: bool, stale_drawn: bool, down: bool) {
+    if !enabled() {
+        return;
+    }
+    let i = treated as usize;
+    FF_CONTESTED[i].fetch_add(1, Ordering::Relaxed);
+    if stale_drawn {
+        FF_STALE_DRAWN[i].fetch_add(1, Ordering::Relaxed);
+        if down {
+            FF_CONTESTED_DOWN[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A treated run took a fresh rival in place of the drawn ghost; `repeat`
+/// says the same ghost had been displaced before.
+#[inline]
+pub fn record_fresh_first_swap(repeat: bool) {
+    if !enabled() {
+        return;
+    }
+    FF_SWAPS.fetch_add(1, Ordering::Relaxed);
+    if repeat {
+        FF_REPEAT_SWAPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A ghost that had been displaced was finally taken, on a treated run.
+#[inline]
+pub fn record_fresh_first_taken(count: fresh_first::DisplacedCount) {
+    if !enabled() {
+        return;
+    }
+    let slot = match count {
+        fresh_first::DisplacedCount::Once => 0,
+        fresh_first::DisplacedCount::Twice => 1,
+        fresh_first::DisplacedCount::Thrice => 2,
+        fresh_first::DisplacedCount::FourOrMore => 3,
+    };
+    FF_SWAP_COUNT_HIST[slot].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A message entry from a sender's dead incarnation; `overtaken` says its
+/// destination had already taken an entry from the sender's current
+/// incarnation. Counted on both halves.
+#[inline]
+pub fn record_fresh_first_ghost_entry(treated: bool, overtaken: bool) {
+    if !enabled() {
+        return;
+    }
+    let i = treated as usize;
+    FF_GHOST_ENTRIES[i].fetch_add(1, Ordering::Relaxed);
+    if overtaken {
+        FF_OVERTAKEN[i].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A fresh grid-arm run that fired the signal entered its arm's replay corpus.
@@ -3328,6 +3415,81 @@ impl GhostSignalStats {
     }
 }
 
+/// One half of the contested-dispatch census. `contested_dispatches` counts
+/// network steps that took a remote record while an eligible remote record
+/// of the opposite incarnation class from the same sender to the same
+/// destination was present; `stale_drawn` the subset whose draw fell on the
+/// ghost, read before any swap, so its share of `contested_dispatches` is
+/// the coin the draw flips between the two classes; `contested_down` the
+/// stale draws whose destination was crashed, which no swap touches.
+/// `ghost_entries_from_restarted_origin` counts message entries from a
+/// sender's dead incarnation and `overtaken` those whose destination had
+/// already taken an entry from the sender's current incarnation.
+#[derive(Serialize, Debug)]
+pub struct FreshFirstHalfStats {
+    pub contested_dispatches: u64,
+    pub stale_drawn: u64,
+    pub contested_down: u64,
+    pub ghost_entries_from_restarted_origin: u64,
+    pub overtaken: u64,
+}
+
+impl FreshFirstHalfStats {
+    fn read(treated: bool) -> Self {
+        let i = treated as usize;
+        Self {
+            contested_dispatches: FF_CONTESTED[i].load(Ordering::Relaxed),
+            stale_drawn: FF_STALE_DRAWN[i].load(Ordering::Relaxed),
+            contested_down: FF_CONTESTED_DOWN[i].load(Ordering::Relaxed),
+            ghost_entries_from_restarted_origin: FF_GHOST_ENTRIES[i].load(Ordering::Relaxed),
+            overtaken: FF_OVERTAKEN[i].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The census on each half of the fresh-first split.
+#[derive(Serialize, Debug)]
+pub struct FreshFirstCensusStats {
+    pub treated: FreshFirstHalfStats,
+    pub control: FreshFirstHalfStats,
+}
+
+/// The fresh-first dispatch block. `swaps` is the number the mechanism is
+/// read as having fired: treated network steps whose draw fell on a ghost
+/// with a live destination and an eligible fresh rival from the same sender
+/// to the same destination, and that took the rival instead. It equals the
+/// treated half's `stale_drawn` less its `contested_down`. `repeat_swaps` is
+/// the subset whose ghost had been displaced before, and
+/// `swap_count_hist_*` the distribution, over ghosts finally taken, of how
+/// many times each had been displaced.
+#[derive(Serialize, Debug)]
+pub struct FreshFirstStats {
+    pub swaps: u64,
+    pub repeat_swaps: u64,
+    pub swap_count_hist_1: u64,
+    pub swap_count_hist_2: u64,
+    pub swap_count_hist_3: u64,
+    pub swap_count_hist_4plus: u64,
+    pub census: FreshFirstCensusStats,
+}
+
+impl FreshFirstStats {
+    fn read() -> Self {
+        Self {
+            swaps: FF_SWAPS.load(Ordering::Relaxed),
+            repeat_swaps: FF_REPEAT_SWAPS.load(Ordering::Relaxed),
+            swap_count_hist_1: FF_SWAP_COUNT_HIST[0].load(Ordering::Relaxed),
+            swap_count_hist_2: FF_SWAP_COUNT_HIST[1].load(Ordering::Relaxed),
+            swap_count_hist_3: FF_SWAP_COUNT_HIST[2].load(Ordering::Relaxed),
+            swap_count_hist_4plus: FF_SWAP_COUNT_HIST[3].load(Ordering::Relaxed),
+            census: FreshFirstCensusStats {
+                treated: FreshFirstHalfStats::read(true),
+                control: FreshFirstHalfStats::read(false),
+            },
+        }
+    }
+}
+
 /// The replay corpus of the grid arms. `parents_admitted` counts fresh runs
 /// whose prefix entered a corpus; `children` the slots that ran a child,
 /// split into `children_prefix` and `children_plan_only`; `slots_unfilled`
@@ -3425,6 +3587,7 @@ pub struct UtilizationSnapshot {
     pub crash_phase: CrashPhaseStats,
     pub victim_swap: VictimSwapStats,
     pub ghost_signal: GhostSignalStats,
+    pub fresh_first: FreshFirstStats,
     pub replay: ReplayStats,
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
@@ -3619,6 +3782,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         crash_phase: CrashPhaseStats::read(),
         victim_swap: VictimSwapStats::read(),
         ghost_signal: GhostSignalStats::read(),
+        fresh_first: FreshFirstStats::read(),
         replay: ReplayStats::read(),
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),
@@ -3630,6 +3794,48 @@ pub fn snapshot() -> UtilizationSnapshot {
 mod tests {
     use super::*;
     use crate::simulator::config_override;
+
+    #[test]
+    fn fresh_first_counters_land_on_their_half_and_in_their_bucket() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        let before = snapshot().fresh_first;
+        record_fresh_first_contest(true, true, false);
+        record_fresh_first_contest(true, true, true);
+        record_fresh_first_contest(true, false, true);
+        record_fresh_first_contest(false, true, false);
+        record_fresh_first_swap(false);
+        record_fresh_first_swap(true);
+        record_fresh_first_taken(fresh_first::DisplacedCount::Once);
+        record_fresh_first_taken(fresh_first::DisplacedCount::Thrice);
+        record_fresh_first_taken(fresh_first::DisplacedCount::FourOrMore);
+        record_fresh_first_ghost_entry(true, true);
+        record_fresh_first_ghost_entry(false, false);
+        record_fresh_first_ghost_entry(false, true);
+        let after = snapshot().fresh_first;
+        set_enabled(false);
+        record_fresh_first_swap(false);
+        assert_eq!(snapshot().fresh_first.swaps, after.swaps, "a disabled session counted");
+
+        let (t, c) = (&after.census.treated, &after.census.control);
+        let (bt, bc) = (&before.census.treated, &before.census.control);
+        assert_eq!(t.contested_dispatches - bt.contested_dispatches, 3);
+        assert_eq!(t.stale_drawn - bt.stale_drawn, 2);
+        assert_eq!(t.contested_down - bt.contested_down, 1, "a fresh draw at a down destination is not a held-back swap");
+        assert_eq!(c.contested_dispatches - bc.contested_dispatches, 1);
+        assert_eq!(c.stale_drawn - bc.stale_drawn, 1);
+        assert_eq!(c.contested_down - bc.contested_down, 0);
+        assert_eq!(after.swaps - before.swaps, 2);
+        assert_eq!(after.repeat_swaps - before.repeat_swaps, 1);
+        assert_eq!(after.swap_count_hist_1 - before.swap_count_hist_1, 1);
+        assert_eq!(after.swap_count_hist_2 - before.swap_count_hist_2, 0);
+        assert_eq!(after.swap_count_hist_3 - before.swap_count_hist_3, 1);
+        assert_eq!(after.swap_count_hist_4plus - before.swap_count_hist_4plus, 1);
+        assert_eq!(t.ghost_entries_from_restarted_origin - bt.ghost_entries_from_restarted_origin, 1);
+        assert_eq!(t.overtaken - bt.overtaken, 1);
+        assert_eq!(c.ghost_entries_from_restarted_origin - bc.ghost_entries_from_restarted_origin, 2);
+        assert_eq!(c.overtaken - bc.overtaken, 1);
+    }
 
     #[test]
     fn term_counters_reset_and_snapshot() {

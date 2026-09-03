@@ -302,10 +302,12 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     purgatory_config: &PurgatoryConfig,
     partial_fanout_crash_bias: f64,
     retarget_crashes: bool,
+    fresh_first: bool,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
     path_state.state.retarget.enabled = retarget_crashes;
+    path_state.state.fresh_first.enabled = fresh_first;
     let backup = max_iterations;
     let is_probe = run_cap::is_probe(run_id);
     let effective_cap = if is_probe {

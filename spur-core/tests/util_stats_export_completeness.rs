@@ -14,8 +14,8 @@
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, CrashPhaseArmStats,
-    CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, GhostSignalStats,
-    ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
+    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -591,6 +591,82 @@ fn victim_swap_leaves(prefix: &str, v: &VictimSwapStats) -> Vec<(String, Value)>
     out
 }
 
+fn fresh_first_half(m: &mut Marks) -> FreshFirstHalfStats {
+    FreshFirstHalfStats {
+        contested_dispatches: m.int(),
+        stale_drawn: m.int(),
+        contested_down: m.int(),
+        ghost_entries_from_restarted_origin: m.int(),
+        overtaken: m.int(),
+    }
+}
+
+fn fresh_first_half_leaves(prefix: &str, h: &FreshFirstHalfStats) -> Vec<(String, Value)> {
+    let FreshFirstHalfStats {
+        contested_dispatches,
+        stale_drawn,
+        contested_down,
+        ghost_entries_from_restarted_origin,
+        overtaken,
+    } = h;
+    vec![
+        leaf(prefix, "contested_dispatches", *contested_dispatches),
+        leaf(prefix, "stale_drawn", *stale_drawn),
+        leaf(prefix, "contested_down", *contested_down),
+        leaf(
+            prefix,
+            "ghost_entries_from_restarted_origin",
+            *ghost_entries_from_restarted_origin,
+        ),
+        leaf(prefix, "overtaken", *overtaken),
+    ]
+}
+
+fn fresh_first(m: &mut Marks) -> FreshFirstStats {
+    FreshFirstStats {
+        swaps: m.int(),
+        repeat_swaps: m.int(),
+        swap_count_hist_1: m.int(),
+        swap_count_hist_2: m.int(),
+        swap_count_hist_3: m.int(),
+        swap_count_hist_4plus: m.int(),
+        census: FreshFirstCensusStats {
+            treated: fresh_first_half(m),
+            control: fresh_first_half(m),
+        },
+    }
+}
+
+fn fresh_first_leaves(prefix: &str, f: &FreshFirstStats) -> Vec<(String, Value)> {
+    let FreshFirstStats {
+        swaps,
+        repeat_swaps,
+        swap_count_hist_1,
+        swap_count_hist_2,
+        swap_count_hist_3,
+        swap_count_hist_4plus,
+        census,
+    } = f;
+    let FreshFirstCensusStats { treated, control } = census;
+    let mut out = vec![
+        leaf(prefix, "swaps", *swaps),
+        leaf(prefix, "repeat_swaps", *repeat_swaps),
+        leaf(prefix, "swap_count_hist_1", *swap_count_hist_1),
+        leaf(prefix, "swap_count_hist_2", *swap_count_hist_2),
+        leaf(prefix, "swap_count_hist_3", *swap_count_hist_3),
+        leaf(prefix, "swap_count_hist_4plus", *swap_count_hist_4plus),
+    ];
+    out.extend(fresh_first_half_leaves(
+        &format!("{prefix}.census.treated"),
+        treated,
+    ));
+    out.extend(fresh_first_half_leaves(
+        &format!("{prefix}.census.control"),
+        control,
+    ));
+    out
+}
+
 fn ghost_signal(m: &mut Marks) -> GhostSignalStats {
     GhostSignalStats {
         fired_runs: m.int(),
@@ -704,6 +780,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         crash_phase: _,
         victim_swap: _,
         ghost_signal: _,
+        fresh_first: _,
         replay: _,
         timer_context: _,
         timeline_keys: _,
@@ -738,6 +815,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "crash_phase",
         "victim_swap",
         "ghost_signal",
+        "fresh_first",
         "replay",
         "timer_context",
         "timeline_keys",
@@ -807,6 +885,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.crash_phase = crash_phase(&mut m);
     s.victim_swap = victim_swap(&mut m);
     s.ghost_signal = ghost_signal(&mut m);
+    s.fresh_first = fresh_first(&mut m);
     s.replay = replay(&mut m);
     s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
@@ -820,6 +899,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(crash_phase_leaves("crash_phase", &s.crash_phase));
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
     expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
+    expected.extend(fresh_first_leaves("fresh_first", &s.fresh_first));
     expected.extend(replay_leaves("replay", &s.replay));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
@@ -859,6 +939,7 @@ fn every_counter_field_reaches_the_written_json() {
         "crash_phase",
         "victim_swap",
         "ghost_signal",
+        "fresh_first",
         "replay",
         "timer_context",
     ] {

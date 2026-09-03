@@ -15,6 +15,7 @@
 
 use crate::simulator::crash_phase;
 use crate::simulator::fault_timing;
+use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
 use crate::simulator::replay_corpus;
 use crate::simulator::run_cap;
@@ -46,6 +47,10 @@ pub const REPLAY_SLOT: i32 = 1 << 20;
 /// A replay slot whose child replays the parent's schedule prefix rather
 /// than only its plan. Joined by the arm like `REPLAY_SLOT`.
 pub const REPLAY_PREFIX: i32 = 1 << 21;
+/// At a network step whose draw fell on a record from a sender's dead
+/// incarnation, the run takes instead an eligible record from that sender's
+/// current incarnation to the same destination.
+pub const FRESH_FIRST_PAIR: i32 = 1 << 24;
 
 /// The whole tag: what the run id selected, plus what the run did.
 pub fn of(run_id: i64, crash_hold_drawn: bool) -> i32 {
@@ -69,6 +74,9 @@ pub fn from_run_id(run_id: i64) -> i32 {
     }
     if ghost_absorber::is_treated(run_id) {
         v |= GHOST_ABSORBER_RETARGET;
+    }
+    if fresh_first::is_treated(run_id) {
+        v |= FRESH_FIRST_PAIR;
     }
     v
 }
@@ -106,6 +114,7 @@ mod tests {
             );
             assert_eq!(v & CRASH_PHASE != 0, crash_phase::is_anchored(id));
             assert_eq!(v & GHOST_ABSORBER_RETARGET != 0, ghost_absorber::is_treated(id));
+            assert_eq!(v & FRESH_FIRST_PAIR != 0, fresh_first::is_treated(id));
             assert_eq!(v & CRASH_HOLD_DRAWN, 0, "the acted bit is not an id bit");
             assert_eq!(of(id, true), v | CRASH_HOLD_DRAWN);
             assert_eq!(of(id, false), v);
@@ -176,6 +185,19 @@ mod tests {
             .count();
         assert!(retargeted > 0 && retargeted < 64_000, "the retarget split leaves no contrast");
         assert_eq!(retargeted_probes, 0, "a run-cap probe must never be retargeted");
+        let fresh_first_runs = (0..64_000i64)
+            .filter(|&id| from_run_id(id) & FRESH_FIRST_PAIR != 0)
+            .count();
+        let fresh_first_probes = (0..64_000i64)
+            .filter(|&id| {
+                from_run_id(id) & (FRESH_FIRST_PAIR | RUN_CAP_PROBE) == FRESH_FIRST_PAIR | RUN_CAP_PROBE
+            })
+            .count();
+        assert!(
+            fresh_first_runs > 0 && fresh_first_runs < 64_000,
+            "the fresh-first split leaves no contrast"
+        );
+        assert_eq!(fresh_first_probes, 0, "a run-cap probe must never prefer fresh records");
         assert!(ordinary_stock > 0, "no stock run that is not a probe, so there is no control");
     }
 }
