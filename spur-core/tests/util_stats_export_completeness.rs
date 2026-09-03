@@ -13,7 +13,9 @@
 
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
-    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, CrashPhaseArmStats,
+    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, ClientAnchorCensusStats,
+    ClientAnchorHalfStats, ClientAnchorHeldHist, ClientAnchorReleaseStats, ClientAnchorStats,
+    CrashCensusStats, CrashPhaseArmStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
     FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderHalfStats, PairOrderStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
@@ -796,6 +798,117 @@ fn pair_order_leaves(prefix: &str, p: &PairOrderStats) -> Vec<(String, Value)> {
     out
 }
 
+fn client_anchor_half(m: &mut Marks) -> ClientAnchorHalfStats {
+    ClientAnchorHalfStats {
+        runs: m.int(),
+        completed_runs: m.int(),
+        population: m.int(),
+        fanout_windows: m.int(),
+        post_fault_invocations: m.int(),
+        in_window_invocations: m.int(),
+    }
+}
+
+fn client_anchor_half_leaves(prefix: &str, h: &ClientAnchorHalfStats) -> Vec<(String, Value)> {
+    let ClientAnchorHalfStats {
+        runs,
+        completed_runs,
+        population,
+        fanout_windows,
+        post_fault_invocations,
+        in_window_invocations,
+    } = h;
+    vec![
+        leaf(prefix, "runs", *runs),
+        leaf(prefix, "completed_runs", *completed_runs),
+        leaf(prefix, "population", *population),
+        leaf(prefix, "fanout_windows", *fanout_windows),
+        leaf(prefix, "post_fault_invocations", *post_fault_invocations),
+        leaf(prefix, "in_window_invocations", *in_window_invocations),
+    ]
+}
+
+fn client_anchor(m: &mut Marks) -> ClientAnchorStats {
+    ClientAnchorStats {
+        held: m.int(),
+        released: ClientAnchorReleaseStats {
+            anchor: m.int(),
+            anchor_first: m.int(),
+            anchor_second_or_later: m.int(),
+            write: m.int(),
+            read: m.int(),
+            rmw: m.int(),
+            expiry: m.int(),
+            dry_queue: m.int(),
+        },
+        held_at_first_firing: ClientAnchorHeldHist {
+            zero: m.int(),
+            one: m.int(),
+            two: m.int(),
+            three_plus: m.int(),
+        },
+        held_at_exit: m.int(),
+        runs_with_held_at_exit: m.int(),
+        hold_steps_sum: m.int(),
+        census: ClientAnchorCensusStats {
+            treated: client_anchor_half(m),
+            control: client_anchor_half(m),
+        },
+    }
+}
+
+fn client_anchor_leaves(prefix: &str, c: &ClientAnchorStats) -> Vec<(String, Value)> {
+    let ClientAnchorStats {
+        held,
+        released,
+        held_at_first_firing,
+        held_at_exit,
+        runs_with_held_at_exit,
+        hold_steps_sum,
+        census,
+    } = c;
+    let ClientAnchorReleaseStats {
+        anchor,
+        anchor_first,
+        anchor_second_or_later,
+        write,
+        read,
+        rmw,
+        expiry,
+        dry_queue,
+    } = released;
+    let ClientAnchorHeldHist {
+        zero,
+        one,
+        two,
+        three_plus,
+    } = held_at_first_firing;
+    let ClientAnchorCensusStats { treated, control } = census;
+    let r = format!("{prefix}.released");
+    let h = format!("{prefix}.held_at_first_firing");
+    let mut out = vec![
+        leaf(prefix, "held", *held),
+        leaf(&r, "anchor", *anchor),
+        leaf(&r, "anchor_first", *anchor_first),
+        leaf(&r, "anchor_second_or_later", *anchor_second_or_later),
+        leaf(&r, "write", *write),
+        leaf(&r, "read", *read),
+        leaf(&r, "rmw", *rmw),
+        leaf(&r, "expiry", *expiry),
+        leaf(&r, "dry_queue", *dry_queue),
+        leaf(&h, "zero", *zero),
+        leaf(&h, "one", *one),
+        leaf(&h, "two", *two),
+        leaf(&h, "three_plus", *three_plus),
+        leaf(prefix, "held_at_exit", *held_at_exit),
+        leaf(prefix, "runs_with_held_at_exit", *runs_with_held_at_exit),
+        leaf(prefix, "hold_steps_sum", *hold_steps_sum),
+    ];
+    out.extend(client_anchor_half_leaves(&format!("{prefix}.census.treated"), treated));
+    out.extend(client_anchor_half_leaves(&format!("{prefix}.census.control"), control));
+    out
+}
+
 fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
     let UtilizationSnapshot {
         rng_streams: _,
@@ -828,6 +941,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         ghost_signal: _,
         fresh_first: _,
         pair_order: _,
+        client_anchor: _,
         replay: _,
         timer_context: _,
         timeline_keys: _,
@@ -864,6 +978,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "ghost_signal",
         "fresh_first",
         "pair_order",
+        "client_anchor",
         "replay",
         "timer_context",
         "timeline_keys",
@@ -935,6 +1050,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.ghost_signal = ghost_signal(&mut m);
     s.fresh_first = fresh_first(&mut m);
     s.pair_order = pair_order(&mut m);
+    s.client_anchor = client_anchor(&mut m);
     s.replay = replay(&mut m);
     s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
@@ -950,6 +1066,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
     expected.extend(fresh_first_leaves("fresh_first", &s.fresh_first));
     expected.extend(pair_order_leaves("pair_order", &s.pair_order));
+    expected.extend(client_anchor_leaves("client_anchor", &s.client_anchor));
     expected.extend(replay_leaves("replay", &s.replay));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
@@ -991,6 +1108,7 @@ fn every_counter_field_reaches_the_written_json() {
         "ghost_signal",
         "fresh_first",
         "pair_order",
+        "client_anchor",
         "replay",
         "timer_context",
     ] {

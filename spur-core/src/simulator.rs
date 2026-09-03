@@ -1,5 +1,6 @@
 pub mod config_override;
 mod core;
+pub mod client_anchor;
 pub mod crash_phase;
 mod coverage;
 mod curriculum;

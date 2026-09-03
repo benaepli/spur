@@ -13,6 +13,7 @@
 //! run acted is a separate fact from whether it was selected, so no single
 //! label could name what a run was.
 
+use crate::simulator::client_anchor;
 use crate::simulator::crash_phase;
 use crate::simulator::fault_timing;
 use crate::simulator::fresh_first;
@@ -42,6 +43,10 @@ pub const CRASH_PHASE: i32 = 1 << 9;
 /// sender to the same destination, sent by the same incarnation, with the
 /// lowest send ordinal.
 pub const PAIR_SEND_ORDER: i32 = 1 << 15;
+/// The run holds client requests that become ready after its first crash
+/// and issues one at the step after a server answers an acted fault-crossing
+/// delivery with a full fan-out still in the air.
+pub const CLIENT_FANOUT_RELEASE: i32 = 1 << 18;
 /// The run's planned crashes move to the live node that last took a
 /// delivery whose sender was down or had restarted since sending.
 pub const GHOST_ABSORBER_RETARGET: i32 = 1 << 19;
@@ -87,6 +92,9 @@ pub fn from_run_id(run_id: i64) -> i32 {
     if pair_order::is_treated(run_id) {
         v |= PAIR_SEND_ORDER;
     }
+    if client_anchor::is_treated(run_id) {
+        v |= CLIENT_FANOUT_RELEASE;
+    }
     v
 }
 
@@ -125,6 +133,7 @@ mod tests {
             assert_eq!(v & GHOST_ABSORBER_RETARGET != 0, ghost_absorber::is_treated(id));
             assert_eq!(v & FRESH_FIRST_PAIR != 0, fresh_first::is_treated(id));
             assert_eq!(v & PAIR_SEND_ORDER != 0, pair_order::is_treated(id));
+            assert_eq!(v & CLIENT_FANOUT_RELEASE != 0, client_anchor::is_treated(id));
             assert_eq!(v & CRASH_HOLD_DRAWN, 0, "the acted bit is not an id bit");
             assert_eq!(of(id, true), v | CRASH_HOLD_DRAWN);
             assert_eq!(of(id, false), v);
@@ -222,6 +231,20 @@ mod tests {
             "the pair-order split leaves no contrast"
         );
         assert_eq!(pair_order_probes, 0, "a probe must never take records in send order");
+        let anchor_runs = (0..64_000i64)
+            .filter(|&id| from_run_id(id) & CLIENT_FANOUT_RELEASE != 0)
+            .count();
+        let anchor_probes = (0..64_000i64)
+            .filter(|&id| {
+                let v = from_run_id(id);
+                v & CLIENT_FANOUT_RELEASE != 0 && v & (RUN_CAP_PROBE | TIMER_STEER_OFF) != 0
+            })
+            .count();
+        assert!(
+            anchor_runs > 0 && anchor_runs < 64_000,
+            "the client-anchor split leaves no contrast"
+        );
+        assert_eq!(anchor_probes, 0, "a probe must never hold client requests");
         assert!(ordinary_stock > 0, "no stock run that is not a probe, so there is no control");
     }
 }

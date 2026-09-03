@@ -7,6 +7,7 @@ use crate::simulator::core::{
     RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, WithinQueueSelector,
     make_local_env, schedule_runnable,
 };
+use crate::simulator::client_anchor::{self, HoldQueue, Released};
 use crate::simulator::crash_phase;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
@@ -19,7 +20,9 @@ use crate::simulator::pair_order as pair_order_split;
 use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
-use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunExtension, RunTermination};
+use crate::simulator::util_stats::{
+    self, ClientAnchorKind, DeliveryBias, RunEnd, RunExtension, RunTermination,
+};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
@@ -208,6 +211,109 @@ fn schedule_client_op<H: HashPolicy>(
     Ok(())
 }
 
+fn validate_node<H: HashPolicy>(
+    state: &State<H>,
+    index: usize,
+    expected_role: NameId,
+) -> Result<NodeId, RuntimeError> {
+    if index >= state.nodes.len() {
+        return Err(RuntimeError::IndexOutOfBounds {
+            index,
+            len: state.nodes.len(),
+        });
+    }
+    let node_val = state.nodes[index].get(0);
+    let node_id = node_val.as_node()?;
+    if node_id.role != expected_role {
+        return Err(RuntimeError::TypeError {
+            expected: "node with correct role",
+            got: "node with incorrect role",
+        });
+    }
+    Ok(node_id)
+}
+
+fn client_op_kind(op_spec: &ClientOpSpec) -> ClientAnchorKind {
+    match op_spec {
+        ClientOpSpec::Write(..) => ClientAnchorKind::Write,
+        ClientOpSpec::Read(..) => ClientAnchorKind::Read,
+        ClientOpSpec::Rmw(..) => ClientAnchorKind::Rmw,
+    }
+}
+
+/// Hand the planned client request at `plan_node` to a client node. The
+/// invocation is recorded at the current step, so a request the run held
+/// back is recorded when it is issued, not when the plan made it ready.
+fn invoke_client_request<H: HashPolicy, F: Feedback>(
+    path_state: &mut PathState<H, F>,
+    program: &Program,
+    snapshot: &F::Snapshot,
+    policy: &SchedulePolicy,
+    purgatory_config: &PurgatoryConfig,
+    server_role: NameId,
+    plan_node: NodeIndex,
+    op_spec: &ClientOpSpec,
+    in_progress: &mut HashMap<i32, NodeIndex>,
+    op_id_counter: &mut i32,
+    rng: &mut impl StreamRng,
+) -> Result<(), RuntimeError> {
+    *op_id_counter += 1;
+    in_progress.insert(*op_id_counter, plan_node);
+    util_stats::record_client_op_invoked();
+
+    // Get a client node from the pool (creates one if needed)
+    let (client_node_id, is_new) = path_state.client_pool.get(&mut path_state.state);
+
+    if is_new && let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
+        let mut env = make_local_env(
+            init_fn,
+            vec![],
+            &Env::<H>::default(),
+            &path_state.state.nodes[client_node_id.index],
+            &program.id_to_name,
+        );
+        if let Err(e) = crate::simulator::core::exec_sync_on_node::<H, _, F>(
+            &mut path_state.state,
+            &mut path_state.logs,
+            program,
+            &mut env,
+            client_node_id,
+            init_fn.entry,
+            snapshot,
+            &mut path_state.feedback,
+            policy,
+            purgatory_config,
+            rng,
+        ) {
+            log::warn!(
+                "Failed to initialize dynamic client node {}: {}",
+                client_node_id,
+                e
+            );
+        }
+    }
+
+    // Validate target server in op_spec
+    let target_idx = match op_spec {
+        ClientOpSpec::Write(t, _) => *t as usize,
+        ClientOpSpec::Read(t, _) => *t as usize,
+        ClientOpSpec::Rmw(t, _) => *t as usize,
+    };
+    validate_node(&path_state.state, target_idx, server_role)?;
+
+    schedule_client_op(
+        &mut path_state.state,
+        &mut path_state.history,
+        program,
+        *op_id_counter,
+        op_spec,
+        client_node_id,
+        server_role,
+        policy,
+        rng,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunOutcome {
     Completed { steps: i32 },
@@ -305,12 +411,19 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     retarget_crashes: bool,
     fresh_first: bool,
     pair_order: bool,
+    client_anchor: bool,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
     path_state.state.retarget.enabled = retarget_crashes;
     path_state.state.fresh_first.enabled = fresh_first;
     path_state.state.pair_order.enabled = pair_order;
+    path_state.state.client_anchor.enabled = client_anchor;
+    let anchored = client_anchor;
+    // Client requests that became ready after the run's first crash and are
+    // waiting for a fan-out window, and the last step at which one opened.
+    let mut held: HoldQueue<(NodeIndex, ClientOpSpec)> = HoldQueue::default();
+    let mut last_window_step: Option<i32> = None;
     let census = util_stats::enabled() && pair_order_split::is_census_run(run_id);
     path_state.state.pair_order.census = census;
     if census {
@@ -391,31 +504,10 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         .map(|(id, _)| *id)
         .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
 
-    let validate_node = |state: &State<H>,
-                         index: usize,
-                         expected_role: NameId,
-                         _role_name: &str|
-     -> Result<NodeId, RuntimeError> {
-        if index >= state.nodes.len() {
-            return Err(RuntimeError::IndexOutOfBounds {
-                index,
-                len: state.nodes.len(),
-            });
-        }
-        let node_val = state.nodes[index].get(0);
-        let node_id = node_val.as_node()?;
-        if node_id.role != expected_role {
-            return Err(RuntimeError::TypeError {
-                expected: "node with correct role",
-                got: "node with incorrect role",
-            });
-        }
-        Ok(node_id)
-    };
-
     for step in 0..effective_cap {
         if engine.is_complete() {
             info!("Plan {} completed in {} steps", run_id, step);
+            util_stats::record_client_anchor_run_end(anchored, true, held.pending());
             record_termination(
                 RunEnd::PlanComplete,
                 run_id,
@@ -446,10 +538,25 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             .map(|(idx, e)| (idx, e.clone()))
             .collect();
 
+        // Requests a window set aside for this step, then any whose wait ran
+        // past expiry. When nothing else in the run can move, the earliest
+        // held request is issued now instead, so a held request never leaves
+        // a run idle or reads as a deadlock.
+        let mut due: Vec<Released<(NodeIndex, ClientOpSpec)>> = held.take_due(step);
         if ready_events.is_empty()
             && path_state.state.all_queues_empty()
+            && due.is_empty()
+            && let Some(dry) = held.take_dry()
+        {
+            due.push(dry);
+        }
+
+        if ready_events.is_empty()
+            && path_state.state.all_queues_empty()
+            && due.is_empty()
             && !in_progress.is_empty()
         {
+            util_stats::record_client_anchor_run_end(anchored, false, held.pending());
             warn!(
                 "Plan {} deadlocked at step {}: {} client op(s) will never complete",
                 run_id, step, in_progress.len()
@@ -474,72 +581,64 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             });
         }
 
+        let in_window = last_window_step == Some(step - 1);
+        for released in due {
+            let (plan_node, op_spec) = released.item;
+            util_stats::record_client_anchor_release(
+                released.release,
+                client_op_kind(&op_spec),
+                (step - released.ready_step).max(0) as u64,
+            );
+            util_stats::record_client_anchor_post_fault_invocation(anchored, in_window);
+            invoke_client_request(
+                path_state,
+                &program,
+                snapshot,
+                policy,
+                purgatory_config,
+                server_role,
+                plan_node,
+                &op_spec,
+                &mut in_progress,
+                &mut op_id_counter,
+                rng,
+            )?;
+        }
+
         for (node_idx, event) in ready_events {
             match &event.action {
                 EventAction::ClientRequest(op_spec) => {
-                    op_id_counter += 1;
-                    in_progress.insert(op_id_counter, node_idx);
-                    util_stats::record_client_op_invoked();
-
-                    // Get a client node from the pool (creates one if needed)
-                    let (client_node_id, is_new) =
-                        path_state.client_pool.get(&mut path_state.state);
-
-                    if is_new
-                        && let Some(init_fn) =
-                            program.get_func_by_name("ClientInterface.BASE_NODE_INIT")
-                        {
-                            let mut env = make_local_env(
-                                init_fn,
-                                vec![],
-                                &Env::<H>::default(),
-                                &path_state.state.nodes[client_node_id.index],
-                                &program.id_to_name,
-                            );
-                            if let Err(e) = crate::simulator::core::exec_sync_on_node::<H, _, F>(
-                                &mut path_state.state,
-                                &mut path_state.logs,
-                                &program,
-                                &mut env,
-                                client_node_id,
-                                init_fn.entry,
-                                snapshot,
-                                &mut path_state.feedback,
-                                policy,
-                                purgatory_config,
-                                rng,
-                            ) {
-                                log::warn!(
-                                    "Failed to initialize dynamic client node {}: {}",
-                                    client_node_id,
-                                    e
-                                );
-                            }
-                        }
-
-                    // Validate target server in op_spec
-                    let target_idx = match op_spec {
-                        ClientOpSpec::Write(t, _) => *t as usize,
-                        ClientOpSpec::Read(t, _) => *t as usize,
-                        ClientOpSpec::Rmw(t, _) => *t as usize,
-                    };
-                    validate_node(&path_state.state, target_idx, server_role, "Node")?;
-
-                    schedule_client_op(
-                        &mut path_state.state,
-                        &mut path_state.history,
+                    // A request that becomes ready once a crash has happened
+                    // is the population the hold applies to; on the treated
+                    // half it waits, on the control half it is issued now.
+                    let post_fault = !crashed_nodes.is_empty();
+                    if post_fault {
+                        util_stats::record_client_anchor_post_fault_request(anchored);
+                    }
+                    if post_fault && anchored {
+                        held.hold((node_idx, op_spec.clone()), step);
+                        continue;
+                    }
+                    if post_fault {
+                        util_stats::record_client_anchor_post_fault_invocation(anchored, in_window);
+                    }
+                    invoke_client_request(
+                        path_state,
                         &program,
-                        op_id_counter,
-                        op_spec,
-                        client_node_id,
-                        server_role,
+                        snapshot,
                         policy,
+                        purgatory_config,
+                        server_role,
+                        node_idx,
+                        op_spec,
+                        &mut in_progress,
+                        &mut op_id_counter,
                         rng,
                     )?;
                 }
                 EventAction::CrashNode(node_id) => {
                     let nid =
-                        validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
+                        validate_node(&path_state.state, *node_id as usize, server_role)?;
                     path_state.state.push_runnable(Runnable::Crash {
                         node_id: nid,
                         priority: policy.sample(rng, RunnableCategory::Crash),
@@ -570,7 +669,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 }
                 EventAction::RecoverNode(node_id) => {
                     let nid =
-                        validate_node(&path_state.state, *node_id as usize, server_role, "Node")?;
+                        validate_node(&path_state.state, *node_id as usize, server_role)?;
                     let target = victim_remap.remove(&nid.index).unwrap_or(nid);
                     path_state.state.push_runnable(Runnable::Recover {
                         node_id: target,
@@ -798,6 +897,25 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             }
         }
 
+        // A window opens when this step's dispatch left a server that took an
+        // acted fault-crossing delivery with its full fan-out still in the
+        // air; a treated run then sets one held request aside for the next
+        // step.
+        if client_anchor::fanout_window(
+            &path_state.state.send_ledger,
+            topology.num_servers.max(0) as usize,
+            step,
+        ) {
+            util_stats::record_client_anchor_window(anchored);
+            last_window_step = Some(step);
+            if anchored {
+                let firing = held.fire();
+                if firing.first {
+                    util_stats::record_client_anchor_first_window(firing.held);
+                }
+            }
+        }
+
         // Only scan new history entries added during this step
         let completed: Vec<i32> = path_state.history[history_start_len..]
             .iter()
@@ -840,6 +958,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         }
     }
 
+    util_stats::record_client_anchor_run_end(anchored, false, held.pending());
     if effective_cap < backup {
         record_termination(
             RunEnd::LearnedCapReached,
@@ -877,4 +996,96 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     Ok(RunOutcome::IterationsExhausted {
         outstanding_events: engine.outstanding_count(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulator::feedback::NoFeedback;
+    use crate::simulator::hash_utils::NoHashing;
+    use crate::simulator::rng::{LiveRng, RecRng, RngSource, StreamSet};
+
+    const SPEC: &str = include_str!("../../tests/fixtures/canchor.spur");
+
+    fn role(program: &Program, name: &str) -> NameId {
+        program
+            .roles
+            .iter()
+            .find(|(_, n)| n == name)
+            .map(|(id, _)| *id)
+            .expect("the fixture declares the role")
+    }
+
+    /// A request held at one step and set aside by a window at a later step
+    /// gets its invocation row, operation id and client record only at the
+    /// step it is issued.
+    #[test]
+    fn a_held_request_is_recorded_at_the_step_it_is_issued() {
+        let program = crate::compiler::compile(SPEC, "canchor.spur")
+            .into_program()
+            .expect("the fixture compiles");
+        let server_role = role(&program, "Node");
+        let client_role = role(&program, "ClientInterface");
+        let mut path_state = PathState::<NoHashing, NoFeedback>::new(
+            &[(server_role, 3)],
+            program.max_node_slots as usize,
+            client_role,
+        );
+        let policy = SchedulePolicy::default();
+        let purgatory = PurgatoryConfig::default();
+        let mut inner = StreamSet::new(7, true);
+        let mut tape = <LiveRng as RngSource>::new_tape(None);
+        let mut rng = RecRng::<LiveRng> {
+            tape: &mut tape,
+            inner: &mut inner,
+        };
+        let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
+        let mut op_id = 0i32;
+        let mut held: HoldQueue<(NodeIndex, ClientOpSpec)> = HoldQueue::default();
+
+        path_state.state.crash_info.current_step = 3;
+        held.hold((NodeIndex::new(4), ClientOpSpec::Write(1, "k".into())), 3);
+        assert!(path_state.history.is_empty(), "holding writes no row");
+        assert_eq!(path_state.state.total_runnable_count(), 0);
+
+        path_state.state.crash_info.current_step = 5;
+        assert!(held.take_due(5).is_empty());
+        assert!(held.fire().released, "the window sets the request aside");
+        assert!(path_state.history.is_empty(), "the window itself writes no row");
+
+        path_state.state.crash_info.current_step = 6;
+        let due = held.take_due(6);
+        assert_eq!(due.len(), 1);
+        for released in due {
+            let (plan_node, spec) = released.item;
+            assert_eq!(released.ready_step, 3);
+            invoke_client_request(
+                &mut path_state,
+                &program,
+                &(),
+                &policy,
+                &purgatory,
+                server_role,
+                plan_node,
+                &spec,
+                &mut in_progress,
+                &mut op_id,
+                &mut rng,
+            )
+            .expect("the request is issued");
+        }
+        assert_eq!(path_state.history.len(), 1);
+        let row = &path_state.history[0];
+        assert_eq!(row.step, 6, "the invocation row carries the issue step");
+        assert!(matches!(row.kind, OpKind::Invocation));
+        assert_eq!(row.op_action, "ClientInterface.Write");
+        assert_eq!(row.unique_id, 1);
+        assert_eq!(in_progress.get(&1), Some(&NodeIndex::new(4)));
+        assert_eq!(
+            path_state.state.total_runnable_count(),
+            1,
+            "the client record is queued when the request is issued"
+        );
+        assert!(held.is_empty());
+    }
 }

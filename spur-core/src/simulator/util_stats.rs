@@ -6,6 +6,7 @@
 //! probe is a single relaxed atomic load.
 
 use crate::simulator::core::steer_terms::{Term, TERMS};
+use crate::simulator::client_anchor;
 use crate::simulator::fresh_first;
 use serde::Serialize;
 use std::cell::RefCell;
@@ -112,6 +113,32 @@ static PO_PAIR_ENTRIES: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; P
 static PO_INVERSIONS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
 static PO_SAMPLED_RUNS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
 static PO_CORRECTED: AtomicU64 = AtomicU64::new(0);
+/// The client-anchor census split by its half: index 0 is the control half,
+/// index 1 the treated half.
+const CAN_HALVES: usize = 2;
+static CAN_RUNS: [AtomicU64; CAN_HALVES] = [const { AtomicU64::new(0) }; CAN_HALVES];
+static CAN_COMPLETED_RUNS: [AtomicU64; CAN_HALVES] = [const { AtomicU64::new(0) }; CAN_HALVES];
+static CAN_POPULATION: [AtomicU64; CAN_HALVES] = [const { AtomicU64::new(0) }; CAN_HALVES];
+static CAN_FANOUT_WINDOWS: [AtomicU64; CAN_HALVES] = [const { AtomicU64::new(0) }; CAN_HALVES];
+static CAN_POST_FAULT_INVOCATIONS: [AtomicU64; CAN_HALVES] =
+    [const { AtomicU64::new(0) }; CAN_HALVES];
+static CAN_IN_WINDOW_INVOCATIONS: [AtomicU64; CAN_HALVES] =
+    [const { AtomicU64::new(0) }; CAN_HALVES];
+static CAN_HELD: AtomicU64 = AtomicU64::new(0);
+static CAN_RELEASED_ANCHOR: AtomicU64 = AtomicU64::new(0);
+static CAN_RELEASED_ANCHOR_FIRST: AtomicU64 = AtomicU64::new(0);
+static CAN_RELEASED_ANCHOR_LATER: AtomicU64 = AtomicU64::new(0);
+static CAN_RELEASED_WRITE: AtomicU64 = AtomicU64::new(0);
+static CAN_RELEASED_READ: AtomicU64 = AtomicU64::new(0);
+static CAN_RELEASED_RMW: AtomicU64 = AtomicU64::new(0);
+static CAN_RELEASED_EXPIRY: AtomicU64 = AtomicU64::new(0);
+static CAN_RELEASED_DRY_QUEUE: AtomicU64 = AtomicU64::new(0);
+/// Requests held when a treated run's first window opened: none, one, two,
+/// three or more.
+static CAN_HELD_AT_FIRST_FIRING: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static CAN_HELD_AT_EXIT: AtomicU64 = AtomicU64::new(0);
+static CAN_RUNS_WITH_HELD_AT_EXIT: AtomicU64 = AtomicU64::new(0);
+static CAN_HOLD_STEPS_SUM: AtomicU64 = AtomicU64::new(0);
 static RP_PARENTS_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -432,6 +459,18 @@ pub fn set_enabled(on: bool) {
             &FF_SWAPS,
             &FF_REPEAT_SWAPS,
             &PO_CORRECTED,
+            &CAN_HELD,
+            &CAN_RELEASED_ANCHOR,
+            &CAN_RELEASED_ANCHOR_FIRST,
+            &CAN_RELEASED_ANCHOR_LATER,
+            &CAN_RELEASED_WRITE,
+            &CAN_RELEASED_READ,
+            &CAN_RELEASED_RMW,
+            &CAN_RELEASED_EXPIRY,
+            &CAN_RELEASED_DRY_QUEUE,
+            &CAN_HELD_AT_EXIT,
+            &CAN_RUNS_WITH_HELD_AT_EXIT,
+            &CAN_HOLD_STEPS_SUM,
             &RW_CLOSED,
             &RW_WIDTH_SUM,
             &RW_MAX,
@@ -477,6 +516,13 @@ pub fn set_enabled(on: bool) {
             .chain(PO_PAIR_ENTRIES.iter())
             .chain(PO_INVERSIONS.iter())
             .chain(PO_SAMPLED_RUNS.iter())
+            .chain(CAN_RUNS.iter())
+            .chain(CAN_COMPLETED_RUNS.iter())
+            .chain(CAN_POPULATION.iter())
+            .chain(CAN_FANOUT_WINDOWS.iter())
+            .chain(CAN_POST_FAULT_INVOCATIONS.iter())
+            .chain(CAN_IN_WINDOW_INVOCATIONS.iter())
+            .chain(CAN_HELD_AT_FIRST_FIRING.iter())
             .chain(ACCEPT_DIST.iter().flatten())
             .chain(ACCEPT_DIST_ACTED.iter().flatten())
         {
@@ -1813,6 +1859,115 @@ pub fn record_pair_order_census_run(treated: bool) {
         return;
     }
     PO_SAMPLED_RUNS[treated as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A planned client request became ready after the run's first crash.
+/// Counted on both halves; on the treated half the request is held.
+#[inline]
+pub fn record_client_anchor_post_fault_request(treated: bool) {
+    if !enabled() {
+        return;
+    }
+    CAN_POPULATION[treated as usize].fetch_add(1, Ordering::Relaxed);
+    if treated {
+        CAN_HELD.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A step's dispatch left a server that took an acted fault-crossing
+/// delivery with a full fan-out in the air. Counted on both halves.
+#[inline]
+pub fn record_client_anchor_window(treated: bool) {
+    if !enabled() {
+        return;
+    }
+    CAN_FANOUT_WINDOWS[treated as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A client request that became ready after the run's first crash was
+/// issued; `in_window` says the step before was one at which a window
+/// opened. Counted on both halves.
+#[inline]
+pub fn record_client_anchor_post_fault_invocation(treated: bool, in_window: bool) {
+    if !enabled() {
+        return;
+    }
+    let i = treated as usize;
+    CAN_POST_FAULT_INVOCATIONS[i].fetch_add(1, Ordering::Relaxed);
+    if in_window {
+        CAN_IN_WINDOW_INVOCATIONS[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The kind of client request a release issued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientAnchorKind {
+    Write,
+    Read,
+    Rmw,
+}
+
+/// A treated run issued a held request: `release` says why it left the
+/// queue, `hold_steps` how many steps it waited past its ready step.
+#[inline]
+pub fn record_client_anchor_release(
+    release: client_anchor::Release,
+    kind: ClientAnchorKind,
+    hold_steps: u64,
+) {
+    if !enabled() {
+        return;
+    }
+    match release {
+        client_anchor::Release::Anchor { first } => {
+            CAN_RELEASED_ANCHOR.fetch_add(1, Ordering::Relaxed);
+            if first {
+                CAN_RELEASED_ANCHOR_FIRST.fetch_add(1, Ordering::Relaxed);
+            } else {
+                CAN_RELEASED_ANCHOR_LATER.fetch_add(1, Ordering::Relaxed);
+            }
+            match kind {
+                ClientAnchorKind::Write => CAN_RELEASED_WRITE.fetch_add(1, Ordering::Relaxed),
+                ClientAnchorKind::Read => CAN_RELEASED_READ.fetch_add(1, Ordering::Relaxed),
+                ClientAnchorKind::Rmw => CAN_RELEASED_RMW.fetch_add(1, Ordering::Relaxed),
+            };
+        }
+        client_anchor::Release::Expiry => {
+            CAN_RELEASED_EXPIRY.fetch_add(1, Ordering::Relaxed);
+        }
+        client_anchor::Release::DryQueue => {
+            CAN_RELEASED_DRY_QUEUE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    CAN_HOLD_STEPS_SUM.fetch_add(hold_steps, Ordering::Relaxed);
+}
+
+/// A treated run's first window opened with `held` requests waiting.
+#[inline]
+pub fn record_client_anchor_first_window(held: usize) {
+    if !enabled() {
+        return;
+    }
+    CAN_HELD_AT_FIRST_FIRING[held.min(3)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A run ended; `completed` says its plan completed and `held_at_exit` how
+/// many requests were still held, which only a run that ran out of steps can
+/// leave behind.
+#[inline]
+pub fn record_client_anchor_run_end(treated: bool, completed: bool, held_at_exit: usize) {
+    if !enabled() {
+        return;
+    }
+    let i = treated as usize;
+    CAN_RUNS[i].fetch_add(1, Ordering::Relaxed);
+    if completed {
+        CAN_COMPLETED_RUNS[i].fetch_add(1, Ordering::Relaxed);
+    }
+    if held_at_exit > 0 {
+        CAN_HELD_AT_EXIT.fetch_add(held_at_exit as u64, Ordering::Relaxed);
+        CAN_RUNS_WITH_HELD_AT_EXIT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A fresh grid-arm run that fired the signal entered its arm's replay corpus.
@@ -3630,6 +3785,117 @@ impl PairOrderStats {
     }
 }
 
+/// The client-anchor census on one half. `population` counts client requests
+/// that became ready after the run's first crash; `fanout_windows` the steps
+/// whose dispatch left a server that took an acted fault-crossing delivery
+/// with a full fan-out in the air; `post_fault_invocations` the issues of
+/// population requests and `in_window_invocations` those issued at the step
+/// after a window opened. `runs` and `completed_runs` count the half's runs
+/// and the ones whose plan completed.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorHalfStats {
+    pub runs: u64,
+    pub completed_runs: u64,
+    pub population: u64,
+    pub fanout_windows: u64,
+    pub post_fault_invocations: u64,
+    pub in_window_invocations: u64,
+}
+
+impl ClientAnchorHalfStats {
+    fn read(treated: bool) -> Self {
+        let i = treated as usize;
+        Self {
+            runs: CAN_RUNS[i].load(Ordering::Relaxed),
+            completed_runs: CAN_COMPLETED_RUNS[i].load(Ordering::Relaxed),
+            population: CAN_POPULATION[i].load(Ordering::Relaxed),
+            fanout_windows: CAN_FANOUT_WINDOWS[i].load(Ordering::Relaxed),
+            post_fault_invocations: CAN_POST_FAULT_INVOCATIONS[i].load(Ordering::Relaxed),
+            in_window_invocations: CAN_IN_WINDOW_INVOCATIONS[i].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The census on each half of the client-anchor split.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorCensusStats {
+    pub treated: ClientAnchorHalfStats,
+    pub control: ClientAnchorHalfStats,
+}
+
+/// Why held requests were issued on the treated half. `anchor` splits by
+/// whether the window was the run's first and by request kind; `expiry` and
+/// `dry_queue` are the releases that did not wait for a window.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorReleaseStats {
+    pub anchor: u64,
+    pub anchor_first: u64,
+    pub anchor_second_or_later: u64,
+    pub write: u64,
+    pub read: u64,
+    pub rmw: u64,
+    pub expiry: u64,
+    pub dry_queue: u64,
+}
+
+/// Requests held when a treated run's first window opened.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorHeldHist {
+    pub zero: u64,
+    pub one: u64,
+    pub two: u64,
+    pub three_plus: u64,
+}
+
+/// The client-anchor block. `held` is the treated half's population;
+/// `released.anchor` is the number the mechanism is read as having fired:
+/// held requests issued at the step after a window opened. `held_at_exit`
+/// sums the requests still held when a run ended, over
+/// `runs_with_held_at_exit` runs, and `hold_steps_sum` the steps every
+/// released request waited past its ready step.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorStats {
+    pub held: u64,
+    pub released: ClientAnchorReleaseStats,
+    pub held_at_first_firing: ClientAnchorHeldHist,
+    pub held_at_exit: u64,
+    pub runs_with_held_at_exit: u64,
+    pub hold_steps_sum: u64,
+    pub census: ClientAnchorCensusStats,
+}
+
+impl ClientAnchorStats {
+    fn read() -> Self {
+        let hist = |i: usize| CAN_HELD_AT_FIRST_FIRING[i].load(Ordering::Relaxed);
+        Self {
+            held: CAN_HELD.load(Ordering::Relaxed),
+            released: ClientAnchorReleaseStats {
+                anchor: CAN_RELEASED_ANCHOR.load(Ordering::Relaxed),
+                anchor_first: CAN_RELEASED_ANCHOR_FIRST.load(Ordering::Relaxed),
+                anchor_second_or_later: CAN_RELEASED_ANCHOR_LATER.load(Ordering::Relaxed),
+                write: CAN_RELEASED_WRITE.load(Ordering::Relaxed),
+                read: CAN_RELEASED_READ.load(Ordering::Relaxed),
+                rmw: CAN_RELEASED_RMW.load(Ordering::Relaxed),
+                expiry: CAN_RELEASED_EXPIRY.load(Ordering::Relaxed),
+                dry_queue: CAN_RELEASED_DRY_QUEUE.load(Ordering::Relaxed),
+            },
+            held_at_first_firing: ClientAnchorHeldHist {
+                zero: hist(0),
+                one: hist(1),
+                two: hist(2),
+                three_plus: hist(3),
+            },
+            held_at_exit: CAN_HELD_AT_EXIT.load(Ordering::Relaxed),
+            runs_with_held_at_exit: CAN_RUNS_WITH_HELD_AT_EXIT.load(Ordering::Relaxed),
+            hold_steps_sum: CAN_HOLD_STEPS_SUM.load(Ordering::Relaxed),
+            census: ClientAnchorCensusStats {
+                treated: ClientAnchorHalfStats::read(true),
+                control: ClientAnchorHalfStats::read(false),
+            },
+        }
+    }
+}
+
 /// The replay corpus of the grid arms. `parents_admitted` counts fresh runs
 /// whose prefix entered a corpus; `children` the slots that ran a child,
 /// split into `children_prefix` and `children_plan_only`; `slots_unfilled`
@@ -3729,6 +3995,7 @@ pub struct UtilizationSnapshot {
     pub ghost_signal: GhostSignalStats,
     pub fresh_first: FreshFirstStats,
     pub pair_order: PairOrderStats,
+    pub client_anchor: ClientAnchorStats,
     pub replay: ReplayStats,
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
@@ -3925,6 +4192,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         ghost_signal: GhostSignalStats::read(),
         fresh_first: FreshFirstStats::read(),
         pair_order: PairOrderStats::read(),
+        client_anchor: ClientAnchorStats::read(),
         replay: ReplayStats::read(),
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),

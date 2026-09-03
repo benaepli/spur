@@ -1,0 +1,80 @@
+// A node that tells every peer about each write it takes and about each
+// timer firing, and that passes a note it has not seen before on to every
+// peer. A crash of a node routinely leaves its own notes in the air; a peer
+// that consumes one while the sender is down, or after the sender has come
+// back, has taken a fault-crossing delivery, writes state on it, and answers
+// with a note to every peer - a full fan-out from one handler. Each node
+// passes a given number on at most once, so the relay ends.
+//
+// The peer list carries the node itself, and a message a node sends to
+// itself is never in flight, so the loops skip it.
+
+role Node {
+    var db: map<string, int> = {};
+    var seen: int = 0;
+    var me: int = 0;
+    var peers: list<Node> = [];
+
+    fn Init(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Heartbeat();
+    }
+
+    async fn RecoverInit(me_: int, peers_: list<Node>) {
+        me = me_;
+        peers = peers_;
+        Heartbeat();
+    }
+
+    async fn Heartbeat() {
+        for ;; {
+            <- set_timer("beat");
+            seen = seen + 1;
+            for var i = 0; i < len(peers); i = i + 1 {
+                if (i != me) {
+                    peers[i]->Note(seen);
+                }
+            }
+        }
+    }
+
+    async fn Note(n: int) {
+        if (n > seen) {
+            seen = n;
+            for var i = 0; i < len(peers); i = i + 1 {
+                if (i != me) {
+                    peers[i]->Note(n);
+                }
+            }
+        }
+    }
+
+    async fn Write(key: string, uid: int): bool {
+        seen = seen + 1;
+        for var i = 0; i < len(peers); i = i + 1 {
+            if (i != me) {
+                peers[i]->Note(seen);
+            }
+        }
+        db = db[key] := uid;
+        return true;
+    }
+
+    async fn Read(key: string): int {
+        if (exists(db, key)) {
+            return db[key];
+        }
+        return 0;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        <-dest->Write(key, uid);
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

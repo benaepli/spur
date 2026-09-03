@@ -1119,6 +1119,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         crate::simulator::ghost_absorber::is_treated(run_id),
         crate::simulator::fresh_first::is_treated(run_id),
         crate::simulator::pair_order::is_treated(run_id),
+        crate::simulator::client_anchor::is_treated(run_id),
         &mut rec,
     )?;
 
@@ -1433,6 +1434,7 @@ fn run_single_plan<F: Feedback>(
         terms,
         purgatory_config,
         partial_fanout_crash_bias,
+        false,
         false,
         false,
         false,

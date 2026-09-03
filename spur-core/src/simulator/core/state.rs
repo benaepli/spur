@@ -8,6 +8,7 @@ use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
 use crate::simulator::crash_phase;
 use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
+use crate::simulator::client_anchor;
 use crate::simulator::pair_order;
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use crate::simulator::rng::{Stream, StreamRng};
@@ -622,6 +623,10 @@ pub struct State<H: HashPolicy> {
     /// crashed and one destination, and the entry table its census is read
     /// against. Scheduling bookkeeping, excluded from `signature()`.
     pub pair_order: pair_order::RunState,
+    /// Whether this run holds client requests that become ready after its
+    /// first crash for a fan-out window. Scheduling bookkeeping, excluded
+    /// from `signature()`.
+    pub client_anchor: client_anchor::RunState,
     /// Where the once-per-run signal fired, when it did: the step, and the
     /// number of scheduling draws taken by then when the run records its
     /// draws. Observation only, excluded from `signature()`.
@@ -767,6 +772,7 @@ impl<H: HashPolicy> State<H> {
             retarget: ghost_absorber::RunState::default(),
             fresh_first: fresh_first::RunState::default(),
             pair_order: pair_order::RunState::default(),
+            client_anchor: client_anchor::RunState::default(),
             replay_cut: None,
             net_stale_records: 0,
             net_requests: 0,
