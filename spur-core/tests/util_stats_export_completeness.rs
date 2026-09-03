@@ -15,8 +15,9 @@ use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, CrashCensusStats, CrashPhaseArmStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, GhostSignalStats,
-    RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally, TimerContextStats,
-    UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats, VictimSwapStats,
+    ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
+    VictimSwapStats,
 };
 use std::collections::BTreeMap;
 
@@ -601,6 +602,42 @@ fn ghost_signal_leaves(prefix: &str, g: &GhostSignalStats) -> Vec<(String, Value
     vec![leaf(prefix, "fired_runs", *fired_runs)]
 }
 
+fn replay(m: &mut Marks) -> ReplayStats {
+    ReplayStats {
+        parents_admitted: m.int(),
+        children: m.int(),
+        children_prefix: m.int(),
+        children_plan_only: m.int(),
+        slots_unfilled: m.int(),
+        prefix_faithful: m.int(),
+        tape_words_sum: m.int(),
+        children_signal_fired: m.int(),
+    }
+}
+
+fn replay_leaves(prefix: &str, r: &ReplayStats) -> Vec<(String, Value)> {
+    let ReplayStats {
+        parents_admitted,
+        children,
+        children_prefix,
+        children_plan_only,
+        slots_unfilled,
+        prefix_faithful,
+        tape_words_sum,
+        children_signal_fired,
+    } = r;
+    vec![
+        leaf(prefix, "parents_admitted", *parents_admitted),
+        leaf(prefix, "children", *children),
+        leaf(prefix, "children_prefix", *children_prefix),
+        leaf(prefix, "children_plan_only", *children_plan_only),
+        leaf(prefix, "slots_unfilled", *slots_unfilled),
+        leaf(prefix, "prefix_faithful", *prefix_faithful),
+        leaf(prefix, "tape_words_sum", *tape_words_sum),
+        leaf(prefix, "children_signal_fired", *children_signal_fired),
+    ]
+}
+
 fn timer_context(m: &mut Marks) -> TimerContextStats {
     TimerContextStats {
         probe_firings: m.int(),
@@ -667,6 +704,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         crash_phase: _,
         victim_swap: _,
         ghost_signal: _,
+        replay: _,
         timer_context: _,
         timeline_keys: _,
         steer_terms: _,
@@ -700,6 +738,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "crash_phase",
         "victim_swap",
         "ghost_signal",
+        "replay",
         "timer_context",
         "timeline_keys",
         "steer_terms",
@@ -768,6 +807,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.crash_phase = crash_phase(&mut m);
     s.victim_swap = victim_swap(&mut m);
     s.ghost_signal = ghost_signal(&mut m);
+    s.replay = replay(&mut m);
     s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
@@ -780,6 +820,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(crash_phase_leaves("crash_phase", &s.crash_phase));
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
     expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
+    expected.extend(replay_leaves("replay", &s.replay));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
 }
@@ -818,6 +859,7 @@ fn every_counter_field_reaches_the_written_json() {
         "crash_phase",
         "victim_swap",
         "ghost_signal",
+        "replay",
         "timer_context",
     ] {
         let mut actual = BTreeMap::new();

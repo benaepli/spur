@@ -88,6 +88,14 @@ static VS_NO_ABSORBER: AtomicU64 = AtomicU64::new(0);
 static VS_SKIPPED_PENDING_PAIR: AtomicU64 = AtomicU64::new(0);
 static VS_VICTIM_CRASHED_HOLDS: AtomicU64 = AtomicU64::new(0);
 static GS_FIRED_RUNS: AtomicU64 = AtomicU64::new(0);
+static RP_PARENTS_ADMITTED: AtomicU64 = AtomicU64::new(0);
+static RP_CHILDREN: AtomicU64 = AtomicU64::new(0);
+static RP_CHILDREN_PREFIX: AtomicU64 = AtomicU64::new(0);
+static RP_CHILDREN_PLAN_ONLY: AtomicU64 = AtomicU64::new(0);
+static RP_SLOTS_UNFILLED: AtomicU64 = AtomicU64::new(0);
+static RP_PREFIX_FAITHFUL: AtomicU64 = AtomicU64::new(0);
+static RP_TAPE_WORDS_SUM: AtomicU64 = AtomicU64::new(0);
+static RP_CHILDREN_SIGNAL_FIRED: AtomicU64 = AtomicU64::new(0);
 
 /// The crash census split by retarget half: index 0 is the control half,
 /// index 1 the treated half.
@@ -1647,6 +1655,56 @@ pub fn record_ghost_signal_run() {
         return;
     }
     GS_FIRED_RUNS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A fresh grid-arm run that fired the signal entered its arm's replay corpus.
+#[inline]
+pub fn record_replay_parent_admitted() {
+    if !enabled() {
+        return;
+    }
+    RP_PARENTS_ADMITTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A replay slot found its arm's corpus empty and ran fresh.
+#[inline]
+pub fn record_replay_slot_unfilled() {
+    if !enabled() {
+        return;
+    }
+    RP_SLOTS_UNFILLED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A fresh grid-arm run recorded `words` scheduling draws.
+#[inline]
+pub fn record_replay_tape_words(words: u64) {
+    if !enabled() {
+        return;
+    }
+    RP_TAPE_WORDS_SUM.fetch_add(words, Ordering::Relaxed);
+}
+
+/// A replay slot ran a child of a corpus parent. `prefix` says the child
+/// replayed the parent's draws rather than only its plan; `signal_fired`
+/// that the child itself reached the signal; `faithful` that a prefix child
+/// reached it at the parent's own step.
+#[inline]
+pub fn record_replay_child(prefix: bool, signal_fired: bool, faithful: bool) {
+    if !enabled() {
+        return;
+    }
+    RP_CHILDREN.fetch_add(1, Ordering::Relaxed);
+    if prefix {
+        RP_CHILDREN_PREFIX.fetch_add(1, Ordering::Relaxed);
+    } else {
+        RP_CHILDREN_PLAN_ONLY.fetch_add(1, Ordering::Relaxed);
+    }
+    if signal_fired {
+        RP_CHILDREN_SIGNAL_FIRED.fetch_add(1, Ordering::Relaxed);
+    }
+    if faithful {
+        RP_PREFIX_FAITHFUL.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Why a single plan execution stopped.
@@ -3270,6 +3328,41 @@ impl GhostSignalStats {
     }
 }
 
+/// The replay corpus of the grid arms. `parents_admitted` counts fresh runs
+/// whose prefix entered a corpus; `children` the slots that ran a child,
+/// split into `children_prefix` and `children_plan_only`; `slots_unfilled`
+/// the slots that found their corpus empty and ran fresh. The mechanism ran
+/// as intended when `children_prefix` is positive and `prefix_faithful`, the
+/// prefix children that reached the signal at their parent's step, is close
+/// to it; `children_signal_fired` counts every child that reached the signal
+/// at all. `tape_words_sum` is the recording cost every fresh grid run pays.
+#[derive(Serialize, Debug)]
+pub struct ReplayStats {
+    pub parents_admitted: u64,
+    pub children: u64,
+    pub children_prefix: u64,
+    pub children_plan_only: u64,
+    pub slots_unfilled: u64,
+    pub prefix_faithful: u64,
+    pub tape_words_sum: u64,
+    pub children_signal_fired: u64,
+}
+
+impl ReplayStats {
+    fn read() -> Self {
+        Self {
+            parents_admitted: RP_PARENTS_ADMITTED.load(Ordering::Relaxed),
+            children: RP_CHILDREN.load(Ordering::Relaxed),
+            children_prefix: RP_CHILDREN_PREFIX.load(Ordering::Relaxed),
+            children_plan_only: RP_CHILDREN_PLAN_ONLY.load(Ordering::Relaxed),
+            slots_unfilled: RP_SLOTS_UNFILLED.load(Ordering::Relaxed),
+            prefix_faithful: RP_PREFIX_FAITHFUL.load(Ordering::Relaxed),
+            tape_words_sum: RP_TAPE_WORDS_SUM.load(Ordering::Relaxed),
+            children_signal_fired: RP_CHILDREN_SIGNAL_FIRED.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The timer-context block: the learner's probe traffic, the steered rolls
 /// that applied a learned multiplier, the rolls an unsupported selector
 /// excluded, and a gauge of the cells currently engaged. `cells_engaged` is
@@ -3332,6 +3425,7 @@ pub struct UtilizationSnapshot {
     pub crash_phase: CrashPhaseStats,
     pub victim_swap: VictimSwapStats,
     pub ghost_signal: GhostSignalStats,
+    pub replay: ReplayStats,
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
@@ -3525,6 +3619,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         crash_phase: CrashPhaseStats::read(),
         victim_swap: VictimSwapStats::read(),
         ghost_signal: GhostSignalStats::read(),
+        replay: ReplayStats::read(),
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),

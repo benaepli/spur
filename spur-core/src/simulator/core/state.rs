@@ -611,6 +611,10 @@ pub struct State<H: HashPolicy> {
     /// once-per-run signal has been counted. Scheduling bookkeeping like
     /// `crash_hold_until`, excluded from `signature()`.
     pub retarget: ghost_absorber::RunState,
+    /// Where the once-per-run signal fired, when it did: the step, and the
+    /// number of scheduling draws taken by then when the run records its
+    /// draws. Observation only, excluded from `signature()`.
+    pub replay_cut: Option<ReplayCut>,
     /// Remote records in the network queue whose origin has restarted since
     /// sending them: the sum over nodes of `net_records - net_fresh`.
     pub net_stale_records: u32,
@@ -626,6 +630,17 @@ pub enum HandlerTrigger {
     None,
     Timer,
     Delivery,
+}
+
+/// The point in a run at which a delivery from a sender that was down, or
+/// had restarted since sending, first entered a node whose own crash was
+/// queued. `tape_pos` is the count of scheduling draws taken by then, present
+/// only when the run records its draws; a run replaying the first `tape_pos`
+/// draws of this run's recording takes the same steps up to `step`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayCut {
+    pub step: i32,
+    pub tape_pos: Option<usize>,
 }
 
 /// One node's send bookkeeping. `issued` numbers the node's sends; `floor`
@@ -739,6 +754,7 @@ impl<H: HashPolicy> State<H> {
             crash_phase: crash_phase::RunAnchor::with_nodes(num_nodes),
             crash_hold_drawn: false,
             retarget: ghost_absorber::RunState::default(),
+            replay_cut: None,
             net_stale_records: 0,
             net_requests: 0,
         }

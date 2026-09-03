@@ -5,6 +5,7 @@ use crate::simulator::core::{
     Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
     Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
 };
+pub use crate::simulator::core::ReplayCut;
 pub use crate::simulator::coverage::GlobalState;
 use crate::simulator::curriculum::{Curriculum, lower};
 pub use crate::simulator::feedback::{CoverageConfig, NoFeedback};
@@ -891,23 +892,27 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feed
 }
 
 /// Outcome of a single run: the genetic fitness, the (optional) self-contained
-/// schedule recording, the run's timeline-tuple set (for AOS credit), and
-/// how the run ended.
+/// schedule recording, the run's timeline-tuple set (for AOS credit), how the
+/// run ended, and where the once-per-run fault-crossing signal fired, if it
+/// did.
 pub struct RunResult {
     pub score: f64,
     pub recording: Option<Recording>,
     pub tuples: HashSet<TimelineTuple>,
     pub outcome: RunOutcome,
+    pub cut: Option<ReplayCut>,
 }
 
 /// Which strategy issued a run, for the `runs` table. A single-strategy
 /// session names its explorer mode with no index; a grid point carries its
-/// index into the expanded grid.
+/// index into the expanded grid. `variant_bits` are the run-variant bits only
+/// the issuing strategy can know, joined to the bits the run id fixes.
 #[derive(Clone, Debug)]
 pub struct RunAttribution {
     pub arm: Arc<str>,
     pub arm_index: i32,
     pub config_index: i32,
+    pub variant_bits: i32,
 }
 
 impl RunAttribution {
@@ -916,12 +921,20 @@ impl RunAttribution {
             arm: Arc::from(name),
             arm_index: -1,
             config_index: -1,
+            variant_bits: 0,
         }
     }
 
     pub fn with_config(&self, config_index: usize) -> Self {
         Self {
             config_index: config_index as i32,
+            ..self.clone()
+        }
+    }
+
+    pub fn with_variant_bits(&self, variant_bits: i32) -> Self {
+        Self {
+            variant_bits,
             ..self.clone()
         }
     }
@@ -984,7 +997,8 @@ fn run_row(
         timers_idle_fired: timers.idle_fired as i32,
         timers_idle_acted: timers.idle_acted as i32,
         max_inert_streak: timers.max_inert_streak as i32,
-        variant: crate::simulator::run_variant::of(run_id, crash_hold_drawn),
+        variant: crate::simulator::run_variant::of(run_id, crash_hold_drawn)
+            | attribution.variant_bits,
     }
 }
 
@@ -1143,6 +1157,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         recording,
         tuples,
         outcome,
+        cut: path_state.state.replay_cut,
     })
 }
 

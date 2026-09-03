@@ -16,6 +16,7 @@
 use crate::simulator::crash_phase;
 use crate::simulator::fault_timing;
 use crate::simulator::ghost_absorber;
+use crate::simulator::replay_corpus;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
 
@@ -37,6 +38,14 @@ pub const CRASH_PHASE: i32 = 1 << 9;
 /// The run's planned crashes move to the live node that last took a
 /// delivery whose sender was down or had restarted since sending.
 pub const GHOST_ABSORBER_RETARGET: i32 = 1 << 19;
+/// The run is a replay slot of a grid arm: it ran as a child of a corpus
+/// parent when the arm held one, and fresh otherwise. Only a grid arm runs
+/// slots, so the arm joins this bit through the run's attribution rather
+/// than `from_run_id`; the bit is still a pure function of the run id.
+pub const REPLAY_SLOT: i32 = 1 << 20;
+/// A replay slot whose child replays the parent's schedule prefix rather
+/// than only its plan. Joined by the arm like `REPLAY_SLOT`.
+pub const REPLAY_PREFIX: i32 = 1 << 21;
 
 /// The whole tag: what the run id selected, plus what the run did.
 pub fn of(run_id: i64, crash_hold_drawn: bool) -> i32 {
@@ -64,6 +73,20 @@ pub fn from_run_id(run_id: i64) -> i32 {
     v
 }
 
+/// The bits a grid arm joins to the tag of every run it issues. A slot whose
+/// corpus held no parent ran fresh and still carries its bits, so the halves
+/// are compared by id, never by whether a parent was available.
+pub fn grid_arm_bits(run_id: i64) -> i32 {
+    let mut v = 0;
+    if replay_corpus::is_slot(run_id) {
+        v |= REPLAY_SLOT;
+    }
+    if replay_corpus::is_prefix(run_id) {
+        v |= REPLAY_PREFIX;
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,7 +109,34 @@ mod tests {
             assert_eq!(v & CRASH_HOLD_DRAWN, 0, "the acted bit is not an id bit");
             assert_eq!(of(id, true), v | CRASH_HOLD_DRAWN);
             assert_eq!(of(id, false), v);
+            assert_eq!(v & (REPLAY_SLOT | REPLAY_PREFIX), 0, "the slot bits are the arm's");
+            let g = grid_arm_bits(id);
+            assert_eq!(g & REPLAY_SLOT != 0, replay_corpus::is_slot(id));
+            assert_eq!(g & REPLAY_PREFIX != 0, replay_corpus::is_prefix(id));
+            assert_eq!(g & !(REPLAY_SLOT | REPLAY_PREFIX), 0, "the arm sets only its bits");
         }
+    }
+
+    #[test]
+    fn the_slot_bits_spare_every_probe_and_leave_a_contrast() {
+        let _serial = config_override::exclusive_session();
+        fault_timing::reset();
+        let n = 64_000i64;
+        let mut slots = 0;
+        let mut prefixes = 0;
+        for id in 0..n {
+            let v = from_run_id(id) | grid_arm_bits(id);
+            if v & (RUN_CAP_PROBE | TIMER_STEER_OFF) != 0 {
+                assert_eq!(v & REPLAY_SLOT, 0, "run {id}: a probe is a replay slot");
+            }
+            if v & REPLAY_PREFIX != 0 {
+                assert_ne!(v & REPLAY_SLOT, 0, "run {id}: a prefix child outside a slot");
+            }
+            slots += (v & REPLAY_SLOT != 0) as i64;
+            prefixes += (v & REPLAY_PREFIX != 0) as i64;
+        }
+        assert!(slots > 0 && slots < n, "the slot split leaves no contrast");
+        assert!(prefixes > 0 && prefixes < slots, "the prefix split leaves no contrast");
     }
 
     #[test]

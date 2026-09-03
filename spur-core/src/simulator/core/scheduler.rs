@@ -7,7 +7,7 @@ use crate::simulator::core::queue_selector::{
     QueueInfo, QueueSelection, QueueSelector, WithinQueueSelector,
 };
 use crate::simulator::core::state::{
-    Continuation, HandlerTrigger, Logger, NodeId, PurgatoryConfig, Record, Runnable,
+    Continuation, HandlerTrigger, Logger, NodeId, PurgatoryConfig, Record, ReplayCut, Runnable,
     RunnableCategory, SchedulePolicy, ScheduleResult, State,
 };
 use crate::simulator::core::steer_terms::{ResolvedTerms, Term, TERMS};
@@ -1067,22 +1067,23 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
 
     match runnable {
         Runnable::Crash { node_id, .. } => {
+            // Every census of what a crash lands on reads the node the crash
+            // is applied to, which may differ from the planned victim. Only
+            // the phase arm is keyed on the planned node, whose fan-out the
+            // hold was evaluated against.
+            let victim = retarget_crash(state, node_id, topology.num_servers.max(0) as usize);
+            let ledger = state.send_ledger.get(victim.index).copied().unwrap_or_default();
             if util_stats::enabled() {
-                let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
                 util_stats::record_crash_anchor_apply(ledger.in_flight > 0);
                 util_stats::record_term_acted(chosen_mask, ledger.recent > 0);
             }
             if let Some(any_candidate) = crash_candidate_with_inflight {
-                let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
                 util_stats::record_crash_census(ledger.in_flight, any_candidate);
             }
             if let Some(arm) = state.crash_phase.arm_of(node_id.index) {
-                let ledger = state.send_ledger.get(node_id.index).copied().unwrap_or_default();
                 util_stats::record_crash_phase_apply(arm, ledger.in_flight);
             }
-            let victim = retarget_crash(state, node_id, topology.num_servers.max(0) as usize);
             if util_stats::enabled() {
-                let ledger = state.send_ledger.get(victim.index).copied().unwrap_or_default();
                 util_stats::record_victim_swap_census(
                     state.retarget.enabled,
                     ledger.last_ghost_step >= 0,
@@ -1235,6 +1236,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                             .is_some_and(|l| l.crash_pending > 0)
                     {
                         state.retarget.signal_counted = true;
+                        state.replay_cut = Some(ReplayCut {
+                            step: entry_step,
+                            tape_pos: rng.position(),
+                        });
                         util_stats::record_ghost_signal_run();
                     }
                     let probe = (util_stats::acted_fraction_enabled() && message_entry).then(|| {

@@ -12,6 +12,7 @@ mod hash_utils;
 pub mod history;
 mod path;
 pub mod plan_config;
+pub mod replay_corpus;
 pub mod rng;
 pub mod run_cap;
 pub mod run_phase;

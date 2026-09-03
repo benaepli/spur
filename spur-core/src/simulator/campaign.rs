@@ -26,7 +26,9 @@ use crate::simulator::feedback::{
     CfgFeedback, CoverageConfig, Feedback, FeedbackMode, FullFeedback, NoFeedback, TimelineFeedback,
 };
 use crate::simulator::history::{HistoryWriter, LogBackend, create_writer};
-use crate::simulator::rng::{LiveRng, SCHEDULE_SALT, WORKLOAD_SALT, derive_seed};
+use crate::simulator::replay_corpus::{self, Corpus, Seed};
+use crate::simulator::rng::{LiveRng, RecordRng, ReplayRng, SCHEDULE_SALT, WORKLOAD_SALT, derive_seed};
+use crate::simulator::run_variant;
 use crate::simulator::util_stats;
 use log::{error, info};
 use rayon::prelude::*;
@@ -369,6 +371,12 @@ impl<F: Feedback> Arm for StrategyArm<F> {
 
 /// The exhaustive grid as an arm: configurations are visited in rounds and
 /// the walk wraps when the grid is exhausted, so the arm never starves.
+///
+/// Every fresh run records its scheduling draws. A fresh run that fires the
+/// fault-crossing signal enters the arm's replay corpus with its draws cut
+/// at the signal, and a run whose id is a replay slot becomes a child of the
+/// next parent in turn when the corpus holds one. Only fresh runs advance
+/// the grid cursor, so children do not thin the grid's coverage.
 pub(crate) struct GridArm<F: Feedback> {
     config: ExplorerConfig,
     configs: Vec<SingleRunConfig>,
@@ -376,6 +384,20 @@ pub(crate) struct GridArm<F: Feedback> {
     global_state: GlobalState<F>,
     batch_size: usize,
     arm_seed: u64,
+    corpus: Corpus<SingleRunConfig>,
+}
+
+/// What one run of a grid-arm batch is.
+enum GridRun {
+    Fresh { config_index: usize },
+    Child { seed: Seed<SingleRunConfig>, prefix: bool },
+}
+
+/// What a grid-arm run hands back: its score, and the corpus entry it earned
+/// when it was a fresh run that fired the signal.
+struct GridOutcome {
+    score: Option<f64>,
+    admit: Option<Seed<SingleRunConfig>>,
 }
 
 impl<F: Feedback> GridArm<F> {
@@ -388,14 +410,138 @@ impl<F: Feedback> GridArm<F> {
             global_state: GlobalState::new(),
             batch_size,
             arm_seed,
+            corpus: Corpus::new(),
+        }
+    }
+
+    fn fresh(&mut self) -> GridRun {
+        let config_index = (self.cursor % self.configs.len() as u64) as usize;
+        self.cursor += 1;
+        GridRun::Fresh { config_index }
+    }
+
+    fn assign(&mut self, run_id: i64) -> GridRun {
+        if !replay_corpus::is_slot(run_id) {
+            return self.fresh();
+        }
+        match self.corpus.next_child() {
+            Some(seed) => GridRun::Child {
+                seed,
+                prefix: replay_corpus::is_prefix(run_id),
+            },
+            None => {
+                util_stats::record_replay_slot_unfilled();
+                self.fresh()
+            }
+        }
+    }
+
+    fn run(&self, ctx: &StepCtx, run_id: i64, run: &GridRun) -> GridOutcome {
+        let bits = run_variant::grid_arm_bits(run_id);
+        let schedule_seed = derive_seed(self.arm_seed, run_id, SCHEDULE_SALT);
+        let weights = &self.config.feedback.weights;
+        match run {
+            GridRun::Fresh { config_index } => {
+                let config_index = *config_index;
+                let workload_seed = derive_seed(self.arm_seed, run_id, WORKLOAD_SALT);
+                let result = run_single_simulation::<F, RecordRng>(
+                    ctx.program,
+                    ctx.writer,
+                    &self.global_state,
+                    run_id,
+                    &self.configs[config_index],
+                    weights,
+                    workload_seed,
+                    schedule_seed,
+                    None,
+                    &ctx.attribution
+                        .with_config(config_index)
+                        .with_variant_bits(bits),
+                );
+                match result {
+                    Ok(r) => {
+                        let tape = r.recording.unwrap_or_default();
+                        util_stats::record_replay_tape_words(tape.len() as u64);
+                        let admit = r.cut.and_then(|cut| {
+                            cut.tape_pos.map(|pos| Seed {
+                                tape: tape[..pos.min(tape.len())].into(),
+                                workload_seed,
+                                cfg: self.configs[config_index].clone(),
+                                config_index,
+                                cut_step: cut.step,
+                            })
+                        });
+                        GridOutcome {
+                            score: Some(r.score),
+                            admit,
+                        }
+                    }
+                    Err(e) => {
+                        error!("Campaign run {} failed: {}", run_id, e);
+                        GridOutcome {
+                            score: None,
+                            admit: None,
+                        }
+                    }
+                }
+            }
+            GridRun::Child { seed, prefix } => {
+                let attribution = ctx
+                    .attribution
+                    .with_config(seed.config_index)
+                    .with_variant_bits(bits);
+                let result = if *prefix {
+                    run_single_simulation::<F, ReplayRng>(
+                        ctx.program,
+                        ctx.writer,
+                        &self.global_state,
+                        run_id,
+                        &seed.cfg,
+                        weights,
+                        seed.workload_seed,
+                        schedule_seed,
+                        Some(seed.tape.clone()),
+                        &attribution,
+                    )
+                } else {
+                    run_single_simulation::<F, LiveRng>(
+                        ctx.program,
+                        ctx.writer,
+                        &self.global_state,
+                        run_id,
+                        &seed.cfg,
+                        weights,
+                        seed.workload_seed,
+                        schedule_seed,
+                        None,
+                        &attribution,
+                    )
+                };
+                match result {
+                    Ok(r) => {
+                        let faithful = *prefix && r.cut.is_some_and(|c| c.step == seed.cut_step);
+                        util_stats::record_replay_child(*prefix, r.cut.is_some(), faithful);
+                        GridOutcome {
+                            score: Some(r.score),
+                            admit: None,
+                        }
+                    }
+                    Err(e) => {
+                        error!("Campaign run {} failed: {}", run_id, e);
+                        GridOutcome {
+                            score: None,
+                            admit: None,
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
 impl<F: Feedback> Arm for GridArm<F> {
     fn step(&mut self, ctx: &StepCtx, max_runs: usize) -> StepReport {
-        let n = self.configs.len() as u64;
-        if n == 0 {
+        if self.configs.is_empty() {
             return StepReport {
                 runs: 0,
                 failed: 0,
@@ -403,45 +549,32 @@ impl<F: Feedback> Arm for GridArm<F> {
             };
         }
         let count = self.batch_size.min(max_runs.max(1));
-        let batch: Vec<(i64, usize)> = (0..count)
+        let batch: Vec<(i64, GridRun)> = (0..count)
             .map(|_| {
                 let run_id = ctx.run_counter.fetch_add(1, Ordering::Relaxed);
-                let config_index = (self.cursor % n) as usize;
-                self.cursor += 1;
-                (run_id, config_index)
+                (run_id, self.assign(run_id))
             })
             .collect();
-        let global_state = &self.global_state;
-        let config = &self.config;
-        let configs = &self.configs;
-        let arm_seed = self.arm_seed;
-        let scores: Vec<Option<f64>> = batch
+        let outcomes: Vec<GridOutcome> = batch
             .par_iter()
-            .map(|&(run_id, config_index)| {
-                match run_single_simulation::<F, LiveRng>(
-                    ctx.program,
-                    ctx.writer,
-                    global_state,
-                    run_id,
-                    &configs[config_index],
-                    &config.feedback.weights,
-                    derive_seed(arm_seed, run_id, WORKLOAD_SALT),
-                    derive_seed(arm_seed, run_id, SCHEDULE_SALT),
-                    None,
-                    &ctx.attribution.with_config(config_index),
-                ) {
-                    Ok(r) => Some(r.score),
-                    Err(e) => {
-                        error!("Campaign run {} failed: {}", run_id, e);
-                        None
-                    }
-                }
-            })
+            .map(|(run_id, run)| self.run(ctx, *run_id, run))
             .collect();
+        let mut failed = 0;
+        let mut best_score = 0.0f64;
+        for outcome in outcomes {
+            match outcome.score {
+                Some(s) => best_score = best_score.max(s),
+                None => failed += 1,
+            }
+            if let Some(seed) = outcome.admit {
+                self.corpus.admit(seed);
+                util_stats::record_replay_parent_admitted();
+            }
+        }
         StepReport {
-            runs: scores.len() as u64,
-            failed: scores.iter().filter(|s| s.is_none()).count() as u64,
-            best_score: scores.iter().flatten().cloned().fold(0.0, f64::max),
+            runs: count as u64,
+            failed,
+            best_score,
         }
     }
 
@@ -495,6 +628,7 @@ fn build_arm(
             arm: Arc::from(spec.id.as_str()),
             arm_index: index as i32,
             config_index: -1,
+            variant_bits: 0,
         },
         arm,
     }

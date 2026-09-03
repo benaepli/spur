@@ -130,6 +130,14 @@ impl RngCore for StreamSet {
 pub trait StreamRng: RngCore {
     #[inline]
     fn use_stream(&mut self, _stream: Stream) {}
+
+    /// How many draws a recording source has captured so far, so a caller can
+    /// cut the tape at the draw it is standing on. `None` when nothing is
+    /// recorded.
+    #[inline]
+    fn position(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl StreamRng for SmallRng {}
@@ -157,6 +165,10 @@ pub trait RngSource: 'static + Send {
     fn into_recording(_tape: Self::Tape) -> Option<Recording> {
         None
     }
+    /// Draws captured so far, when this strategy records.
+    fn position(_tape: &Self::Tape) -> Option<usize> {
+        None
+    }
 }
 
 /// A `RngCore` newtype over an `RngSource`, so every threaded `&mut impl Rng`
@@ -170,6 +182,10 @@ impl<S: RngSource> StreamRng for RecRng<'_, S> {
     #[inline]
     fn use_stream(&mut self, stream: Stream) {
         self.inner.select(stream);
+    }
+    #[inline]
+    fn position(&self) -> Option<usize> {
+        S::position(self.tape)
     }
 }
 
@@ -227,6 +243,10 @@ impl RngSource for RecordRng {
     fn into_recording(tape: Vec<u64>) -> Option<Recording> {
         Some(tape.into())
     }
+    #[inline]
+    fn position(tape: &Vec<u64>) -> Option<usize> {
+        Some(tape.len())
+    }
 }
 
 /// Replay-then-record: returns `src[pos++]` until the source tape is
@@ -268,6 +288,10 @@ impl RngSource for ReplayRng {
     }
     fn into_recording(tape: ReplayTape) -> Option<Recording> {
         Some(tape.out.into())
+    }
+    #[inline]
+    fn position(tape: &ReplayTape) -> Option<usize> {
+        Some(tape.out.len())
     }
 }
 
@@ -372,6 +396,46 @@ mod tests {
             (0..10).map(|_| rep.next_u64()).collect()
         };
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn position_counts_recorded_draws_and_is_absent_when_nothing_is_recorded() {
+        let mut inner = StreamSet::new(5, true);
+        let mut live_tape = LiveRng::new_tape(None);
+        let mut live = RecRng::<LiveRng> {
+            tape: &mut live_tape,
+            inner: &mut inner,
+        };
+        live.next_u64();
+        assert_eq!(live.position(), None, "a live source records nothing to cut");
+        assert_eq!(SmallRng::seed_from_u64(1).position(), None);
+
+        let mut inner = StreamSet::new(5, true);
+        let mut tape = RecordRng::new_tape(None);
+        let mut rec = RecRng::<RecordRng> {
+            tape: &mut tape,
+            inner: &mut inner,
+        };
+        assert_eq!(rec.position(), Some(0));
+        rec.next_u64();
+        rec.use_stream(Stream::SendDelay);
+        rec.next_u32();
+        rec.fill_bytes(&mut [0u8; 12]);
+        assert_eq!(rec.position(), Some(4), "one u64, one u32 and two words of bytes");
+        let cut = rec.position().unwrap();
+        assert_eq!(RecordRng::into_recording(tape).unwrap().len(), cut);
+
+        let src: Recording = vec![9, 8, 7].into();
+        let mut inner = StreamSet::new(5, false);
+        let mut rtape = ReplayRng::new_tape(Some(src));
+        let mut rep = RecRng::<ReplayRng> {
+            tape: &mut rtape,
+            inner: &mut inner,
+        };
+        for _ in 0..5 {
+            rep.next_u64();
+        }
+        assert_eq!(rep.position(), Some(5), "replayed and fallback draws both count");
     }
 
     #[test]
