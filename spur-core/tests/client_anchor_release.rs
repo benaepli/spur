@@ -1,8 +1,9 @@
 //! The client hold has to fire on a real workload and leave the plan whole:
 //! over a session of treated runs on a fixture whose peers answer a
 //! fault-crossing delivery with a fan-out, client requests that become ready
-//! after the first crash must be held, some must be issued at the step after
-//! a window opens, none may still be held when a run ends, every run must
+//! after the first crash must be held, every one that leaves the hold must
+//! do so at expiry or when the run has nothing else to move, windows must
+//! still be counted, none may still be held when a run ends, every run must
 //! issue every planned request exactly once, and the share of runs that
 //! complete their plan must stay close to a control session's. On the
 //! untreated half nothing may change: the same run id gives the same event
@@ -15,8 +16,9 @@ use spur_core::simulator::explorer::{
 };
 use spur_core::simulator::history::{HistoryWriter, LogBackend, create_writer};
 use spur_core::simulator::rng::LiveRng;
+use spur_core::simulator::client_anchor::{self, EXPIRY_STEPS};
 use spur_core::simulator::util_stats::ClientAnchorStats;
-use spur_core::simulator::{client_anchor, fault_timing, run_cap, run_variant, util_stats};
+use spur_core::simulator::{fault_timing, run_cap, run_variant, util_stats};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -224,35 +226,23 @@ fn check_treated() {
     let (b, a): (&ClientAnchorStats, &ClientAnchorStats) =
         (&before.client_anchor, &after.client_anchor);
     let held = a.held - b.held;
-    let anchor = a.released.anchor - b.released.anchor;
     let expiry = a.released.expiry - b.released.expiry;
     let dry = a.released.dry_queue - b.released.dry_queue;
+    let held_at_exit = a.held_at_exit - b.held_at_exit;
     assert!(held > 0, "no post-crash request was held: {a:?}");
-    assert!(anchor > 0, "no held request was issued at a window: {a:?}");
-    assert_eq!(
-        a.held_at_exit, b.held_at_exit,
-        "a run ended with a request still held"
-    );
+    assert!(expiry > 0, "no held request expired: {a:?}");
+    assert_eq!(held_at_exit, 0, "a run ended with a request still held: {a:?}");
     assert_eq!(a.runs_with_held_at_exit, b.runs_with_held_at_exit);
     assert_eq!(
-        anchor + expiry + dry,
-        held,
-        "every held request leaves the queue exactly once"
+        expiry + dry,
+        held - held_at_exit,
+        "every held request that left did so at expiry or a dry queue"
     );
-    assert_eq!(
-        a.released.anchor_first + a.released.anchor_second_or_later
-            - b.released.anchor_first
-            - b.released.anchor_second_or_later,
-        anchor
+    assert!(
+        a.hold_steps_sum - b.hold_steps_sum >= expiry * (EXPIRY_STEPS as u64 + 1),
+        "an expired request waited fewer than {} steps",
+        EXPIRY_STEPS + 1
     );
-    assert_eq!(
-        a.released.write + a.released.read + a.released.rmw
-            - b.released.write
-            - b.released.read
-            - b.released.rmw,
-        anchor
-    );
-    assert_eq!(a.released.rmw, b.released.rmw, "the plan holds no read-modify-write");
     let t = &a.census.treated;
     assert_eq!(t.runs - b.census.treated.runs, TREATED_RUNS as u64);
     assert_eq!(
@@ -269,9 +259,15 @@ fn check_treated() {
         held,
         "every held request was issued"
     );
+    let first_windows = |s: &ClientAnchorStats| {
+        s.held_at_first_firing.zero
+            + s.held_at_first_firing.one
+            + s.held_at_first_firing.two
+            + s.held_at_first_firing.three_plus
+    };
     assert!(
-        t.in_window_invocations - b.census.treated.in_window_invocations >= anchor,
-        "an anchor release is an in-window invocation by construction"
+        first_windows(a) > first_windows(b),
+        "no treated run recorded what it held at its first window"
     );
     assert_eq!(
         a.census.control.runs, b.census.control.runs,
@@ -353,7 +349,6 @@ fn check_untreated() {
 
     let (b, a) = (&before.client_anchor, &after.client_anchor);
     assert_eq!(a.held, b.held, "an untreated run held a request");
-    assert_eq!(a.released.anchor, b.released.anchor);
     assert_eq!(a.released.expiry, b.released.expiry);
     assert_eq!(a.released.dry_queue, b.released.dry_queue);
     assert_eq!(a.held_at_exit, b.held_at_exit);

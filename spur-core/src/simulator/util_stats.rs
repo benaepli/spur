@@ -125,12 +125,6 @@ static CAN_POST_FAULT_INVOCATIONS: [AtomicU64; CAN_HALVES] =
 static CAN_IN_WINDOW_INVOCATIONS: [AtomicU64; CAN_HALVES] =
     [const { AtomicU64::new(0) }; CAN_HALVES];
 static CAN_HELD: AtomicU64 = AtomicU64::new(0);
-static CAN_RELEASED_ANCHOR: AtomicU64 = AtomicU64::new(0);
-static CAN_RELEASED_ANCHOR_FIRST: AtomicU64 = AtomicU64::new(0);
-static CAN_RELEASED_ANCHOR_LATER: AtomicU64 = AtomicU64::new(0);
-static CAN_RELEASED_WRITE: AtomicU64 = AtomicU64::new(0);
-static CAN_RELEASED_READ: AtomicU64 = AtomicU64::new(0);
-static CAN_RELEASED_RMW: AtomicU64 = AtomicU64::new(0);
 static CAN_RELEASED_EXPIRY: AtomicU64 = AtomicU64::new(0);
 static CAN_RELEASED_DRY_QUEUE: AtomicU64 = AtomicU64::new(0);
 /// Requests held when a treated run's first window opened: none, one, two,
@@ -460,12 +454,6 @@ pub fn set_enabled(on: bool) {
             &FF_REPEAT_SWAPS,
             &PO_CORRECTED,
             &CAN_HELD,
-            &CAN_RELEASED_ANCHOR,
-            &CAN_RELEASED_ANCHOR_FIRST,
-            &CAN_RELEASED_ANCHOR_LATER,
-            &CAN_RELEASED_WRITE,
-            &CAN_RELEASED_READ,
-            &CAN_RELEASED_RMW,
             &CAN_RELEASED_EXPIRY,
             &CAN_RELEASED_DRY_QUEUE,
             &CAN_HELD_AT_EXIT,
@@ -1899,39 +1887,14 @@ pub fn record_client_anchor_post_fault_invocation(treated: bool, in_window: bool
     }
 }
 
-/// The kind of client request a release issued.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClientAnchorKind {
-    Write,
-    Read,
-    Rmw,
-}
-
 /// A treated run issued a held request: `release` says why it left the
 /// queue, `hold_steps` how many steps it waited past its ready step.
 #[inline]
-pub fn record_client_anchor_release(
-    release: client_anchor::Release,
-    kind: ClientAnchorKind,
-    hold_steps: u64,
-) {
+pub fn record_client_anchor_release(release: client_anchor::Release, hold_steps: u64) {
     if !enabled() {
         return;
     }
     match release {
-        client_anchor::Release::Anchor { first } => {
-            CAN_RELEASED_ANCHOR.fetch_add(1, Ordering::Relaxed);
-            if first {
-                CAN_RELEASED_ANCHOR_FIRST.fetch_add(1, Ordering::Relaxed);
-            } else {
-                CAN_RELEASED_ANCHOR_LATER.fetch_add(1, Ordering::Relaxed);
-            }
-            match kind {
-                ClientAnchorKind::Write => CAN_RELEASED_WRITE.fetch_add(1, Ordering::Relaxed),
-                ClientAnchorKind::Read => CAN_RELEASED_READ.fetch_add(1, Ordering::Relaxed),
-                ClientAnchorKind::Rmw => CAN_RELEASED_RMW.fetch_add(1, Ordering::Relaxed),
-            };
-        }
         client_anchor::Release::Expiry => {
             CAN_RELEASED_EXPIRY.fetch_add(1, Ordering::Relaxed);
         }
@@ -3823,17 +3786,10 @@ pub struct ClientAnchorCensusStats {
     pub control: ClientAnchorHalfStats,
 }
 
-/// Why held requests were issued on the treated half. `anchor` splits by
-/// whether the window was the run's first and by request kind; `expiry` and
-/// `dry_queue` are the releases that did not wait for a window.
+/// Why held requests were issued on the treated half: `expiry` once the
+/// fixed wait ran out, `dry_queue` when nothing else in the run could move.
 #[derive(Serialize, Debug)]
 pub struct ClientAnchorReleaseStats {
-    pub anchor: u64,
-    pub anchor_first: u64,
-    pub anchor_second_or_later: u64,
-    pub write: u64,
-    pub read: u64,
-    pub rmw: u64,
     pub expiry: u64,
     pub dry_queue: u64,
 }
@@ -3847,12 +3803,11 @@ pub struct ClientAnchorHeldHist {
     pub three_plus: u64,
 }
 
-/// The client-anchor block. `held` is the treated half's population;
-/// `released.anchor` is the number the mechanism is read as having fired:
-/// held requests issued at the step after a window opened. `held_at_exit`
-/// sums the requests still held when a run ended, over
-/// `runs_with_held_at_exit` runs, and `hold_steps_sum` the steps every
-/// released request waited past its ready step.
+/// The client-anchor block. `held` is the treated half's population and
+/// `released` says why each held request was issued. `held_at_exit` sums
+/// the requests still held when a run ended, over `runs_with_held_at_exit`
+/// runs, and `hold_steps_sum` the steps every released request waited past
+/// its ready step.
 #[derive(Serialize, Debug)]
 pub struct ClientAnchorStats {
     pub held: u64,
@@ -3870,12 +3825,6 @@ impl ClientAnchorStats {
         Self {
             held: CAN_HELD.load(Ordering::Relaxed),
             released: ClientAnchorReleaseStats {
-                anchor: CAN_RELEASED_ANCHOR.load(Ordering::Relaxed),
-                anchor_first: CAN_RELEASED_ANCHOR_FIRST.load(Ordering::Relaxed),
-                anchor_second_or_later: CAN_RELEASED_ANCHOR_LATER.load(Ordering::Relaxed),
-                write: CAN_RELEASED_WRITE.load(Ordering::Relaxed),
-                read: CAN_RELEASED_READ.load(Ordering::Relaxed),
-                rmw: CAN_RELEASED_RMW.load(Ordering::Relaxed),
                 expiry: CAN_RELEASED_EXPIRY.load(Ordering::Relaxed),
                 dry_queue: CAN_RELEASED_DRY_QUEUE.load(Ordering::Relaxed),
             },

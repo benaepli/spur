@@ -832,12 +832,6 @@ fn client_anchor(m: &mut Marks) -> ClientAnchorStats {
     ClientAnchorStats {
         held: m.int(),
         released: ClientAnchorReleaseStats {
-            anchor: m.int(),
-            anchor_first: m.int(),
-            anchor_second_or_later: m.int(),
-            write: m.int(),
-            read: m.int(),
-            rmw: m.int(),
             expiry: m.int(),
             dry_queue: m.int(),
         },
@@ -867,16 +861,7 @@ fn client_anchor_leaves(prefix: &str, c: &ClientAnchorStats) -> Vec<(String, Val
         hold_steps_sum,
         census,
     } = c;
-    let ClientAnchorReleaseStats {
-        anchor,
-        anchor_first,
-        anchor_second_or_later,
-        write,
-        read,
-        rmw,
-        expiry,
-        dry_queue,
-    } = released;
+    let ClientAnchorReleaseStats { expiry, dry_queue } = released;
     let ClientAnchorHeldHist {
         zero,
         one,
@@ -888,12 +873,6 @@ fn client_anchor_leaves(prefix: &str, c: &ClientAnchorStats) -> Vec<(String, Val
     let h = format!("{prefix}.held_at_first_firing");
     let mut out = vec![
         leaf(prefix, "held", *held),
-        leaf(&r, "anchor", *anchor),
-        leaf(&r, "anchor_first", *anchor_first),
-        leaf(&r, "anchor_second_or_later", *anchor_second_or_later),
-        leaf(&r, "write", *write),
-        leaf(&r, "read", *read),
-        leaf(&r, "rmw", *rmw),
         leaf(&r, "expiry", *expiry),
         leaf(&r, "dry_queue", *dry_queue),
         leaf(&h, "zero", *zero),

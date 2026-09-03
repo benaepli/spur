@@ -20,9 +20,7 @@ use crate::simulator::pair_order as pair_order_split;
 use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
-use crate::simulator::util_stats::{
-    self, ClientAnchorKind, DeliveryBias, RunEnd, RunExtension, RunTermination,
-};
+use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunExtension, RunTermination};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
@@ -233,14 +231,6 @@ fn validate_node<H: HashPolicy>(
     Ok(node_id)
 }
 
-fn client_op_kind(op_spec: &ClientOpSpec) -> ClientAnchorKind {
-    match op_spec {
-        ClientOpSpec::Write(..) => ClientAnchorKind::Write,
-        ClientOpSpec::Read(..) => ClientAnchorKind::Read,
-        ClientOpSpec::Rmw(..) => ClientAnchorKind::Rmw,
-    }
-}
-
 /// Hand the planned client request at `plan_node` to a client node. The
 /// invocation is recorded at the current step, so a request the run held
 /// back is recorded when it is issued, not when the plan made it ready.
@@ -421,7 +411,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     path_state.state.client_anchor.enabled = client_anchor;
     let anchored = client_anchor;
     // Client requests that became ready after the run's first crash and are
-    // waiting for a fan-out window, and the last step at which one opened.
+    // waiting out their hold, and the last step at which a window opened.
     let mut held: HoldQueue<(NodeIndex, ClientOpSpec)> = HoldQueue::default();
     let mut last_window_step: Option<i32> = None;
     let census = util_stats::enabled() && pair_order_split::is_census_run(run_id);
@@ -538,10 +528,9 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             .map(|(idx, e)| (idx, e.clone()))
             .collect();
 
-        // Requests a window set aside for this step, then any whose wait ran
-        // past expiry. When nothing else in the run can move, the earliest
-        // held request is issued now instead, so a held request never leaves
-        // a run idle or reads as a deadlock.
+        // Requests whose wait ran past expiry. When nothing else in the run
+        // can move, the earliest held request is issued now instead, so a
+        // held request never leaves a run idle or reads as a deadlock.
         let mut due: Vec<Released<(NodeIndex, ClientOpSpec)>> = held.take_due(step);
         if ready_events.is_empty()
             && path_state.state.all_queues_empty()
@@ -586,7 +575,6 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             let (plan_node, op_spec) = released.item;
             util_stats::record_client_anchor_release(
                 released.release,
-                client_op_kind(&op_spec),
                 (step - released.ready_step).max(0) as u64,
             );
             util_stats::record_client_anchor_post_fault_invocation(anchored, in_window);
@@ -899,8 +887,8 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 
         // A window opens when this step's dispatch left a server that took an
         // acted fault-crossing delivery with its full fan-out still in the
-        // air; a treated run then sets one held request aside for the next
-        // step.
+        // air. It is counted on both halves and issues nothing; a treated run
+        // records what it held at its first window.
         if client_anchor::fanout_window(
             &path_state.state.send_ledger,
             topology.num_servers.max(0) as usize,
@@ -1016,9 +1004,9 @@ mod tests {
             .expect("the fixture declares the role")
     }
 
-    /// A request held at one step and set aside by a window at a later step
-    /// gets its invocation row, operation id and client record only at the
-    /// step it is issued.
+    /// A request held at one step and issued at expiry gets its invocation
+    /// row, operation id and client record only at the step it is issued;
+    /// a window in between writes nothing.
     #[test]
     fn a_held_request_is_recorded_at_the_step_it_is_issued() {
         let program = crate::compiler::compile(SPEC, "canchor.spur")
@@ -1050,15 +1038,19 @@ mod tests {
 
         path_state.state.crash_info.current_step = 5;
         assert!(held.take_due(5).is_empty());
-        assert!(held.fire().released, "the window sets the request aside");
+        assert_eq!(held.fire(), client_anchor::Firing { first: true, held: 1 });
+        assert!(held.take_due(6).is_empty(), "a window sets nothing aside");
         assert!(path_state.history.is_empty(), "the window itself writes no row");
 
-        path_state.state.crash_info.current_step = 6;
-        let due = held.take_due(6);
+        let issue_step = 3 + client_anchor::EXPIRY_STEPS + 1;
+        assert!(held.take_due(issue_step - 1).is_empty());
+        path_state.state.crash_info.current_step = issue_step;
+        let due = held.take_due(issue_step);
         assert_eq!(due.len(), 1);
         for released in due {
             let (plan_node, spec) = released.item;
             assert_eq!(released.ready_step, 3);
+            assert_eq!(released.release, client_anchor::Release::Expiry);
             invoke_client_request(
                 &mut path_state,
                 &program,
@@ -1076,7 +1068,7 @@ mod tests {
         }
         assert_eq!(path_state.history.len(), 1);
         let row = &path_state.history[0];
-        assert_eq!(row.step, 6, "the invocation row carries the issue step");
+        assert_eq!(row.step, issue_step, "the invocation row carries the issue step");
         assert!(matches!(row.kind, OpKind::Invocation));
         assert_eq!(row.op_action, "ClientInterface.Write");
         assert_eq!(row.unique_id, 1);

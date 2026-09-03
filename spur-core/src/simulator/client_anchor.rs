@@ -1,5 +1,4 @@
-//! Client request timing keyed on a peer's answer to a fault-crossing
-//! delivery.
+//! Deferral of client requests that become ready after a run's first crash.
 //!
 //! A delivery crosses a fault when its sender is down at delivery time or
 //! has come back from a crash since sending. When the node that takes such
@@ -11,12 +10,12 @@
 //! long after such a window.
 //!
 //! On the treated half of the runs a client request that becomes ready after
-//! the run's first crash is held instead of issued, and one held request is
-//! issued at the step after each such window opens, earliest ready first. A
-//! held request is issued anyway once it has waited past a fixed number of
-//! steps, or when nothing else in the run can move, so no run stalls or ends
-//! on a request that was never issued. Requests ready before the first crash
-//! are issued when they become ready on both halves.
+//! the run's first crash is held instead of issued, and is issued once it has
+//! waited a fixed number of steps, or earlier when nothing else in the run
+//! can move, so no run stalls or ends on a request that was never issued.
+//! Requests ready before the first crash are issued when they become ready
+//! on both halves. Fan-out windows are detected and counted on both halves
+//! and issue nothing.
 //!
 //! The treated half is drawn under a salt of its own, so the split is
 //! independent of every other split of a session. Probes are never treated:
@@ -32,12 +31,11 @@ use std::collections::VecDeque;
 /// Salt for the treated half. Distinct from every other split of a session.
 pub const CLIENT_ANCHOR_SALT: u64 = 0x_434C_4E54_4143_4852; // "CLNTACHR"
 
-/// A held request is issued regardless once its ready step lies this many
-/// steps or more behind the current step.
+/// A held request is issued once its ready step lies this many steps or
+/// more behind the current step.
 pub const EXPIRY_STEPS: i32 = 32;
 
-/// Whether this run holds its post-crash client requests for a fan-out
-/// window.
+/// Whether this run holds its post-crash client requests.
 pub fn is_treated(run_id: i64) -> bool {
     !run_cap::is_probe(run_id)
         && timer_context::run_mode(run_id) != timer_context::RunMode::Probe
@@ -73,9 +71,6 @@ pub struct RunState {
 /// Why a held request left the queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Release {
-    /// Issued at the step after a window opened; `first` says it was the
-    /// run's first window.
-    Anchor { first: bool },
     /// Waited past `EXPIRY_STEPS`.
     Expiry,
     /// Nothing else in the run could move.
@@ -90,25 +85,21 @@ pub struct Released<T> {
     pub release: Release,
 }
 
-/// What one window did to the queue.
+/// What a window found in the queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Firing {
     /// This was the run's first window.
     pub first: bool,
-    /// Requests held when the window opened, before any left.
+    /// Requests held when the window opened.
     pub held: usize,
-    /// One request was set aside for issue at the next step.
-    pub released: bool,
 }
 
-/// The held requests of one run in ready order, plus the one a window has
-/// set aside for issue at the following step. A request is pending work
+/// The held requests of one run in ready order. A request is pending work
 /// from the moment it is held until it is taken for issue, so a run must
 /// not be read as finished or stuck while the queue holds anything.
 #[derive(Clone, Debug)]
 pub struct HoldQueue<T> {
     held: VecDeque<(T, i32)>,
-    due: Option<Released<T>>,
     firings: u32,
 }
 
@@ -116,7 +107,6 @@ impl<T> Default for HoldQueue<T> {
     fn default() -> Self {
         Self {
             held: VecDeque::new(),
-            due: None,
             firings: 0,
         }
     }
@@ -128,19 +118,19 @@ impl<T> HoldQueue<T> {
         self.held.push_back((item, ready_step));
     }
 
-    /// Requests held and not yet set aside for issue.
+    /// Requests held.
     pub fn held(&self) -> usize {
         self.held.len()
     }
 
-    /// Requests held or set aside: the work the run still owes.
+    /// The work the run still owes.
     pub fn pending(&self) -> usize {
-        self.held.len() + self.due.is_some() as usize
+        self.held.len()
     }
 
-    /// Whether nothing is held or set aside.
+    /// Whether nothing is held.
     pub fn is_empty(&self) -> bool {
-        self.pending() == 0
+        self.held.is_empty()
     }
 
     /// Windows seen so far in this run.
@@ -148,41 +138,19 @@ impl<T> HoldQueue<T> {
         self.firings
     }
 
-    /// A window opened: set the earliest held request aside for issue at the
-    /// next step, unless one is already set aside.
+    /// A window opened: count it and leave every held request where it is.
     pub fn fire(&mut self) -> Firing {
         self.firings += 1;
-        let first = self.firings == 1;
-        let held = self.held.len();
-        let released = if self.due.is_none() {
-            match self.held.pop_front() {
-                Some((item, ready_step)) => {
-                    self.due = Some(Released {
-                        item,
-                        ready_step,
-                        release: Release::Anchor { first },
-                    });
-                    true
-                }
-                None => false,
-            }
-        } else {
-            false
-        };
         Firing {
-            first,
-            held,
-            released,
+            first: self.firings == 1,
+            held: self.held.len(),
         }
     }
 
-    /// The requests to issue at `step`: the one a window set aside, then
-    /// every request whose wait has run past `EXPIRY_STEPS`, in ready order.
+    /// The requests to issue at `step`: every request whose wait has run
+    /// past `EXPIRY_STEPS`, in ready order.
     pub fn take_due(&mut self, step: i32) -> Vec<Released<T>> {
         let mut out = Vec::new();
-        if let Some(d) = self.due.take() {
-            out.push(d);
-        }
         while let Some((_, ready_step)) = self.held.front()
             && ready_step + EXPIRY_STEPS < step
         {
@@ -281,72 +249,29 @@ mod tests {
     }
 
     #[test]
-    fn a_window_releases_the_earliest_held_request_for_the_next_step() {
+    fn a_window_counts_what_is_held_and_releases_nothing() {
         let mut q: HoldQueue<&str> = HoldQueue::default();
         q.hold("a", 3);
         q.hold("b", 5);
         assert_eq!(q.held(), 2);
-        assert!(q.take_due(6).is_empty(), "nothing is due before a window");
-        let f = q.fire();
-        assert_eq!(
-            f,
-            Firing {
-                first: true,
-                held: 2,
-                released: true
-            }
-        );
-        assert_eq!(q.held(), 1);
-        assert_eq!(q.pending(), 2, "the request set aside is still owed");
+        assert!(q.take_due(6).is_empty(), "nothing is due before expiry");
+        assert_eq!(q.fire(), Firing { first: true, held: 2 });
+        assert_eq!(q.held(), 2, "a window leaves the queue as it was");
+        assert_eq!(q.pending(), 2);
         assert!(!q.is_empty());
-        let due = q.take_due(7);
+        assert!(q.take_due(7).is_empty(), "a window sets nothing aside");
+        assert_eq!(q.fire(), Firing { first: false, held: 2 });
+        assert_eq!(q.firings(), 2);
+        let due = q.take_due(3 + EXPIRY_STEPS + 1);
         assert_eq!(
             due,
             vec![Released {
                 item: "a",
                 ready_step: 3,
-                release: Release::Anchor { first: true }
+                release: Release::Expiry
             }]
         );
-        let f = q.fire();
-        assert_eq!(
-            f,
-            Firing {
-                first: false,
-                held: 1,
-                released: true
-            }
-        );
-        assert_eq!(
-            q.take_due(9),
-            vec![Released {
-                item: "b",
-                ready_step: 5,
-                release: Release::Anchor { first: false }
-            }]
-        );
-        assert!(q.is_empty());
-        let f = q.fire();
-        assert_eq!(
-            f,
-            Firing {
-                first: false,
-                held: 0,
-                released: false
-            }
-        );
-        assert_eq!(q.firings(), 3);
-    }
-
-    #[test]
-    fn one_window_releases_one_request() {
-        let mut q: HoldQueue<u32> = HoldQueue::default();
-        q.hold(1, 0);
-        q.hold(2, 0);
-        assert!(q.fire().released);
-        assert!(!q.fire().released, "a second window before the issue step releases nothing");
-        assert_eq!(q.held(), 1);
-        assert_eq!(q.take_due(1).len(), 1);
+        assert_eq!(q.fire(), Firing { first: false, held: 1 });
     }
 
     #[test]

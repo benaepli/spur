@@ -44,8 +44,8 @@ pub const CRASH_PHASE: i32 = 1 << 9;
 /// lowest send ordinal.
 pub const PAIR_SEND_ORDER: i32 = 1 << 15;
 /// The run holds client requests that become ready after its first crash
-/// and issues one at the step after a server answers an acted fault-crossing
-/// delivery with a full fan-out still in the air.
+/// and issues each once it has waited a fixed number of steps, or earlier
+/// when nothing else in the run can move.
 pub const CLIENT_FANOUT_RELEASE: i32 = 1 << 18;
 /// The run's planned crashes move to the live node that last took a
 /// delivery whose sender was down or had restarted since sending.
