@@ -2,11 +2,14 @@
 //! change only what it claims to: over a session of treated runs on a
 //! fixture whose handlers send two messages in a row to every peer and whose
 //! nodes crash with those sends in the air, a network step whose pick is a
-//! later send from a sender that has crashed must take the eligible earlier
-//! send of the same class instead; every such contest must end with the
-//! earliest send taken; and no message entry from such a sender may ever be
-//! taken ahead of an earlier queued send of its class, while on the control
-//! half such inversions happen. On the untreated half nothing may change:
+//! later send of an incarnation that is no longer running must take the
+//! eligible earlier send of the same class instead; every such contest must
+//! end with the earliest send taken; and no message entry of that class may
+//! ever be taken ahead of an earlier queued send of its class, while on the
+//! control half such inversions happen. A pick of the sender's current
+//! incarnation keeps the order the draw gave it, so entries of that class
+//! still invert on the treated half, and the replacements the preference
+//! declines to make are counted. On the untreated half nothing may change:
 //! the same run id gives the same event sequence twice and no pick is
 //! replaced, while the census still counts. The census is read on a salted
 //! sixteenth of the runs, so the sessions here are drawn from census runs;
@@ -19,7 +22,9 @@ use spur_core::simulator::explorer::{
 };
 use spur_core::simulator::history::{HistoryWriter, LogBackend, create_writer};
 use spur_core::simulator::rng::LiveRng;
-use spur_core::simulator::util_stats::{PairOrderHalfStats, PairOrderStats, UtilizationSnapshot};
+use spur_core::simulator::util_stats::{
+    PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, UtilizationSnapshot,
+};
 use spur_core::simulator::{fault_timing, pair_order, run_cap, run_variant, util_stats};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -185,7 +190,9 @@ fn half_delta(a: &PairOrderHalfStats, b: &PairOrderHalfStats) -> PairOrderHalfSt
         contests: a.contests - b.contests,
         inorder_draws: a.inorder_draws - b.inorder_draws,
         pair_entries: a.pair_entries - b.pair_entries,
+        pair_entries_ghost: a.pair_entries_ghost - b.pair_entries_ghost,
         inversions: a.inversions - b.inversions,
+        inversions_ghost: a.inversions_ghost - b.inversions_ghost,
         sampled_runs: a.sampled_runs - b.sampled_runs,
     }
 }
@@ -194,6 +201,14 @@ fn block_delta(after: &UtilizationSnapshot, before: &UtilizationSnapshot) -> Pai
     let (a, b) = (&after.pair_order, &before.pair_order);
     PairOrderStats {
         corrected: a.corrected - b.corrected,
+        contests_by_class: PairOrderClassCounts {
+            ghost: a.contests_by_class.ghost - b.contests_by_class.ghost,
+            fresh: a.contests_by_class.fresh - b.contests_by_class.fresh,
+        },
+        corrections_ghost: a.corrections_ghost - b.corrections_ghost,
+        corrections_fresh: a.corrections_fresh - b.corrections_fresh,
+        corrections_fresh_suppressed: a.corrections_fresh_suppressed
+            - b.corrections_fresh_suppressed,
         census: spur_core::simulator::util_stats::PairOrderCensusStats {
             treated: half_delta(&a.census.treated, &b.census.treated),
             control: half_delta(&a.census.control, &b.census.control),
@@ -238,15 +253,41 @@ fn check_treated() {
         "the draw never fell on both the earlier and the later send: {d:?}"
     );
     assert_eq!(
+        d.contests_by_class.ghost + d.contests_by_class.fresh,
+        t.contests,
+        "a treated contest was counted without a class: {d:?}"
+    );
+    assert!(
+        d.contests_by_class.fresh > 0,
+        "no contest fell on the incarnation running now, so the class test is untested: {d:?}"
+    );
+    assert_eq!(
+        d.corrections_ghost, d.corrected,
+        "a replacement landed outside the dead class: {d:?}"
+    );
+    assert_eq!(
+        d.corrections_fresh, 0,
+        "a pick of the incarnation running now was replaced: {d:?}"
+    );
+    assert!(
+        d.corrections_fresh_suppressed > 0,
+        "no replacement was declined, so the class test never bound: {d:?}"
+    );
+    assert_eq!(
         t.contests - t.inorder_draws,
-        d.corrected,
-        "a treated contest kept a later send while an earlier one was eligible: {d:?}"
+        d.corrected + d.corrections_fresh_suppressed,
+        "a treated contest with an earlier eligible send was neither replaced nor declined: {d:?}"
     );
     assert_eq!(t.sampled_runs as usize, HALF_RUNS, "every treated run here is a census run: {d:?}");
     assert!(t.pair_entries > 0, "no entry from a crashed sender had a sibling: {d:?}");
+    assert!(t.pair_entries_ghost > 0, "no entry of the dead class had a sibling: {d:?}");
     assert_eq!(
-        t.inversions, 0,
-        "a treated run took a later send ahead of an earlier queued one: {d:?}"
+        t.inversions_ghost, 0,
+        "a treated run took a later send of a dead incarnation ahead of an earlier queued one: {d:?}"
+    );
+    assert!(
+        t.inversions > 0,
+        "the incarnation running now never inverted, so the class test changed nothing: {d:?}"
     );
     assert_eq!(
         d.census.control.contests, 0,
@@ -311,6 +352,15 @@ fn check_treated() {
     assert!(cc.inorder_draws < cc.contests, "the control draw never fell on a later send: {c:?}");
     assert!(cc.pair_entries > 0, "no entry from a crashed sender had a sibling on the control half: {c:?}");
     assert!(cc.inversions > 0, "the control half never took a later send first: {c:?}");
+    assert!(
+        cc.inversions_ghost > 0,
+        "the control half never took a later send of a dead incarnation first: {c:?}"
+    );
+    assert_eq!(
+        c.contests_by_class.ghost + c.contests_by_class.fresh,
+        0,
+        "a control session counted a class: {c:?}"
+    );
 
     eprintln!("pair_order treated session: {d:?}");
     eprintln!("pair_order control session: {c:?}");
@@ -320,6 +370,13 @@ fn check_treated() {
         share(cc.inorder_draws, cc.contests),
         share(t.inversions, t.pair_entries),
         share(cc.inversions, cc.pair_entries)
+    );
+    eprintln!(
+        "ghost-class inversion share treated {:.3} control {:.3}; corrections {} ghost, {} declined on the incarnation running now",
+        share(t.inversions_ghost, t.pair_entries_ghost),
+        share(cc.inversions_ghost, cc.pair_entries_ghost),
+        d.corrections_ghost,
+        d.corrections_fresh_suppressed
     );
     let _ = fs::remove_dir_all(&out);
     let _ = fs::remove_dir_all(&control_out);

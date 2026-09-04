@@ -5,17 +5,25 @@
 //! with each send, but the network step draws among them freely, so a
 //! destination routinely takes a later send before an earlier one. Around
 //! a crash of the sender that freedom decides which of the dead
-//! incarnation's messages a peer acts on first, and which of the restarted
-//! incarnation's. On the treated half of the runs, a network step whose
-//! pick is a remote record from a sender that has crashed at least once in
-//! the run takes instead the eligible record from the same sender to the
-//! same destination, sent by the same incarnation, with the lowest send
-//! ordinal, when one is below the pick's. Records of a sender that never
-//! crashed keep the pick. Nothing is masked or held: the displaced record
-//! stays in the queue and stays eligible. The replacement runs after the
-//! draw and after the fresh-incarnation swap, and consumes no random draw,
-//! so a treated and an untreated run read the same random sequence at every
-//! step.
+//! incarnation's messages a peer acts on first. On the treated half of the
+//! runs, a network step whose pick is a remote record whose sending
+//! incarnation is not the one running now - which covers every record of a
+//! sender that is down - takes instead the eligible record from the same
+//! sender to the same destination, sent by the same incarnation, with the
+//! lowest send ordinal, when one is below the pick's. A pick of the
+//! sender's current incarnation, and a pick from a sender that never
+//! crashed, keep the order the draw gave them. Nothing is masked or held:
+//! the displaced record stays in the queue and stays eligible. The
+//! replacement runs after the draw and after the fresh-incarnation swap,
+//! and consumes no random draw, so a treated and an untreated run read the
+//! same random sequence at every step.
+//!
+//! The firing is counted by the incarnation class of the pick: contests and
+//! replacements for the dead class, and, for the sender's current
+//! incarnation, the replacements the preference declines to make. The
+//! entry census names the dead class's share of the pair entries and of the
+//! inversions on both halves, so the class the preference acts on can be
+//! read against the class it leaves alone.
 //!
 //! The treated half is drawn under a salt of its own, so the split is
 //! independent of every other split of a session. Run-cap probes and

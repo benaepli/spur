@@ -1333,7 +1333,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         if let Some(inverted) =
                             pair_order::classify_entry(siblings, r.send_ordinal, entered_before)
                         {
-                            util_stats::record_pair_order_entry(state.pair_order.enabled, inverted);
+                            util_stats::record_pair_order_entry(
+                                state.pair_order.enabled,
+                                state.fault_crossing(record_origin, r.origin_incarnation),
+                                inverted,
+                            );
                         }
                     }
                     // A delivery from a sender that is down, or that restarted
@@ -1603,17 +1607,20 @@ fn fresh_first_dispatch<H: HashPolicy>(
 }
 
 /// After the draw and the fresh-incarnation swap have settled on `pick`: on
-/// a treated run, a remote record from a sender that has crashed at least
-/// once in the run gives way to the eligible record from the same sender to
-/// the same destination, sent by the same incarnation, that carries the
-/// lowest send ordinal, when that ordinal is below the pick's. The scan is
-/// gated on the sender's ledger holding at least one other remote record in
-/// the queue. Records of a sender that never crashed, and anything but a
-/// remote record, keep the pick. A pick with an eligible rival of its class
-/// is counted as a contest, with whether the pick already carried the
-/// lowest ordinal: on every treated run, where the scan happens anyway, and
-/// on census runs of the control half; any other untreated run returns
-/// without reading the queue. No random draw is taken.
+/// a treated run, a remote record whose sending incarnation is not the one
+/// running now - which covers every record of a sender that is down - gives
+/// way to the eligible record from the same sender to the same destination,
+/// sent by the same incarnation, that carries the lowest send ordinal, when
+/// that ordinal is below the pick's. The scan is gated on the sender's
+/// ledger holding at least one other remote record in the queue. A pick of
+/// the sender's current incarnation keeps the order the draw gave it, and
+/// the replacement it would otherwise have taken is counted as suppressed.
+/// Records of a sender that never crashed, and anything but a remote
+/// record, keep the pick. A pick with an eligible rival of its class is
+/// counted as a contest, with whether the pick already carried the lowest
+/// ordinal: on every treated run, where the scan happens anyway, and on
+/// census runs of the control half; any other untreated run returns without
+/// reading the queue. No random draw is taken.
 fn pair_order_dispatch<H: HashPolicy>(state: &State<H>, eligible: &[usize], pick: usize) -> usize {
     let treated = state.pair_order.enabled;
     if !treated && !state.pair_order.census {
@@ -1654,12 +1661,21 @@ fn pair_order_dispatch<H: HashPolicy>(state: &State<H>, eligible: &[usize], pick
         return pick;
     }
     util_stats::record_pair_order_contest(treated, contest.earliest.is_none());
+    if !treated {
+        return pick;
+    }
+    let ghost = state.fault_crossing(origin, rec.origin_incarnation);
+    util_stats::record_pair_order_contest_class(ghost);
     match contest.earliest {
-        Some(earliest) if treated => {
-            util_stats::record_pair_order_corrected();
+        Some(earliest) if ghost => {
+            util_stats::record_pair_order_correction(ghost);
             earliest
         }
-        _ => pick,
+        Some(_) => {
+            util_stats::record_pair_order_fresh_suppressed();
+            pick
+        }
+        None => pick,
     }
 }
 
@@ -2773,7 +2789,8 @@ mod tests {
     }
 
     #[test]
-    fn a_treated_step_takes_the_earliest_send_of_the_pick_s_class_from_a_crashed_sender() {
+    fn a_treated_step_takes_the_earliest_send_of_a_dead_incarnation_s_class() {
+        let _serial = crate::simulator::config_override::exclusive_session();
         let (mut state, slots) = ordered_state();
         let [ghost_a, ghost_b, fresh_a, ghost_other, fresh_b, chan, quiet_a, quiet_b] = slots[..] else {
             unreachable!()
@@ -2790,7 +2807,11 @@ mod tests {
 
         state.pair_order.enabled = true;
         assert_eq!(pair_order_dispatch(&state, &eligible, ghost_b), ghost_a, "the later ghost gives way to the earlier one");
-        assert_eq!(pair_order_dispatch(&state, &eligible, fresh_b), fresh_a, "the later fresh record gives way to the earlier one");
+        assert_eq!(
+            pair_order_dispatch(&state, &eligible, fresh_b),
+            fresh_b,
+            "a pick of the incarnation running now keeps the order the draw gave it"
+        );
         for pick in [ghost_a, fresh_a] {
             assert_eq!(pair_order_dispatch(&state, &eligible, pick), pick, "the earliest of its class is kept");
         }
@@ -2806,7 +2827,11 @@ mod tests {
         assert_eq!(pair_order_dispatch(&state, &only_fresh_b, fresh_b), fresh_b, "no eligible rival keeps the pick");
 
         state.crash_info.currently_crashed.insert(node(2));
-        assert_eq!(pair_order_dispatch(&state, &eligible, quiet_b), quiet_a, "a sender that is down counts as crashed");
+        assert_eq!(
+            pair_order_dispatch(&state, &eligible, quiet_b),
+            quiet_a,
+            "a sender that is down has no incarnation running, so its records are the dead class"
+        );
         state.crash_info.currently_crashed.remove(&node(2));
 
         let ledger = state.send_ledger[0];
@@ -2814,6 +2839,40 @@ mod tests {
         assert_eq!(pair_order_dispatch(&state, &eligible, ghost_b), ghost_b, "a ledger with a single record closes the gate");
         state.send_ledger[0] = ledger;
         assert_eq!(pair_order_dispatch(&state, &eligible, ghost_b), ghost_a);
+    }
+
+    /// The dead class is counted and replaced, the current incarnation's
+    /// class is counted and left where the draw put it.
+    #[test]
+    fn a_treated_step_prices_the_replacement_it_declines_to_make() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        let (mut state, slots) = ordered_state();
+        let [ghost_a, ghost_b, _, _, fresh_b, _, _, _] = slots[..] else {
+            unreachable!()
+        };
+        let eligible: Vec<usize> = (0..state.network_queue.len()).collect();
+        state.pair_order.enabled = true;
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().pair_order;
+        pair_order_dispatch(&state, &eligible, ghost_b);
+        pair_order_dispatch(&state, &eligible, fresh_b);
+        pair_order_dispatch(&state, &eligible, ghost_a);
+        let after = util_stats::snapshot().pair_order;
+        util_stats::set_enabled(false);
+
+        assert_eq!(after.corrections_ghost - before.corrections_ghost, 1);
+        assert_eq!(
+            after.corrections_fresh - before.corrections_fresh,
+            0,
+            "a pick of the incarnation running now was replaced"
+        );
+        assert_eq!(
+            after.corrections_fresh_suppressed - before.corrections_fresh_suppressed,
+            1
+        );
+        assert_eq!(after.contests_by_class.ghost - before.contests_by_class.ghost, 2);
+        assert_eq!(after.contests_by_class.fresh - before.contests_by_class.fresh, 1);
+        assert_eq!(after.corrected - before.corrected, 1);
     }
 
     /// The replacement takes no draw: after the within-queue selection a
@@ -2824,10 +2883,11 @@ mod tests {
         let _serial = crate::simulator::config_override::exclusive_session();
         let (state, slots) = ordered_state();
         let later = [slots[1], slots[4]];
+        let later_ghost = slots[1];
         let eligible: Vec<usize> = (0..state.network_queue.len()).collect();
         let selector = WithinQueueSelector::Tournament { k: 3 };
         let mut positions = Vec::new();
-        for seed in 0..8u64 {
+        for seed in 0..32u64 {
             for treated in [false, true] {
                 let mut state = state.clone();
                 state.pair_order.enabled = treated;
@@ -2843,8 +2903,13 @@ mod tests {
                     &mut rng,
                 );
                 let taken = pair_order_dispatch(&state, &eligible, drawn);
+                let replaces = treated && drawn == later_ghost;
                 if later.contains(&drawn) {
-                    assert_eq!(taken != drawn, treated, "only the treated step replaces a later send");
+                    assert_eq!(
+                        taken != drawn,
+                        replaces,
+                        "a later send of the wrong class was replaced"
+                    );
                 } else {
                     assert_eq!(taken, drawn);
                 }
@@ -2856,8 +2921,8 @@ mod tests {
             "the halves diverged: {positions:?}"
         );
         assert!(
-            positions.iter().any(|p| later.contains(&p.1)),
-            "no draw fell on a later send, so the replacement was never exercised"
+            positions.iter().any(|p| p.1 == later_ghost),
+            "no draw fell on a later send of the dead class, so the replacement was never exercised"
         );
     }
 

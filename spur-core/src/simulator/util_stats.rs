@@ -112,7 +112,17 @@ static PO_INORDER_DRAWS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; 
 static PO_PAIR_ENTRIES: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
 static PO_INVERSIONS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
 static PO_SAMPLED_RUNS: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
+static PO_PAIR_ENTRIES_GHOST: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
+static PO_INVERSIONS_GHOST: [AtomicU64; PO_HALVES] = [const { AtomicU64::new(0) }; PO_HALVES];
 static PO_CORRECTED: AtomicU64 = AtomicU64::new(0);
+/// The firing of the preference on the treated half by the incarnation class
+/// of the pick: index 1 is a pick whose sending incarnation is not the one
+/// running now, index 0 a pick of the sender's current incarnation.
+const PO_CLASSES: usize = 2;
+static PO_CONTESTS_BY_CLASS: [AtomicU64; PO_CLASSES] = [const { AtomicU64::new(0) }; PO_CLASSES];
+static PO_CORRECTIONS_BY_CLASS: [AtomicU64; PO_CLASSES] =
+    [const { AtomicU64::new(0) }; PO_CLASSES];
+static PO_FRESH_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 /// The client-anchor census split by its half: index 0 is the control half,
 /// index 1 the treated half.
 const CAN_HALVES: usize = 2;
@@ -464,6 +474,7 @@ pub fn set_enabled(on: bool) {
             &FF_SWAPS,
             &FF_REPEAT_SWAPS,
             &PO_CORRECTED,
+            &PO_FRESH_SUPPRESSED,
             &CAN_HELD,
             &CAN_RELEASED_EXPIRY,
             &CAN_RELEASED_DRY_QUEUE,
@@ -515,6 +526,10 @@ pub fn set_enabled(on: bool) {
             .chain(PO_PAIR_ENTRIES.iter())
             .chain(PO_INVERSIONS.iter())
             .chain(PO_SAMPLED_RUNS.iter())
+            .chain(PO_PAIR_ENTRIES_GHOST.iter())
+            .chain(PO_INVERSIONS_GHOST.iter())
+            .chain(PO_CONTESTS_BY_CLASS.iter())
+            .chain(PO_CORRECTIONS_BY_CLASS.iter())
             .chain(CAN_RUNS.iter())
             .chain(CAN_COMPLETED_RUNS.iter())
             .chain(CAN_POPULATION.iter())
@@ -1822,30 +1837,63 @@ pub fn record_pair_order_contest(treated: bool, inorder: bool) {
     }
 }
 
-/// A treated run replaced the pick with the eligible record of its class
-/// carrying the lowest send ordinal.
+/// A treated step's pick was contested. `ghost` says the pick's sending
+/// incarnation is not the one running now. Counted before any replacement,
+/// so each class's share of the contests the preference sees is readable.
 #[inline]
-pub fn record_pair_order_corrected() {
+pub fn record_pair_order_contest_class(ghost: bool) {
+    if !enabled() {
+        return;
+    }
+    PO_CONTESTS_BY_CLASS[ghost as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A treated run replaced the pick with the eligible record of its class
+/// carrying the lowest send ordinal. `ghost` says the pick's sending
+/// incarnation is not the one running now; only that class is replaced, so
+/// the count of the other class is an audit that must read zero.
+#[inline]
+pub fn record_pair_order_correction(ghost: bool) {
     if !enabled() {
         return;
     }
     PO_CORRECTED.fetch_add(1, Ordering::Relaxed);
+    PO_CORRECTIONS_BY_CLASS[ghost as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A treated run left a pick of the sender's current incarnation where the
+/// draw put it, where a rule covering every class would have replaced it
+/// with an earlier send.
+#[inline]
+pub fn record_pair_order_fresh_suppressed() {
+    if !enabled() {
+        return;
+    }
+    PO_FRESH_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A message entry from a sender that has crashed at least once in the run
 /// whose class - same sender, same destination, same sending incarnation -
 /// has a sibling already entered or still in the network queue; `inverted`
 /// says a queued sibling carries a lower send ordinal, so the destination
-/// acts on the later send first. Counted on the census runs of both halves.
+/// acts on the later send first, and `ghost` that the entry's sending
+/// incarnation is not the one running now. Counted on the census runs of
+/// both halves.
 #[inline]
-pub fn record_pair_order_entry(treated: bool, inverted: bool) {
+pub fn record_pair_order_entry(treated: bool, ghost: bool, inverted: bool) {
     if !enabled() {
         return;
     }
     let i = treated as usize;
     PO_PAIR_ENTRIES[i].fetch_add(1, Ordering::Relaxed);
+    if ghost {
+        PO_PAIR_ENTRIES_GHOST[i].fetch_add(1, Ordering::Relaxed);
+    }
     if inverted {
         PO_INVERSIONS[i].fetch_add(1, Ordering::Relaxed);
+        if ghost {
+            PO_INVERSIONS_GHOST[i].fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -3813,6 +3861,13 @@ impl FreshFirstStats {
 /// `inversions` the subset with a queued sibling of a lower send ordinal,
 /// an entry the destination takes ahead of an earlier send.
 ///
+/// `pair_entries_ghost` and `inversions_ghost` are the subsets of those two
+/// whose entry was sent by an incarnation other than the one running now,
+/// which covers every entry from a sender that is down; the rest of each
+/// belongs to the sender's current incarnation. The preference acts on the
+/// first subset alone, so `inversions_ghost` on the treated half is what it
+/// removes.
+///
 /// `sampled_runs` counts the half's census runs. `pair_entries` and
 /// `inversions` come from those runs alone on both halves, as do `contests`
 /// and `inorder_draws` on the control half; the treated half counts its
@@ -3823,7 +3878,9 @@ pub struct PairOrderHalfStats {
     pub contests: u64,
     pub inorder_draws: u64,
     pub pair_entries: u64,
+    pub pair_entries_ghost: u64,
     pub inversions: u64,
+    pub inversions_ghost: u64,
     pub sampled_runs: u64,
 }
 
@@ -3834,7 +3891,9 @@ impl PairOrderHalfStats {
             contests: PO_CONTESTS[i].load(Ordering::Relaxed),
             inorder_draws: PO_INORDER_DRAWS[i].load(Ordering::Relaxed),
             pair_entries: PO_PAIR_ENTRIES[i].load(Ordering::Relaxed),
+            pair_entries_ghost: PO_PAIR_ENTRIES_GHOST[i].load(Ordering::Relaxed),
             inversions: PO_INVERSIONS[i].load(Ordering::Relaxed),
+            inversions_ghost: PO_INVERSIONS_GHOST[i].load(Ordering::Relaxed),
             sampled_runs: PO_SAMPLED_RUNS[i].load(Ordering::Relaxed),
         }
     }
@@ -3847,14 +3906,33 @@ pub struct PairOrderCensusStats {
     pub control: PairOrderHalfStats,
 }
 
+/// Contested treated steps by the incarnation class of the pick: `ghost` is
+/// a pick whose sending incarnation is not the one running now, which covers
+/// every record of a sender that is down, and `fresh` a pick of the sender's
+/// current incarnation. Counted before any replacement, so the two sum to
+/// the treated half's `contests`.
+#[derive(Serialize, Debug)]
+pub struct PairOrderClassCounts {
+    pub ghost: u64,
+    pub fresh: u64,
+}
+
 /// The pair-order dispatch block. `corrected` is the number the mechanism is
-/// read as having fired: treated contests whose pick did not carry the
-/// lowest send ordinal of its class and that took the lowest-ordinal record
-/// instead. It equals the treated half's `contests` less its
-/// `inorder_draws`.
+/// read as having fired: treated contests of the dead class whose pick did
+/// not carry the lowest send ordinal of its class and that took the
+/// lowest-ordinal record instead. `corrections_ghost` is that same count
+/// split out, and `corrections_fresh` the audit that must read zero, since
+/// only the dead class is replaced. `corrections_fresh_suppressed` counts
+/// the replacements a rule covering every class would have made on the
+/// sender's current incarnation, so its ratio to `corrected` is how much
+/// firing the class test returns to the draw.
 #[derive(Serialize, Debug)]
 pub struct PairOrderStats {
     pub corrected: u64,
+    pub contests_by_class: PairOrderClassCounts,
+    pub corrections_ghost: u64,
+    pub corrections_fresh: u64,
+    pub corrections_fresh_suppressed: u64,
     pub census: PairOrderCensusStats,
 }
 
@@ -3862,6 +3940,13 @@ impl PairOrderStats {
     fn read() -> Self {
         Self {
             corrected: PO_CORRECTED.load(Ordering::Relaxed),
+            contests_by_class: PairOrderClassCounts {
+                ghost: PO_CONTESTS_BY_CLASS[1].load(Ordering::Relaxed),
+                fresh: PO_CONTESTS_BY_CLASS[0].load(Ordering::Relaxed),
+            },
+            corrections_ghost: PO_CORRECTIONS_BY_CLASS[1].load(Ordering::Relaxed),
+            corrections_fresh: PO_CORRECTIONS_BY_CLASS[0].load(Ordering::Relaxed),
+            corrections_fresh_suppressed: PO_FRESH_SUPPRESSED.load(Ordering::Relaxed),
             census: PairOrderCensusStats {
                 treated: PairOrderHalfStats::read(true),
                 control: PairOrderHalfStats::read(false),
@@ -4284,16 +4369,21 @@ mod tests {
         record_pair_order_contest(true, false);
         record_pair_order_contest(true, true);
         record_pair_order_contest(false, false);
-        record_pair_order_corrected();
-        record_pair_order_entry(true, false);
-        record_pair_order_entry(false, true);
-        record_pair_order_entry(false, false);
+        record_pair_order_contest_class(true);
+        record_pair_order_contest_class(false);
+        record_pair_order_correction(true);
+        record_pair_order_fresh_suppressed();
+        record_pair_order_fresh_suppressed();
+        record_pair_order_entry(true, true, false);
+        record_pair_order_entry(false, true, true);
+        record_pair_order_entry(false, false, false);
         record_pair_order_census_run(true);
         record_pair_order_census_run(false);
         record_pair_order_census_run(false);
         let after = snapshot().pair_order;
         set_enabled(false);
-        record_pair_order_corrected();
+        record_pair_order_correction(true);
+        record_pair_order_fresh_suppressed();
         assert_eq!(snapshot().pair_order.corrected, after.corrected, "a disabled session counted");
 
         let (t, c) = (&after.census.treated, &after.census.control);
@@ -4303,10 +4393,28 @@ mod tests {
         assert_eq!(c.contests - bc.contests, 1);
         assert_eq!(c.inorder_draws - bc.inorder_draws, 0);
         assert_eq!(after.corrected - before.corrected, 1);
+        assert_eq!(
+            after.contests_by_class.ghost - before.contests_by_class.ghost,
+            1
+        );
+        assert_eq!(
+            after.contests_by_class.fresh - before.contests_by_class.fresh,
+            1
+        );
+        assert_eq!(after.corrections_ghost - before.corrections_ghost, 1);
+        assert_eq!(after.corrections_fresh - before.corrections_fresh, 0);
+        assert_eq!(
+            after.corrections_fresh_suppressed - before.corrections_fresh_suppressed,
+            2
+        );
         assert_eq!(t.pair_entries - bt.pair_entries, 1);
+        assert_eq!(t.pair_entries_ghost - bt.pair_entries_ghost, 1);
         assert_eq!(t.inversions - bt.inversions, 0);
+        assert_eq!(t.inversions_ghost - bt.inversions_ghost, 0);
         assert_eq!(c.pair_entries - bc.pair_entries, 2);
+        assert_eq!(c.pair_entries_ghost - bc.pair_entries_ghost, 1);
         assert_eq!(c.inversions - bc.inversions, 1);
+        assert_eq!(c.inversions_ghost - bc.inversions_ghost, 1);
         assert_eq!(t.sampled_runs - bt.sampled_runs, 1);
         assert_eq!(c.sampled_runs - bc.sampled_runs, 2);
     }

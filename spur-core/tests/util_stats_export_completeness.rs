@@ -17,7 +17,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorHalfStats, ClientAnchorHeldHist, ClientAnchorReleaseStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderHalfStats, PairOrderStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -833,7 +833,9 @@ fn pair_order_half(m: &mut Marks) -> PairOrderHalfStats {
         contests: m.int(),
         inorder_draws: m.int(),
         pair_entries: m.int(),
+        pair_entries_ghost: m.int(),
         inversions: m.int(),
+        inversions_ghost: m.int(),
         sampled_runs: m.int(),
     }
 }
@@ -843,14 +845,18 @@ fn pair_order_half_leaves(prefix: &str, h: &PairOrderHalfStats) -> Vec<(String, 
         contests,
         inorder_draws,
         pair_entries,
+        pair_entries_ghost,
         inversions,
+        inversions_ghost,
         sampled_runs,
     } = h;
     vec![
         leaf(prefix, "contests", *contests),
         leaf(prefix, "inorder_draws", *inorder_draws),
         leaf(prefix, "pair_entries", *pair_entries),
+        leaf(prefix, "pair_entries_ghost", *pair_entries_ghost),
         leaf(prefix, "inversions", *inversions),
+        leaf(prefix, "inversions_ghost", *inversions_ghost),
         leaf(prefix, "sampled_runs", *sampled_runs),
     ]
 }
@@ -858,6 +864,13 @@ fn pair_order_half_leaves(prefix: &str, h: &PairOrderHalfStats) -> Vec<(String, 
 fn pair_order(m: &mut Marks) -> PairOrderStats {
     PairOrderStats {
         corrected: m.int(),
+        contests_by_class: PairOrderClassCounts {
+            ghost: m.int(),
+            fresh: m.int(),
+        },
+        corrections_ghost: m.int(),
+        corrections_fresh: m.int(),
+        corrections_fresh_suppressed: m.int(),
         census: PairOrderCensusStats {
             treated: pair_order_half(m),
             control: pair_order_half(m),
@@ -866,9 +879,28 @@ fn pair_order(m: &mut Marks) -> PairOrderStats {
 }
 
 fn pair_order_leaves(prefix: &str, p: &PairOrderStats) -> Vec<(String, Value)> {
-    let PairOrderStats { corrected, census } = p;
+    let PairOrderStats {
+        corrected,
+        contests_by_class,
+        corrections_ghost,
+        corrections_fresh,
+        corrections_fresh_suppressed,
+        census,
+    } = p;
+    let PairOrderClassCounts { ghost, fresh } = contests_by_class;
     let PairOrderCensusStats { treated, control } = census;
-    let mut out = vec![leaf(prefix, "corrected", *corrected)];
+    let mut out = vec![
+        leaf(prefix, "corrected", *corrected),
+        leaf(&format!("{prefix}.contests_by_class"), "ghost", *ghost),
+        leaf(&format!("{prefix}.contests_by_class"), "fresh", *fresh),
+        leaf(prefix, "corrections_ghost", *corrections_ghost),
+        leaf(prefix, "corrections_fresh", *corrections_fresh),
+        leaf(
+            prefix,
+            "corrections_fresh_suppressed",
+            *corrections_fresh_suppressed,
+        ),
+    ];
     out.extend(pair_order_half_leaves(&format!("{prefix}.census.treated"), treated));
     out.extend(pair_order_half_leaves(&format!("{prefix}.census.control"), control));
     out
