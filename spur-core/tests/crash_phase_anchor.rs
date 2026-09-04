@@ -14,7 +14,7 @@ use spur_core::simulator::explorer::{
 };
 use spur_core::simulator::history::{HistoryWriter, LogBackend, create_writer};
 use spur_core::simulator::rng::LiveRng;
-use spur_core::simulator::{crash_phase, fault_timing, run_cap, util_stats};
+use spur_core::simulator::{crash_phase, fault_timing, ghost_absorber, run_cap, util_stats};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,11 +52,70 @@ const END_REASONS: [&str; 4] = [
     "learned_cap_reached",
 ];
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join("spur_crash_phase_anchor");
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(name);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("creates scratch directory");
     dir
+}
+
+/// Feed the span learner completed lengths short enough that a drawn hold
+/// expires inside a run.
+fn seed_span() {
+    run_cap::reset();
+    fault_timing::reset();
+    let feeder = (0..1_000_000i64)
+        .find(|&id| run_cap::is_probe(id))
+        .expect("some run id is a probe");
+    for _ in 0..200 {
+        fault_timing::merge_stock_probe(
+            feeder,
+            BACKUP,
+            run_cap::Outcome::Completed,
+            SEEDED_LENGTH,
+        );
+    }
+    assert!(
+        fault_timing::median(BACKUP).is_some_and(|m| m < 64),
+        "the seeded span must be short enough to expire inside a run"
+    );
+}
+
+/// One session of `run_ids` on the fixture, written under `out`, with the
+/// counters and the crash census on.
+fn run_session(run_ids: &[i64], out: &Path) {
+    let program = compiler::compile(SPEC, "fanout.spur")
+        .into_program()
+        .expect("spec compiles");
+    let config: ExplorerConfig = serde_json::from_str(CONFIG).expect("config parses");
+    let run_config = config
+        .expand_grid()
+        .into_iter()
+        .next()
+        .expect("the grid holds one config");
+    let writer: Arc<dyn HistoryWriter> = Arc::from(
+        create_writer(LogBackend::Parquet, out.to_str().expect("utf-8 path"))
+            .expect("creates writer"),
+    );
+    let global_state = GlobalState::<NoFeedback>::new();
+    util_stats::set_enabled(true);
+    util_stats::set_crash_census_enabled(true);
+    for &run_id in run_ids {
+        run_single_simulation::<NoFeedback, LiveRng>(
+            &program,
+            &writer,
+            &global_state,
+            run_id,
+            &run_config,
+            &Default::default(),
+            0x_C0FF_EE00 ^ run_id as u64,
+            0x_5EED_1234 ^ run_id as u64,
+            None,
+            &RunAttribution::mode("test"),
+        )
+        .expect("the run executes");
+    }
+    writer.shutdown();
 }
 
 fn columns(dir: &Path, table: &str, names: &[&str]) -> Vec<Vec<String>> {
@@ -107,33 +166,7 @@ fn a_session_of_anchored_runs_arms_both_waiting_arms_and_censuses_them() {
 
 fn check() {
     let _serial = config_override::exclusive_session();
-    run_cap::reset();
-    fault_timing::reset();
-    let feeder = (0..1_000_000i64)
-        .find(|&id| run_cap::is_probe(id))
-        .expect("some run id is a probe");
-    for _ in 0..200 {
-        fault_timing::merge_stock_probe(
-            feeder,
-            BACKUP,
-            run_cap::Outcome::Completed,
-            SEEDED_LENGTH,
-        );
-    }
-    assert!(
-        fault_timing::median(BACKUP).is_some_and(|m| m < 64),
-        "the seeded span must be short enough to expire inside a run"
-    );
-
-    let program = compiler::compile(SPEC, "fanout.spur")
-        .into_program()
-        .expect("spec compiles");
-    let config: ExplorerConfig = serde_json::from_str(CONFIG).expect("config parses");
-    let run_config = config
-        .expand_grid()
-        .into_iter()
-        .next()
-        .expect("the grid holds one config");
+    seed_span();
 
     let anchored: Vec<i64> = (0..1_000_000i64)
         .filter(|&id| crash_phase::is_anchored(id))
@@ -141,30 +174,8 @@ fn check() {
         .collect();
     assert_eq!(anchored.len(), RUNS, "not enough anchored run ids");
 
-    let out = scratch();
-    let writer: Arc<dyn HistoryWriter> = Arc::from(
-        create_writer(LogBackend::Parquet, out.to_str().expect("utf-8 path"))
-            .expect("creates writer"),
-    );
-    let global_state = GlobalState::<NoFeedback>::new();
-    util_stats::set_enabled(true);
-    util_stats::set_crash_census_enabled(true);
-    for &run_id in &anchored {
-        run_single_simulation::<NoFeedback, LiveRng>(
-            &program,
-            &writer,
-            &global_state,
-            run_id,
-            &run_config,
-            &Default::default(),
-            0x_C0FF_EE00 ^ run_id as u64,
-            0x_5EED_1234 ^ run_id as u64,
-            None,
-            &RunAttribution::mode("test"),
-        )
-        .expect("the run executes");
-    }
-    writer.shutdown();
+    let out = scratch("spur_crash_phase_anchor");
+    run_session(&anchored, &out);
     let phase = util_stats::snapshot().crash_phase;
     util_stats::set_crash_census_enabled(false);
     util_stats::set_enabled(false);
@@ -265,4 +276,81 @@ fn check() {
         "invocations without a response in a completed run: {unanswered:?}"
     );
     let _ = fs::remove_dir_all(&out);
+}
+
+/// On anchored runs that retarget their crashes the phase read must land on
+/// another node on a real workload and end there, and the moved census must
+/// carry counts; anchored runs that do not retarget must leave every landing
+/// counter and the moved census untouched.
+#[test]
+fn a_retargeting_session_counts_its_landing_reads_and_a_plain_one_none() {
+    std::thread::Builder::new()
+        .stack_size(SESSION_STACK_BYTES)
+        .spawn(check_landing)
+        .expect("spawns the session thread")
+        .join()
+        .expect("the session thread runs to completion");
+}
+
+fn moved_crashes(phase: &util_stats::CrashPhaseStats) -> u64 {
+    [&phase.early, &phase.mid, &phase.stock]
+        .iter()
+        .map(|a| a.moved_read_on_landing.crashes_applied)
+        .sum()
+}
+
+fn check_landing() {
+    let _serial = config_override::exclusive_session();
+    seed_span();
+
+    let retargeting: Vec<i64> = (0..1_000_000i64)
+        .filter(|&id| crash_phase::is_anchored(id) && ghost_absorber::is_treated(id))
+        .take(RUNS)
+        .collect();
+    let plain: Vec<i64> = (0..1_000_000i64)
+        .filter(|&id| crash_phase::is_anchored(id) && !ghost_absorber::is_treated(id))
+        .take(RUNS)
+        .collect();
+    assert_eq!(retargeting.len(), RUNS, "not enough retargeting run ids");
+    assert_eq!(plain.len(), RUNS, "not enough plain anchored run ids");
+
+    let before = util_stats::snapshot().crash_phase;
+    let out_retargeting = scratch("spur_crash_phase_landing_retargeting");
+    let out_plain = scratch("spur_crash_phase_landing_plain");
+    run_session(&retargeting, &out_retargeting);
+    let mid = util_stats::snapshot().crash_phase;
+    run_session(&plain, &out_plain);
+    let after = util_stats::snapshot().crash_phase;
+    util_stats::set_crash_census_enabled(false);
+    util_stats::set_enabled(false);
+    run_cap::reset();
+    fault_timing::reset();
+    let _ = fs::remove_dir_all(&out_retargeting);
+    let _ = fs::remove_dir_all(&out_plain);
+
+    let (b, m, a) = (&before.landing, &mid.landing, &after.landing);
+    let evaluated = m.evaluated_on_other_node - b.evaluated_on_other_node;
+    let condition = m.condition_on_other_node - b.condition_on_other_node;
+    let expired = m.expired_on_other_node - b.expired_on_other_node;
+    let mismatch = m.mismatch_at_apply - b.mismatch_at_apply;
+    assert!(evaluated > 0, "no phase was ever read on another node: {m:?}");
+    assert!(
+        condition + expired > 0 && condition + expired <= evaluated,
+        "the reads on another node never ended: {condition} + {expired} of {evaluated}"
+    );
+    assert!(mismatch <= condition, "more mismatches than releases by phase");
+    assert!(
+        moved_crashes(&mid) - moved_crashes(&before) > 0,
+        "no crash moved on the retargeting runs"
+    );
+
+    assert_eq!(a.evaluated_on_other_node, m.evaluated_on_other_node, "plain runs evaluated");
+    assert_eq!(a.condition_on_other_node, m.condition_on_other_node, "plain runs released");
+    assert_eq!(a.expired_on_other_node, m.expired_on_other_node, "plain runs expired");
+    assert_eq!(a.mismatch_at_apply, m.mismatch_at_apply, "plain runs mismatched");
+    assert_eq!(
+        moved_crashes(&after),
+        moved_crashes(&mid),
+        "a crash moved on a run that does not retarget"
+    );
 }

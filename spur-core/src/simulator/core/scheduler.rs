@@ -699,7 +699,13 @@ fn route_by_terms<H: HashPolicy>(
 /// the ordinary crash admission applies unchanged. Each offer the target step
 /// excludes is counted per node per step; the anchor's waiting is counted in
 /// its own block, so the placement counters keep meaning the step hold alone.
-fn crash_hold_mask<H: HashPolicy>(state: &mut State<H>, rng: &mut impl StreamRng) -> u64 {
+/// The fan-out is read on the node `phase_read_node` names, which is the
+/// victim itself on every run that does not retarget its crashes.
+fn crash_hold_mask<H: HashPolicy>(
+    state: &mut State<H>,
+    servers: usize,
+    rng: &mut impl StreamRng,
+) -> u64 {
     let step_now = state.crash_info.current_step;
     let mut mask = 0u64;
     let width = state.crash_hold_until.len().min(u64::BITS as usize);
@@ -710,21 +716,52 @@ fn crash_hold_mask<H: HashPolicy>(state: &mut State<H>, rng: &mut impl StreamRng
         if ledger.crash_pending == 0 {
             continue;
         }
-        let fanout = crash_phase::Fanout {
-            segment_sends: ledger.issued.saturating_sub(ledger.floor),
-            undelivered: ledger.recent,
-            in_flight: ledger.in_flight,
-        };
         if step_now < state.crash_hold_until[n] {
             mask |= 1u64 << n;
             util_stats::record_crash_place_hold();
             continue;
         }
-        if state.crash_phase.hold(n, fanout, step_now, rng) {
+        let read = phase_read_node(state, n, servers);
+        let ledger = state.send_ledger.get(read).copied().unwrap_or(*ledger);
+        let fanout = crash_phase::Fanout {
+            segment_sends: ledger.issued.saturating_sub(ledger.floor),
+            undelivered: ledger.recent,
+            in_flight: ledger.in_flight,
+        };
+        if state
+            .crash_phase
+            .hold_read_on(n, read, fanout, step_now, rng)
+        {
             mask |= 1u64 << n;
         }
     }
     mask
+}
+
+/// The node whose ledger the fan-out phase of `n`'s waiting crash is read
+/// on. This is `n` itself unless the run retargets its crashes, still has a
+/// release ahead for `n`, and the absorber ranking would move the crash to
+/// another node at this step. The ranking is the one `retarget_crash`
+/// consults at apply, on the same ledgers, so the node read and the node
+/// crashed can differ only by what moves between the last read and the
+/// apply.
+fn phase_read_node<H: HashPolicy>(state: &State<H>, n: usize, servers: usize) -> usize {
+    if !state.retarget.enabled || !state.crash_phase.awaits_release(n) {
+        return n;
+    }
+    let planned = state.local_queues.get(n).and_then(|queue| {
+        queue.iter().find_map(|r| match r {
+            Runnable::Crash { node_id, .. } => Some(*node_id),
+            _ => None,
+        })
+    });
+    let Some(planned) = planned else {
+        return n;
+    };
+    match absorber_decision(state, planned, servers).choice {
+        ghost_absorber::Choice::Retarget { node, .. } => node,
+        ghost_absorber::Choice::SameVictim | ghost_absorber::Choice::NoAbsorber => n,
+    }
 }
 
 pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback>(
@@ -759,7 +796,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // offered again at the next step, which keeps the number of crashes a run
     // takes the same and moves only when they land. Nodes past the width of the
     // mask are never withheld.
-    let crash_hold_mask = crash_hold_mask(state, rng);
+    let crash_hold_mask = crash_hold_mask(state, topology.num_servers.max(0) as usize, rng);
 
     let crash_defer_mask: u64 = if partial_fanout_crash_bias > 0.0 {
         let mut mask = 0u64;
@@ -1080,8 +1117,8 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         Runnable::Crash { node_id, .. } => {
             // Every census of what a crash lands on reads the node the crash
             // is applied to, which may differ from the planned victim. Only
-            // the phase arm is keyed on the planned node, whose fan-out the
-            // hold was evaluated against.
+            // the phase arm is keyed on the planned node, the node the hold
+            // was armed on.
             let victim = retarget_crash(state, node_id, topology.num_servers.max(0) as usize);
             let ledger = state.send_ledger.get(victim.index).copied().unwrap_or_default();
             if util_stats::enabled() {
@@ -1092,7 +1129,12 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 util_stats::record_crash_census(ledger.in_flight, any_candidate);
             }
             if let Some(arm) = state.crash_phase.arm_of(node_id.index) {
-                util_stats::record_crash_phase_apply(arm, ledger.in_flight);
+                util_stats::record_crash_phase_apply(
+                    arm,
+                    ledger.in_flight,
+                    victim.index != node_id.index,
+                );
+                state.crash_phase.landing_applied(node_id.index, victim.index);
             }
             if util_stats::enabled() {
                 util_stats::record_victim_swap_census(
@@ -1440,21 +1482,7 @@ fn retarget_crash<H: HashPolicy>(state: &State<H>, planned: NodeId, servers: usi
     if !state.retarget.enabled {
         return planned;
     }
-    let decision = ghost_absorber::choose(
-        planned.index,
-        &state.send_ledger,
-        servers,
-        |n| {
-            !state.crash_info.currently_crashed.contains(&NodeId {
-                role: planned.role,
-                index: n,
-            })
-        },
-        |n| {
-            state.retarget.has_pending_pair(n)
-                || state.send_ledger.get(n).is_some_and(|l| l.crash_pending > 0)
-        },
-    );
+    let decision = absorber_decision(state, planned, servers);
     let (outcome, victim) = match decision.choice {
         ghost_absorber::Choice::Retarget { node, acted } => (
             util_stats::VictimSwap::Applied { acted },
@@ -1468,6 +1496,33 @@ fn retarget_crash<H: HashPolicy>(state: &State<H>, planned: NodeId, servers: usi
     };
     util_stats::record_victim_swap(outcome, decision.skipped_pending_pair);
     victim
+}
+
+/// The absorber ranking's choice for a crash planned on `planned`, read on
+/// the current ledgers. A node that is down cannot be crashed, and a node
+/// the plan still has a crash or recover outstanding on, or whose own
+/// crash is still queued, is passed over. Both the hold-time read and the
+/// apply-time retarget consult this, so they agree on the same ledgers.
+fn absorber_decision<H: HashPolicy>(
+    state: &State<H>,
+    planned: NodeId,
+    servers: usize,
+) -> ghost_absorber::Decision {
+    ghost_absorber::choose(
+        planned.index,
+        &state.send_ledger,
+        servers,
+        |n| {
+            !state.crash_info.currently_crashed.contains(&NodeId {
+                role: planned.role,
+                index: n,
+            })
+        },
+        |n| {
+            state.retarget.has_pending_pair(n)
+                || state.send_ledger.get(n).is_some_and(|l| l.crash_pending > 0)
+        },
+    )
 }
 
 /// The network-queue index a step takes once the within-queue draw has
@@ -1943,10 +1998,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(5);
 
         state.crash_info.current_step = 4;
-        assert_eq!(crash_hold_mask(&mut state, &mut rng), 1u64 << 1);
+        assert_eq!(crash_hold_mask(&mut state, 2, &mut rng), 1u64 << 1);
         state.crash_info.current_step = 10;
         assert_eq!(
-            crash_hold_mask(&mut state, &mut rng),
+            crash_hold_mask(&mut state, 2, &mut rng),
             0,
             "the hold expires at its target step"
         );
@@ -1954,7 +2009,7 @@ mod tests {
         state.crash_info.current_step = 4;
         state.crash_hold_until[0] = 10;
         assert_eq!(
-            crash_hold_mask(&mut state, &mut rng),
+            crash_hold_mask(&mut state, 2, &mut rng),
             1u64 << 1,
             "node 0 has no pending crash"
         );
@@ -1993,7 +2048,7 @@ mod tests {
         let mut waited = 0;
         for step in 10..10 + crash_phase::WINDOW {
             state.crash_info.current_step = step;
-            if crash_hold_mask(&mut state, &mut rng) != 0 {
+            if crash_hold_mask(&mut state, 2, &mut rng) != 0 {
                 waited += 1;
             }
         }
@@ -2349,6 +2404,143 @@ mod tests {
         state.send_ledger[0].trigger = HandlerTrigger::Delivery;
         state.send_ledger[0].recent = 0;
         assert!(route_by_terms(&state, &info, &terms, &mut rng).is_none(), "no sends in flight");
+    }
+
+    /// The node a waiting crash's phase is read on is the node the retarget
+    /// would crash on the same ledgers, and the planned victim itself when
+    /// the run does not retarget, has no release ahead for the node, or the
+    /// ranking keeps or cannot move the crash.
+    #[test]
+    fn the_phase_is_read_where_the_retarget_would_land_and_falls_back_to_the_victim() {
+        let mut state = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        let planned = node(0);
+        state.push_runnable(Runnable::Crash {
+            node_id: planned,
+            priority: 0.5,
+        });
+        state.crash_phase.arm_node(0, 0);
+        state.send_ledger[1].last_ghost_step = 40;
+        state.send_ledger[1].last_ghost_acted = true;
+        state.send_ledger[2].last_ghost_step = 9;
+
+        assert_eq!(phase_read_node(&state, 0, 3), 0, "a run that does not retarget");
+        state.retarget.enabled = true;
+        assert_eq!(phase_read_node(&state, 0, 3), 1);
+        assert_eq!(phase_read_node(&state, 0, 3), retarget_crash(&state, planned, 3).index);
+        state.retarget.pending_pair_mask = 1 << 1;
+        assert_eq!(phase_read_node(&state, 0, 3), 2, "an outstanding pair is passed over");
+        assert_eq!(phase_read_node(&state, 0, 3), retarget_crash(&state, planned, 3).index);
+        state.retarget.pending_pair_mask = 0;
+        crash_node(&mut state, node(1));
+        assert_eq!(phase_read_node(&state, 0, 3), 2, "a node that is down is not read");
+        assert_eq!(phase_read_node(&state, 0, 3), retarget_crash(&state, planned, 3).index);
+
+        state.send_ledger[0].last_ghost_step = 99;
+        state.send_ledger[0].last_ghost_acted = true;
+        assert_eq!(phase_read_node(&state, 0, 3), 0, "the victim at the top of the ranking");
+        assert_eq!(retarget_crash(&state, planned, 3), planned);
+        for l in state.send_ledger.iter_mut() {
+            l.last_ghost_step = -1;
+            l.last_ghost_acted = false;
+        }
+        assert_eq!(phase_read_node(&state, 0, 3), 0, "no mark anywhere");
+        assert_eq!(retarget_crash(&state, planned, 3), planned);
+
+        state.send_ledger[0].last_ghost_step = 5;
+        state.push_runnable(Runnable::Crash {
+            node_id: node(2),
+            priority: 0.5,
+        });
+        assert_eq!(phase_read_node(&state, 2, 3), 2, "a crash with no release ahead is not read");
+        state.crash_phase.arm_node(2, 0);
+        assert_eq!(
+            phase_read_node(&state, 2, 3),
+            2,
+            "a node whose own crash is still queued is passed over"
+        );
+        assert_eq!(phase_read_node(&state, 2, 3), retarget_crash(&state, node(2), 3).index);
+        state.send_ledger[0].crash_pending = 0;
+        assert_eq!(phase_read_node(&state, 2, 3), 0);
+        assert_eq!(phase_read_node(&state, 2, 3), retarget_crash(&state, node(2), 3).index);
+    }
+
+    /// Two twins differing only in whether the run retargets draw the same
+    /// arm and leave their streams at the same position; the retargeting
+    /// twin releases when the absorber's segment shows the arm's phase
+    /// while the other waits out its window on the victim's silent segment,
+    /// and the landing counters count each crash once.
+    #[test]
+    fn a_retargeting_run_waits_on_the_absorber_s_fanout_and_draws_like_its_twin() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_phase.landing;
+        let build = |retarget: bool| {
+            let mut state = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+            state.push_runnable(Runnable::Crash {
+                node_id: node(0),
+                priority: 0.5,
+            });
+            state.crash_hold_until[0] = 10;
+            state.crash_phase.arm_node(0, 0);
+            state.retarget.enabled = retarget;
+            state.send_ledger[2].last_ghost_step = 40;
+            state.send_ledger[2].last_ghost_acted = true;
+            state
+        };
+        let meet = |ledger: &mut crate::simulator::core::state::SendLedger,
+                    arm: util_stats::CrashPhaseArm| {
+            ledger.issued = 2;
+            ledger.floor = 0;
+            ledger.recent = match arm {
+                util_stats::CrashPhaseArm::Early => 2,
+                _ => 1,
+            };
+            ledger.in_flight = ledger.recent;
+        };
+        let seeds = 40u64;
+        let mut waiting = 0u64;
+        for seed in 0..seeds {
+            let mut control = build(false);
+            let mut retargeting = build(true);
+            let mut rng_c = StdRng::seed_from_u64(seed);
+            let mut rng_r = StdRng::seed_from_u64(seed);
+            let mut held_c = 0;
+            let mut held_r = 0;
+            for step in 10..=10 + crash_phase::WINDOW {
+                control.crash_info.current_step = step;
+                retargeting.crash_info.current_step = step;
+                if step == 11 {
+                    let arm = retargeting.crash_phase.arm_of(0).expect("the retargeting twin drew");
+                    assert_eq!(control.crash_phase.arm_of(0), Some(arm), "the twins drew apart");
+                    meet(&mut control.send_ledger[2], arm);
+                    meet(&mut retargeting.send_ledger[2], arm);
+                }
+                held_c += (crash_hold_mask(&mut control, 3, &mut rng_c) != 0) as i32;
+                held_r += (crash_hold_mask(&mut retargeting, 3, &mut rng_r) != 0) as i32;
+            }
+            assert_eq!(
+                rng_c.next_u64(),
+                rng_r.next_u64(),
+                "seed {seed}: the twins consumed different streams"
+            );
+            match retargeting.crash_phase.arm_of(0) {
+                Some(util_stats::CrashPhaseArm::Stock) => {
+                    assert_eq!((held_c, held_r), (0, 0), "seed {seed}: a stock draw held");
+                }
+                Some(_) => {
+                    waiting += 1;
+                    assert_eq!(held_c, crash_phase::WINDOW, "seed {seed}: the control twin");
+                    assert_eq!(held_r, 1, "seed {seed}: the retargeting twin");
+                }
+                None => panic!("seed {seed}: no arm drawn"),
+            }
+        }
+        let after = util_stats::snapshot().crash_phase.landing;
+        util_stats::set_enabled(false);
+        assert!(waiting > 0, "no seed drew a waiting arm");
+        assert_eq!(after.evaluated_on_other_node - before.evaluated_on_other_node, seeds);
+        assert_eq!(after.condition_on_other_node - before.condition_on_other_node, waiting);
+        assert_eq!(after.expired_on_other_node - before.expired_on_other_node, 0);
     }
 
     /// A crash wipes what its node absorbed, so a node that comes back never

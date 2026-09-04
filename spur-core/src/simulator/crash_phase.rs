@@ -14,6 +14,12 @@
 //! mask comes off after a fixed window of steps whatever the fan-out does,
 //! and never past the step reserve a run keeps for its recovery tail, so an
 //! unmet phase costs a bounded stretch of a run and never the run.
+//!
+//! On a run that also retargets its crashes, the node a released crash lands
+//! on may not be the node the plan named. The phase is then read on the node
+//! the retarget would pick at that step, so the wait and the crash describe
+//! the same node; the arm draw, the window and the reserve are unchanged,
+//! and the read draws no random value of its own.
 
 use crate::simulator::fault_timing;
 use crate::simulator::rng::{Stream, StreamRng};
@@ -74,11 +80,24 @@ pub enum Slot {
     Released { arm: CrashPhaseArm },
 }
 
+/// Which node one crash's phase was read on. `last` is the node of the most
+/// recent read; `other_seen` marks that some read was on a node other than
+/// the planned victim, and `on_condition` that the wait ended by reaching
+/// its phase.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LandingRead {
+    last: Option<usize>,
+    other_seen: bool,
+    on_condition: bool,
+}
+
 /// One run's second stage: a slot per node, the arms already seen in this
-/// run, and the step past which no wait may run.
+/// run, the step past which no wait may run, and where each crash's phase
+/// was read.
 #[derive(Clone, Debug, Default)]
 pub struct RunAnchor {
     slots: Vec<Slot>,
+    landing: Vec<LandingRead>,
     seen: [bool; CrashPhaseArm::ALL.len()],
     reserve: i32,
 }
@@ -87,6 +106,7 @@ impl RunAnchor {
     pub fn with_nodes(num_nodes: usize) -> Self {
         Self {
             slots: vec![Slot::Off; num_nodes],
+            landing: vec![LandingRead::default(); num_nodes],
             seen: [false; CrashPhaseArm::ALL.len()],
             reserve: 0,
         }
@@ -94,6 +114,16 @@ impl RunAnchor {
 
     pub fn push_node(&mut self) {
         self.slots.push(Slot::Off);
+        self.landing.push(LandingRead::default());
+    }
+
+    /// Whether `node`'s crash still has a release ahead of it, so a call to
+    /// `hold` would read the fan-out it is given.
+    pub fn awaits_release(&self, node: usize) -> bool {
+        matches!(
+            self.slots.get(node),
+            Some(Slot::Pending) | Some(Slot::Waiting { .. })
+        )
     }
 
     /// This node's queued crash is placed on an anchored run: draw its arm
@@ -116,11 +146,27 @@ impl RunAnchor {
     }
 
     /// Whether `node`'s crash stays withheld at `step_now`, past the step
-    /// its placement hold expired. Draws exactly one value the first time it
-    /// is asked about a node armed by `arm_node`, and none at all otherwise.
+    /// its placement hold expired, with `f` read on `node` itself. Draws
+    /// exactly one value the first time it is asked about a node armed by
+    /// `arm_node`, and none at all otherwise.
     pub fn hold(
         &mut self,
         node: usize,
+        f: Fanout,
+        step_now: i32,
+        rng: &mut impl StreamRng,
+    ) -> bool {
+        self.hold_read_on(node, node, f, step_now, rng)
+    }
+
+    /// `hold` with `f` read on `read_node`, which is `node` itself unless
+    /// the retarget would move the crash there. The draw and the wait are
+    /// those of `hold`; only the landing counters learn where the read was,
+    /// each once per crash.
+    pub fn hold_read_on(
+        &mut self,
+        node: usize,
+        read_node: usize,
         f: Fanout,
         step_now: i32,
         rng: &mut impl StreamRng,
@@ -129,7 +175,19 @@ impl RunAnchor {
             Some(s) => *s,
             None => return false,
         };
-        let next = match slot {
+        if matches!(slot, Slot::Off | Slot::Released { .. }) {
+            return false;
+        }
+        let other = read_node != node;
+        let read = &mut self.landing[node];
+        read.last = Some(read_node);
+        if other && !read.other_seen {
+            read.other_seen = true;
+            util_stats::record_crash_phase_landing(
+                util_stats::CrashPhaseLanding::EvaluatedOnOtherNode,
+            );
+        }
+        let (next, release) = match slot {
             Slot::Off | Slot::Released { .. } => return false,
             Slot::Pending => {
                 let arm = self.draw(rng);
@@ -140,7 +198,7 @@ impl RunAnchor {
                         0,
                         f.in_flight,
                     );
-                    Slot::Released { arm }
+                    (Slot::Released { arm }, Some(CrashPhaseRelease::Immediate))
                 } else {
                     self.settle(arm, step_now, step_now, f)
                 }
@@ -148,7 +206,35 @@ impl RunAnchor {
             Slot::Waiting { arm, armed_at } => self.settle(arm, armed_at, step_now, f),
         };
         self.slots[node] = next;
+        match release {
+            Some(CrashPhaseRelease::Condition) => {
+                self.landing[node].on_condition = true;
+                if other {
+                    util_stats::record_crash_phase_landing(
+                        util_stats::CrashPhaseLanding::ConditionOnOtherNode,
+                    );
+                }
+            }
+            Some(CrashPhaseRelease::Expired) if other => {
+                util_stats::record_crash_phase_landing(
+                    util_stats::CrashPhaseLanding::ExpiredOnOtherNode,
+                );
+            }
+            _ => {}
+        }
         matches!(next, Slot::Waiting { .. })
+    }
+
+    /// `node`'s crash was applied to `victim`. A crash released by its phase
+    /// whose victim is not the node that phase was last read on is counted
+    /// as a mismatch.
+    pub fn landing_applied(&self, node: usize, victim: usize) {
+        let Some(read) = self.landing.get(node) else {
+            return;
+        };
+        if read.on_condition && read.last.is_some_and(|last| last != victim) {
+            util_stats::record_crash_phase_landing(util_stats::CrashPhaseLanding::MismatchAtApply);
+        }
     }
 
     /// One equal-mass arm, and the run's first draw of it.
@@ -162,9 +248,15 @@ impl RunAnchor {
         arm
     }
 
-    /// Whether a waiting arm keeps waiting at `step_now`, and what to record
-    /// when it stops.
-    fn settle(&self, arm: CrashPhaseArm, armed_at: i32, step_now: i32, f: Fanout) -> Slot {
+    /// Whether a waiting arm keeps waiting at `step_now`, with the kind of
+    /// release when it stops; each release is recorded once, here.
+    fn settle(
+        &self,
+        arm: CrashPhaseArm,
+        armed_at: i32,
+        step_now: i32,
+        f: Fanout,
+    ) -> (Slot, Option<CrashPhaseRelease>) {
         let waited = (step_now - armed_at).max(0) as u64;
         if phase_reached(arm, f) {
             util_stats::record_crash_phase_release(
@@ -173,7 +265,7 @@ impl RunAnchor {
                 waited,
                 f.in_flight,
             );
-            return Slot::Released { arm };
+            return (Slot::Released { arm }, Some(CrashPhaseRelease::Condition));
         }
         if step_now >= self.deadline(armed_at) {
             util_stats::record_crash_phase_release(
@@ -182,9 +274,9 @@ impl RunAnchor {
                 waited,
                 f.in_flight,
             );
-            return Slot::Released { arm };
+            return (Slot::Released { arm }, Some(CrashPhaseRelease::Expired));
         }
-        Slot::Waiting { arm, armed_at }
+        (Slot::Waiting { arm, armed_at }, None)
     }
 
     /// The last step a wait armed at `armed_at` may still withhold: the
@@ -275,6 +367,86 @@ mod tests {
             .count();
         let overlap = both as f64 / placed as f64;
         assert!((overlap - 0.5).abs() < 0.03, "anchoring follows the plain phase at {overlap}");
+    }
+
+    /// A read on another node consumes exactly the draws a read on the
+    /// victim does: twins fed the same fan-outs hold alike, draw alike, and
+    /// leave their streams at the same position.
+    #[test]
+    fn reading_another_node_draws_nothing_the_victim_read_does_not() {
+        let _serial = config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let n = 900;
+        let mut on_victim = RunAnchor::with_nodes(n);
+        let mut on_other = RunAnchor::with_nodes(n);
+        let mut rng_v = CountingRng::new(31);
+        let mut rng_o = CountingRng::new(31);
+        for node in 0..n {
+            on_victim.arm_node(node, 0);
+            on_other.arm_node(node, 0);
+        }
+        for step in 0..3 {
+            let f = if step == 0 { fanout(0, 0) } else { fanout(2, 2) };
+            for node in 0..n {
+                let held_v = on_victim.hold(node, f, step, &mut rng_v);
+                let held_o = on_other.hold_read_on(node, (node + 1) % n, f, step, &mut rng_o);
+                assert_eq!(held_v, held_o, "step {step}, node {node}: the twins disagree");
+                assert_eq!(on_victim.arm_of(node), on_other.arm_of(node));
+            }
+        }
+        util_stats::set_enabled(false);
+        assert_eq!(rng_v.draws, n as u64, "one draw per armed crash");
+        assert_eq!(rng_o.draws, rng_v.draws, "the other-node read drew a different count");
+        assert_eq!(
+            rng_v.inner.next_u64(),
+            rng_o.inner.next_u64(),
+            "the twins' streams are at different positions"
+        );
+    }
+
+    /// Each landing counter fires once per crash however many steps the
+    /// read was on another node, and a read on the victim itself counts no
+    /// evaluation.
+    #[test]
+    fn the_landing_counters_count_each_crash_once() {
+        let _serial = config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_phase.landing;
+        let mut rng = CountingRng::new(1);
+        let unmet = fanout(0, 0);
+
+        // Read on node 2 for ten steps, released there by its phase, then
+        // applied once where it was read and once elsewhere.
+        let (mut reached, _) = armed_at(CrashPhaseArm::Early, 0, 10);
+        for step in 10..20 {
+            assert!(reached.hold_read_on(0, 2, unmet, step, &mut rng));
+        }
+        assert!(!reached.hold_read_on(0, 2, fanout(2, 2), 20, &mut rng));
+        reached.landing_applied(0, 2);
+        reached.landing_applied(0, 1);
+
+        // Read on node 1 until the window runs out.
+        let (mut expired, _) = armed_at(CrashPhaseArm::Mid, 0, 0);
+        for step in 0..=WINDOW {
+            expired.hold_read_on(0, 1, unmet, step, &mut rng);
+        }
+        assert!(!expired.awaits_release(0), "the window did not end the wait");
+        expired.landing_applied(0, 1);
+
+        // Read on the victim itself: released by its phase, then applied
+        // on the victim and then elsewhere.
+        let (mut same, _) = armed_at(CrashPhaseArm::Early, 0, 0);
+        assert!(!same.hold(0, fanout(1, 1), 0, &mut rng));
+        same.landing_applied(0, 0);
+        same.landing_applied(0, 1);
+
+        let after = util_stats::snapshot().crash_phase.landing;
+        util_stats::set_enabled(false);
+        assert_eq!(rng.draws, 0, "an already-armed slot draws nothing");
+        assert_eq!(after.evaluated_on_other_node - before.evaluated_on_other_node, 2);
+        assert_eq!(after.condition_on_other_node - before.condition_on_other_node, 1);
+        assert_eq!(after.expired_on_other_node - before.expired_on_other_node, 1);
+        assert_eq!(after.mismatch_at_apply - before.mismatch_at_apply, 2);
     }
 
     #[test]

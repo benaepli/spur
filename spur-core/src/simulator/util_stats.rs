@@ -368,6 +368,17 @@ static CP_APPLY_INFLIGHT: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; C
 static CP_CRASHES_APPLIED: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
 static CP_INFLIGHT: [[AtomicU64; CC_INFLIGHT_SLOTS]; CP_ARMS] =
     [const { [const { AtomicU64::new(0) }; CC_INFLIGHT_SLOTS] }; CP_ARMS];
+/// Crashes whose landing node differs from the planned victim, per arm.
+static CP_MOVED_APPLIED: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_MOVED_APPLY_DECISIONS: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_MOVED_APPLY_INFLIGHT: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
+static CP_MOVED_INFLIGHT: [[AtomicU64; CC_INFLIGHT_SLOTS]; CP_ARMS] =
+    [const { [const { AtomicU64::new(0) }; CC_INFLIGHT_SLOTS] }; CP_ARMS];
+/// Once-per-crash events of phase reads on the node a crash would land on,
+/// indexed by `CrashPhaseLanding`.
+const CP_LANDING_EVENTS: usize = 4;
+static CP_LANDING: [AtomicU64; CP_LANDING_EVENTS] =
+    [const { AtomicU64::new(0) }; CP_LANDING_EVENTS];
 
 static TIMER_CONTEXT_PROBE_FIRINGS: AtomicU64 = AtomicU64::new(0);
 static TIMER_CONTEXT_PROBE_ACTED: AtomicU64 = AtomicU64::new(0);
@@ -2502,15 +2513,20 @@ pub fn record_crash_phase_release(
 }
 
 /// One crash whose release carried `arm` was applied to a node holding
-/// `victim_inflight` undelivered messages of its own. The census half needs
-/// the crash census switched on, the same gate the unsplit census reads.
+/// `victim_inflight` undelivered messages of its own; `moved` means that
+/// node is not the planned victim, and the crash is then counted again
+/// under the arm's moved census. The census halves need the crash census
+/// switched on, the same gate the unsplit census reads.
 #[inline]
-pub fn record_crash_phase_apply(arm: CrashPhaseArm, victim_inflight: u32) {
+pub fn record_crash_phase_apply(arm: CrashPhaseArm, victim_inflight: u32, moved: bool) {
     if !enabled() {
         return;
     }
     let i = arm.index();
     CP_CRASHES_APPLIED[i].fetch_add(1, Ordering::Relaxed);
+    if moved {
+        CP_MOVED_APPLIED[i].fetch_add(1, Ordering::Relaxed);
+    }
     if !crash_census_enabled() {
         return;
     }
@@ -2520,6 +2536,50 @@ pub fn record_crash_phase_apply(arm: CrashPhaseArm, victim_inflight: u32) {
     }
     let slot = (victim_inflight as usize).min(CC_INFLIGHT_SLOTS - 1);
     CP_INFLIGHT[i][slot].fetch_add(1, Ordering::Relaxed);
+    if moved {
+        CP_MOVED_APPLY_DECISIONS[i].fetch_add(1, Ordering::Relaxed);
+        if victim_inflight > 0 {
+            CP_MOVED_APPLY_INFLIGHT[i].fetch_add(1, Ordering::Relaxed);
+        }
+        CP_MOVED_INFLIGHT[i][slot].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A once-per-crash event of the phase read on the node the retarget would
+/// move a waiting crash to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrashPhaseLanding {
+    /// The phase was read on a node other than the planned victim at least
+    /// once while the crash waited.
+    EvaluatedOnOtherNode,
+    /// The wait reached its phase with the read on another node.
+    ConditionOnOtherNode,
+    /// The window or the reserve ended the wait with the read on another
+    /// node.
+    ExpiredOnOtherNode,
+    /// A crash released by its phase landed on a node other than the one
+    /// the phase was last read on.
+    MismatchAtApply,
+}
+
+impl CrashPhaseLanding {
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            CrashPhaseLanding::EvaluatedOnOtherNode => 0,
+            CrashPhaseLanding::ConditionOnOtherNode => 1,
+            CrashPhaseLanding::ExpiredOnOtherNode => 2,
+            CrashPhaseLanding::MismatchAtApply => 3,
+        }
+    }
+}
+
+#[inline]
+pub fn record_crash_phase_landing(event: CrashPhaseLanding) {
+    if !enabled() {
+        return;
+    }
+    CP_LANDING[event.index()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// One steer-off probe-run timer firing was folded into the timer-context
@@ -3468,6 +3528,64 @@ pub struct CrashPhaseArmStats {
     pub inflight_bucket_1: u64,
     pub inflight_bucket_2: u64,
     pub inflight_bucket_3plus: u64,
+    /// The crashes above that landed on another node than the planned
+    /// victim.
+    pub moved_read_on_landing: CrashPhaseMovedStats,
+}
+
+/// The apply-time census of one arm's crashes that landed on another node
+/// than the planned victim.
+#[derive(Serialize, Debug)]
+pub struct CrashPhaseMovedStats {
+    pub crashes_applied: u64,
+    pub apply_decisions: u64,
+    pub apply_victim_had_inflight: u64,
+    pub inflight_bucket_0: u64,
+    pub inflight_bucket_1: u64,
+    pub inflight_bucket_2: u64,
+    pub inflight_bucket_3plus: u64,
+}
+
+impl CrashPhaseMovedStats {
+    fn read(arm: CrashPhaseArm) -> Self {
+        let i = arm.index();
+        Self {
+            crashes_applied: CP_MOVED_APPLIED[i].load(Ordering::Relaxed),
+            apply_decisions: CP_MOVED_APPLY_DECISIONS[i].load(Ordering::Relaxed),
+            apply_victim_had_inflight: CP_MOVED_APPLY_INFLIGHT[i].load(Ordering::Relaxed),
+            inflight_bucket_0: CP_MOVED_INFLIGHT[i][0].load(Ordering::Relaxed),
+            inflight_bucket_1: CP_MOVED_INFLIGHT[i][1].load(Ordering::Relaxed),
+            inflight_bucket_2: CP_MOVED_INFLIGHT[i][2].load(Ordering::Relaxed),
+            inflight_bucket_3plus: CP_MOVED_INFLIGHT[i][3].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Once-per-crash counts of phase reads on the node the retarget would
+/// move a waiting crash to. `evaluated_on_other_node` is the number the
+/// read is read as having fired: waiting crashes whose phase was read on
+/// another node at least once. `condition_on_other_node` and
+/// `expired_on_other_node` split those by how the wait ended, and
+/// `mismatch_at_apply` counts the crashes released by their phase that
+/// landed on a node other than the one the phase was last read on.
+#[derive(Serialize, Debug)]
+pub struct CrashPhaseLandingStats {
+    pub evaluated_on_other_node: u64,
+    pub condition_on_other_node: u64,
+    pub expired_on_other_node: u64,
+    pub mismatch_at_apply: u64,
+}
+
+impl CrashPhaseLandingStats {
+    fn read() -> Self {
+        let at = |e: CrashPhaseLanding| CP_LANDING[e.index()].load(Ordering::Relaxed);
+        Self {
+            evaluated_on_other_node: at(CrashPhaseLanding::EvaluatedOnOtherNode),
+            condition_on_other_node: at(CrashPhaseLanding::ConditionOnOtherNode),
+            expired_on_other_node: at(CrashPhaseLanding::ExpiredOnOtherNode),
+            mismatch_at_apply: at(CrashPhaseLanding::MismatchAtApply),
+        }
+    }
 }
 
 impl CrashPhaseArmStats {
@@ -3489,6 +3607,7 @@ impl CrashPhaseArmStats {
             inflight_bucket_1: CP_INFLIGHT[i][1].load(Ordering::Relaxed),
             inflight_bucket_2: CP_INFLIGHT[i][2].load(Ordering::Relaxed),
             inflight_bucket_3plus: CP_INFLIGHT[i][3].load(Ordering::Relaxed),
+            moved_read_on_landing: CrashPhaseMovedStats::read(arm),
         }
     }
 }
@@ -3497,7 +3616,8 @@ impl CrashPhaseArmStats {
 /// phase of their victim's fan-out, and what they landed on. `armed` is the
 /// two waiting arms together, the number this mechanism is read as having
 /// fired; `stock_releases` is the third arm, drawn on the same runs and
-/// released where it would have been anyway.
+/// released where it would have been anyway. `landing` counts the reads
+/// made on the node a retargeting run would move the crash to.
 #[derive(Serialize, Debug)]
 pub struct CrashPhaseStats {
     pub armed: u64,
@@ -3505,6 +3625,7 @@ pub struct CrashPhaseStats {
     pub early: CrashPhaseArmStats,
     pub mid: CrashPhaseArmStats,
     pub stock: CrashPhaseArmStats,
+    pub landing: CrashPhaseLandingStats,
 }
 
 impl CrashPhaseStats {
@@ -3518,6 +3639,7 @@ impl CrashPhaseStats {
             early,
             mid,
             stock,
+            landing: CrashPhaseLandingStats::read(),
         }
     }
 }

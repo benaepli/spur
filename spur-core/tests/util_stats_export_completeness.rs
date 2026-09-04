@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, ClientAnchorCensusStats,
     ClientAnchorHalfStats, ClientAnchorHeldHist, ClientAnchorReleaseStats, ClientAnchorStats,
-    CrashCensusStats, CrashPhaseArmStats,
+    CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
     FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderHalfStats, PairOrderStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
@@ -430,6 +430,43 @@ fn crash_place_leaves(prefix: &str, c: &CrashPlaceStats) -> Vec<(String, Value)>
     ]
 }
 
+fn crash_phase_moved(m: &mut Marks) -> CrashPhaseMovedStats {
+    CrashPhaseMovedStats {
+        crashes_applied: m.int(),
+        apply_decisions: m.int(),
+        apply_victim_had_inflight: m.int(),
+        inflight_bucket_0: m.int(),
+        inflight_bucket_1: m.int(),
+        inflight_bucket_2: m.int(),
+        inflight_bucket_3plus: m.int(),
+    }
+}
+
+fn crash_phase_moved_leaves(prefix: &str, a: &CrashPhaseMovedStats) -> Vec<(String, Value)> {
+    let CrashPhaseMovedStats {
+        crashes_applied,
+        apply_decisions,
+        apply_victim_had_inflight,
+        inflight_bucket_0,
+        inflight_bucket_1,
+        inflight_bucket_2,
+        inflight_bucket_3plus,
+    } = a;
+    vec![
+        leaf(prefix, "crashes_applied", *crashes_applied),
+        leaf(prefix, "apply_decisions", *apply_decisions),
+        leaf(
+            prefix,
+            "apply_victim_had_inflight",
+            *apply_victim_had_inflight,
+        ),
+        leaf(prefix, "inflight_bucket_0", *inflight_bucket_0),
+        leaf(prefix, "inflight_bucket_1", *inflight_bucket_1),
+        leaf(prefix, "inflight_bucket_2", *inflight_bucket_2),
+        leaf(prefix, "inflight_bucket_3plus", *inflight_bucket_3plus),
+    ]
+}
+
 fn crash_phase_arm(m: &mut Marks) -> CrashPhaseArmStats {
     CrashPhaseArmStats {
         runs: m.int(),
@@ -447,6 +484,7 @@ fn crash_phase_arm(m: &mut Marks) -> CrashPhaseArmStats {
         inflight_bucket_1: m.int(),
         inflight_bucket_2: m.int(),
         inflight_bucket_3plus: m.int(),
+        moved_read_on_landing: crash_phase_moved(m),
     }
 }
 
@@ -467,8 +505,9 @@ fn crash_phase_arm_leaves(prefix: &str, a: &CrashPhaseArmStats) -> Vec<(String, 
         inflight_bucket_1,
         inflight_bucket_2,
         inflight_bucket_3plus,
+        moved_read_on_landing,
     } = a;
-    vec![
+    let mut out = vec![
         leaf(prefix, "runs", *runs),
         leaf(prefix, "armed", *armed),
         leaf(prefix, "released_on_condition", *released_on_condition),
@@ -496,7 +535,12 @@ fn crash_phase_arm_leaves(prefix: &str, a: &CrashPhaseArmStats) -> Vec<(String, 
         leaf(prefix, "inflight_bucket_1", *inflight_bucket_1),
         leaf(prefix, "inflight_bucket_2", *inflight_bucket_2),
         leaf(prefix, "inflight_bucket_3plus", *inflight_bucket_3plus),
-    ]
+    ];
+    out.extend(crash_phase_moved_leaves(
+        &format!("{prefix}.moved_read_on_landing"),
+        moved_read_on_landing,
+    ));
+    out
 }
 
 fn crash_phase(m: &mut Marks) -> CrashPhaseStats {
@@ -506,6 +550,12 @@ fn crash_phase(m: &mut Marks) -> CrashPhaseStats {
         early: crash_phase_arm(m),
         mid: crash_phase_arm(m),
         stock: crash_phase_arm(m),
+        landing: CrashPhaseLandingStats {
+            evaluated_on_other_node: m.int(),
+            condition_on_other_node: m.int(),
+            expired_on_other_node: m.int(),
+            mismatch_at_apply: m.int(),
+        },
     }
 }
 
@@ -516,7 +566,14 @@ fn crash_phase_leaves(prefix: &str, c: &CrashPhaseStats) -> Vec<(String, Value)>
         early,
         mid,
         stock,
+        landing,
     } = c;
+    let CrashPhaseLandingStats {
+        evaluated_on_other_node,
+        condition_on_other_node,
+        expired_on_other_node,
+        mismatch_at_apply,
+    } = landing;
     let mut out = vec![
         leaf(prefix, "armed", *armed),
         leaf(prefix, "stock_releases", *stock_releases),
@@ -524,6 +581,25 @@ fn crash_phase_leaves(prefix: &str, c: &CrashPhaseStats) -> Vec<(String, Value)>
     for (name, arm) in [("early", early), ("mid", mid), ("stock", stock)] {
         out.extend(crash_phase_arm_leaves(&format!("{prefix}.{name}"), arm));
     }
+    let landing_prefix = format!("{prefix}.landing");
+    out.extend([
+        leaf(
+            &landing_prefix,
+            "evaluated_on_other_node",
+            *evaluated_on_other_node,
+        ),
+        leaf(
+            &landing_prefix,
+            "condition_on_other_node",
+            *condition_on_other_node,
+        ),
+        leaf(
+            &landing_prefix,
+            "expired_on_other_node",
+            *expired_on_other_node,
+        ),
+        leaf(&landing_prefix, "mismatch_at_apply", *mismatch_at_apply),
+    ]);
     out
 }
 
