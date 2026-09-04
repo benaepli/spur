@@ -33,7 +33,7 @@ pub const CLIENT_ANCHOR_SALT: u64 = 0x_434C_4E54_4143_4852; // "CLNTACHR"
 
 /// A held request is issued once its ready step lies this many steps or
 /// more behind the current step.
-pub const EXPIRY_STEPS: i32 = 32;
+pub const EXPIRY_STEPS: i32 = 64;
 
 /// Whether this run holds its post-crash client requests.
 pub fn is_treated(run_id: i64) -> bool {
@@ -276,6 +276,7 @@ mod tests {
 
     #[test]
     fn a_request_expires_after_the_fixed_wait_in_ready_order() {
+        assert_eq!(EXPIRY_STEPS, 64, "the wait is fixed at 64 steps");
         let mut q: HoldQueue<u32> = HoldQueue::default();
         q.hold(1, 10);
         q.hold(2, 11);
