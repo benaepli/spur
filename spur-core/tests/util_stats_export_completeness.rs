@@ -13,7 +13,8 @@
 
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
-    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, ClientAnchorArmRuns,
+    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, ArmSelectorAxisStats,
+    ArmSelectorLearnerStats, ArmSelectorRewardStats, ClientAnchorArmRuns,
     ClientAnchorAxisStats, ClientAnchorCensusStats, ClientAnchorDistance,
     ClientAnchorFirstDelivery, ClientAnchorHalfStats, ClientAnchorHeldHist,
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
@@ -788,6 +789,228 @@ fn replay(m: &mut Marks) -> ReplayStats {
     }
 }
 
+fn marks_vec(m: &mut Marks, n: usize) -> Vec<u64> {
+    (0..n).map(|_| m.int()).collect()
+}
+
+fn arm_selector_reward(m: &mut Marks) -> ArmSelectorRewardStats {
+    ArmSelectorRewardStats {
+        reward_runs_control: m.int(),
+        reward_positive_control: m.int(),
+        control_runs_by_direction: marks_vec(m, 12),
+        control_reward_positive_by_direction: marks_vec(m, 12),
+        control_runs_by_combination: marks_vec(m, 72),
+        control_reward_positive_by_combination: marks_vec(m, 72),
+    }
+}
+
+fn arm_selector_learner(m: &mut Marks) -> ArmSelectorLearnerStats {
+    ArmSelectorLearnerStats {
+        treated_runs: m.int(),
+        chosen_runs: m.int(),
+        coin_fallback_runs: m.int(),
+        departures: m.int(),
+        axis_leader_agreements: m.int(),
+        axis_draws: m.int(),
+        chosen_placed_runs: m.int(),
+        cells: m.int(),
+        reward_runs_treated: m.int(),
+        reward_positive_treated: m.int(),
+        reward_runs_control: m.int(),
+        reward_positive_control: m.int(),
+        chosen_by_direction: marks_vec(m, 12),
+        control_runs_by_direction: marks_vec(m, 12),
+        control_reward_positive_by_direction: marks_vec(m, 12),
+        chosen_by_combination: marks_vec(m, 72),
+        control_runs_by_combination: marks_vec(m, 72),
+        control_reward_positive_by_combination: marks_vec(m, 72),
+    }
+}
+
+fn arm_selector_axis(m: &mut Marks) -> ArmSelectorAxisStats {
+    ArmSelectorAxisStats {
+        treated_runs: m.int(),
+        chosen_runs: m.int(),
+        coin_fallback_runs: m.int(),
+        departures: m.int(),
+        axis_leader_agreements: m.int(),
+        axis_draws: m.int(),
+        observations: m.int(),
+        reward_runs_treated: m.int(),
+        reward_positive_treated: m.int(),
+        reward_runs_control: m.int(),
+        reward_positive_control: m.int(),
+        cells: m.int(),
+        chosen_placed_runs: m.int(),
+        reward_runs_by_arm: marks_vec(m, 8),
+        reward_positive_by_arm: marks_vec(m, 8),
+        chosen_by_direction: marks_vec(m, 12),
+        control_runs_by_direction: marks_vec(m, 12),
+        control_reward_positive_by_direction: marks_vec(m, 12),
+        chosen_by_combination: marks_vec(m, 72),
+        control_runs_by_combination: marks_vec(m, 72),
+        control_reward_positive_by_combination: marks_vec(m, 72),
+        overtaken_ghost: arm_selector_learner(m),
+        absorber_cycle: arm_selector_learner(m),
+        ghost_signal: arm_selector_reward(m),
+        either_shape: arm_selector_reward(m),
+    }
+}
+
+fn vec_leaves(prefix: &str, name: &str, v: &[u64]) -> Vec<(String, Value)> {
+    let p = format!("{prefix}.{name}");
+    v.iter()
+        .enumerate()
+        .map(|(i, x)| leaf(&p, &i.to_string(), *x))
+        .collect()
+}
+
+fn arm_selector_reward_leaves(prefix: &str, r: &ArmSelectorRewardStats) -> Vec<(String, Value)> {
+    let ArmSelectorRewardStats {
+        reward_runs_control,
+        reward_positive_control,
+        control_runs_by_direction,
+        control_reward_positive_by_direction,
+        control_runs_by_combination,
+        control_reward_positive_by_combination,
+    } = r;
+    let mut out = vec![
+        leaf(prefix, "reward_runs_control", *reward_runs_control),
+        leaf(prefix, "reward_positive_control", *reward_positive_control),
+    ];
+    out.extend(vec_leaves(prefix, "control_runs_by_direction", control_runs_by_direction));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_direction",
+        control_reward_positive_by_direction,
+    ));
+    out.extend(vec_leaves(prefix, "control_runs_by_combination", control_runs_by_combination));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_combination",
+        control_reward_positive_by_combination,
+    ));
+    out
+}
+
+fn arm_selector_learner_leaves(prefix: &str, l: &ArmSelectorLearnerStats) -> Vec<(String, Value)> {
+    let ArmSelectorLearnerStats {
+        treated_runs,
+        chosen_runs,
+        coin_fallback_runs,
+        departures,
+        axis_leader_agreements,
+        axis_draws,
+        chosen_placed_runs,
+        cells,
+        reward_runs_treated,
+        reward_positive_treated,
+        reward_runs_control,
+        reward_positive_control,
+        chosen_by_direction,
+        control_runs_by_direction,
+        control_reward_positive_by_direction,
+        chosen_by_combination,
+        control_runs_by_combination,
+        control_reward_positive_by_combination,
+    } = l;
+    let mut out = vec![
+        leaf(prefix, "treated_runs", *treated_runs),
+        leaf(prefix, "chosen_runs", *chosen_runs),
+        leaf(prefix, "coin_fallback_runs", *coin_fallback_runs),
+        leaf(prefix, "departures", *departures),
+        leaf(prefix, "axis_leader_agreements", *axis_leader_agreements),
+        leaf(prefix, "axis_draws", *axis_draws),
+        leaf(prefix, "chosen_placed_runs", *chosen_placed_runs),
+        leaf(prefix, "cells", *cells),
+        leaf(prefix, "reward_runs_treated", *reward_runs_treated),
+        leaf(prefix, "reward_positive_treated", *reward_positive_treated),
+        leaf(prefix, "reward_runs_control", *reward_runs_control),
+        leaf(prefix, "reward_positive_control", *reward_positive_control),
+    ];
+    out.extend(vec_leaves(prefix, "chosen_by_direction", chosen_by_direction));
+    out.extend(vec_leaves(prefix, "control_runs_by_direction", control_runs_by_direction));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_direction",
+        control_reward_positive_by_direction,
+    ));
+    out.extend(vec_leaves(prefix, "chosen_by_combination", chosen_by_combination));
+    out.extend(vec_leaves(prefix, "control_runs_by_combination", control_runs_by_combination));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_combination",
+        control_reward_positive_by_combination,
+    ));
+    out
+}
+
+fn arm_selector_axis_leaves(prefix: &str, a: &ArmSelectorAxisStats) -> Vec<(String, Value)> {
+    let ArmSelectorAxisStats {
+        treated_runs,
+        chosen_runs,
+        coin_fallback_runs,
+        departures,
+        axis_leader_agreements,
+        axis_draws,
+        observations,
+        reward_runs_treated,
+        reward_positive_treated,
+        reward_runs_control,
+        reward_positive_control,
+        cells,
+        chosen_placed_runs,
+        reward_runs_by_arm,
+        reward_positive_by_arm,
+        chosen_by_direction,
+        control_runs_by_direction,
+        control_reward_positive_by_direction,
+        chosen_by_combination,
+        control_runs_by_combination,
+        control_reward_positive_by_combination,
+        overtaken_ghost,
+        absorber_cycle,
+        ghost_signal,
+        either_shape,
+    } = a;
+    let mut out = vec![
+        leaf(prefix, "treated_runs", *treated_runs),
+        leaf(prefix, "chosen_runs", *chosen_runs),
+        leaf(prefix, "coin_fallback_runs", *coin_fallback_runs),
+        leaf(prefix, "departures", *departures),
+        leaf(prefix, "axis_leader_agreements", *axis_leader_agreements),
+        leaf(prefix, "axis_draws", *axis_draws),
+        leaf(prefix, "observations", *observations),
+        leaf(prefix, "reward_runs_treated", *reward_runs_treated),
+        leaf(prefix, "reward_positive_treated", *reward_positive_treated),
+        leaf(prefix, "reward_runs_control", *reward_runs_control),
+        leaf(prefix, "reward_positive_control", *reward_positive_control),
+        leaf(prefix, "cells", *cells),
+        leaf(prefix, "chosen_placed_runs", *chosen_placed_runs),
+    ];
+    out.extend(vec_leaves(prefix, "reward_runs_by_arm", reward_runs_by_arm));
+    out.extend(vec_leaves(prefix, "reward_positive_by_arm", reward_positive_by_arm));
+    out.extend(vec_leaves(prefix, "chosen_by_direction", chosen_by_direction));
+    out.extend(vec_leaves(prefix, "control_runs_by_direction", control_runs_by_direction));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_direction",
+        control_reward_positive_by_direction,
+    ));
+    out.extend(vec_leaves(prefix, "chosen_by_combination", chosen_by_combination));
+    out.extend(vec_leaves(prefix, "control_runs_by_combination", control_runs_by_combination));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_combination",
+        control_reward_positive_by_combination,
+    ));
+    out.extend(arm_selector_learner_leaves(&format!("{prefix}.overtaken_ghost"), overtaken_ghost));
+    out.extend(arm_selector_learner_leaves(&format!("{prefix}.absorber_cycle"), absorber_cycle));
+    out.extend(arm_selector_reward_leaves(&format!("{prefix}.ghost_signal"), ghost_signal));
+    out.extend(arm_selector_reward_leaves(&format!("{prefix}.either_shape"), either_shape));
+    out
+}
+
 fn replay_leaves(prefix: &str, r: &ReplayStats) -> Vec<(String, Value)> {
     let ReplayStats {
         parents_admitted,
@@ -1106,6 +1329,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         fresh_first: _,
         pair_order: _,
         client_anchor: _,
+        arm_selector_axis: _,
         replay: _,
         timer_context: _,
         timeline_keys: _,
@@ -1143,6 +1367,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "fresh_first",
         "pair_order",
         "client_anchor",
+        "arm_selector_axis",
         "replay",
         "timer_context",
         "timeline_keys",
@@ -1215,6 +1440,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.fresh_first = fresh_first(&mut m);
     s.pair_order = pair_order(&mut m);
     s.client_anchor = client_anchor(&mut m);
+    s.arm_selector_axis = arm_selector_axis(&mut m);
     s.replay = replay(&mut m);
     s.timer_context = timer_context(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
@@ -1231,6 +1457,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(fresh_first_leaves("fresh_first", &s.fresh_first));
     expected.extend(pair_order_leaves("pair_order", &s.pair_order));
     expected.extend(client_anchor_leaves("client_anchor", &s.client_anchor));
+    expected.extend(arm_selector_axis_leaves("arm_selector_axis", &s.arm_selector_axis));
     expected.extend(replay_leaves("replay", &s.replay));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     (s, expected)
@@ -1273,6 +1500,7 @@ fn every_counter_field_reaches_the_written_json() {
         "fresh_first",
         "pair_order",
         "client_anchor",
+        "arm_selector_axis",
         "replay",
         "timer_context",
     ] {

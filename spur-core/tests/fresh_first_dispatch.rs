@@ -166,7 +166,11 @@ fn seed_span() {
 
 fn ids(treated: bool, n: usize) -> Vec<i64> {
     let ids: Vec<i64> = (0..1_000_000i64)
-        .filter(|&id| fresh_first::is_treated(id) == treated && fault_timing::is_placed(id))
+        .filter(|&id| {
+            fresh_first::is_treated(id) == treated
+                && fault_timing::is_placed(id)
+                && !spur_core::simulator::arm_selector::is_treated(id)
+        })
         .take(n)
         .collect();
     assert_eq!(ids.len(), n, "not enough run ids on the half");

@@ -1281,7 +1281,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     // Whether a ghost reached a destination that had already
                     // heard from the sender's current incarnation, read off
                     // the per-destination table before this entry is added.
-                    if message_entry && util_stats::enabled() {
+                    // The table is kept on every run: the overtaken-ghost
+                    // reward reads it.
+                    let mut overtaken_at_restarted = false;
+                    if message_entry {
                         let current = state.incarnation(record_origin);
                         if r.origin_incarnation != current {
                             let overtaken = state.fresh_first.heard_from(
@@ -1289,11 +1292,20 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                                 record_origin.index,
                                 current,
                             );
+                            overtaken_at_restarted = state.overtaken_ghost_at_restarted(
+                                record_origin,
+                                r.origin_incarnation,
+                                record_dest,
+                            );
                             util_stats::record_fresh_first_ghost_entry(
                                 state.fresh_first.enabled,
                                 overtaken,
                                 state.incarnation(record_dest) > 0,
                             );
+                        }
+                        if state.fresh_peer_at_absorber(record_origin, r.origin_incarnation, record_dest)
+                        {
+                            state.absorber_cycle_fresh_peer = true;
                         }
                         state.fresh_first.note_entry(
                             record_dest.index,
@@ -1420,6 +1432,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     )?;
                     if let Some(before) = ghost {
                         state.note_ghost_delivery(record_dest.index, entry_step, before);
+                        // A dead-incarnation record is a ghost, so the
+                        // token taken for the mark serves the reward too.
+                        if overtaken_at_restarted && state.node_state_token(record_dest) != before {
+                            state.overtaken_ghost_acted = true;
+                        }
                     }
                     if let Some((bias, before, distance)) = probe {
                         let acted = state.node_state_token(record_dest) != before;
@@ -1738,6 +1755,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
     }
     state.crash_info.currently_crashed.insert(node_id);
     state.note_handler_entry(node_id.index, HandlerTrigger::None);
+    state.note_crash_of_acted_absorber(node_id.index);
     state.clear_ghost_mark(node_id.index);
 
     let mut held: u64 = 0;

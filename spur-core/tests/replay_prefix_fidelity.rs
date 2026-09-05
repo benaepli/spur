@@ -188,11 +188,14 @@ fn check_prefix() {
     // Parent and child ids carry the same mechanism bits, so the only thing
     // that differs between the two runs is the schedule seed the child falls
     // back on once the replayed prefix runs out. Placed runs hold a queued
-    // crash back, which is what lets a delivery reach its node first.
+    // crash back, which is what lets a delivery reach its node first. Runs
+    // on the arm selector's treated half take arms the id does not name,
+    // so they are left out.
     let eligible = |id: i64| {
         let v = run_variant::from_run_id(id);
         v & run_variant::CRASH_PLACED != 0
             && v & (run_variant::RUN_CAP_PROBE | run_variant::TIMER_STEER_OFF) == 0
+            && !spur_core::simulator::arm_selector::is_treated(id)
     };
     let candidates: Vec<i64> = (0..1_000_000i64)
         .filter(|&id| eligible(id))

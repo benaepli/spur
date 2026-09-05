@@ -639,6 +639,16 @@ pub struct State<H: HashPolicy> {
     /// number of scheduling draws taken by then when the run records its
     /// draws. Observation only, excluded from `signature()`.
     pub replay_cut: Option<ReplayCut>,
+    /// Whether some message entry in the run came from a dead incarnation
+    /// of a restarted sender, landed on a restarted destination that had
+    /// already heard from the sender's current incarnation, and wrote the
+    /// destination's state. Observation only, excluded from `signature()`.
+    pub overtaken_ghost_acted: bool,
+    /// Whether some node in the run crashed while marked as having acted on
+    /// a fault-crossing delivery, recovered, and then took a message entry
+    /// from another restarted node's current incarnation. Observation only,
+    /// excluded from `signature()`.
+    pub absorber_cycle_fresh_peer: bool,
     /// Remote records in the network queue whose origin has restarted since
     /// sending them: the sum over nodes of `net_records - net_fresh`.
     pub net_stale_records: u32,
@@ -681,6 +691,9 @@ pub struct ReplayCut {
 /// of the last delivery this node took whose sender was crashed or had
 /// restarted since sending, -1 when none since the node's own last restart;
 /// `last_ghost_acted` says whether that delivery wrote the node's state.
+/// `crashed_as_acted_absorber` says whether a crash of this node ever
+/// landed while that mark said the delivery wrote state; it is never
+/// cleared within a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendLedger {
     pub issued: u32,
@@ -695,6 +708,7 @@ pub struct SendLedger {
     pub entries_at_restart: u32,
     pub last_ghost_step: i32,
     pub last_ghost_acted: bool,
+    pub crashed_as_acted_absorber: bool,
 }
 
 impl Default for SendLedger {
@@ -712,6 +726,7 @@ impl Default for SendLedger {
             entries_at_restart: 0,
             last_ghost_step: -1,
             last_ghost_acted: false,
+            crashed_as_acted_absorber: false,
         }
     }
 }
@@ -782,6 +797,8 @@ impl<H: HashPolicy> State<H> {
             pair_order: pair_order::RunState::default(),
             client_anchor: client_anchor::RunState::default(),
             replay_cut: None,
+            overtaken_ghost_acted: false,
+            absorber_cycle_fresh_peer: false,
             net_stale_records: 0,
             net_requests: 0,
         }
@@ -1124,6 +1141,45 @@ impl<H: HashPolicy> State<H> {
             l.last_ghost_step = -1;
             l.last_ghost_acted = false;
         }
+    }
+
+    /// A crash is landing on `node` while its ghost mark says the absorbed
+    /// delivery wrote state; the fact outlives the mark. Read the mark
+    /// before `clear_ghost_mark`.
+    pub fn note_crash_of_acted_absorber(&mut self, node: usize) {
+        if let Some(l) = self.send_ledger.get_mut(node)
+            && l.last_ghost_acted
+        {
+            l.crashed_as_acted_absorber = true;
+        }
+    }
+
+    /// Whether a message entry at `dest` sent by `origin` at incarnation
+    /// `sent_at` is an overtaken ghost at a restarted receiver: the sending
+    /// incarnation is no longer the origin's current one, `dest` has itself
+    /// restarted, and `dest` has already taken an entry from the origin's
+    /// current incarnation. Read before the entry joins the heard table.
+    pub fn overtaken_ghost_at_restarted(&self, origin: NodeId, sent_at: u32, dest: NodeId) -> bool {
+        let current = self.incarnation(origin);
+        sent_at != current
+            && self.incarnation(dest) > 0
+            && self.fresh_first.heard_from(dest.index, origin.index, current)
+    }
+
+    /// Whether a message entry at `dest` sent by `origin` at incarnation
+    /// `sent_at` closes an absorber cycle: a crash of `dest` once landed
+    /// while it was marked as having acted on a fault-crossing delivery,
+    /// `dest` has restarted, and the entry is from a restarted origin's
+    /// current incarnation.
+    pub fn fresh_peer_at_absorber(&self, origin: NodeId, sent_at: u32, dest: NodeId) -> bool {
+        let current = self.incarnation(origin);
+        self.incarnation(dest) > 0
+            && self
+                .send_ledger
+                .get(dest.index)
+                .is_some_and(|l| l.crashed_as_acted_absorber)
+            && current > 0
+            && sent_at == current
     }
 
     /// Which crash term a crash of `node` satisfies right now, if any.
@@ -1559,6 +1615,66 @@ mod ledger_tests {
         st.clear_ghost_mark(1);
         assert_eq!(st.send_ledger[1].last_ghost_step, -1);
         assert!(!st.send_ledger[1].last_ghost_acted);
+    }
+
+    /// The overtaken-ghost predicate needs a dead sending incarnation, a
+    /// restarted destination, and an earlier entry from the sender's
+    /// current incarnation, in that order of strictness.
+    #[test]
+    fn an_overtaken_ghost_at_a_restarted_receiver_needs_all_three_facts() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        assert!(!st.overtaken_ghost_at_restarted(a, 0, b), "nothing restarted");
+        st.incarnations[0] = 1;
+        assert!(!st.overtaken_ghost_at_restarted(a, 0, b), "the receiver never restarted");
+        st.incarnations[1] = 1;
+        assert!(!st.overtaken_ghost_at_restarted(a, 0, b), "the receiver has not heard the new sender");
+        st.fresh_first.note_entry(1, 0, 0);
+        assert!(!st.overtaken_ghost_at_restarted(a, 0, b), "an entry from the dead incarnation is not a hearing");
+        st.fresh_first.note_entry(1, 0, 1);
+        assert!(st.overtaken_ghost_at_restarted(a, 0, b), "overtaken at a restarted receiver");
+        assert!(!st.overtaken_ghost_at_restarted(a, 1, b), "the current incarnation is not a ghost");
+        assert!(!st.overtaken_ghost_at_restarted(b, 0, a), "the roles do not commute");
+    }
+
+    /// A crash landing while the ghost mark says the delivery wrote state
+    /// is remembered past the mark's clearing, and the absorber-cycle
+    /// predicate then needs the receiver restarted and a restarted sender's
+    /// current incarnation.
+    #[test]
+    fn an_absorber_cycle_closes_on_a_fresh_entry_after_the_acted_crash() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        let c = node(SERVER, 2);
+        // b absorbs a ghost that writes state; c absorbs one that does not.
+        let before = st.node_state_token(b);
+        st.nodes[1].set(1, Value::<NoHashing>::int(5));
+        st.note_ghost_delivery(1, 23, before);
+        let before = st.node_state_token(c);
+        st.note_ghost_delivery(2, 24, before);
+        st.note_crash_of_acted_absorber(1);
+        st.clear_ghost_mark(1);
+        st.note_crash_of_acted_absorber(2);
+        st.clear_ghost_mark(2);
+        assert!(st.send_ledger[1].crashed_as_acted_absorber, "b crashed as an acted absorber");
+        assert!(!st.send_ledger[2].crashed_as_acted_absorber, "c's mark had not acted");
+        assert!(!st.send_ledger[1].last_ghost_acted, "the mark itself is cleared");
+        assert!(!st.fresh_peer_at_absorber(a, 0, b), "b has not restarted");
+        st.incarnations[1] = 1;
+        assert!(!st.fresh_peer_at_absorber(a, 0, b), "a never restarted");
+        st.incarnations[0] = 1;
+        assert!(!st.fresh_peer_at_absorber(a, 0, b), "a message from a's dead incarnation");
+        assert!(st.fresh_peer_at_absorber(a, 1, b), "a restarted peer's fresh message closes the cycle");
+        st.incarnations[2] = 1;
+        assert!(!st.fresh_peer_at_absorber(a, 1, c), "c never crashed as an acted absorber");
+        // A later ghost mark on b, acted or not, does not disturb the fact.
+        let before = st.node_state_token(b);
+        st.note_ghost_delivery(1, 40, before);
+        st.note_crash_of_acted_absorber(1);
+        st.clear_ghost_mark(1);
+        assert!(st.send_ledger[1].crashed_as_acted_absorber, "never cleared within a run");
     }
 
     #[test]

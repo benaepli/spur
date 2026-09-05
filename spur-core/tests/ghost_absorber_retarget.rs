@@ -205,7 +205,11 @@ fn check_treated() {
     seed_span();
     let (program, run_config) = compile();
     let treated: Vec<i64> = (0..1_000_000i64)
-        .filter(|&id| ghost_absorber::is_treated(id) && fault_timing::is_placed(id))
+        .filter(|&id| {
+            ghost_absorber::is_treated(id)
+                && fault_timing::is_placed(id)
+                && !spur_core::simulator::arm_selector::is_treated(id)
+        })
         .take(TREATED_RUNS)
         .collect();
     assert_eq!(treated.len(), TREATED_RUNS, "not enough treated run ids");
@@ -309,7 +313,11 @@ fn check_untreated() {
     fault_timing::reset();
     let (program, run_config) = compile();
     let untreated: Vec<i64> = (0..1_000_000i64)
-        .filter(|&id| !ghost_absorber::is_treated(id) && fault_timing::is_placed(id))
+        .filter(|&id| {
+            !ghost_absorber::is_treated(id)
+                && fault_timing::is_placed(id)
+                && !spur_core::simulator::arm_selector::is_treated(id)
+        })
         .take(UNTREATED_RUNS)
         .collect();
 

@@ -12,7 +12,14 @@
 //! A timer-context probe is placed like any other run, and whether a placed
 //! run acted is a separate fact from whether it was selected, so no single
 //! label could name what a run was.
+//!
+//! The mechanism bits describe the arms the run actually ran under, held in
+//! an `ArmSet`. On most runs the arm set is the one the run id's coins name;
+//! a run the arm selector treats takes a learned arm set instead, and its
+//! tag carries the chosen bits plus the bit of the learner that drew them,
+//! `ARM_SELECTOR_AXIS` or `ARM_SELECTOR_AXIS_B`.
 
+use crate::simulator::arm_selector;
 use crate::simulator::client_anchor;
 use crate::simulator::crash_phase;
 use crate::simulator::fault_timing;
@@ -66,13 +73,231 @@ pub const REPLAY_PREFIX: i32 = 1 << 21;
 /// incarnation, the run takes instead an eligible record from that sender's
 /// current incarnation to the same destination.
 pub const FRESH_FIRST_PAIR: i32 = 1 << 24;
+/// The run's arm set was drawn by the arm selector's first learner rather
+/// than by the run id's coins. The mechanism bits then name the chosen
+/// arms.
+pub const ARM_SELECTOR_AXIS: i32 = 1 << 6;
+/// As `ARM_SELECTOR_AXIS`, for the selector's second learner. A run carries
+/// at most one of the two.
+pub const ARM_SELECTOR_AXIS_B: i32 = 1 << 5;
 
-/// The whole tag: what the run id selected, plus what the run did.
-pub fn of(run_id: i64, crash_hold_drawn: bool) -> i32 {
-    from_run_id(run_id) | if crash_hold_drawn { CRASH_HOLD_DRAWN } else { 0 }
+/// The direction a run takes on the crash-timing axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CrashArm {
+    /// Crashes compete at once; no hold is drawn.
+    #[default]
+    Stock,
+    /// Crashes hold until a step drawn over the learned completed-run span.
+    Placed,
+    /// Placed, and the crash then waits for a drawn phase of its victim's
+    /// own fan-out.
+    PlacedPhase,
 }
 
-/// The bits that follow from the run id alone.
+impl CrashArm {
+    /// The index this direction occupies on its axis.
+    pub fn index(self) -> usize {
+        match self {
+            CrashArm::Stock => 0,
+            CrashArm::Placed => 1,
+            CrashArm::PlacedPhase => 2,
+        }
+    }
+
+    fn from_index(i: usize) -> Self {
+        match i {
+            0 => CrashArm::Stock,
+            1 => CrashArm::Placed,
+            _ => CrashArm::PlacedPhase,
+        }
+    }
+}
+
+/// Number of axes an arm set spans.
+pub const AXES: usize = 5;
+/// Number of directions over all axes.
+pub const DIRECTIONS: usize = 12;
+/// Number of distinct arm sets.
+pub const COMBINATIONS: usize = 72;
+/// Axis `a` owns the direction indices `AXIS_START[a]..AXIS_START[a + 1]`:
+/// crash, retarget, fresh-first, pair-order, request timing.
+pub const AXIS_START: [usize; AXES + 1] = [0, 3, 5, 7, 9, 12];
+
+/// The direction a run takes on each of the five mechanism axes. The
+/// mechanisms read their direction from here and never from the run id, so
+/// the set in effect is the only truth about what a run ran under.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArmSet {
+    pub crash: CrashArm,
+    pub retarget: bool,
+    pub fresh_first: bool,
+    pub pair_order: bool,
+    pub request: client_anchor::Arm,
+}
+
+impl ArmSet {
+    /// The arm set the run id's coins name: the direction each mechanism
+    /// would draw for this id on its own, each with its own probe
+    /// exemptions.
+    pub fn coins(run_id: i64) -> Self {
+        let crash = if crash_phase::is_anchored(run_id) {
+            CrashArm::PlacedPhase
+        } else if fault_timing::is_placed(run_id) {
+            CrashArm::Placed
+        } else {
+            CrashArm::Stock
+        };
+        Self {
+            crash,
+            retarget: ghost_absorber::is_treated(run_id),
+            fresh_first: fresh_first::is_treated(run_id),
+            pair_order: pair_order::is_treated(run_id),
+            request: client_anchor::arm(run_id),
+        }
+    }
+
+    /// The crash axis from the coins and every other axis stock: what a run
+    /// of a user-written plan takes, since only crash placement acts on a
+    /// plan that was not generated.
+    pub fn crash_coin_only(run_id: i64) -> Self {
+        Self {
+            crash: Self::coins(run_id).crash,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the run draws crash holds.
+    pub fn placed(&self) -> bool {
+        self.crash != CrashArm::Stock
+    }
+
+    /// The direction index the set takes on each axis, in axis order.
+    pub fn directions(&self) -> [usize; AXES] {
+        [
+            AXIS_START[0] + self.crash.index(),
+            AXIS_START[1] + self.retarget as usize,
+            AXIS_START[2] + self.fresh_first as usize,
+            AXIS_START[3] + self.pair_order as usize,
+            AXIS_START[4] + self.request.index(),
+        ]
+    }
+
+    /// The set whose direction on axis `a` is `directions[a]`, given as a
+    /// direction index within that axis's range.
+    pub fn from_directions(directions: [usize; AXES]) -> Self {
+        let on = |a: usize| directions[a] - AXIS_START[a];
+        Self {
+            crash: CrashArm::from_index(on(0)),
+            retarget: on(1) == 1,
+            fresh_first: on(2) == 1,
+            pair_order: on(3) == 1,
+            request: request_from_index(on(4)),
+        }
+    }
+
+    /// The set's position among the `COMBINATIONS` sets, mixed radix in
+    /// axis order.
+    pub fn index(&self) -> usize {
+        let d = self.directions();
+        let mut i = 0;
+        for a in 0..AXES {
+            i = i * (AXIS_START[a + 1] - AXIS_START[a]) + (d[a] - AXIS_START[a]);
+        }
+        i
+    }
+
+    /// The inverse of `index`.
+    pub fn from_index(mut index: usize) -> Self {
+        let mut directions = [0usize; AXES];
+        for a in (0..AXES).rev() {
+            let width = AXIS_START[a + 1] - AXIS_START[a];
+            directions[a] = AXIS_START[a] + index % width;
+            index /= width;
+        }
+        Self::from_directions(directions)
+    }
+
+    /// The share of the runs eligible for every mechanism - neither kind of
+    /// probe - whose coins land on `direction`. The shares of one axis sum
+    /// to one.
+    pub fn coin_probability(direction: usize) -> f64 {
+        let placed = fault_timing::placed_share_of_unprobed();
+        match direction {
+            0 => 1.0 - placed,
+            1 | 2 => placed / 2.0,
+            3..=8 => 0.5,
+            9 => 0.5,
+            _ => 0.25,
+        }
+    }
+}
+
+fn request_from_index(i: usize) -> client_anchor::Arm {
+    match i {
+        0 => client_anchor::Arm::Hold,
+        1 => client_anchor::Arm::Rush,
+        _ => client_anchor::Arm::Stock,
+    }
+}
+
+/// The mechanism bits an arm set names.
+pub fn of_arms(arms: &ArmSet) -> i32 {
+    let mut v = 0;
+    if arms.placed() {
+        v |= CRASH_PLACED;
+    }
+    if arms.crash == CrashArm::PlacedPhase {
+        v |= CRASH_PHASE;
+    }
+    if arms.retarget {
+        v |= GHOST_ABSORBER_RETARGET;
+    }
+    if arms.fresh_first {
+        v |= FRESH_FIRST_PAIR;
+    }
+    if arms.pair_order {
+        v |= PAIR_SEND_ORDER;
+    }
+    match arms.request {
+        client_anchor::Arm::Hold => v |= CLIENT_FANOUT_RELEASE,
+        client_anchor::Arm::Rush => v |= CLIENT_RUSH_PRIORITY,
+        client_anchor::Arm::Stock => {}
+    }
+    v
+}
+
+/// The bit that names the learner steering a run, or zero on a run the
+/// selector leaves to its coins.
+pub fn selector_bit(run_id: i64) -> i32 {
+    match arm_selector::learner(run_id) {
+        Some(arm_selector::Learner::OvertakenGhost) => ARM_SELECTOR_AXIS,
+        Some(arm_selector::Learner::AbsorberCycle) => ARM_SELECTOR_AXIS_B,
+        None => 0,
+    }
+}
+
+/// The bits that name a run's probe roles and its selector third, all pure
+/// functions of the run id.
+pub fn probe_bits(run_id: i64) -> i32 {
+    let mut v = 0;
+    if run_cap::is_probe(run_id) {
+        v |= RUN_CAP_PROBE;
+    }
+    if timer_context::run_mode(run_id) == timer_context::RunMode::Probe {
+        v |= TIMER_STEER_OFF;
+    }
+    v | selector_bit(run_id)
+}
+
+/// The whole tag: the run's probe roles, the arms it ran under, and what
+/// the run did.
+pub fn of(run_id: i64, arms: &ArmSet, crash_hold_drawn: bool) -> i32 {
+    probe_bits(run_id) | of_arms(arms) | if crash_hold_drawn { CRASH_HOLD_DRAWN } else { 0 }
+}
+
+/// The bits the run id's coins alone would name, read straight from each
+/// mechanism's own coin. A run under its coin arm set carries exactly these
+/// bits plus its selector half.
 pub fn from_run_id(run_id: i64) -> i32 {
     let mut v = 0;
     if fault_timing::is_placed(run_id) {
@@ -148,14 +373,101 @@ mod tests {
                 "a run took both directions of the request-timing axis"
             );
             assert_eq!(v & CRASH_HOLD_DRAWN, 0, "the acted bit is not an id bit");
-            assert_eq!(of(id, true), v | CRASH_HOLD_DRAWN);
-            assert_eq!(of(id, false), v);
+            let third = selector_bit(id);
+            let coins = ArmSet::coins(id);
+            assert_eq!(of(id, &coins, true), v | third | CRASH_HOLD_DRAWN);
+            assert_eq!(of(id, &coins, false), v | third);
             assert_eq!(v & (REPLAY_SLOT | REPLAY_PREFIX), 0, "the slot bits are the arm's");
             let g = grid_arm_bits(id);
             assert_eq!(g & REPLAY_SLOT != 0, replay_corpus::is_slot(id));
             assert_eq!(g & REPLAY_PREFIX != 0, replay_corpus::is_prefix(id));
             assert_eq!(g & !(REPLAY_SLOT | REPLAY_PREFIX), 0, "the arm sets only its bits");
         }
+    }
+
+    #[test]
+    fn the_coin_arm_set_reproduces_every_mechanism_coin_over_64k_ids() {
+        let _serial = config_override::exclusive_session();
+        fault_timing::reset();
+        let mut treated = 0i64;
+        let mut by_bit = [0i64; 2];
+        for id in -32_000..32_000i64 {
+            let coins = ArmSet::coins(id);
+            assert_eq!(coins.placed(), fault_timing::is_placed(id), "run {id}: placed");
+            assert_eq!(
+                coins.crash == CrashArm::PlacedPhase,
+                crash_phase::is_anchored(id),
+                "run {id}: anchored"
+            );
+            assert_eq!(coins.retarget, ghost_absorber::is_treated(id), "run {id}: retarget");
+            assert_eq!(coins.fresh_first, fresh_first::is_treated(id), "run {id}: fresh first");
+            assert_eq!(coins.pair_order, pair_order::is_treated(id), "run {id}: pair order");
+            assert_eq!(coins.request, client_anchor::arm(id), "run {id}: request");
+            let tag = of(id, &coins, false);
+            let third = selector_bit(id);
+            assert_eq!(tag, from_run_id(id) | third, "run {id}: tag");
+            assert_ne!(
+                tag & (ARM_SELECTOR_AXIS | ARM_SELECTOR_AXIS_B),
+                ARM_SELECTOR_AXIS | ARM_SELECTOR_AXIS_B,
+                "run {id}: a run carries both learners' bits"
+            );
+            assert_eq!(
+                tag & ARM_SELECTOR_AXIS != 0,
+                arm_selector::learner(id) == Some(arm_selector::Learner::OvertakenGhost),
+                "run {id}: the first learner's bit"
+            );
+            assert_eq!(
+                tag & ARM_SELECTOR_AXIS_B != 0,
+                arm_selector::learner(id) == Some(arm_selector::Learner::AbsorberCycle),
+                "run {id}: the second learner's bit"
+            );
+            assert_eq!(ArmSet::from_index(coins.index()), coins, "run {id}: index round trip");
+            let probe = run_cap::is_probe(id)
+                || timer_context::run_mode(id) == timer_context::RunMode::Probe;
+            if probe {
+                assert_eq!(third, 0, "run {id}: a probe is selector-treated");
+            }
+            treated += (third != 0) as i64;
+            by_bit[0] += (third == ARM_SELECTOR_AXIS) as i64;
+            by_bit[1] += (third == ARM_SELECTOR_AXIS_B) as i64;
+        }
+        assert!(treated > 30_000 && treated < 50_000, "the selector split leaves no contrast");
+        assert!(by_bit[0] > 15_000 && by_bit[1] > 15_000, "a learner's third is empty {by_bit:?}");
+    }
+
+    #[test]
+    fn every_combination_index_round_trips_and_coins_sum_to_one_per_axis() {
+        let _serial = config_override::exclusive_session();
+        fault_timing::reset();
+        for i in 0..COMBINATIONS {
+            let arms = ArmSet::from_index(i);
+            assert_eq!(arms.index(), i);
+            assert_eq!(ArmSet::from_directions(arms.directions()), arms);
+            for (a, d) in arms.directions().iter().enumerate() {
+                assert!((AXIS_START[a]..AXIS_START[a + 1]).contains(d));
+            }
+        }
+        for a in 0..AXES {
+            let sum: f64 = (AXIS_START[a]..AXIS_START[a + 1])
+                .map(ArmSet::coin_probability)
+                .sum();
+            assert!((sum - 1.0).abs() < 1e-9, "axis {a} coins sum to {sum}");
+        }
+        // The crash axis coins are the placed share of the runs neither
+        // probe exempts, read against a long id range.
+        let n = 64_000i64;
+        let eligible = (0..n)
+            .filter(|&id| {
+                !run_cap::is_probe(id)
+                    && timer_context::run_mode(id) != timer_context::RunMode::Probe
+            })
+            .collect::<Vec<_>>();
+        let placed = eligible.iter().filter(|&&id| fault_timing::is_placed(id)).count() as f64
+            / eligible.len() as f64;
+        let want = ArmSet::coin_probability(1) + ArmSet::coin_probability(2);
+        assert!((placed - want).abs() < 0.01, "placed share {placed} against coin {want}");
+        assert!(ArmSet::coin_probability(0) < 0.15, "the stock crash coin is small");
+        assert_eq!(of_arms(&ArmSet::default()), 0, "the all-stock set names no bit");
     }
 
     #[test]

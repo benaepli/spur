@@ -967,6 +967,7 @@ pub fn run_explorer_campaign(
     info!("campaign session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
     crate::simulator::run_cap::reset();
+    crate::simulator::arm_selector::reset();
     crate::simulator::fault_timing::reset();
     crate::simulator::timer_context::reset();
     crate::simulator::fault_timing::set_fraction(

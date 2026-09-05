@@ -169,7 +169,7 @@ fn check() {
     seed_span();
 
     let anchored: Vec<i64> = (0..1_000_000i64)
-        .filter(|&id| crash_phase::is_anchored(id))
+        .filter(|&id| crash_phase::is_anchored(id) && !spur_core::simulator::arm_selector::is_treated(id))
         .take(RUNS)
         .collect();
     assert_eq!(anchored.len(), RUNS, "not enough anchored run ids");
@@ -304,11 +304,19 @@ fn check_landing() {
     seed_span();
 
     let retargeting: Vec<i64> = (0..1_000_000i64)
-        .filter(|&id| crash_phase::is_anchored(id) && ghost_absorber::is_treated(id))
+        .filter(|&id| {
+            crash_phase::is_anchored(id)
+                && ghost_absorber::is_treated(id)
+                && !spur_core::simulator::arm_selector::is_treated(id)
+        })
         .take(RUNS)
         .collect();
     let plain: Vec<i64> = (0..1_000_000i64)
-        .filter(|&id| crash_phase::is_anchored(id) && !ghost_absorber::is_treated(id))
+        .filter(|&id| {
+            crash_phase::is_anchored(id)
+                && !ghost_absorber::is_treated(id)
+                && !spur_core::simulator::arm_selector::is_treated(id)
+        })
         .take(RUNS)
         .collect();
     assert_eq!(retargeting.len(), RUNS, "not enough retargeting run ids");

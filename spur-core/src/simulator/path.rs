@@ -8,7 +8,6 @@ use crate::simulator::core::{
     make_local_env, schedule_runnable,
 };
 use crate::simulator::client_anchor::{self, HoldQueue, Released};
-use crate::simulator::crash_phase;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
@@ -19,6 +18,7 @@ use crate::simulator::fault_timing;
 use crate::simulator::pair_order as pair_order_split;
 use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
+use crate::simulator::run_variant::{ArmSet, CrashArm};
 use crate::simulator::timer_context;
 use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunExtension, RunTermination};
 use ecow::EcoString;
@@ -416,18 +416,16 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     terms: &ResolvedTerms,
     purgatory_config: &PurgatoryConfig,
     partial_fanout_crash_bias: f64,
-    retarget_crashes: bool,
-    fresh_first: bool,
-    pair_order: bool,
-    client_anchor: client_anchor::Arm,
+    arms: &ArmSet,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
-    path_state.state.retarget.enabled = retarget_crashes;
-    path_state.state.fresh_first.enabled = fresh_first;
-    path_state.state.pair_order.enabled = pair_order;
-    path_state.state.client_anchor.arm = client_anchor;
-    util_stats::record_client_anchor_arm_run(client_anchor);
+    path_state.state.retarget.enabled = arms.retarget;
+    path_state.state.fresh_first.enabled = arms.fresh_first;
+    path_state.state.pair_order.enabled = arms.pair_order;
+    path_state.state.client_anchor.arm = arms.request;
+    let pair_order = arms.pair_order;
+    util_stats::record_client_anchor_arm_run(arms.request);
     let anchored = path_state.state.client_anchor.holds();
     // Client requests that became ready after the run's first crash and are
     // waiting out their hold, and the last step at which a window opened.
@@ -653,11 +651,11 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         node_id: nid,
                         priority: policy.sample(rng, RunnableCategory::Crash),
                     });
-                    // Placed-posture runs hold the crash until a step drawn
+                    // Placed runs hold the crash until a step drawn
                     // uniformly over the learned completed-run span; stock
-                    // runs draw nothing and behave exactly as before.
+                    // runs draw nothing.
                     if let Some(target) =
-                        fault_timing::draw_hold(run_id, backup, effective_cap, step, rng)
+                        fault_timing::draw_hold(arms.placed(), backup, effective_cap, step, rng)
                     {
                         path_state.state.crash_hold_drawn = true;
                         if let Some(hold) =
@@ -665,10 +663,10 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         {
                             *hold = target;
                         }
-                        // On the anchored half of the placed runs the crash
-                        // waits further, for a drawn phase of the victim's
-                        // own fan-out, once that target step arrives.
-                        if crash_phase::is_anchored(run_id) {
+                        // On the phase arm the crash waits further, for a
+                        // drawn phase of the victim's own fan-out, once that
+                        // target step arrives.
+                        if arms.crash == CrashArm::PlacedPhase {
                             path_state.state.crash_phase.arm_node(
                                 nid.index,
                                 fault_timing::cap_reserve(effective_cap),
@@ -733,7 +731,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 
         let history_start_len = path_state.history.len();
 
-        if retarget_crashes {
+        if arms.retarget {
             let mut mask = 0u64;
             for &n in pending_crash.keys().chain(pending_recover.keys()) {
                 if n < u64::BITS as usize {

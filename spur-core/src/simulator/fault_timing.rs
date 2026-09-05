@@ -74,6 +74,20 @@ pub fn is_placed(run_id: i64) -> bool {
         && run_phase::phase(run_id, POSTURE_PERIOD) >= PLACED_FROM.load(Ordering::Relaxed)
 }
 
+/// The share of the runs that are not run-cap probes whose posture is
+/// placed: the admitted phases less the probe phases among them, over the
+/// phases that are not probes. Phases are uniform over the ids, so this is
+/// the placed coin's probability on any population drawn independently of
+/// the posture phase.
+pub fn placed_share_of_unprobed() -> f64 {
+    let from = PLACED_FROM.load(Ordering::Relaxed);
+    let placed = (from..POSTURE_PERIOD)
+        .filter(|p| p.rem_euclid(run_cap::PROBE_PERIOD) != 0)
+        .count() as f64;
+    let unprobed = (POSTURE_PERIOD - POSTURE_PERIOD / run_cap::PROBE_PERIOD) as f64;
+    placed / unprobed
+}
+
 /// Whether this run's completed length may feed the learner. Every run-cap
 /// probe does, since none of them is placed - so the feed is one run in
 /// `run_cap::PROBE_PERIOD` rather than one in `POSTURE_PERIOD`, and the
@@ -167,17 +181,17 @@ pub fn cap_reserve(effective_cap: i32) -> i32 {
 
 /// Draw the step a placed run holds a crash until: uniform over
 /// `[t_ready, U)` where `U` is the learned median bounded by three quarters
-/// of the run's frozen step cap. Returns None, drawing nothing from any
-/// random stream, when the run is in the stock posture, the scope is below
-/// its floor, or the span is already spent.
+/// of the run's frozen step cap. `placed` is the run's crash-axis arm.
+/// Returns None, drawing nothing from any random stream, when the run is
+/// not placed, the scope is below its floor, or the span is already spent.
 pub fn draw_hold(
-    run_id: i64,
+    placed: bool,
     backup: i32,
     effective_cap: i32,
     t_ready: i32,
     rng: &mut impl StreamRng,
 ) -> Option<i32> {
-    if !is_placed(run_id) {
+    if !placed {
         return None;
     }
     let l50 = median(backup)?;
@@ -411,11 +425,11 @@ mod tests {
         for phase in 0..stock_phases {
             let id = id_at_phase(phase);
             assert!(!is_placed(id), "phase {phase} should be below the placed threshold");
-            assert_eq!(draw_hold(id, 6000, 6000, 10, &mut rng), None, "run {id} is stock");
+            assert_eq!(draw_hold(is_placed(id), 6000, 6000, 10, &mut rng), None, "run {id} is stock");
         }
         // A probe is stock at every fraction, wherever its phase falls.
         let probe = (0..1_000_000i64).find(|&id| run_cap::is_probe(id)).unwrap();
-        assert_eq!(draw_hold(probe, 6000, 6000, 10, &mut rng), None, "a probe is never placed");
+        assert_eq!(draw_hold(is_placed(probe), 6000, 6000, 10, &mut rng), None, "a probe is never placed");
         assert_eq!(rng.draws, 0, "stock posture must not touch the stream");
         reset();
     }
@@ -428,15 +442,15 @@ mod tests {
         let mut rng = CountingRng::new(7);
         let placed = id_at_phase(POSTURE_PERIOD - 1);
         for _ in 0..100 {
-            let t = draw_hold(placed, 6000, 6000, 10, &mut rng).expect("engaged scope draws");
+            let t = draw_hold(is_placed(placed), 6000, 6000, 10, &mut rng).expect("engaged scope draws");
             assert!((10..1223).contains(&t), "target {t} escapes [t_ready, U)");
         }
         assert_eq!(
-            draw_hold(placed, 6000, 6000, 1223, &mut rng),
+            draw_hold(is_placed(placed), 6000, 6000, 1223, &mut rng),
             None,
             "a spent span draws nothing"
         );
-        assert_eq!(draw_hold(placed, 1500, 6000, 10, &mut rng), None, "unengaged scope");
+        assert_eq!(draw_hold(is_placed(placed), 1500, 6000, 10, &mut rng), None, "unengaged scope");
         reset();
     }
 
@@ -451,10 +465,10 @@ mod tests {
         let placed = id_at_phase(POSTURE_PERIOD - 1);
         // Three quarters of a 400-step cap is 300, under the 1223 median.
         for _ in 0..50 {
-            let t = draw_hold(placed, 6000, 400, 0, &mut rng).expect("capped span still draws");
+            let t = draw_hold(is_placed(placed), 6000, 400, 0, &mut rng).expect("capped span still draws");
             assert!((0..300).contains(&t), "target {t} escapes the reserve bound");
         }
-        let t = draw_hold(placed, 6000, 6000, 0, &mut rng).expect("uncapped draw");
+        let t = draw_hold(is_placed(placed), 6000, 6000, 0, &mut rng).expect("uncapped draw");
         assert!((0..1223).contains(&t));
         let after = util_stats::snapshot().crash_place;
         util_stats::set_enabled(false);

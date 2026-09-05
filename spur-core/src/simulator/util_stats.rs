@@ -7,6 +7,7 @@
 
 use crate::simulator::core::steer_terms::{Term, TERMS};
 use crate::simulator::client_anchor;
+use crate::simulator::run_variant;
 use crate::simulator::fresh_first;
 use serde::Serialize;
 use std::cell::RefCell;
@@ -160,6 +161,91 @@ static CAN_RUSH_WAS_PICK: AtomicU64 = AtomicU64::new(0);
 static CAN_RUSH_DISPLACED: AtomicU64 = AtomicU64::new(0);
 static CAN_FIRST_DELIVERY_SUM: [AtomicU64; CAN_ARMS] = [const { AtomicU64::new(0) }; CAN_ARMS];
 static CAN_FIRST_DELIVERY_COUNT: [AtomicU64; CAN_ARMS] = [const { AtomicU64::new(0) }; CAN_ARMS];
+/// The per-run rewards the arm selector reads. The first two each train
+/// one learner; the last two are read on the coin third only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reward {
+    OvertakenGhost,
+    AbsorberCycle,
+    GhostSignal,
+    EitherShape,
+}
+
+impl Reward {
+    pub const ALL: [Reward; 4] = [
+        Reward::OvertakenGhost,
+        Reward::AbsorberCycle,
+        Reward::GhostSignal,
+        Reward::EitherShape,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Reward::OvertakenGhost => 0,
+            Reward::AbsorberCycle => 1,
+            Reward::GhostSignal => 2,
+            Reward::EitherShape => 3,
+        }
+    }
+}
+
+/// The arm selector's counters for one reward: the coin third's runs and
+/// rewards per direction and per combination, the reward on each third,
+/// and, for a reward a learner is trained on, that learner's draws.
+struct AxCounters {
+    treated_runs: AtomicU64,
+    chosen_runs: AtomicU64,
+    coin_fallback_runs: AtomicU64,
+    departures: AtomicU64,
+    axis_leader_agreements: AtomicU64,
+    axis_draws: AtomicU64,
+    chosen_placed_runs: AtomicU64,
+    cells: AtomicU64,
+    /// Indexed by whether the run was treated.
+    reward_runs: [AtomicU64; 2],
+    reward_positive: [AtomicU64; 2],
+    chosen_by_direction: [AtomicU64; run_variant::DIRECTIONS],
+    control_runs_by_direction: [AtomicU64; run_variant::DIRECTIONS],
+    control_reward_positive_by_direction: [AtomicU64; run_variant::DIRECTIONS],
+    chosen_by_combination: [AtomicU64; run_variant::COMBINATIONS],
+    control_runs_by_combination: [AtomicU64; run_variant::COMBINATIONS],
+    control_reward_positive_by_combination: [AtomicU64; run_variant::COMBINATIONS],
+}
+
+impl AxCounters {
+    const fn new() -> Self {
+        Self {
+            treated_runs: AtomicU64::new(0),
+            chosen_runs: AtomicU64::new(0),
+            coin_fallback_runs: AtomicU64::new(0),
+            departures: AtomicU64::new(0),
+            axis_leader_agreements: AtomicU64::new(0),
+            axis_draws: AtomicU64::new(0),
+            chosen_placed_runs: AtomicU64::new(0),
+            cells: AtomicU64::new(0),
+            reward_runs: [const { AtomicU64::new(0) }; 2],
+            reward_positive: [const { AtomicU64::new(0) }; 2],
+            chosen_by_direction: [const { AtomicU64::new(0) }; run_variant::DIRECTIONS],
+            control_runs_by_direction: [const { AtomicU64::new(0) }; run_variant::DIRECTIONS],
+            control_reward_positive_by_direction: [const { AtomicU64::new(0) };
+                run_variant::DIRECTIONS],
+            chosen_by_combination: [const { AtomicU64::new(0) }; run_variant::COMBINATIONS],
+            control_runs_by_combination: [const { AtomicU64::new(0) }; run_variant::COMBINATIONS],
+            control_reward_positive_by_combination: [const { AtomicU64::new(0) };
+                run_variant::COMBINATIONS],
+        }
+    }
+}
+
+static AX: [AxCounters; 4] = [const { AxCounters::new() }; 4];
+static AX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+/// The first learner's reward per campaign arm over every observed run,
+/// slot `arm_index + 1` so an unattributed run lands in slot zero; arms
+/// past the width share the last slot.
+const AX_ARM_SLOTS: usize = 8;
+static AX_REWARD_RUNS_BY_ARM: [AtomicU64; AX_ARM_SLOTS] = [const { AtomicU64::new(0) }; AX_ARM_SLOTS];
+static AX_REWARD_POSITIVE_BY_ARM: [AtomicU64; AX_ARM_SLOTS] =
+    [const { AtomicU64::new(0) }; AX_ARM_SLOTS];
 static RP_PARENTS_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -2043,6 +2129,102 @@ pub fn record_client_anchor_arm_run(arm: client_anchor::Arm) {
         return;
     }
     CAN_ARM_RUNS[arm.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A run on a learner's third drew its arms: `reward` names the learner,
+/// `chosen` is the learned set, or None when the cell was below warmup and
+/// the run took `coins`. `leader_agreements` counts the axes on which the
+/// drawn direction was the axis's highest posterior mean.
+pub fn record_arm_selector_treated_run(
+    reward: Reward,
+    chosen: Option<&run_variant::ArmSet>,
+    coins: &run_variant::ArmSet,
+    leader_agreements: u64,
+) {
+    if !enabled() {
+        return;
+    }
+    let ax = &AX[reward.index()];
+    ax.treated_runs.fetch_add(1, Ordering::Relaxed);
+    let Some(arms) = chosen else {
+        ax.coin_fallback_runs.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    ax.chosen_runs.fetch_add(1, Ordering::Relaxed);
+    ax.axis_draws.fetch_add(run_variant::AXES as u64, Ordering::Relaxed);
+    ax.axis_leader_agreements.fetch_add(leader_agreements, Ordering::Relaxed);
+    if arms != coins {
+        ax.departures.fetch_add(1, Ordering::Relaxed);
+    }
+    if arms.placed() {
+        ax.chosen_placed_runs.fetch_add(1, Ordering::Relaxed);
+    }
+    for d in arms.directions() {
+        ax.chosen_by_direction[d].fetch_add(1, Ordering::Relaxed);
+    }
+    ax.chosen_by_combination[arms.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A run the arm selector observed, once per run whichever rewards were
+/// read on it: `arm_index` is the campaign arm the run's cell belongs to
+/// and `overtaken_ghost` the first learner's reward.
+pub fn record_arm_selector_run_observed(arm_index: i32, overtaken_ghost: bool) {
+    if !enabled() {
+        return;
+    }
+    AX_OBSERVATIONS.fetch_add(1, Ordering::Relaxed);
+    let slot = ((arm_index + 1).max(0) as usize).min(AX_ARM_SLOTS - 1);
+    AX_REWARD_RUNS_BY_ARM[slot].fetch_add(1, Ordering::Relaxed);
+    if overtaken_ghost {
+        AX_REWARD_POSITIVE_BY_ARM[slot].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One reward was read on a run: `treated` says whether the run was on the
+/// reward's learner's third rather than the coin third, `arms` the set the
+/// run carried, and `positive` the reward's value.
+pub fn record_arm_selector_observation(
+    reward: Reward,
+    treated: bool,
+    arms: &run_variant::ArmSet,
+    positive: bool,
+) {
+    if !enabled() {
+        return;
+    }
+    let ax = &AX[reward.index()];
+    let half = treated as usize;
+    ax.reward_runs[half].fetch_add(1, Ordering::Relaxed);
+    if positive {
+        ax.reward_positive[half].fetch_add(1, Ordering::Relaxed);
+    }
+    if treated {
+        return;
+    }
+    for d in arms.directions() {
+        ax.control_runs_by_direction[d].fetch_add(1, Ordering::Relaxed);
+        if positive {
+            ax.control_reward_positive_by_direction[d].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let c = arms.index();
+    ax.control_runs_by_combination[c].fetch_add(1, Ordering::Relaxed);
+    if positive {
+        ax.control_reward_positive_by_combination[c].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A gauge, not a counter, so it reads with stats off: a cell was created
+/// in the learner trained on `reward`.
+pub fn record_arm_selector_cell_created(reward: Reward) {
+    AX[reward.index()].cells.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The learners were cleared, so their gauges read empty.
+pub fn reset_arm_selector_gauges() {
+    for ax in &AX {
+        ax.cells.store(0, Ordering::Relaxed);
+    }
 }
 
 /// A post-crash client request was issued under the rush direction.
@@ -4247,6 +4429,170 @@ impl ClientAnchorStats {
     }
 }
 
+/// One reward read on the arm selector's coin third. `reward_runs_control`
+/// and `reward_positive_control` are the coin third's runs and rewards; the
+/// per-direction and per-combination arrays follow `run_variant::AXIS_START`
+/// and `ArmSet::index` and say what each coin direction earned.
+#[derive(Serialize, Debug, Clone)]
+pub struct ArmSelectorRewardStats {
+    pub reward_runs_control: u64,
+    pub reward_positive_control: u64,
+    pub control_runs_by_direction: Vec<u64>,
+    pub control_reward_positive_by_direction: Vec<u64>,
+    pub control_runs_by_combination: Vec<u64>,
+    pub control_reward_positive_by_combination: Vec<u64>,
+}
+
+impl ArmSelectorRewardStats {
+    fn read(reward: Reward) -> Self {
+        let ax = &AX[reward.index()];
+        let load = |a: &[AtomicU64]| a.iter().map(|n| n.load(Ordering::Relaxed)).collect();
+        Self {
+            reward_runs_control: ax.reward_runs[0].load(Ordering::Relaxed),
+            reward_positive_control: ax.reward_positive[0].load(Ordering::Relaxed),
+            control_runs_by_direction: load(&ax.control_runs_by_direction),
+            control_reward_positive_by_direction: load(&ax.control_reward_positive_by_direction),
+            control_runs_by_combination: load(&ax.control_runs_by_combination),
+            control_reward_positive_by_combination: load(
+                &ax.control_reward_positive_by_combination,
+            ),
+        }
+    }
+}
+
+/// One reward a learner is trained on, with that learner's draws. The
+/// learner ran as intended when `chosen_runs` is most of `treated_runs`,
+/// `coin_fallback_runs` is the warmup remainder, and
+/// `axis_leader_agreements / axis_draws` sits well above the share
+/// independent draws would give. `departures` counts chosen runs whose set
+/// differs from the id's coins; `cells` is a gauge of the learner's table.
+/// `reward_runs_treated` and `reward_positive_treated` are the learner's own
+/// third; the control fields are the coin third, and `chosen_by_*` what the
+/// learner's third took.
+#[derive(Serialize, Debug, Clone)]
+pub struct ArmSelectorLearnerStats {
+    pub treated_runs: u64,
+    pub chosen_runs: u64,
+    pub coin_fallback_runs: u64,
+    pub departures: u64,
+    pub axis_leader_agreements: u64,
+    pub axis_draws: u64,
+    pub chosen_placed_runs: u64,
+    pub cells: u64,
+    pub reward_runs_treated: u64,
+    pub reward_positive_treated: u64,
+    pub reward_runs_control: u64,
+    pub reward_positive_control: u64,
+    pub chosen_by_direction: Vec<u64>,
+    pub control_runs_by_direction: Vec<u64>,
+    pub control_reward_positive_by_direction: Vec<u64>,
+    pub chosen_by_combination: Vec<u64>,
+    pub control_runs_by_combination: Vec<u64>,
+    pub control_reward_positive_by_combination: Vec<u64>,
+}
+
+impl ArmSelectorLearnerStats {
+    fn read(reward: Reward) -> Self {
+        let ax = &AX[reward.index()];
+        let load = |a: &[AtomicU64]| a.iter().map(|n| n.load(Ordering::Relaxed)).collect();
+        Self {
+            treated_runs: ax.treated_runs.load(Ordering::Relaxed),
+            chosen_runs: ax.chosen_runs.load(Ordering::Relaxed),
+            coin_fallback_runs: ax.coin_fallback_runs.load(Ordering::Relaxed),
+            departures: ax.departures.load(Ordering::Relaxed),
+            axis_leader_agreements: ax.axis_leader_agreements.load(Ordering::Relaxed),
+            axis_draws: ax.axis_draws.load(Ordering::Relaxed),
+            chosen_placed_runs: ax.chosen_placed_runs.load(Ordering::Relaxed),
+            cells: ax.cells.load(Ordering::Relaxed),
+            reward_runs_treated: ax.reward_runs[1].load(Ordering::Relaxed),
+            reward_positive_treated: ax.reward_positive[1].load(Ordering::Relaxed),
+            reward_runs_control: ax.reward_runs[0].load(Ordering::Relaxed),
+            reward_positive_control: ax.reward_positive[0].load(Ordering::Relaxed),
+            chosen_by_direction: load(&ax.chosen_by_direction),
+            control_runs_by_direction: load(&ax.control_runs_by_direction),
+            control_reward_positive_by_direction: load(&ax.control_reward_positive_by_direction),
+            chosen_by_combination: load(&ax.chosen_by_combination),
+            control_runs_by_combination: load(&ax.control_runs_by_combination),
+            control_reward_positive_by_combination: load(
+                &ax.control_reward_positive_by_combination,
+            ),
+        }
+    }
+}
+
+/// The arm selector block. The top-level fields are the first learner's,
+/// the one trained on the overtaken-ghost reward, and repeat under
+/// `overtaken_ghost`; the second learner's are under `absorber_cycle`.
+/// `ghost_signal` and `either_shape` are read on the coin third and train
+/// nothing. `observations` counts every run the selector observed, over
+/// all three thirds; `reward_runs_by_arm` and `reward_positive_by_arm`
+/// split the first learner's reward over those runs by campaign arm, slot
+/// `arm_index + 1`, so a young arm's rate can be read against a mature one.
+#[derive(Serialize, Debug, Clone)]
+pub struct ArmSelectorAxisStats {
+    pub treated_runs: u64,
+    pub chosen_runs: u64,
+    pub coin_fallback_runs: u64,
+    pub departures: u64,
+    pub axis_leader_agreements: u64,
+    pub axis_draws: u64,
+    pub observations: u64,
+    pub reward_runs_treated: u64,
+    pub reward_positive_treated: u64,
+    pub reward_runs_control: u64,
+    pub reward_positive_control: u64,
+    pub cells: u64,
+    pub chosen_placed_runs: u64,
+    pub reward_runs_by_arm: Vec<u64>,
+    pub reward_positive_by_arm: Vec<u64>,
+    pub chosen_by_direction: Vec<u64>,
+    pub control_runs_by_direction: Vec<u64>,
+    pub control_reward_positive_by_direction: Vec<u64>,
+    pub chosen_by_combination: Vec<u64>,
+    pub control_runs_by_combination: Vec<u64>,
+    pub control_reward_positive_by_combination: Vec<u64>,
+    pub overtaken_ghost: ArmSelectorLearnerStats,
+    pub absorber_cycle: ArmSelectorLearnerStats,
+    pub ghost_signal: ArmSelectorRewardStats,
+    pub either_shape: ArmSelectorRewardStats,
+}
+
+impl ArmSelectorAxisStats {
+    fn read() -> Self {
+        let load = |a: &[AtomicU64]| a.iter().map(|n| n.load(Ordering::Relaxed)).collect();
+        let a = ArmSelectorLearnerStats::read(Reward::OvertakenGhost);
+        Self {
+            treated_runs: a.treated_runs,
+            chosen_runs: a.chosen_runs,
+            coin_fallback_runs: a.coin_fallback_runs,
+            departures: a.departures,
+            axis_leader_agreements: a.axis_leader_agreements,
+            axis_draws: a.axis_draws,
+            observations: AX_OBSERVATIONS.load(Ordering::Relaxed),
+            reward_runs_treated: a.reward_runs_treated,
+            reward_positive_treated: a.reward_positive_treated,
+            reward_runs_control: a.reward_runs_control,
+            reward_positive_control: a.reward_positive_control,
+            cells: a.cells,
+            chosen_placed_runs: a.chosen_placed_runs,
+            reward_runs_by_arm: load(&AX_REWARD_RUNS_BY_ARM),
+            reward_positive_by_arm: load(&AX_REWARD_POSITIVE_BY_ARM),
+            chosen_by_direction: a.chosen_by_direction.clone(),
+            control_runs_by_direction: a.control_runs_by_direction.clone(),
+            control_reward_positive_by_direction: a.control_reward_positive_by_direction.clone(),
+            chosen_by_combination: a.chosen_by_combination.clone(),
+            control_runs_by_combination: a.control_runs_by_combination.clone(),
+            control_reward_positive_by_combination: a
+                .control_reward_positive_by_combination
+                .clone(),
+            overtaken_ghost: a,
+            absorber_cycle: ArmSelectorLearnerStats::read(Reward::AbsorberCycle),
+            ghost_signal: ArmSelectorRewardStats::read(Reward::GhostSignal),
+            either_shape: ArmSelectorRewardStats::read(Reward::EitherShape),
+        }
+    }
+}
+
 /// The replay corpus of the grid arms. `parents_admitted` counts fresh runs
 /// whose prefix entered a corpus; `children` the slots that ran a child,
 /// split into `children_prefix` and `children_plan_only`; `slots_unfilled`
@@ -4347,6 +4693,7 @@ pub struct UtilizationSnapshot {
     pub fresh_first: FreshFirstStats,
     pub pair_order: PairOrderStats,
     pub client_anchor: ClientAnchorStats,
+    pub arm_selector_axis: ArmSelectorAxisStats,
     pub replay: ReplayStats,
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
@@ -4544,6 +4891,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         fresh_first: FreshFirstStats::read(),
         pair_order: PairOrderStats::read(),
         client_anchor: ClientAnchorStats::read(),
+        arm_selector_axis: ArmSelectorAxisStats::read(),
         replay: ReplayStats::read(),
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),

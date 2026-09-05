@@ -1,3 +1,4 @@
+pub mod arm_selector;
 pub mod config_override;
 mod core;
 pub mod client_anchor;

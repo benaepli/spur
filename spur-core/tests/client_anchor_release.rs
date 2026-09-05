@@ -180,7 +180,11 @@ fn seed_span() {
 
 fn placed_ids(treated: bool, n: usize) -> Vec<i64> {
     let ids: Vec<i64> = (0..1_000_000i64)
-        .filter(|&id| client_anchor::is_treated(id) == treated && fault_timing::is_placed(id))
+        .filter(|&id| {
+            client_anchor::is_treated(id) == treated
+                && fault_timing::is_placed(id)
+                && !spur_core::simulator::arm_selector::is_treated(id)
+        })
         .take(n)
         .collect();
     assert_eq!(ids.len(), n, "not enough run ids on that half");

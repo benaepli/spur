@@ -178,6 +178,7 @@ fn ids(treated: bool, census: bool, n: usize) -> Vec<i64> {
             pair_order::is_treated(id) == treated
                 && pair_order::is_census_run(id) == census
                 && fault_timing::is_placed(id)
+                && !spur_core::simulator::arm_selector::is_treated(id)
         })
         .take(n)
         .collect();

@@ -25,8 +25,10 @@ use crate::simulator::rng::{
     LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, StreamRng,
     StreamSet, WORKLOAD_SALT, derive_seed, mutate_tape,
 };
+use crate::simulator::arm_selector;
 use crate::simulator::fault_timing;
 use crate::simulator::run_cap;
+use crate::simulator::run_variant::{self, ArmSet};
 use crate::simulator::timer_context;
 use crate::simulator::util_stats;
 use crossbeam::channel;
@@ -971,6 +973,7 @@ fn run_row(
     max_iterations: i32,
     wall: std::time::Duration,
     timers: crate::simulator::core::state::TimerRunStats,
+    arms: &ArmSet,
     crash_hold_drawn: bool,
 ) -> crate::simulator::history::PersistableRun {
     let (steps_used, end_reason) = match outcome {
@@ -997,7 +1000,7 @@ fn run_row(
         timers_idle_fired: timers.idle_fired as i32,
         timers_idle_acted: timers.idle_acted as i32,
         max_inert_streak: timers.max_inert_streak as i32,
-        variant: crate::simulator::run_variant::of(run_id, crash_hold_drawn)
+        variant: crate::simulator::run_variant::of(run_id, arms, crash_hold_drawn)
             | attribution.variant_bits,
     }
 }
@@ -1100,6 +1103,10 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &mut rec,
     )?;
 
+    // The arms are drawn before the plan runs and read nothing from the
+    // run's schedule stream.
+    let cell = (attribution.arm_index, attribution.config_index);
+    let arms = arm_selector::choose(run_id, schedule_seed, cell);
     let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
         program.clone(),
@@ -1116,12 +1123,22 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &config.steer_terms,
         &config.purgatory,
         config.partial_fanout_crash_bias,
-        crate::simulator::ghost_absorber::is_treated(run_id),
-        crate::simulator::fresh_first::is_treated(run_id),
-        crate::simulator::pair_order::is_treated(run_id),
-        crate::simulator::client_anchor::arm(run_id),
+        &arms,
         &mut rec,
     )?;
+    // A replay slot's prefix carries its parent's ghost signal, so the
+    // signal is not read on it.
+    let replay_slot = attribution.variant_bits & run_variant::REPLAY_SLOT != 0;
+    arm_selector::observe(
+        cell,
+        run_id,
+        &arms,
+        &arm_selector::Rewards {
+            overtaken_ghost: path_state.state.overtaken_ghost_acted,
+            absorber_cycle: path_state.state.absorber_cycle_fresh_peer,
+            ghost_signal: (!replay_slot).then_some(path_state.state.replay_cut.is_some()),
+        },
+    );
 
     if let RunOutcome::Deadlock { step, pending_ops } = &outcome {
         warn!(
@@ -1152,6 +1169,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         config.max_iterations,
         started.elapsed(),
         path_state.state.timer_stats,
+        &arms,
         path_state.state.crash_hold_drawn,
     ));
 
@@ -1190,6 +1208,7 @@ pub fn run_explorer(
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     run_cap::reset();
+    arm_selector::reset();
     fault_timing::reset();
     timer_context::reset();
     fault_timing::set_fraction(config.faults.crash_placement_fraction);
@@ -1418,6 +1437,7 @@ fn run_single_plan<F: Feedback>(
         &mut rng,
     )?;
 
+    let arms = ArmSet::crash_coin_only(run_id);
     let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
         program.clone(),
@@ -1434,10 +1454,7 @@ fn run_single_plan<F: Feedback>(
         terms,
         purgatory_config,
         partial_fanout_crash_bias,
-        false,
-        false,
-        false,
-        crate::simulator::client_anchor::Arm::Stock,
+        &arms,
         &mut rng,
     )?;
 
@@ -1464,6 +1481,7 @@ fn run_single_plan<F: Feedback>(
         max_iterations,
         started.elapsed(),
         path_state.state.timer_stats,
+        &arms,
         path_state.state.crash_hold_drawn,
     ));
 
@@ -1591,6 +1609,7 @@ pub fn run_explorer_genetic(
     info!("session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     run_cap::reset();
+    arm_selector::reset();
     fault_timing::reset();
     timer_context::reset();
     fault_timing::set_fraction(config.faults.crash_placement_fraction);
@@ -2032,6 +2051,7 @@ pub fn run_explorer_aos(
     info!("AOS session_seed = {}", config.session_seed);
     util_stats::set_enabled(config.stats);
     run_cap::reset();
+    arm_selector::reset();
     fault_timing::reset();
     timer_context::reset();
     fault_timing::set_fraction(config.faults.crash_placement_fraction);
@@ -2686,6 +2706,7 @@ pub fn run_explorer_continuous(
     info!("Continuous session_seed = {}", config.envelope.session_seed);
     util_stats::set_enabled(config.envelope.stats);
     run_cap::reset();
+    arm_selector::reset();
     fault_timing::reset();
     timer_context::reset();
     fault_timing::set_fraction(config.envelope.faults.crash_placement_fraction);
