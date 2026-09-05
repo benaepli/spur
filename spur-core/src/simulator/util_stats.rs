@@ -208,7 +208,8 @@ impl Reward {
 
 /// The arm selector's counters for one reward: the coin quarter's runs and
 /// rewards per direction and per combination, the reward on each quarter,
-/// and, for a reward a learner is trained on, that learner's draws.
+/// and, for a reward a learner is trained on, that learner's draws, split
+/// by the half of its quarter the run fell in.
 struct AxCounters {
     treated_runs: AtomicU64,
     chosen_runs: AtomicU64,
@@ -218,10 +219,18 @@ struct AxCounters {
     axis_draws: AtomicU64,
     chosen_placed_runs: AtomicU64,
     cells: AtomicU64,
+    concentrated_runs: AtomicU64,
+    concentrated_chosen_runs: AtomicU64,
     /// Indexed by whether the run was treated.
     reward_runs: [AtomicU64; 2],
     reward_positive: [AtomicU64; 2],
     chosen_by_direction: [AtomicU64; run_variant::DIRECTIONS],
+    concentrated_by_direction: [AtomicU64; run_variant::DIRECTIONS],
+    matched_by_direction: [AtomicU64; run_variant::DIRECTIONS],
+    /// Per axis, the sum in millionths of the pairwise probability that
+    /// the highest-mean direction leads the next, over the concentrated
+    /// half's chosen runs.
+    concentrated_leader_margin_micro: [AtomicU64; run_variant::AXES],
     control_runs_by_direction: [AtomicU64; run_variant::DIRECTIONS],
     control_reward_positive_by_direction: [AtomicU64; run_variant::DIRECTIONS],
     chosen_by_combination: [AtomicU64; run_variant::COMBINATIONS],
@@ -240,9 +249,14 @@ impl AxCounters {
             axis_draws: AtomicU64::new(0),
             chosen_placed_runs: AtomicU64::new(0),
             cells: AtomicU64::new(0),
+            concentrated_runs: AtomicU64::new(0),
+            concentrated_chosen_runs: AtomicU64::new(0),
             reward_runs: [const { AtomicU64::new(0) }; 2],
             reward_positive: [const { AtomicU64::new(0) }; 2],
             chosen_by_direction: [const { AtomicU64::new(0) }; run_variant::DIRECTIONS],
+            concentrated_by_direction: [const { AtomicU64::new(0) }; run_variant::DIRECTIONS],
+            matched_by_direction: [const { AtomicU64::new(0) }; run_variant::DIRECTIONS],
+            concentrated_leader_margin_micro: [const { AtomicU64::new(0) }; run_variant::AXES],
             control_runs_by_direction: [const { AtomicU64::new(0) }; run_variant::DIRECTIONS],
             control_reward_positive_by_direction: [const { AtomicU64::new(0) };
                 run_variant::DIRECTIONS],
@@ -2151,23 +2165,44 @@ pub fn record_client_anchor_arm_run(arm: client_anchor::Arm) {
 /// A run on a learner's quarter drew its arms: `reward` names the learner,
 /// `chosen` is the learned set, or None when the cell was below warmup and
 /// the run took `coins`. `leader_agreements` counts the axes on which the
-/// drawn direction was the axis's highest posterior mean.
+/// drawn direction was the axis's highest posterior mean. `concentrated`
+/// says which half of the quarter the run fell in, and `leader_margins`
+/// carries, on that half, the per-axis pairwise probability that the
+/// highest-mean direction leads the next; it is read on no other run.
 pub fn record_arm_selector_treated_run(
     reward: Reward,
     chosen: Option<&run_variant::ArmSet>,
     coins: &run_variant::ArmSet,
     leader_agreements: u64,
+    concentrated: bool,
+    leader_margins: &[f64; run_variant::AXES],
 ) {
     if !enabled() {
         return;
     }
     let ax = &AX[reward.index()];
     ax.treated_runs.fetch_add(1, Ordering::Relaxed);
+    if concentrated {
+        ax.concentrated_runs.fetch_add(1, Ordering::Relaxed);
+    }
     let Some(arms) = chosen else {
         ax.coin_fallback_runs.fetch_add(1, Ordering::Relaxed);
         return;
     };
     ax.chosen_runs.fetch_add(1, Ordering::Relaxed);
+    let by_half = if concentrated {
+        ax.concentrated_chosen_runs.fetch_add(1, Ordering::Relaxed);
+        for (a, m) in leader_margins.iter().enumerate() {
+            let micro = (m.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
+            ax.concentrated_leader_margin_micro[a].fetch_add(micro, Ordering::Relaxed);
+        }
+        &ax.concentrated_by_direction
+    } else {
+        &ax.matched_by_direction
+    };
+    for d in arms.directions() {
+        by_half[d].fetch_add(1, Ordering::Relaxed);
+    }
     ax.axis_draws.fetch_add(run_variant::AXES as u64, Ordering::Relaxed);
     ax.axis_leader_agreements.fetch_add(leader_agreements, Ordering::Relaxed);
     if arms != coins {
@@ -4521,7 +4556,15 @@ impl ArmSelectorRewardStats {
 /// differs from the id's coins; `cells` is a gauge of the learner's table.
 /// `reward_runs_treated` and `reward_positive_treated` are the learner's own
 /// quarter; the control fields are the coin quarter, and `chosen_by_*` what
-/// the learner's quarter took.
+/// the learner's quarter took over both of its halves. `concentrated_runs`
+/// counts the treated runs on the half that picks by the probability of
+/// leading, `concentrated_chosen_runs` those of them that drew from a cell,
+/// and `concentrated_by_direction` and `matched_by_direction` split
+/// `chosen_by_direction` by half. `concentrated_leader_margin_micro` is,
+/// per axis, the sum in millionths over the concentrated half's chosen
+/// runs of the pairwise probability that the axis's highest-mean direction
+/// leads the next; divided by `concentrated_chosen_runs` it is the mean
+/// margin the pick rule saw.
 #[derive(Serialize, Debug, Clone)]
 pub struct ArmSelectorLearnerStats {
     pub treated_runs: u64,
@@ -4532,11 +4575,16 @@ pub struct ArmSelectorLearnerStats {
     pub axis_draws: u64,
     pub chosen_placed_runs: u64,
     pub cells: u64,
+    pub concentrated_runs: u64,
+    pub concentrated_chosen_runs: u64,
     pub reward_runs_treated: u64,
     pub reward_positive_treated: u64,
     pub reward_runs_control: u64,
     pub reward_positive_control: u64,
     pub chosen_by_direction: Vec<u64>,
+    pub concentrated_by_direction: Vec<u64>,
+    pub matched_by_direction: Vec<u64>,
+    pub concentrated_leader_margin_micro: Vec<u64>,
     pub control_runs_by_direction: Vec<u64>,
     pub control_reward_positive_by_direction: Vec<u64>,
     pub chosen_by_combination: Vec<u64>,
@@ -4557,11 +4605,16 @@ impl ArmSelectorLearnerStats {
             axis_draws: ax.axis_draws.load(Ordering::Relaxed),
             chosen_placed_runs: ax.chosen_placed_runs.load(Ordering::Relaxed),
             cells: ax.cells.load(Ordering::Relaxed),
+            concentrated_runs: ax.concentrated_runs.load(Ordering::Relaxed),
+            concentrated_chosen_runs: ax.concentrated_chosen_runs.load(Ordering::Relaxed),
             reward_runs_treated: ax.reward_runs[1].load(Ordering::Relaxed),
             reward_positive_treated: ax.reward_positive[1].load(Ordering::Relaxed),
             reward_runs_control: ax.reward_runs[0].load(Ordering::Relaxed),
             reward_positive_control: ax.reward_positive[0].load(Ordering::Relaxed),
             chosen_by_direction: load(&ax.chosen_by_direction),
+            concentrated_by_direction: load(&ax.concentrated_by_direction),
+            matched_by_direction: load(&ax.matched_by_direction),
+            concentrated_leader_margin_micro: load(&ax.concentrated_leader_margin_micro),
             control_runs_by_direction: load(&ax.control_runs_by_direction),
             control_reward_positive_by_direction: load(&ax.control_reward_positive_by_direction),
             chosen_by_combination: load(&ax.chosen_by_combination),
@@ -4598,9 +4651,14 @@ pub struct ArmSelectorAxisStats {
     pub reward_positive_control: u64,
     pub cells: u64,
     pub chosen_placed_runs: u64,
+    pub concentrated_runs: u64,
+    pub concentrated_chosen_runs: u64,
     pub reward_runs_by_arm: Vec<u64>,
     pub reward_positive_by_arm: Vec<u64>,
     pub chosen_by_direction: Vec<u64>,
+    pub concentrated_by_direction: Vec<u64>,
+    pub matched_by_direction: Vec<u64>,
+    pub concentrated_leader_margin_micro: Vec<u64>,
     pub control_runs_by_direction: Vec<u64>,
     pub control_reward_positive_by_direction: Vec<u64>,
     pub chosen_by_combination: Vec<u64>,
@@ -4633,9 +4691,14 @@ impl ArmSelectorAxisStats {
             reward_positive_control: a.reward_positive_control,
             cells: a.cells,
             chosen_placed_runs: a.chosen_placed_runs,
+            concentrated_runs: a.concentrated_runs,
+            concentrated_chosen_runs: a.concentrated_chosen_runs,
             reward_runs_by_arm: load(&AX_REWARD_RUNS_BY_ARM),
             reward_positive_by_arm: load(&AX_REWARD_POSITIVE_BY_ARM),
             chosen_by_direction: a.chosen_by_direction.clone(),
+            concentrated_by_direction: a.concentrated_by_direction.clone(),
+            matched_by_direction: a.matched_by_direction.clone(),
+            concentrated_leader_margin_micro: a.concentrated_leader_margin_micro.clone(),
             control_runs_by_direction: a.control_runs_by_direction.clone(),
             control_reward_positive_by_direction: a.control_reward_positive_by_direction.clone(),
             chosen_by_combination: a.chosen_by_combination.clone(),

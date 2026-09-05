@@ -17,7 +17,10 @@
 //! an `ArmSet`. On most runs the arm set is the one the run id's coins name;
 //! a run the arm selector treats takes a learned arm set instead, and its
 //! tag carries the chosen bits plus the bit of the learner that drew them,
-//! `ARM_SELECTOR_AXIS`, `ARM_SELECTOR_AXIS_B` or `ARM_SELECTOR_AXIS_C`.
+//! `ARM_SELECTOR_AXIS`, `ARM_SELECTOR_AXIS_B` or `ARM_SELECTOR_AXIS_C`, and
+//! `ARM_SELECTOR_CONCENTRATED` on the half of each learner's quarter that
+//! picks by the posterior probability of leading rather than the posterior
+//! mean.
 
 use crate::simulator::arm_selector;
 use crate::simulator::client_anchor;
@@ -84,6 +87,11 @@ pub const ARM_SELECTOR_AXIS_B: i32 = 1 << 5;
 pub const ARM_SELECTOR_AXIS_C: i32 = 1 << 7;
 /// Every learner's bit.
 pub const ARM_SELECTOR_BITS: i32 = ARM_SELECTOR_AXIS | ARM_SELECTOR_AXIS_B | ARM_SELECTOR_AXIS_C;
+/// The run is on the half of its learner's quarter that picks each axis by
+/// the coin share times the posterior probability of leading the axis; the
+/// other half picks by the coin share times the posterior mean. A pure
+/// function of the run id, never set on the coin quarter or a probe.
+pub const ARM_SELECTOR_CONCENTRATED: i32 = 1 << 8;
 
 /// The direction a run takes on the crash-timing axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -281,8 +289,14 @@ pub fn selector_bit(run_id: i64) -> i32 {
     }
 }
 
-/// The bits that name a run's probe roles and its selector quarter, all
-/// pure functions of the run id.
+/// The bit that names the half of a learner's quarter that picks by the
+/// probability of leading, or zero elsewhere.
+pub fn concentrated_bit(run_id: i64) -> i32 {
+    if arm_selector::is_concentrated(run_id) { ARM_SELECTOR_CONCENTRATED } else { 0 }
+}
+
+/// The bits that name a run's probe roles, its selector quarter and its
+/// pick rule within that quarter, all pure functions of the run id.
 pub fn probe_bits(run_id: i64) -> i32 {
     let mut v = 0;
     if run_cap::is_probe(run_id) {
@@ -291,7 +305,7 @@ pub fn probe_bits(run_id: i64) -> i32 {
     if timer_context::run_mode(run_id) == timer_context::RunMode::Probe {
         v |= TIMER_STEER_OFF;
     }
-    v | selector_bit(run_id)
+    v | selector_bit(run_id) | concentrated_bit(run_id)
 }
 
 /// The whole tag: the run's probe roles, the arms it ran under, and what
@@ -378,7 +392,7 @@ mod tests {
                 "a run took both directions of the request-timing axis"
             );
             assert_eq!(v & CRASH_HOLD_DRAWN, 0, "the acted bit is not an id bit");
-            let third = selector_bit(id);
+            let third = selector_bit(id) | concentrated_bit(id);
             let coins = ArmSet::coins(id);
             assert_eq!(of(id, &coins, true), v | third | CRASH_HOLD_DRAWN);
             assert_eq!(of(id, &coins, false), v | third);
@@ -396,6 +410,7 @@ mod tests {
         fault_timing::reset();
         let mut treated = 0i64;
         let mut by_bit = [0i64; 3];
+        let mut concentrated_by_bit = [0i64; 3];
         for id in -32_000..32_000i64 {
             let coins = ArmSet::coins(id);
             assert_eq!(coins.placed(), fault_timing::is_placed(id), "run {id}: placed");
@@ -410,7 +425,16 @@ mod tests {
             assert_eq!(coins.request, client_anchor::arm(id), "run {id}: request");
             let tag = of(id, &coins, false);
             let third = selector_bit(id);
-            assert_eq!(tag, from_run_id(id) | third, "run {id}: tag");
+            let concentrated = concentrated_bit(id);
+            assert_eq!(tag, from_run_id(id) | third | concentrated, "run {id}: tag");
+            assert_eq!(
+                concentrated != 0,
+                arm_selector::is_concentrated(id),
+                "run {id}: the concentrated bit"
+            );
+            if concentrated != 0 {
+                assert_ne!(third, 0, "run {id}: concentrated outside a learner's quarter");
+            }
             assert!(
                 (tag & ARM_SELECTOR_BITS).count_ones() <= 1,
                 "run {id}: a run carries two learners' bits"
@@ -440,12 +464,24 @@ mod tests {
             by_bit[0] += (third == ARM_SELECTOR_AXIS) as i64;
             by_bit[1] += (third == ARM_SELECTOR_AXIS_B) as i64;
             by_bit[2] += (third == ARM_SELECTOR_AXIS_C) as i64;
+            if concentrated != 0 {
+                concentrated_by_bit[0] += (third == ARM_SELECTOR_AXIS) as i64;
+                concentrated_by_bit[1] += (third == ARM_SELECTOR_AXIS_B) as i64;
+                concentrated_by_bit[2] += (third == ARM_SELECTOR_AXIS_C) as i64;
+            }
         }
         assert!(treated > 36_000 && treated < 56_000, "the selector split leaves no contrast");
         assert!(
             by_bit.iter().all(|&n| n > 11_000),
             "a learner's quarter is empty {by_bit:?}"
         );
+        for l in 0..3 {
+            let share = concentrated_by_bit[l] as f64 / by_bit[l] as f64;
+            assert!(
+                (share - 0.5).abs() < 0.03,
+                "learner {l}: the concentrated half holds {share} of the quarter"
+            );
+        }
     }
 
     #[test]

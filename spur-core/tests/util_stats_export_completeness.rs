@@ -815,11 +815,16 @@ fn arm_selector_learner(m: &mut Marks) -> ArmSelectorLearnerStats {
         axis_draws: m.int(),
         chosen_placed_runs: m.int(),
         cells: m.int(),
+        concentrated_runs: m.int(),
+        concentrated_chosen_runs: m.int(),
         reward_runs_treated: m.int(),
         reward_positive_treated: m.int(),
         reward_runs_control: m.int(),
         reward_positive_control: m.int(),
         chosen_by_direction: marks_vec(m, 12),
+        concentrated_by_direction: marks_vec(m, 12),
+        matched_by_direction: marks_vec(m, 12),
+        concentrated_leader_margin_micro: marks_vec(m, 5),
         control_runs_by_direction: marks_vec(m, 12),
         control_reward_positive_by_direction: marks_vec(m, 12),
         chosen_by_combination: marks_vec(m, 72),
@@ -843,9 +848,14 @@ fn arm_selector_axis(m: &mut Marks) -> ArmSelectorAxisStats {
         reward_positive_control: m.int(),
         cells: m.int(),
         chosen_placed_runs: m.int(),
+        concentrated_runs: m.int(),
+        concentrated_chosen_runs: m.int(),
         reward_runs_by_arm: marks_vec(m, 8),
         reward_positive_by_arm: marks_vec(m, 8),
         chosen_by_direction: marks_vec(m, 12),
+        concentrated_by_direction: marks_vec(m, 12),
+        matched_by_direction: marks_vec(m, 12),
+        concentrated_leader_margin_micro: marks_vec(m, 5),
         control_runs_by_direction: marks_vec(m, 12),
         control_reward_positive_by_direction: marks_vec(m, 12),
         chosen_by_combination: marks_vec(m, 72),
@@ -907,11 +917,16 @@ fn arm_selector_learner_leaves(prefix: &str, l: &ArmSelectorLearnerStats) -> Vec
         axis_draws,
         chosen_placed_runs,
         cells,
+        concentrated_runs,
+        concentrated_chosen_runs,
         reward_runs_treated,
         reward_positive_treated,
         reward_runs_control,
         reward_positive_control,
         chosen_by_direction,
+        concentrated_by_direction,
+        matched_by_direction,
+        concentrated_leader_margin_micro,
         control_runs_by_direction,
         control_reward_positive_by_direction,
         chosen_by_combination,
@@ -927,12 +942,21 @@ fn arm_selector_learner_leaves(prefix: &str, l: &ArmSelectorLearnerStats) -> Vec
         leaf(prefix, "axis_draws", *axis_draws),
         leaf(prefix, "chosen_placed_runs", *chosen_placed_runs),
         leaf(prefix, "cells", *cells),
+        leaf(prefix, "concentrated_runs", *concentrated_runs),
+        leaf(prefix, "concentrated_chosen_runs", *concentrated_chosen_runs),
         leaf(prefix, "reward_runs_treated", *reward_runs_treated),
         leaf(prefix, "reward_positive_treated", *reward_positive_treated),
         leaf(prefix, "reward_runs_control", *reward_runs_control),
         leaf(prefix, "reward_positive_control", *reward_positive_control),
     ];
     out.extend(vec_leaves(prefix, "chosen_by_direction", chosen_by_direction));
+    out.extend(vec_leaves(prefix, "concentrated_by_direction", concentrated_by_direction));
+    out.extend(vec_leaves(prefix, "matched_by_direction", matched_by_direction));
+    out.extend(vec_leaves(
+        prefix,
+        "concentrated_leader_margin_micro",
+        concentrated_leader_margin_micro,
+    ));
     out.extend(vec_leaves(prefix, "control_runs_by_direction", control_runs_by_direction));
     out.extend(vec_leaves(
         prefix,
@@ -964,9 +988,14 @@ fn arm_selector_axis_leaves(prefix: &str, a: &ArmSelectorAxisStats) -> Vec<(Stri
         reward_positive_control,
         cells,
         chosen_placed_runs,
+        concentrated_runs,
+        concentrated_chosen_runs,
         reward_runs_by_arm,
         reward_positive_by_arm,
         chosen_by_direction,
+        concentrated_by_direction,
+        matched_by_direction,
+        concentrated_leader_margin_micro,
         control_runs_by_direction,
         control_reward_positive_by_direction,
         chosen_by_combination,
@@ -994,10 +1023,19 @@ fn arm_selector_axis_leaves(prefix: &str, a: &ArmSelectorAxisStats) -> Vec<(Stri
         leaf(prefix, "reward_positive_control", *reward_positive_control),
         leaf(prefix, "cells", *cells),
         leaf(prefix, "chosen_placed_runs", *chosen_placed_runs),
+        leaf(prefix, "concentrated_runs", *concentrated_runs),
+        leaf(prefix, "concentrated_chosen_runs", *concentrated_chosen_runs),
     ];
     out.extend(vec_leaves(prefix, "reward_runs_by_arm", reward_runs_by_arm));
     out.extend(vec_leaves(prefix, "reward_positive_by_arm", reward_positive_by_arm));
     out.extend(vec_leaves(prefix, "chosen_by_direction", chosen_by_direction));
+    out.extend(vec_leaves(prefix, "concentrated_by_direction", concentrated_by_direction));
+    out.extend(vec_leaves(prefix, "matched_by_direction", matched_by_direction));
+    out.extend(vec_leaves(
+        prefix,
+        "concentrated_leader_margin_micro",
+        concentrated_leader_margin_micro,
+    ));
     out.extend(vec_leaves(prefix, "control_runs_by_direction", control_runs_by_direction));
     out.extend(vec_leaves(
         prefix,
