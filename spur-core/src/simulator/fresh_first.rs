@@ -15,6 +15,11 @@
 //! draw itself, so a treated and an untreated run read the same random
 //! sequence at every step.
 //!
+//! The preference acts only at a destination that has itself restarted in
+//! the run. A destination that never went down cannot have rebuilt its
+//! state from a peer, so the order in which it takes the two classes
+//! decides much less there, and the drawn ghost stays.
+//!
 //! The treated half is drawn under a salt of its own, so the split is
 //! independent of every other split of a session. Run-cap probes are never
 //! treated: their completed lengths feed the length learners, which must not

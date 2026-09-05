@@ -181,6 +181,10 @@ fn half_delta(a: &FreshFirstHalfStats, b: &FreshFirstHalfStats) -> FreshFirstHal
         ghost_entries_from_restarted_origin: a.ghost_entries_from_restarted_origin
             - b.ghost_entries_from_restarted_origin,
         overtaken: a.overtaken - b.overtaken,
+        ghost_entries_to_restarted_dest: a.ghost_entries_to_restarted_dest
+            - b.ghost_entries_to_restarted_dest,
+        overtaken_at_restarted_dest: a.overtaken_at_restarted_dest
+            - b.overtaken_at_restarted_dest,
     }
 }
 
@@ -189,6 +193,7 @@ fn block_delta(after: &UtilizationSnapshot, before: &UtilizationSnapshot) -> Fre
     FreshFirstStats {
         swaps: a.swaps - b.swaps,
         repeat_swaps: a.repeat_swaps - b.repeat_swaps,
+        skipped_never_restarted_dest: a.skipped_never_restarted_dest - b.skipped_never_restarted_dest,
         swap_count_hist_1: a.swap_count_hist_1 - b.swap_count_hist_1,
         swap_count_hist_2: a.swap_count_hist_2 - b.swap_count_hist_2,
         swap_count_hist_3: a.swap_count_hist_3 - b.swap_count_hist_3,
@@ -241,7 +246,7 @@ fn check_treated() {
         "the draw never fell on both classes: {d:?}"
     );
     assert_eq!(
-        t.stale_drawn - t.contested_down - d.swaps,
+        t.stale_drawn - t.contested_down - d.swaps - d.skipped_never_restarted_dest,
         0,
         "a treated contest at a live destination took the ghost while a fresh record was eligible: {d:?}"
     );

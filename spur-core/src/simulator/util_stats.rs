@@ -104,6 +104,13 @@ static FF_STALE_DRAWN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF
 static FF_CONTESTED_DOWN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
 static FF_GHOST_ENTRIES: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
 static FF_OVERTAKEN: [AtomicU64; FF_HALVES] = [const { AtomicU64::new(0) }; FF_HALVES];
+/// The ghost-entry census of each half split again by whether the
+/// destination has itself come back from a crash in the run.
+static FF_GHOST_ENTRIES_RESTARTED_DEST: [AtomicU64; FF_HALVES] =
+    [const { AtomicU64::new(0) }; FF_HALVES];
+static FF_OVERTAKEN_RESTARTED_DEST: [AtomicU64; FF_HALVES] =
+    [const { AtomicU64::new(0) }; FF_HALVES];
+static FF_SKIPPED_NEVER_RESTARTED_DEST: AtomicU64 = AtomicU64::new(0);
 /// The pair-order census split by its half: index 0 is the control half,
 /// index 1 the treated half.
 const PO_HALVES: usize = 2;
@@ -483,6 +490,7 @@ pub fn set_enabled(on: bool) {
             &GS_FIRED_RUNS,
             &FF_SWAPS,
             &FF_REPEAT_SWAPS,
+            &FF_SKIPPED_NEVER_RESTARTED_DEST,
             &PO_CORRECTED,
             &PO_FRESH_SUPPRESSED,
             &CAN_HELD,
@@ -535,6 +543,8 @@ pub fn set_enabled(on: bool) {
             .chain(FF_CONTESTED_DOWN.iter())
             .chain(FF_GHOST_ENTRIES.iter())
             .chain(FF_OVERTAKEN.iter())
+            .chain(FF_GHOST_ENTRIES_RESTARTED_DEST.iter())
+            .chain(FF_OVERTAKEN_RESTARTED_DEST.iter())
             .chain(PO_CONTESTS.iter())
             .chain(PO_INORDER_DRAWS.iter())
             .chain(PO_PAIR_ENTRIES.iter())
@@ -1823,9 +1833,10 @@ pub fn record_fresh_first_taken(count: fresh_first::DisplacedCount) {
 
 /// A message entry from a sender's dead incarnation; `overtaken` says its
 /// destination had already taken an entry from the sender's current
-/// incarnation. Counted on both halves.
+/// incarnation and `restarted_dest` that the destination has itself come
+/// back from a crash in this run. Counted on both halves.
 #[inline]
-pub fn record_fresh_first_ghost_entry(treated: bool, overtaken: bool) {
+pub fn record_fresh_first_ghost_entry(treated: bool, overtaken: bool, restarted_dest: bool) {
     if !enabled() {
         return;
     }
@@ -1834,6 +1845,22 @@ pub fn record_fresh_first_ghost_entry(treated: bool, overtaken: bool) {
     if overtaken {
         FF_OVERTAKEN[i].fetch_add(1, Ordering::Relaxed);
     }
+    if restarted_dest {
+        FF_GHOST_ENTRIES_RESTARTED_DEST[i].fetch_add(1, Ordering::Relaxed);
+        if overtaken {
+            FF_OVERTAKEN_RESTARTED_DEST[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A contested step at a destination that has never restarted in the run
+/// kept the drawn ghost instead of taking the fresh rival.
+#[inline]
+pub fn record_fresh_first_skipped_never_restarted_dest() {
+    if !enabled() {
+        return;
+    }
+    FF_SKIPPED_NEVER_RESTARTED_DEST.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A network step's pick was a remote record from a sender that has crashed
@@ -3856,6 +3883,9 @@ impl GhostSignalStats {
 /// `ghost_entries_from_restarted_origin` counts message entries from a
 /// sender's dead incarnation and `overtaken` those whose destination had
 /// already taken an entry from the sender's current incarnation.
+/// `ghost_entries_to_restarted_dest` and `overtaken_at_restarted_dest` are
+/// the subsets whose destination has itself come back from a crash in the
+/// run.
 #[derive(Serialize, Debug)]
 pub struct FreshFirstHalfStats {
     pub contested_dispatches: u64,
@@ -3863,6 +3893,8 @@ pub struct FreshFirstHalfStats {
     pub contested_down: u64,
     pub ghost_entries_from_restarted_origin: u64,
     pub overtaken: u64,
+    pub ghost_entries_to_restarted_dest: u64,
+    pub overtaken_at_restarted_dest: u64,
 }
 
 impl FreshFirstHalfStats {
@@ -3874,6 +3906,9 @@ impl FreshFirstHalfStats {
             contested_down: FF_CONTESTED_DOWN[i].load(Ordering::Relaxed),
             ghost_entries_from_restarted_origin: FF_GHOST_ENTRIES[i].load(Ordering::Relaxed),
             overtaken: FF_OVERTAKEN[i].load(Ordering::Relaxed),
+            ghost_entries_to_restarted_dest: FF_GHOST_ENTRIES_RESTARTED_DEST[i]
+                .load(Ordering::Relaxed),
+            overtaken_at_restarted_dest: FF_OVERTAKEN_RESTARTED_DEST[i].load(Ordering::Relaxed),
         }
     }
 }
@@ -3892,11 +3927,14 @@ pub struct FreshFirstCensusStats {
 /// treated half's `stale_drawn` less its `contested_down`. `repeat_swaps` is
 /// the subset whose ghost had been displaced before, and
 /// `swap_count_hist_*` the distribution, over ghosts finally taken, of how
-/// many times each had been displaced.
+/// many times each had been displaced. `skipped_never_restarted_dest`
+/// counts the swaps not made at a destination that has never restarted in
+/// the run.
 #[derive(Serialize, Debug)]
 pub struct FreshFirstStats {
     pub swaps: u64,
     pub repeat_swaps: u64,
+    pub skipped_never_restarted_dest: u64,
     pub swap_count_hist_1: u64,
     pub swap_count_hist_2: u64,
     pub swap_count_hist_3: u64,
@@ -3909,6 +3947,7 @@ impl FreshFirstStats {
         Self {
             swaps: FF_SWAPS.load(Ordering::Relaxed),
             repeat_swaps: FF_REPEAT_SWAPS.load(Ordering::Relaxed),
+            skipped_never_restarted_dest: FF_SKIPPED_NEVER_RESTARTED_DEST.load(Ordering::Relaxed),
             swap_count_hist_1: FF_SWAP_COUNT_HIST[0].load(Ordering::Relaxed),
             swap_count_hist_2: FF_SWAP_COUNT_HIST[1].load(Ordering::Relaxed),
             swap_count_hist_3: FF_SWAP_COUNT_HIST[2].load(Ordering::Relaxed),
@@ -4589,9 +4628,10 @@ mod tests {
         record_fresh_first_taken(fresh_first::DisplacedCount::Once);
         record_fresh_first_taken(fresh_first::DisplacedCount::Thrice);
         record_fresh_first_taken(fresh_first::DisplacedCount::FourOrMore);
-        record_fresh_first_ghost_entry(true, true);
-        record_fresh_first_ghost_entry(false, false);
-        record_fresh_first_ghost_entry(false, true);
+        record_fresh_first_ghost_entry(true, true, true);
+        record_fresh_first_ghost_entry(false, false, true);
+        record_fresh_first_ghost_entry(false, true, false);
+        record_fresh_first_skipped_never_restarted_dest();
         let after = snapshot().fresh_first;
         set_enabled(false);
         record_fresh_first_swap(false);
@@ -4615,6 +4655,15 @@ mod tests {
         assert_eq!(t.overtaken - bt.overtaken, 1);
         assert_eq!(c.ghost_entries_from_restarted_origin - bc.ghost_entries_from_restarted_origin, 2);
         assert_eq!(c.overtaken - bc.overtaken, 1);
+        assert_eq!(t.ghost_entries_to_restarted_dest - bt.ghost_entries_to_restarted_dest, 1);
+        assert_eq!(t.overtaken_at_restarted_dest - bt.overtaken_at_restarted_dest, 1);
+        assert_eq!(c.ghost_entries_to_restarted_dest - bc.ghost_entries_to_restarted_dest, 1);
+        assert_eq!(
+            c.overtaken_at_restarted_dest - bc.overtaken_at_restarted_dest,
+            0,
+            "an overtaken entry at a destination that never restarted is not in the subset"
+        );
+        assert_eq!(after.skipped_never_restarted_dest - before.skipped_never_restarted_dest, 1);
     }
 
     #[test]

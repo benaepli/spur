@@ -1292,6 +1292,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                             util_stats::record_fresh_first_ghost_entry(
                                 state.fresh_first.enabled,
                                 overtaken,
+                                state.incarnation(record_dest) > 0,
                             );
                         }
                         state.fresh_first.note_entry(
@@ -1542,7 +1543,8 @@ fn absorber_decision<H: HashPolicy>(
 /// priority, the lowest index among equals. The sender's ledger says in
 /// O(1) whether it has both a fresh and a stale record in the queue, and
 /// nothing else is read when it does not. The displaced ghost stays in the
-/// queue and stays eligible. No random draw is taken here, so a treated
+/// queue and stays eligible. A destination that has never restarted in the
+/// run keeps the drawn ghost. No random draw is taken here, so a treated
 /// step reads the same random sequence as an untreated one.
 fn fresh_first_dispatch<H: HashPolicy>(
     state: &mut State<H>,
@@ -1590,6 +1592,10 @@ fn fresh_first_dispatch<H: HashPolicy>(
         let down = state.crash_info.currently_crashed.contains(&dest);
         util_stats::record_fresh_first_contest(treated, stale_drawn, down);
         if !treated || !stale_drawn || down {
+            break 'pick drawn;
+        }
+        if state.incarnation(dest) == 0 {
+            util_stats::record_fresh_first_skipped_never_restarted_dest();
             break 'pick drawn;
         }
         let Some(fresh) = best_fresh else {
@@ -2691,12 +2697,17 @@ mod tests {
         state.network_queue.len() - 1
     }
 
-    /// Three nodes; node 0 has restarted once, so its incarnation is 1. The
+    /// Three nodes; node 0 has restarted once, so its incarnation is 1, and
+    /// so have the two destinations, which the preference requires. The
     /// queue holds, in order: a ghost 0->1, a fresh 0->1 at priority 0.3, a
     /// channel send 0->1, a fresh 0->2, a fresh 0->1 at priority 0.8, and a
     /// second fresh 0->1 at priority 0.8.
     fn contested_state() -> (State<NoHashing>, Vec<usize>) {
         let mut state = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        for dest in [1, 2] {
+            state.incarnations[dest] = 1;
+            state.note_incarnation_bump(dest);
+        }
         let ghost = queue_record(&mut state, 0, 1, 0, 0.9);
         state.incarnations[0] = 1;
         state.note_incarnation_bump(0);

@@ -678,6 +678,8 @@ fn fresh_first_half(m: &mut Marks) -> FreshFirstHalfStats {
         contested_down: m.int(),
         ghost_entries_from_restarted_origin: m.int(),
         overtaken: m.int(),
+        ghost_entries_to_restarted_dest: m.int(),
+        overtaken_at_restarted_dest: m.int(),
     }
 }
 
@@ -688,6 +690,8 @@ fn fresh_first_half_leaves(prefix: &str, h: &FreshFirstHalfStats) -> Vec<(String
         contested_down,
         ghost_entries_from_restarted_origin,
         overtaken,
+        ghost_entries_to_restarted_dest,
+        overtaken_at_restarted_dest,
     } = h;
     vec![
         leaf(prefix, "contested_dispatches", *contested_dispatches),
@@ -699,6 +703,16 @@ fn fresh_first_half_leaves(prefix: &str, h: &FreshFirstHalfStats) -> Vec<(String
             *ghost_entries_from_restarted_origin,
         ),
         leaf(prefix, "overtaken", *overtaken),
+        leaf(
+            prefix,
+            "ghost_entries_to_restarted_dest",
+            *ghost_entries_to_restarted_dest,
+        ),
+        leaf(
+            prefix,
+            "overtaken_at_restarted_dest",
+            *overtaken_at_restarted_dest,
+        ),
     ]
 }
 
@@ -706,6 +720,7 @@ fn fresh_first(m: &mut Marks) -> FreshFirstStats {
     FreshFirstStats {
         swaps: m.int(),
         repeat_swaps: m.int(),
+        skipped_never_restarted_dest: m.int(),
         swap_count_hist_1: m.int(),
         swap_count_hist_2: m.int(),
         swap_count_hist_3: m.int(),
@@ -721,6 +736,7 @@ fn fresh_first_leaves(prefix: &str, f: &FreshFirstStats) -> Vec<(String, Value)>
     let FreshFirstStats {
         swaps,
         repeat_swaps,
+        skipped_never_restarted_dest,
         swap_count_hist_1,
         swap_count_hist_2,
         swap_count_hist_3,
@@ -731,6 +747,7 @@ fn fresh_first_leaves(prefix: &str, f: &FreshFirstStats) -> Vec<(String, Value)>
     let mut out = vec![
         leaf(prefix, "swaps", *swaps),
         leaf(prefix, "repeat_swaps", *repeat_swaps),
+        leaf(prefix, "skipped_never_restarted_dest", *skipped_never_restarted_dest),
         leaf(prefix, "swap_count_hist_1", *swap_count_hist_1),
         leaf(prefix, "swap_count_hist_2", *swap_count_hist_2),
         leaf(prefix, "swap_count_hist_3", *swap_count_hist_3),
