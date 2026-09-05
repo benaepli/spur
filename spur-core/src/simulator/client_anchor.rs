@@ -51,6 +51,11 @@ pub const EXPIRY_STEPS: i32 = 64;
 /// priority on this scale, where one is the top of the range.
 pub const RUSH_PRIORITY: f64 = 1.0;
 
+/// One operation in this many reports the steps between its issue and its
+/// first delivery. Every dispatch would otherwise consult the table of
+/// operations still awaiting one.
+pub const DISTANCE_STRIDE: i32 = 8;
+
 /// Whether the run id names a run that either direction may act on.
 fn is_eligible(run_id: i64) -> bool {
     !run_cap::is_probe(run_id)

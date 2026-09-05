@@ -1609,11 +1609,19 @@ fn fresh_first_dispatch<H: HashPolicy>(
     chosen
 }
 
+/// Steps between two reads of the rushed-dispatch split.
+const RUSH_DISPATCH_STRIDE: i32 = 64;
+
 /// Split the network steps that had a record of a rushed client operation
 /// among their candidates by whether the step dispatched one. The layers
 /// that run ahead of the score can take another record even when a rushed
 /// one carries the top priority, and only this split says how often they do.
+/// Every step would pay a scan of the candidates, so one step in
+/// `RUSH_DISPATCH_STRIDE` is read and the split is that sample's.
 fn observe_rush_dispatch<H: HashPolicy>(state: &State<H>, eligible: &[usize], pick: usize) {
+    if state.crash_info.current_step % RUSH_DISPATCH_STRIDE != 0 {
+        return;
+    }
     if state.client_anchor.rushed_ops.is_empty() || !util_stats::enabled() {
         return;
     }

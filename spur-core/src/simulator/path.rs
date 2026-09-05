@@ -260,7 +260,7 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
             path_state.state.client_anchor.rushed_ops.insert(op_id);
             util_stats::record_client_anchor_rush_op();
         }
-        if util_stats::enabled() {
+        if util_stats::enabled() && op_id % client_anchor::DISTANCE_STRIDE == 0 {
             path_state
                 .state
                 .client_anchor
