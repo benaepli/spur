@@ -509,6 +509,14 @@ impl<H: HashPolicy> Runnable<H> {
         }
     }
 
+    /// The client operation this runnable descends from, when it has one.
+    pub fn causal_operation_id(&self) -> Option<i32> {
+        match self {
+            Runnable::Record(r) => r.causal_operation_id,
+            _ => None,
+        }
+    }
+
     /// Get the scheduling priority for this runnable.
     pub fn priority(&self) -> f64 {
         match self {
@@ -623,9 +631,9 @@ pub struct State<H: HashPolicy> {
     /// crashed and one destination, and the entry table its census is read
     /// against. Scheduling bookkeeping, excluded from `signature()`.
     pub pair_order: pair_order::RunState,
-    /// Whether this run holds client requests that become ready after its
-    /// first crash for a fan-out window. Scheduling bookkeeping, excluded
-    /// from `signature()`.
+    /// The direction this run takes on the post-crash request-timing axis,
+    /// with the client operations it is following. Scheduling bookkeeping,
+    /// excluded from `signature()`.
     pub client_anchor: client_anchor::RunState,
     /// Where the once-per-run signal fired, when it did: the step, and the
     /// number of scheduling draws taken by then when the run records its
@@ -776,6 +784,19 @@ impl<H: HashPolicy> State<H> {
             replay_cut: None,
             net_stale_records: 0,
             net_requests: 0,
+        }
+    }
+
+    /// The priority a record built under `causal_operation_id` takes: the
+    /// top of the range when that operation is rushed, and `drawn` when it
+    /// is not. Callers draw either way, so the run's random stream keeps
+    /// the same shape whichever direction the run took.
+    pub fn record_priority(&self, causal_operation_id: Option<i32>, drawn: f64) -> f64 {
+        if self.client_anchor.rushes(causal_operation_id) {
+            crate::simulator::util_stats::record_client_anchor_rush_record();
+            client_anchor::RUSH_PRIORITY
+        } else {
+            drawn
         }
     }
 

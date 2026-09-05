@@ -143,6 +143,16 @@ static CAN_HELD_AT_FIRST_FIRING: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 
 static CAN_HELD_AT_EXIT: AtomicU64 = AtomicU64::new(0);
 static CAN_RUNS_WITH_HELD_AT_EXIT: AtomicU64 = AtomicU64::new(0);
 static CAN_HOLD_STEPS_SUM: AtomicU64 = AtomicU64::new(0);
+/// One slot per direction of the post-crash request-timing axis, in the
+/// order `client_anchor::Arm::index` gives.
+const CAN_ARMS: usize = 3;
+static CAN_ARM_RUNS: [AtomicU64; CAN_ARMS] = [const { AtomicU64::new(0) }; CAN_ARMS];
+static CAN_RUSH_OPS: AtomicU64 = AtomicU64::new(0);
+static CAN_RUSH_RECORDS_PRIORITIZED: AtomicU64 = AtomicU64::new(0);
+static CAN_RUSH_WAS_PICK: AtomicU64 = AtomicU64::new(0);
+static CAN_RUSH_DISPLACED: AtomicU64 = AtomicU64::new(0);
+static CAN_FIRST_DELIVERY_SUM: [AtomicU64; CAN_ARMS] = [const { AtomicU64::new(0) }; CAN_ARMS];
+static CAN_FIRST_DELIVERY_COUNT: [AtomicU64; CAN_ARMS] = [const { AtomicU64::new(0) }; CAN_ARMS];
 static RP_PARENTS_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -481,6 +491,10 @@ pub fn set_enabled(on: bool) {
             &CAN_HELD_AT_EXIT,
             &CAN_RUNS_WITH_HELD_AT_EXIT,
             &CAN_HOLD_STEPS_SUM,
+            &CAN_RUSH_OPS,
+            &CAN_RUSH_RECORDS_PRIORITIZED,
+            &CAN_RUSH_WAS_PICK,
+            &CAN_RUSH_DISPLACED,
             &RW_CLOSED,
             &RW_WIDTH_SUM,
             &RW_MAX,
@@ -537,6 +551,9 @@ pub fn set_enabled(on: bool) {
             .chain(CAN_POST_FAULT_INVOCATIONS.iter())
             .chain(CAN_IN_WINDOW_INVOCATIONS.iter())
             .chain(CAN_HELD_AT_FIRST_FIRING.iter())
+            .chain(CAN_ARM_RUNS.iter())
+            .chain(CAN_FIRST_DELIVERY_SUM.iter())
+            .chain(CAN_FIRST_DELIVERY_COUNT.iter())
             .chain(ACCEPT_DIST.iter().flatten())
             .chain(ACCEPT_DIST_ACTED.iter().flatten())
         {
@@ -1990,6 +2007,61 @@ pub fn record_client_anchor_run_end(treated: bool, completed: bool, held_at_exit
         CAN_HELD_AT_EXIT.fetch_add(held_at_exit as u64, Ordering::Relaxed);
         CAN_RUNS_WITH_HELD_AT_EXIT.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// A run took `arm` on the post-crash request-timing axis. One call per run.
+#[inline]
+pub fn record_client_anchor_arm_run(arm: client_anchor::Arm) {
+    if !enabled() {
+        return;
+    }
+    CAN_ARM_RUNS[arm.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A post-crash client request was issued under the rush direction.
+#[inline]
+pub fn record_client_anchor_rush_op() {
+    if !enabled() {
+        return;
+    }
+    CAN_RUSH_OPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A record took the top of the priority range because the operation that
+/// caused it is rushed.
+#[inline]
+pub fn record_client_anchor_rush_record() {
+    if !enabled() {
+        return;
+    }
+    CAN_RUSH_RECORDS_PRIORITIZED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A network step had a rushed record among its eligible candidates;
+/// `was_pick` says the step dispatched one, rather than a record the
+/// eligibility and preference layers took ahead of it.
+#[inline]
+pub fn record_client_anchor_rush_dispatch(was_pick: bool) {
+    if !enabled() {
+        return;
+    }
+    if was_pick {
+        CAN_RUSH_WAS_PICK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CAN_RUSH_DISPLACED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A post-crash client request was delivered for the first time, `steps`
+/// after it was issued. Counted on every direction of the axis.
+#[inline]
+pub fn record_client_anchor_first_delivery(arm: client_anchor::Arm, steps: u64) {
+    if !enabled() {
+        return;
+    }
+    let i = arm.index();
+    CAN_FIRST_DELIVERY_SUM[i].fetch_add(steps, Ordering::Relaxed);
+    CAN_FIRST_DELIVERY_COUNT[i].fetch_add(1, Ordering::Relaxed);
 }
 
 /// A fresh grid-arm run that fired the signal entered its arm's replay corpus.
@@ -4010,6 +4082,88 @@ pub struct ClientAnchorHeldHist {
     pub three_plus: u64,
 }
 
+/// Runs on each direction of the post-crash request-timing axis.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorArmRuns {
+    pub hold: u64,
+    pub rush: u64,
+    pub stock: u64,
+}
+
+/// The steps between a post-crash request's invocation and its first
+/// delivery, summed over `count` requests.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorDistance {
+    pub sum: u64,
+    pub count: u64,
+}
+
+impl ClientAnchorDistance {
+    fn read(arm: client_anchor::Arm) -> Self {
+        let i = arm.index();
+        Self {
+            sum: CAN_FIRST_DELIVERY_SUM[i].load(Ordering::Relaxed),
+            count: CAN_FIRST_DELIVERY_COUNT[i].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The first-delivery distance on each direction, so the directions are
+/// read against one another.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorFirstDelivery {
+    pub hold: ClientAnchorDistance,
+    pub rush: ClientAnchorDistance,
+    pub stock: ClientAnchorDistance,
+}
+
+/// What the rush direction did. `ops` counts the post-crash requests it
+/// issued and `records_prioritized` the records that took the top of the
+/// priority range. `was_pick` and `displaced` split the network steps that
+/// had a rushed record eligible by whether the step dispatched one, which
+/// says how much of the top priority the eligibility and preference layers
+/// left standing.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorRushStats {
+    pub ops: u64,
+    pub records_prioritized: u64,
+    pub was_pick: u64,
+    pub displaced: u64,
+    pub first_delivery_distance: ClientAnchorFirstDelivery,
+}
+
+/// The post-crash request-timing axis: how many runs took each direction
+/// and what the rush direction did.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorAxisStats {
+    pub arm_runs: ClientAnchorArmRuns,
+    pub rush: ClientAnchorRushStats,
+}
+
+impl ClientAnchorAxisStats {
+    fn read() -> Self {
+        let runs = |a: client_anchor::Arm| CAN_ARM_RUNS[a.index()].load(Ordering::Relaxed);
+        Self {
+            arm_runs: ClientAnchorArmRuns {
+                hold: runs(client_anchor::Arm::Hold),
+                rush: runs(client_anchor::Arm::Rush),
+                stock: runs(client_anchor::Arm::Stock),
+            },
+            rush: ClientAnchorRushStats {
+                ops: CAN_RUSH_OPS.load(Ordering::Relaxed),
+                records_prioritized: CAN_RUSH_RECORDS_PRIORITIZED.load(Ordering::Relaxed),
+                was_pick: CAN_RUSH_WAS_PICK.load(Ordering::Relaxed),
+                displaced: CAN_RUSH_DISPLACED.load(Ordering::Relaxed),
+                first_delivery_distance: ClientAnchorFirstDelivery {
+                    hold: ClientAnchorDistance::read(client_anchor::Arm::Hold),
+                    rush: ClientAnchorDistance::read(client_anchor::Arm::Rush),
+                    stock: ClientAnchorDistance::read(client_anchor::Arm::Stock),
+                },
+            },
+        }
+    }
+}
+
 /// The client-anchor block. `held` is the treated half's population and
 /// `released` says why each held request was issued. `held_at_exit` sums
 /// the requests still held when a run ended, over `runs_with_held_at_exit`
@@ -4024,6 +4178,7 @@ pub struct ClientAnchorStats {
     pub runs_with_held_at_exit: u64,
     pub hold_steps_sum: u64,
     pub census: ClientAnchorCensusStats,
+    pub axis: ClientAnchorAxisStats,
 }
 
 impl ClientAnchorStats {
@@ -4048,6 +4203,7 @@ impl ClientAnchorStats {
                 treated: ClientAnchorHalfStats::read(true),
                 control: ClientAnchorHalfStats::read(false),
             },
+            axis: ClientAnchorAxisStats::read(),
         }
     }
 }

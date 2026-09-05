@@ -1053,6 +1053,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             );
             let idx = fresh_first_dispatch(state, &eligible, drawn);
             let idx = pair_order_dispatch(state, &eligible, idx);
+            observe_rush_dispatch(state, &eligible, idx);
+            let delivered_op = state.network_queue[idx].causal_operation_id();
+            note_first_delivery(state, delivered_op);
             // The mask names the predicates true of the record the step
             // runs, under the same condition the selection computed it.
             let mask = if idx != drawn && util_stats::enabled() && terms.any_predicate() {
@@ -1604,6 +1607,41 @@ fn fresh_first_dispatch<H: HashPolicy>(
         util_stats::record_fresh_first_taken(count);
     }
     chosen
+}
+
+/// Split the network steps that had a record of a rushed client operation
+/// among their candidates by whether the step dispatched one. The layers
+/// that run ahead of the score can take another record even when a rushed
+/// one carries the top priority, and only this split says how often they do.
+fn observe_rush_dispatch<H: HashPolicy>(state: &State<H>, eligible: &[usize], pick: usize) {
+    if state.client_anchor.rushed_ops.is_empty() || !util_stats::enabled() {
+        return;
+    }
+    let rushed = |i: usize| {
+        state
+            .client_anchor
+            .rushes(state.network_queue[i].causal_operation_id())
+    };
+    if eligible.iter().any(|&i| rushed(i)) {
+        util_stats::record_client_anchor_rush_dispatch(rushed(pick));
+    }
+}
+
+/// A record of a client operation that became ready after the run's first
+/// crash is about to be delivered. The first such delivery of an operation
+/// gives the steps it spent between issue and arrival, which every
+/// direction of the request-timing axis reports.
+fn note_first_delivery<H: HashPolicy>(state: &mut State<H>, op: Option<i32>) {
+    if state.client_anchor.awaiting_delivery.is_empty() {
+        return;
+    }
+    let Some(op) = op else {
+        return;
+    };
+    if let Some(invoked_step) = state.client_anchor.awaiting_delivery.remove(&op) {
+        let steps = (state.crash_info.current_step - invoked_step).max(0) as u64;
+        util_stats::record_client_anchor_first_delivery(state.client_anchor.arm, steps);
+    }
 }
 
 /// After the draw and the fresh-incarnation swap have settled on `pick`: on

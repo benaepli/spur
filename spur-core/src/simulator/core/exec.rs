@@ -253,6 +253,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                 });
 
                 let send_ordinal = state.next_send_ordinal(node_id);
+                let drawn_priority = policy.sample(rng, RunnableCategory::Record);
                 let mut new_record = Record {
                     pc: func_info.entry,
                     node: target_node,
@@ -261,7 +262,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     entry_pc: func_info.entry,
                     initial_env: callee_locals.clone(),
                     env: callee_locals,
-                    priority: policy.sample(rng, RunnableCategory::Record),
+                    priority: state.record_priority(causal_operation_id, drawn_priority),
                     causal_operation_id,
                     trace_id: pending_trace_id.take(),
                     link_seq,

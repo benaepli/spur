@@ -13,8 +13,10 @@
 
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
-    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, ClientAnchorCensusStats,
-    ClientAnchorHalfStats, ClientAnchorHeldHist, ClientAnchorReleaseStats, ClientAnchorStats,
+    self, AcceptanceDistanceBucket, AcceptanceDistanceStats, ClientAnchorArmRuns,
+    ClientAnchorAxisStats, ClientAnchorCensusStats, ClientAnchorDistance,
+    ClientAnchorFirstDelivery, ClientAnchorHalfStats, ClientAnchorHeldHist,
+    ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
     FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
@@ -956,7 +958,37 @@ fn client_anchor(m: &mut Marks) -> ClientAnchorStats {
             treated: client_anchor_half(m),
             control: client_anchor_half(m),
         },
+        axis: ClientAnchorAxisStats {
+            arm_runs: ClientAnchorArmRuns {
+                hold: m.int(),
+                rush: m.int(),
+                stock: m.int(),
+            },
+            rush: ClientAnchorRushStats {
+                ops: m.int(),
+                records_prioritized: m.int(),
+                was_pick: m.int(),
+                displaced: m.int(),
+                first_delivery_distance: ClientAnchorFirstDelivery {
+                    hold: client_anchor_distance(m),
+                    rush: client_anchor_distance(m),
+                    stock: client_anchor_distance(m),
+                },
+            },
+        },
     }
+}
+
+fn client_anchor_distance(m: &mut Marks) -> ClientAnchorDistance {
+    ClientAnchorDistance {
+        sum: m.int(),
+        count: m.int(),
+    }
+}
+
+fn client_anchor_distance_leaves(prefix: &str, d: &ClientAnchorDistance) -> Vec<(String, Value)> {
+    let ClientAnchorDistance { sum, count } = d;
+    vec![leaf(prefix, "sum", *sum), leaf(prefix, "count", *count)]
 }
 
 fn client_anchor_leaves(prefix: &str, c: &ClientAnchorStats) -> Vec<(String, Value)> {
@@ -968,6 +1000,7 @@ fn client_anchor_leaves(prefix: &str, c: &ClientAnchorStats) -> Vec<(String, Val
         runs_with_held_at_exit,
         hold_steps_sum,
         census,
+        axis,
     } = c;
     let ClientAnchorReleaseStats { expiry, dry_queue } = released;
     let ClientAnchorHeldHist {
@@ -993,6 +1026,33 @@ fn client_anchor_leaves(prefix: &str, c: &ClientAnchorStats) -> Vec<(String, Val
     ];
     out.extend(client_anchor_half_leaves(&format!("{prefix}.census.treated"), treated));
     out.extend(client_anchor_half_leaves(&format!("{prefix}.census.control"), control));
+    let ClientAnchorAxisStats { arm_runs, rush } = axis;
+    let ClientAnchorArmRuns { hold, rush: rush_runs, stock } = arm_runs;
+    let a = format!("{prefix}.axis.arm_runs");
+    out.push(leaf(&a, "hold", *hold));
+    out.push(leaf(&a, "rush", *rush_runs));
+    out.push(leaf(&a, "stock", *stock));
+    let ClientAnchorRushStats {
+        ops,
+        records_prioritized,
+        was_pick,
+        displaced,
+        first_delivery_distance,
+    } = rush;
+    let u = format!("{prefix}.axis.rush");
+    out.push(leaf(&u, "ops", *ops));
+    out.push(leaf(&u, "records_prioritized", *records_prioritized));
+    out.push(leaf(&u, "was_pick", *was_pick));
+    out.push(leaf(&u, "displaced", *displaced));
+    let ClientAnchorFirstDelivery {
+        hold: hold_distance,
+        rush: rush_distance,
+        stock: stock_distance,
+    } = first_delivery_distance;
+    let d = format!("{u}.first_delivery_distance");
+    out.extend(client_anchor_distance_leaves(&format!("{d}.hold"), hold_distance));
+    out.extend(client_anchor_distance_leaves(&format!("{d}.rush"), rush_distance));
+    out.extend(client_anchor_distance_leaves(&format!("{d}.stock"), stock_distance));
     out
 }
 

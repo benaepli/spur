@@ -47,6 +47,10 @@ pub const PAIR_SEND_ORDER: i32 = 1 << 15;
 /// and issues each once it has waited a fixed number of steps, or earlier
 /// when nothing else in the run can move.
 pub const CLIENT_FANOUT_RELEASE: i32 = 1 << 18;
+/// The run issues client requests that become ready after its first crash
+/// at their ready step, and gives every record those requests cause the top
+/// of the priority range.
+pub const CLIENT_RUSH_PRIORITY: i32 = 1 << 14;
 /// The run's planned crashes move to the live node that last took a
 /// delivery whose sender was down or had restarted since sending.
 pub const GHOST_ABSORBER_RETARGET: i32 = 1 << 19;
@@ -95,6 +99,9 @@ pub fn from_run_id(run_id: i64) -> i32 {
     if client_anchor::is_treated(run_id) {
         v |= CLIENT_FANOUT_RELEASE;
     }
+    if client_anchor::is_rushed(run_id) {
+        v |= CLIENT_RUSH_PRIORITY;
+    }
     v
 }
 
@@ -134,6 +141,12 @@ mod tests {
             assert_eq!(v & FRESH_FIRST_PAIR != 0, fresh_first::is_treated(id));
             assert_eq!(v & PAIR_SEND_ORDER != 0, pair_order::is_treated(id));
             assert_eq!(v & CLIENT_FANOUT_RELEASE != 0, client_anchor::is_treated(id));
+            assert_eq!(v & CLIENT_RUSH_PRIORITY != 0, client_anchor::is_rushed(id));
+            assert_ne!(
+                v & (CLIENT_FANOUT_RELEASE | CLIENT_RUSH_PRIORITY),
+                CLIENT_FANOUT_RELEASE | CLIENT_RUSH_PRIORITY,
+                "a run took both directions of the request-timing axis"
+            );
             assert_eq!(v & CRASH_HOLD_DRAWN, 0, "the acted bit is not an id bit");
             assert_eq!(of(id, true), v | CRASH_HOLD_DRAWN);
             assert_eq!(of(id, false), v);
@@ -245,6 +258,27 @@ mod tests {
             "the client-anchor split leaves no contrast"
         );
         assert_eq!(anchor_probes, 0, "a probe must never hold client requests");
+        let rush_runs = (0..64_000i64)
+            .filter(|&id| from_run_id(id) & CLIENT_RUSH_PRIORITY != 0)
+            .count();
+        let rush_probes = (0..64_000i64)
+            .filter(|&id| {
+                let v = from_run_id(id);
+                v & CLIENT_RUSH_PRIORITY != 0 && v & (RUN_CAP_PROBE | TIMER_STEER_OFF) != 0
+            })
+            .count();
+        let rush_and_hold = (0..64_000i64)
+            .filter(|&id| {
+                from_run_id(id) & (CLIENT_RUSH_PRIORITY | CLIENT_FANOUT_RELEASE)
+                    == CLIENT_RUSH_PRIORITY | CLIENT_FANOUT_RELEASE
+            })
+            .count();
+        assert!(
+            rush_runs > 0 && rush_runs < anchor_runs,
+            "the rush split leaves no contrast against the hold"
+        );
+        assert_eq!(rush_probes, 0, "a probe must never rush client requests");
+        assert_eq!(rush_and_hold, 0, "the two directions must never meet on a run");
         assert!(ordinary_stock > 0, "no stock run that is not a probe, so there is no control");
     }
 }

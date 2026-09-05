@@ -184,6 +184,7 @@ fn schedule_client_op<H: HashPolicy>(
 
     let send_ordinal = state.next_send_ordinal(client_node_id);
     let receiver_token_at_send = state.node_state_token(client_node_id);
+    let drawn_priority = policy.sample(rng, RunnableCategory::Record);
     state.push_runnable(Runnable::Record(Record {
         pc: op_func.entry,
         node: client_node_id,
@@ -196,7 +197,7 @@ fn schedule_client_op<H: HashPolicy>(
         entry_pc: op_func.entry,
         initial_env: env.clone(),
         env,
-        priority: policy.sample(rng, RunnableCategory::Record),
+        priority: state.record_priority(Some(op_id), drawn_priority),
         causal_operation_id: Some(op_id),
         trace_id: None,
         link_seq: None,
@@ -243,6 +244,7 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
     server_role: NameId,
     plan_node: NodeIndex,
     op_spec: &ClientOpSpec,
+    post_fault: bool,
     in_progress: &mut HashMap<i32, NodeIndex>,
     op_id_counter: &mut i32,
     rng: &mut impl StreamRng,
@@ -250,6 +252,22 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
     *op_id_counter += 1;
     in_progress.insert(*op_id_counter, plan_node);
     util_stats::record_client_op_invoked();
+
+    if post_fault {
+        let op_id = *op_id_counter;
+        let step = path_state.state.crash_info.current_step;
+        if path_state.state.client_anchor.arm == client_anchor::Arm::Rush {
+            path_state.state.client_anchor.rushed_ops.insert(op_id);
+            util_stats::record_client_anchor_rush_op();
+        }
+        if util_stats::enabled() {
+            path_state
+                .state
+                .client_anchor
+                .awaiting_delivery
+                .insert(op_id, step);
+        }
+    }
 
     // Get a client node from the pool (creates one if needed)
     let (client_node_id, is_new) = path_state.client_pool.get(&mut path_state.state);
@@ -401,15 +419,16 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     retarget_crashes: bool,
     fresh_first: bool,
     pair_order: bool,
-    client_anchor: bool,
+    client_anchor: client_anchor::Arm,
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
     path_state.state.retarget.enabled = retarget_crashes;
     path_state.state.fresh_first.enabled = fresh_first;
     path_state.state.pair_order.enabled = pair_order;
-    path_state.state.client_anchor.enabled = client_anchor;
-    let anchored = client_anchor;
+    path_state.state.client_anchor.arm = client_anchor;
+    util_stats::record_client_anchor_arm_run(client_anchor);
+    let anchored = path_state.state.client_anchor.holds();
     // Client requests that became ready after the run's first crash and are
     // waiting out their hold, and the last step at which a window opened.
     let mut held: HoldQueue<(NodeIndex, ClientOpSpec)> = HoldQueue::default();
@@ -587,6 +606,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 server_role,
                 plan_node,
                 &op_spec,
+                true,
                 &mut in_progress,
                 &mut op_id_counter,
                 rng,
@@ -597,8 +617,9 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             match &event.action {
                 EventAction::ClientRequest(op_spec) => {
                     // A request that becomes ready once a crash has happened
-                    // is the population the hold applies to; on the treated
-                    // half it waits, on the control half it is issued now.
+                    // is the population every direction of the axis acts on:
+                    // a holding run makes it wait, and the others issue it
+                    // now.
                     let post_fault = !crashed_nodes.is_empty();
                     if post_fault {
                         util_stats::record_client_anchor_post_fault_request(anchored);
@@ -619,6 +640,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         server_role,
                         node_idx,
                         op_spec,
+                        post_fault,
                         &mut in_progress,
                         &mut op_id_counter,
                         rng,
@@ -1060,6 +1082,7 @@ mod tests {
                 server_role,
                 plan_node,
                 &spec,
+                true,
                 &mut in_progress,
                 &mut op_id,
                 &mut rng,

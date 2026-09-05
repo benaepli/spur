@@ -17,29 +17,92 @@
 //! on both halves. Fan-out windows are detected and counted on both halves
 //! and issue nothing.
 //!
-//! The treated half is drawn under a salt of its own, so the split is
-//! independent of every other split of a session. Probes are never treated:
-//! run-cap probes feed the length learners, and timer-context probes must
-//! run unsteered.
+//! The opposite direction on the same axis is the rush: the request is
+//! issued at its ready step, as an untreated run does, and the record its
+//! invocation pushes takes the top of the priority range, as does every
+//! record later built while that operation is the ambient cause. A rushed
+//! run therefore lands the request ahead of the fan-out instead of behind
+//! it. A quarter of the runs that do not hold are rushed, so the axis
+//! carries a hold half, a rush quarter and a stock quarter.
+//!
+//! Each direction is drawn under a salt of its own, so the split is
+//! independent of every other split of a session. Probes take neither
+//! direction: run-cap probes feed the length learners, and timer-context
+//! probes must run unsteered.
 
 use crate::simulator::core::state::{HandlerTrigger, SendLedger};
 use crate::simulator::run_cap;
 use crate::simulator::run_phase;
 use crate::simulator::timer_context;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Salt for the treated half. Distinct from every other split of a session.
 pub const CLIENT_ANCHOR_SALT: u64 = 0x_434C_4E54_4143_4852; // "CLNTACHR"
+
+/// Salt for the rushed quarter. Distinct from every other split of a
+/// session, so the direction a run draws does not follow from the hold.
+pub const RUSH_SALT: u64 = 0x_434C_4E54_5255_5348; // "CLNTRUSH"
 
 /// A held request is issued once its ready step lies this many steps or
 /// more behind the current step.
 pub const EXPIRY_STEPS: i32 = 64;
 
-/// Whether this run holds its post-crash client requests.
-pub fn is_treated(run_id: i64) -> bool {
+/// The priority a rushed operation's records take. The scoring blend reads
+/// priority on this scale, where one is the top of the range.
+pub const RUSH_PRIORITY: f64 = 1.0;
+
+/// Whether the run id names a run that either direction may act on.
+fn is_eligible(run_id: i64) -> bool {
     !run_cap::is_probe(run_id)
         && timer_context::run_mode(run_id) != timer_context::RunMode::Probe
-        && run_phase::salted_phase(run_id, CLIENT_ANCHOR_SALT, 2) == 1
+}
+
+/// Whether this run holds its post-crash client requests.
+pub fn is_treated(run_id: i64) -> bool {
+    is_eligible(run_id) && run_phase::salted_phase(run_id, CLIENT_ANCHOR_SALT, 2) == 1
+}
+
+/// Whether this run rushes its post-crash client requests. Drawn over the
+/// runs that do not hold, so the two directions never meet on one run.
+pub fn is_rushed(run_id: i64) -> bool {
+    is_eligible(run_id)
+        && !is_treated(run_id)
+        && run_phase::salted_phase(run_id, RUSH_SALT, 2) == 1
+}
+
+/// A direction on the post-crash request-timing axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Arm {
+    /// The request is issued at its ready step and contends as it is drawn.
+    #[default]
+    Stock,
+    /// The request waits and is issued once its hold runs out.
+    Hold,
+    /// The request is issued at its ready step and its records take the top
+    /// of the priority range.
+    Rush,
+}
+
+impl Arm {
+    /// The index this direction occupies in a per-arm counter.
+    pub fn index(self) -> usize {
+        match self {
+            Arm::Hold => 0,
+            Arm::Rush => 1,
+            Arm::Stock => 2,
+        }
+    }
+}
+
+/// The direction this run draws.
+pub fn arm(run_id: i64) -> Arm {
+    if is_treated(run_id) {
+        Arm::Hold
+    } else if is_rushed(run_id) {
+        Arm::Rush
+    } else {
+        Arm::Stock
+    }
 }
 
 /// Whether a window opened at `step`: some server among the first `servers`
@@ -61,11 +124,31 @@ pub fn fanout_window(ledgers: &[SendLedger], servers: usize, step: i32) -> bool 
     })
 }
 
-/// One run's switch. `enabled` is set on the treated half of generated
-/// runs and never on a plan run from a file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// One run's direction and the operations it is following. `arm` is drawn
+/// from the run id for a generated run and is always `Stock` for a plan run
+/// from a file. `rushed_ops` names the client operations whose records take
+/// the top priority; `awaiting_delivery` holds the invocation step of every
+/// post-crash operation whose first delivery has not been counted yet, on
+/// all three directions, so the distance is comparable across them, and is
+/// filled only while the counters are on, since nothing else reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunState {
-    pub enabled: bool,
+    pub arm: Arm,
+    pub rushed_ops: HashSet<i32>,
+    pub awaiting_delivery: HashMap<i32, i32>,
+}
+
+impl RunState {
+    /// Whether the run holds its post-crash client requests.
+    pub fn holds(&self) -> bool {
+        self.arm == Arm::Hold
+    }
+
+    /// Whether a record caused by `causal_operation_id` takes the top of the
+    /// priority range.
+    pub fn rushes(&self, causal_operation_id: Option<i32>) -> bool {
+        causal_operation_id.is_some_and(|op| self.rushed_ops.contains(&op))
+    }
 }
 
 /// Why a held request left the queue.
@@ -180,6 +263,55 @@ impl<T> HoldQueue<T> {
 mod tests {
     use super::*;
     use crate::simulator::config_override;
+
+    #[test]
+    fn the_three_directions_partition_the_eligible_runs() {
+        let _serial = config_override::exclusive_session();
+        let n = 40_000i64;
+        let mut counts = [0i64; 3];
+        let mut eligible = 0i64;
+        for id in 0..n {
+            let a = arm(id);
+            assert_eq!(a, arm(id), "the direction must not vary between reads");
+            assert_eq!(is_treated(id), a == Arm::Hold);
+            assert_eq!(is_rushed(id), a == Arm::Rush);
+            assert!(
+                !(is_treated(id) && is_rushed(id)),
+                "run {id} took both directions"
+            );
+            let probe = run_cap::is_probe(id)
+                || timer_context::run_mode(id) == timer_context::RunMode::Probe;
+            if probe {
+                assert_eq!(a, Arm::Stock, "probe {id} took a direction");
+            } else {
+                eligible += 1;
+                counts[a.index()] += 1;
+            }
+        }
+        assert_eq!(counts.iter().sum::<i64>(), eligible);
+        let hold = counts[Arm::Hold.index()] as f64 / eligible as f64;
+        let rush = counts[Arm::Rush.index()] as f64 / eligible as f64;
+        let stock = counts[Arm::Stock.index()] as f64 / eligible as f64;
+        assert!((hold - 0.5).abs() < 0.02, "the hold takes {hold} of the eligible runs");
+        assert!((rush - 0.25).abs() < 0.02, "the rush takes {rush} of the eligible runs");
+        assert!((stock - 0.25).abs() < 0.02, "stock takes {stock} of the eligible runs");
+    }
+
+    #[test]
+    fn a_run_state_rushes_only_the_operations_it_was_given() {
+        let mut st = RunState::default();
+        assert!(!st.holds());
+        assert!(!st.rushes(Some(1)));
+        assert!(!st.rushes(None));
+        st.arm = Arm::Hold;
+        assert!(st.holds());
+        st.arm = Arm::Rush;
+        st.rushed_ops.insert(7);
+        assert!(!st.holds());
+        assert!(st.rushes(Some(7)));
+        assert!(!st.rushes(Some(8)));
+        assert!(!st.rushes(None), "a record with no cause is never rushed");
+    }
 
     #[test]
     fn the_treated_half_is_about_half_and_never_a_probe() {
