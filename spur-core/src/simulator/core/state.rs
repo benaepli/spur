@@ -649,6 +649,24 @@ pub struct State<H: HashPolicy> {
     /// from another restarted node's current incarnation. Observation only,
     /// excluded from `signature()`.
     pub absorber_cycle_fresh_peer: bool,
+    /// The step of the first message entry that set
+    /// `absorber_cycle_fresh_peer`. Observation only, excluded from
+    /// `signature()`.
+    pub absorber_cycle_closed_step: Option<i32>,
+    /// Whether two distinct nodes each crashed while marked as having acted
+    /// on a fault-crossing delivery, each recovered, and each then took a
+    /// message entry from the other's current incarnation. Observation
+    /// only, excluded from `signature()`.
+    pub mutual_absorber_cycle: bool,
+    /// The step of the first message entry at a server whose record was
+    /// caused by a client operation invoked after the run's first crash.
+    /// Observation only, excluded from `signature()`.
+    pub first_post_fault_request_entry_step: Option<i32>,
+    /// Whether some restarted node, at its first request-caused message
+    /// entry since its restart, had already taken a fault-crossing delivery
+    /// that wrote its state and heard another restarted node's current
+    /// incarnation. Observation only, excluded from `signature()`.
+    pub exchange_before_request: bool,
     /// Remote records in the network queue whose origin has restarted since
     /// sending them: the sum over nodes of `net_records - net_fresh`.
     pub net_stale_records: u32,
@@ -693,7 +711,13 @@ pub struct ReplayCut {
 /// `last_ghost_acted` says whether that delivery wrote the node's state.
 /// `crashed_as_acted_absorber` says whether a crash of this node ever
 /// landed while that mark said the delivery wrote state; it is never
-/// cleared within a run.
+/// cleared within a run. The last three fields hold since the node's last
+/// restart and are cleared when it crashes: `absorber_peers_heard` is a
+/// bitmask over node indices of the peers that also crashed as acted
+/// absorbers and whose current incarnation this node has taken a message
+/// entry from; `ghost_acted_since_restart` says whether a fault-crossing
+/// delivery wrote the node's state; `request_entered_since_restart` whether
+/// a message entry caused by a post-fault client operation has reached it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendLedger {
     pub issued: u32,
@@ -709,6 +733,9 @@ pub struct SendLedger {
     pub last_ghost_step: i32,
     pub last_ghost_acted: bool,
     pub crashed_as_acted_absorber: bool,
+    pub absorber_peers_heard: u64,
+    pub ghost_acted_since_restart: bool,
+    pub request_entered_since_restart: bool,
 }
 
 impl Default for SendLedger {
@@ -727,6 +754,9 @@ impl Default for SendLedger {
             last_ghost_step: -1,
             last_ghost_acted: false,
             crashed_as_acted_absorber: false,
+            absorber_peers_heard: 0,
+            ghost_acted_since_restart: false,
+            request_entered_since_restart: false,
         }
     }
 }
@@ -799,6 +829,10 @@ impl<H: HashPolicy> State<H> {
             replay_cut: None,
             overtaken_ghost_acted: false,
             absorber_cycle_fresh_peer: false,
+            absorber_cycle_closed_step: None,
+            mutual_absorber_cycle: false,
+            first_post_fault_request_entry_step: None,
+            exchange_before_request: false,
             net_stale_records: 0,
             net_requests: 0,
         }
@@ -915,6 +949,11 @@ impl<H: HashPolicy> State<H> {
     #[inline]
     pub fn incarnation(&self, node: NodeId) -> u32 {
         self.incarnations.get(node.index).copied().unwrap_or(0)
+    }
+
+    /// `incarnation` by node index.
+    fn incarnation_at(&self, index: usize) -> u32 {
+        self.incarnations.get(index).copied().unwrap_or(0)
     }
 
     /// A value that changes whenever `node`'s persistent state is written.
@@ -1129,17 +1168,25 @@ impl<H: HashPolicy> State<H> {
     /// records whether the delivery wrote anything.
     pub fn note_ghost_delivery(&mut self, node: usize, step: i32, before: u64) {
         let acted = self.nodes.get(node).is_some_and(|env| env.writes != before);
+        let restarted = self.incarnation_at(node) > 0;
         if let Some(l) = self.send_ledger.get_mut(node) {
             l.last_ghost_step = step;
             l.last_ghost_acted = acted;
+            if acted && restarted {
+                l.ghost_acted_since_restart = true;
+            }
         }
     }
 
-    /// `node` is going down: whatever it absorbed is lost with its state.
+    /// `node` is going down: whatever it absorbed and heard is lost with
+    /// its state.
     pub fn clear_ghost_mark(&mut self, node: usize) {
         if let Some(l) = self.send_ledger.get_mut(node) {
             l.last_ghost_step = -1;
             l.last_ghost_acted = false;
+            l.absorber_peers_heard = 0;
+            l.ghost_acted_since_restart = false;
+            l.request_entered_since_restart = false;
         }
     }
 
@@ -1180,6 +1227,82 @@ impl<H: HashPolicy> State<H> {
                 .is_some_and(|l| l.crashed_as_acted_absorber)
             && current > 0
             && sent_at == current
+    }
+
+    /// A message entry at `dest` sent by `origin` at incarnation `sent_at`
+    /// landed at `step`. When `fresh_peer_at_absorber` holds the entry
+    /// closes the absorber cycle; when the origin also crashed as an acted
+    /// absorber, `dest` has now heard it since its own restart, and the run
+    /// carries a mutual absorber cycle once `origin` has likewise heard
+    /// `dest`. Nodes past the width of the mask are never noted.
+    pub fn note_entry_at_absorber(&mut self, origin: NodeId, sent_at: u32, dest: NodeId, step: i32) {
+        if !self.fresh_peer_at_absorber(origin, sent_at, dest) {
+            return;
+        }
+        self.absorber_cycle_fresh_peer = true;
+        if self.absorber_cycle_closed_step.is_none() {
+            self.absorber_cycle_closed_step = Some(step);
+        }
+        if origin.index >= u64::BITS as usize || dest.index >= u64::BITS as usize {
+            return;
+        }
+        let origin_acted = self
+            .send_ledger
+            .get(origin.index)
+            .is_some_and(|l| l.crashed_as_acted_absorber);
+        if !origin_acted {
+            return;
+        }
+        if let Some(l) = self.send_ledger.get_mut(dest.index) {
+            l.absorber_peers_heard |= 1 << origin.index;
+        }
+        let heard_back = self
+            .send_ledger
+            .get(origin.index)
+            .is_some_and(|l| l.absorber_peers_heard & (1 << dest.index) != 0);
+        if heard_back {
+            self.mutual_absorber_cycle = true;
+        }
+    }
+
+    /// A message entry caused by a post-fault client operation reached the
+    /// server at index `dest` at `step`; `servers` is the number of server
+    /// nodes. The first such entry in the run fixes
+    /// `first_post_fault_request_entry_step`. The first at `dest` since its
+    /// restart sets `exchange_before_request` when `dest` had already taken
+    /// a fault-crossing delivery that wrote its state and heard some other
+    /// restarted server's current incarnation.
+    pub fn note_post_fault_request_entry(&mut self, dest: usize, step: i32, servers: usize) {
+        if self.first_post_fault_request_entry_step.is_none() {
+            self.first_post_fault_request_entry_step = Some(step);
+        }
+        let Some(l) = self.send_ledger.get_mut(dest) else {
+            return;
+        };
+        if l.request_entered_since_restart {
+            return;
+        }
+        l.request_entered_since_restart = true;
+        let ghost_acted = l.ghost_acted_since_restart;
+        if !ghost_acted || self.incarnation_at(dest) == 0 {
+            return;
+        }
+        let heard_restarted_peer = (0..servers).any(|peer| {
+            let current = self.incarnation_at(peer);
+            peer != dest && current > 0 && self.fresh_first.heard_from(dest, peer, current)
+        });
+        if heard_restarted_peer {
+            self.exchange_before_request = true;
+        }
+    }
+
+    /// Whether the absorber cycle closed before the first message entry
+    /// caused by a post-fault client operation reached a server.
+    pub fn cycle_before_request(&self) -> bool {
+        match (self.absorber_cycle_closed_step, self.first_post_fault_request_entry_step) {
+            (Some(closed), Some(request)) => closed < request,
+            _ => false,
+        }
     }
 
     /// Which crash term a crash of `node` satisfies right now, if any.
@@ -1675,6 +1798,109 @@ mod ledger_tests {
         st.note_crash_of_acted_absorber(1);
         st.clear_ghost_mark(1);
         assert!(st.send_ledger[1].crashed_as_acted_absorber, "never cleared within a run");
+    }
+
+    /// Two nodes that each crashed as an acted absorber and restarted carry
+    /// a mutual absorber cycle once each has taken a message entry from the
+    /// other's current incarnation; one direction alone is not enough, nor
+    /// is a peer that never crashed as an acted absorber.
+    #[test]
+    fn a_mutual_absorber_cycle_needs_both_hearings() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        let c = node(SERVER, 2);
+        for i in [0, 1] {
+            let before = st.node_state_token(node(SERVER, i));
+            st.nodes[i].set(1, Value::<NoHashing>::int(5));
+            st.note_ghost_delivery(i, 20 + i as i32, before);
+            st.note_crash_of_acted_absorber(i);
+            st.clear_ghost_mark(i);
+        }
+        st.incarnations[0] = 1;
+        st.incarnations[1] = 1;
+        st.incarnations[2] = 1;
+        st.note_entry_at_absorber(a, 1, b, 30);
+        assert!(st.absorber_cycle_fresh_peer, "a's fresh message at b closes b's cycle");
+        assert_eq!(st.absorber_cycle_closed_step, Some(30));
+        assert_eq!(st.send_ledger[1].absorber_peers_heard, 1 << 0, "b heard a");
+        assert!(!st.mutual_absorber_cycle, "one direction is not mutual");
+        st.note_entry_at_absorber(c, 1, a, 31);
+        assert!(!st.mutual_absorber_cycle, "c never crashed as an acted absorber");
+        assert_eq!(st.send_ledger[0].absorber_peers_heard, 0, "c is not noted at a");
+        st.note_entry_at_absorber(a, 0, b, 32);
+        assert!(!st.mutual_absorber_cycle, "a dead incarnation is not a hearing");
+        st.note_entry_at_absorber(b, 1, a, 33);
+        assert!(st.mutual_absorber_cycle, "each has heard the other's current incarnation");
+        assert_eq!(st.absorber_cycle_closed_step, Some(30), "the closing step is the first");
+        // A crash of b clears what b heard; the run's fact stays.
+        st.clear_ghost_mark(1);
+        assert_eq!(st.send_ledger[1].absorber_peers_heard, 0);
+        assert!(st.mutual_absorber_cycle);
+    }
+
+    /// Only one direction: the second hearing lands at the node that
+    /// already heard, so the pair is never reciprocal.
+    #[test]
+    fn a_repeated_one_way_hearing_is_not_a_mutual_absorber_cycle() {
+        let mut st = state();
+        let a = node(SERVER, 0);
+        let b = node(SERVER, 1);
+        for i in [0, 1] {
+            let before = st.node_state_token(node(SERVER, i));
+            st.nodes[i].set(1, Value::<NoHashing>::int(5));
+            st.note_ghost_delivery(i, 20, before);
+            st.note_crash_of_acted_absorber(i);
+            st.clear_ghost_mark(i);
+        }
+        st.incarnations[0] = 1;
+        st.incarnations[1] = 1;
+        st.note_entry_at_absorber(a, 1, b, 30);
+        st.note_entry_at_absorber(a, 1, b, 31);
+        assert!(st.absorber_cycle_fresh_peer);
+        assert!(!st.mutual_absorber_cycle);
+    }
+
+    /// The first request-caused entry in the run fixes its step, and the
+    /// first at a restarted node reads the exchange facts as they stood
+    /// before it: a ghost that wrote state since the restart and a
+    /// restarted peer's current incarnation already heard.
+    #[test]
+    fn the_exchange_is_read_at_the_first_request_entry_since_restart() {
+        let mut st = state();
+        let b = node(SERVER, 1);
+        assert!(!st.cycle_before_request());
+        st.incarnations[1] = 1;
+        st.incarnations[2] = 1;
+        let before = st.node_state_token(b);
+        st.nodes[1].set(1, Value::<NoHashing>::int(5));
+        st.note_ghost_delivery(1, 20, before);
+        assert!(st.send_ledger[1].ghost_acted_since_restart);
+        // b has heard c's dead incarnation only.
+        st.fresh_first.note_entry(1, 2, 0);
+        st.note_post_fault_request_entry(1, 40, 3);
+        assert_eq!(st.first_post_fault_request_entry_step, Some(40));
+        assert!(!st.exchange_before_request, "c's current incarnation was not heard");
+        assert!(st.send_ledger[1].request_entered_since_restart);
+        // A later hearing does not reopen the check until b restarts.
+        st.fresh_first.note_entry(1, 2, 1);
+        st.note_post_fault_request_entry(1, 41, 3);
+        assert!(!st.exchange_before_request);
+        assert_eq!(st.first_post_fault_request_entry_step, Some(40), "the first step stays");
+        st.clear_ghost_mark(1);
+        assert!(!st.send_ledger[1].request_entered_since_restart);
+        assert!(!st.send_ledger[1].ghost_acted_since_restart);
+        st.incarnations[1] = 2;
+        let before = st.node_state_token(b);
+        st.nodes[1].set(1, Value::<NoHashing>::int(6));
+        st.note_ghost_delivery(1, 50, before);
+        st.note_post_fault_request_entry(1, 60, 3);
+        assert!(st.exchange_before_request, "ghost acted and c's current incarnation heard");
+        // The absorber cycle closed before the first request entry.
+        st.absorber_cycle_closed_step = Some(39);
+        assert!(st.cycle_before_request());
+        st.absorber_cycle_closed_step = Some(40);
+        assert!(!st.cycle_before_request(), "the same step is not before");
     }
 
     #[test]

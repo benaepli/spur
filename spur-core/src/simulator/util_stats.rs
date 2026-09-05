@@ -161,36 +161,53 @@ static CAN_RUSH_WAS_PICK: AtomicU64 = AtomicU64::new(0);
 static CAN_RUSH_DISPLACED: AtomicU64 = AtomicU64::new(0);
 static CAN_FIRST_DELIVERY_SUM: [AtomicU64; CAN_ARMS] = [const { AtomicU64::new(0) }; CAN_ARMS];
 static CAN_FIRST_DELIVERY_COUNT: [AtomicU64; CAN_ARMS] = [const { AtomicU64::new(0) }; CAN_ARMS];
-/// The per-run rewards the arm selector reads. The first two each train
-/// one learner; the last two are read on the coin third only.
+/// The step of the first message entry caused by a post-fault client
+/// operation, per direction the run carried, over the arm selector's coin
+/// quarter: runs that had one and the sum of their steps.
+static CAN_FIRST_ENTRY_RUNS: [AtomicU64; run_variant::DIRECTIONS] =
+    [const { AtomicU64::new(0) }; run_variant::DIRECTIONS];
+static CAN_FIRST_ENTRY_STEPS_SUM: [AtomicU64; run_variant::DIRECTIONS] =
+    [const { AtomicU64::new(0) }; run_variant::DIRECTIONS];
+/// The per-run rewards the arm selector reads. `OvertakenGhost`,
+/// `AbsorberCycle` and `CycleBeforeRequest` each train one learner; the
+/// rest are read on the coin quarter only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reward {
     OvertakenGhost,
     AbsorberCycle,
+    MutualAbsorberCycle,
     GhostSignal,
     EitherShape,
+    CycleBeforeRequest,
+    ExchangeBeforeRequest,
 }
 
 impl Reward {
-    pub const ALL: [Reward; 4] = [
+    pub const ALL: [Reward; 7] = [
         Reward::OvertakenGhost,
         Reward::AbsorberCycle,
+        Reward::MutualAbsorberCycle,
         Reward::GhostSignal,
         Reward::EitherShape,
+        Reward::CycleBeforeRequest,
+        Reward::ExchangeBeforeRequest,
     ];
 
     fn index(self) -> usize {
         match self {
             Reward::OvertakenGhost => 0,
             Reward::AbsorberCycle => 1,
-            Reward::GhostSignal => 2,
-            Reward::EitherShape => 3,
+            Reward::MutualAbsorberCycle => 2,
+            Reward::GhostSignal => 3,
+            Reward::EitherShape => 4,
+            Reward::CycleBeforeRequest => 5,
+            Reward::ExchangeBeforeRequest => 6,
         }
     }
 }
 
-/// The arm selector's counters for one reward: the coin third's runs and
-/// rewards per direction and per combination, the reward on each third,
+/// The arm selector's counters for one reward: the coin quarter's runs and
+/// rewards per direction and per combination, the reward on each quarter,
 /// and, for a reward a learner is trained on, that learner's draws.
 struct AxCounters {
     treated_runs: AtomicU64,
@@ -237,7 +254,7 @@ impl AxCounters {
     }
 }
 
-static AX: [AxCounters; 4] = [const { AxCounters::new() }; 4];
+static AX: [AxCounters; 7] = [const { AxCounters::new() }; 7];
 static AX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 /// The first learner's reward per campaign arm over every observed run,
 /// slot `arm_index + 1` so an unattributed run lands in slot zero; arms
@@ -2131,7 +2148,7 @@ pub fn record_client_anchor_arm_run(arm: client_anchor::Arm) {
     CAN_ARM_RUNS[arm.index()].fetch_add(1, Ordering::Relaxed);
 }
 
-/// A run on a learner's third drew its arms: `reward` names the learner,
+/// A run on a learner's quarter drew its arms: `reward` names the learner,
 /// `chosen` is the learned set, or None when the cell was below warmup and
 /// the run took `coins`. `leader_agreements` counts the axes on which the
 /// drawn direction was the axis's highest posterior mean.
@@ -2181,8 +2198,8 @@ pub fn record_arm_selector_run_observed(arm_index: i32, overtaken_ghost: bool) {
 }
 
 /// One reward was read on a run: `treated` says whether the run was on the
-/// reward's learner's third rather than the coin third, `arms` the set the
-/// run carried, and `positive` the reward's value.
+/// reward's learner's quarter rather than the coin quarter, `arms` the set
+/// the run carried, and `positive` the reward's value.
 pub fn record_arm_selector_observation(
     reward: Reward,
     treated: bool,
@@ -2271,6 +2288,20 @@ pub fn record_client_anchor_first_delivery(arm: client_anchor::Arm, steps: u64) 
     let i = arm.index();
     CAN_FIRST_DELIVERY_SUM[i].fetch_add(steps, Ordering::Relaxed);
     CAN_FIRST_DELIVERY_COUNT[i].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A coin-quarter run's first message entry caused by a post-fault client
+/// operation landed at `step`, credited to the directions the run carried.
+#[inline]
+pub fn record_client_anchor_first_post_fault_entry(arms: &run_variant::ArmSet, step: i32) {
+    if !enabled() {
+        return;
+    }
+    let step = step.max(0) as u64;
+    for d in arms.directions() {
+        CAN_FIRST_ENTRY_RUNS[d].fetch_add(1, Ordering::Relaxed);
+        CAN_FIRST_ENTRY_STEPS_SUM[d].fetch_add(step, Ordering::Relaxed);
+    }
 }
 
 /// A fresh grid-arm run that fired the signal entered its arm's replay corpus.
@@ -4385,6 +4416,17 @@ impl ClientAnchorAxisStats {
     }
 }
 
+/// The step of the first message entry at a server caused by a post-fault
+/// client operation, on the arm selector's coin quarter, by the direction
+/// the run carried in the order `run_variant::AXIS_START` gives: `runs`
+/// counts the runs that had such an entry and `steps_sum` their steps, so
+/// each entry of the two is one direction's mean.
+#[derive(Serialize, Debug)]
+pub struct ClientAnchorFirstEntry {
+    pub runs: Vec<u64>,
+    pub steps_sum: Vec<u64>,
+}
+
 /// The client-anchor block. `held` is the treated half's population and
 /// `released` says why each held request was issued. `held_at_exit` sums
 /// the requests still held when a run ended, over `runs_with_held_at_exit`
@@ -4400,6 +4442,7 @@ pub struct ClientAnchorStats {
     pub hold_steps_sum: u64,
     pub census: ClientAnchorCensusStats,
     pub axis: ClientAnchorAxisStats,
+    pub first_post_fault_entry: ClientAnchorFirstEntry,
 }
 
 impl ClientAnchorStats {
@@ -4425,12 +4468,22 @@ impl ClientAnchorStats {
                 control: ClientAnchorHalfStats::read(false),
             },
             axis: ClientAnchorAxisStats::read(),
+            first_post_fault_entry: ClientAnchorFirstEntry {
+                runs: CAN_FIRST_ENTRY_RUNS
+                    .iter()
+                    .map(|n| n.load(Ordering::Relaxed))
+                    .collect(),
+                steps_sum: CAN_FIRST_ENTRY_STEPS_SUM
+                    .iter()
+                    .map(|n| n.load(Ordering::Relaxed))
+                    .collect(),
+            },
         }
     }
 }
 
-/// One reward read on the arm selector's coin third. `reward_runs_control`
-/// and `reward_positive_control` are the coin third's runs and rewards; the
+/// One reward read on the arm selector's coin quarter. `reward_runs_control`
+/// and `reward_positive_control` are the coin quarter's runs and rewards; the
 /// per-direction and per-combination arrays follow `run_variant::AXIS_START`
 /// and `ArmSet::index` and say what each coin direction earned.
 #[derive(Serialize, Debug, Clone)]
@@ -4467,8 +4520,8 @@ impl ArmSelectorRewardStats {
 /// independent draws would give. `departures` counts chosen runs whose set
 /// differs from the id's coins; `cells` is a gauge of the learner's table.
 /// `reward_runs_treated` and `reward_positive_treated` are the learner's own
-/// third; the control fields are the coin third, and `chosen_by_*` what the
-/// learner's third took.
+/// quarter; the control fields are the coin quarter, and `chosen_by_*` what
+/// the learner's quarter took.
 #[derive(Serialize, Debug, Clone)]
 pub struct ArmSelectorLearnerStats {
     pub treated_runs: u64,
@@ -4522,12 +4575,14 @@ impl ArmSelectorLearnerStats {
 
 /// The arm selector block. The top-level fields are the first learner's,
 /// the one trained on the overtaken-ghost reward, and repeat under
-/// `overtaken_ghost`; the second learner's are under `absorber_cycle`.
-/// `ghost_signal` and `either_shape` are read on the coin third and train
-/// nothing. `observations` counts every run the selector observed, over
-/// all three thirds; `reward_runs_by_arm` and `reward_positive_by_arm`
-/// split the first learner's reward over those runs by campaign arm, slot
-/// `arm_index + 1`, so a young arm's rate can be read against a mature one.
+/// `overtaken_ghost`; the second learner's are under `absorber_cycle` and
+/// the third's under `cycle_before_request`. `ghost_signal`,
+/// `either_shape`, `mutual_absorber_cycle` and `exchange_before_request`
+/// are read on the coin quarter and train nothing. `observations` counts every
+/// run the selector observed, over all four quarters; `reward_runs_by_arm`
+/// and `reward_positive_by_arm` split the first learner's reward over those
+/// runs by campaign arm, slot `arm_index + 1`, so a young arm's rate can be
+/// read against a mature one.
 #[derive(Serialize, Debug, Clone)]
 pub struct ArmSelectorAxisStats {
     pub treated_runs: u64,
@@ -4553,8 +4608,11 @@ pub struct ArmSelectorAxisStats {
     pub control_reward_positive_by_combination: Vec<u64>,
     pub overtaken_ghost: ArmSelectorLearnerStats,
     pub absorber_cycle: ArmSelectorLearnerStats,
+    pub cycle_before_request: ArmSelectorLearnerStats,
     pub ghost_signal: ArmSelectorRewardStats,
     pub either_shape: ArmSelectorRewardStats,
+    pub mutual_absorber_cycle: ArmSelectorRewardStats,
+    pub exchange_before_request: ArmSelectorRewardStats,
 }
 
 impl ArmSelectorAxisStats {
@@ -4587,8 +4645,11 @@ impl ArmSelectorAxisStats {
                 .clone(),
             overtaken_ghost: a,
             absorber_cycle: ArmSelectorLearnerStats::read(Reward::AbsorberCycle),
+            cycle_before_request: ArmSelectorLearnerStats::read(Reward::CycleBeforeRequest),
             ghost_signal: ArmSelectorRewardStats::read(Reward::GhostSignal),
             either_shape: ArmSelectorRewardStats::read(Reward::EitherShape),
+            mutual_absorber_cycle: ArmSelectorRewardStats::read(Reward::MutualAbsorberCycle),
+            exchange_before_request: ArmSelectorRewardStats::read(Reward::ExchangeBeforeRequest),
         }
     }
 }

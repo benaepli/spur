@@ -3,16 +3,16 @@
 //!
 //! Every run carries one direction on each of five mechanism axes (the
 //! `ArmSet`). The runs that are not probes of either kind are split by id
-//! under a salt of their own into three thirds. The coin third takes the
-//! directions the run id's coins name. Each of the other two thirds is
+//! under a salt of their own into four quarters. The coin quarter takes the
+//! directions the run id's coins name. Each of the other three quarters is
 //! steered by one learner: one discounted Beta posterior per direction is
 //! kept for every cell, a cell being one campaign arm at one configuration,
 //! and the treated run picks each axis independently, a direction with
 //! probability proportional to the coin's share of that direction times
 //! its posterior mean, so with equal posteriors the expected share of every
 //! direction is the coin's, and a learner departs from the coins only on
-//! evidence. Nothing is drawn from the posteriors: the coin third, which
-//! both learners observe, supplies the exploration. Each direction's prior
+//! evidence. Nothing is drawn from the posteriors: the coin quarter, which
+//! every learner observes, supplies the exploration. Each direction's prior
 //! is shrunk toward the cell's own discounted reward rate with the warmup
 //! count as its weight, so a direction the cell has rarely carried sits
 //! near the cell's rate, not near one half. A cell below its warmup count
@@ -20,14 +20,14 @@
 //!
 //! Each learner has a reward of its own, a per-run bool the scheduler sets
 //! when the run reached the shape the learner is after. A learner observes
-//! the coin third and its own third, credited to the five directions the
-//! run carried, and never the other learner's third, so the two learners
-//! are read against one common control. Two further rewards are read on the
-//! coin third for calibration and steer nothing.
+//! the coin quarter and its own quarter, credited to the five directions
+//! the run carried, and never another learner's quarter, so the three
+//! learners are read against one common control. Further rewards are read
+//! on the coin quarter for calibration and steer nothing.
 //!
 //! The selector's own draws come from a generator seeded from the run's
 //! schedule seed under a salt of its own, so the run's schedule stream is
-//! untouched and a coin-third run draws exactly what it would without the
+//! untouched and a coin-quarter run draws exactly what it would without the
 //! selector. A treated run's arm set depends on the learner's state at draw
 //! time, so it is not a function of the run id alone; the run's tag records
 //! the arms it ran under and which learner drew them.
@@ -44,7 +44,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use std::sync::LazyLock;
 
-/// Salt for the three thirds. Distinct from every other split of a session.
+/// Salt for the four quarters. Distinct from every other split of a session.
 pub const SELECTOR_SALT: u64 = 0x_4152_4D53_454C_4354; // "ARMSELCT"
 
 /// Salt for the selector's own generator, derived per run from the schedule
@@ -53,7 +53,7 @@ const DRAW_SALT: u64 = 0x_4152_4D44_5241_5753; // "ARMDRAWS"
 
 /// Per-observation discount on the posteriors of the directions a run
 /// carried, so a cell follows its recent reward rate rather than its whole
-/// history. Both rewards are rare, so the window is about five hundred
+/// history. Every reward is rare, so the window is about five hundred
 /// observations per cell.
 pub const DISCOUNT: f64 = 0.998;
 
@@ -65,7 +65,7 @@ pub const WARMUP_OBSERVATIONS: u64 = 24;
 /// attributed to.
 pub type Cell = (i32, i32);
 
-/// The two learners, each steering one third of the runs.
+/// The three learners, each steering one quarter of the runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Learner {
     /// Rewarded when a message from a dead incarnation of a restarted sender
@@ -76,15 +76,24 @@ pub enum Learner {
     /// fault-crossing delivery, recovers, and then takes a message from
     /// another restarted node's current incarnation.
     AbsorberCycle,
+    /// Rewarded when the absorber cycle closed before the first message
+    /// entry caused by a client operation invoked after the run's first
+    /// crash reached a server.
+    CycleBeforeRequest,
 }
 
 impl Learner {
-    pub const ALL: [Learner; 2] = [Learner::OvertakenGhost, Learner::AbsorberCycle];
+    pub const ALL: [Learner; 3] = [
+        Learner::OvertakenGhost,
+        Learner::AbsorberCycle,
+        Learner::CycleBeforeRequest,
+    ];
 
     fn index(self) -> usize {
         match self {
             Learner::OvertakenGhost => 0,
             Learner::AbsorberCycle => 1,
+            Learner::CycleBeforeRequest => 2,
         }
     }
 
@@ -93,37 +102,39 @@ impl Learner {
         match self {
             Learner::OvertakenGhost => Reward::OvertakenGhost,
             Learner::AbsorberCycle => Reward::AbsorberCycle,
+            Learner::CycleBeforeRequest => Reward::CycleBeforeRequest,
         }
     }
 }
 
-/// Which third a run falls in: the coin third, or the third one learner
-/// steers.
+/// Which quarter a run falls in: the coin quarter, or the quarter one
+/// learner steers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Third {
+pub enum Quarter {
     Coin,
     Learned(Learner),
 }
 
-/// The run's third, or None for a probe of either kind: run-cap probes
+/// The run's quarter, or None for a probe of either kind: run-cap probes
 /// feed the length learners and timer-context probes must run unsteered,
 /// so neither is steered nor observed.
-pub fn third(run_id: i64) -> Option<Third> {
+pub fn quarter(run_id: i64) -> Option<Quarter> {
     if run_cap::is_probe(run_id) || timer_context::run_mode(run_id) == timer_context::RunMode::Probe
     {
         return None;
     }
-    Some(match run_phase::salted_phase(run_id, SELECTOR_SALT, 3) {
-        0 => Third::Coin,
-        1 => Third::Learned(Learner::OvertakenGhost),
-        _ => Third::Learned(Learner::AbsorberCycle),
+    Some(match run_phase::salted_phase(run_id, SELECTOR_SALT, 4) {
+        0 => Quarter::Coin,
+        1 => Quarter::Learned(Learner::OvertakenGhost),
+        2 => Quarter::Learned(Learner::AbsorberCycle),
+        _ => Quarter::Learned(Learner::CycleBeforeRequest),
     })
 }
 
 /// The learner that steers this run, if any.
 pub fn learner(run_id: i64) -> Option<Learner> {
-    match third(run_id) {
-        Some(Third::Learned(l)) => Some(l),
+    match quarter(run_id) {
+        Some(Quarter::Learned(l)) => Some(l),
         _ => None,
     }
 }
@@ -138,10 +149,16 @@ pub fn is_treated(run_id: i64) -> bool {
 pub struct Rewards {
     pub overtaken_ghost: bool,
     pub absorber_cycle: bool,
+    pub mutual_absorber_cycle: bool,
     /// Whether the run's ghost signal fired, or None on a run whose prefix
     /// replays a recorded tape: the signal is then the parent's, not the
     /// arms', and the run is not read for it.
     pub ghost_signal: Option<bool>,
+    pub cycle_before_request: bool,
+    pub exchange_before_request: bool,
+    /// The step of the first message entry at a server caused by a
+    /// post-fault client operation, when the run had one.
+    pub first_post_fault_request_entry_step: Option<i32>,
 }
 
 /// One cell's learner state.
@@ -206,7 +223,7 @@ impl CellLearner {
 
     /// Pick one direction of axis `a` with probability proportional to the
     /// coin share times the posterior mean. No value is drawn from the
-    /// posterior: the coin third supplies the exploration, so a treated run
+    /// posterior: the coin quarter supplies the exploration, so a treated run
     /// exploits what the cell has learned, and the generator serves the
     /// categorical pick only.
     fn sample_axis(&self, a: usize, rng: &mut SmallRng) -> usize {
@@ -243,10 +260,13 @@ impl CellLearner {
     }
 }
 
-static CELLS: [LazyLock<DashMap<Cell, CellLearner>>; 2] =
-    [LazyLock::new(DashMap::new), LazyLock::new(DashMap::new)];
+static CELLS: [LazyLock<DashMap<Cell, CellLearner>>; 3] = [
+    LazyLock::new(DashMap::new),
+    LazyLock::new(DashMap::new),
+    LazyLock::new(DashMap::new),
+];
 
-/// The arm set a run takes. A coin-third run or a probe takes its coins; a
+/// The arm set a run takes. A coin-quarter run or a probe takes its coins; a
 /// treated run draws from its learner's cell once the cell is past warmup.
 /// The draw reads nothing from the run's schedule stream.
 pub fn choose(run_id: i64, schedule_seed: u64, cell: Cell) -> ArmSet {
@@ -290,23 +310,26 @@ fn credit(learner: Learner, cell: Cell, arms: &ArmSet, reward: bool) {
         .credit(arms, reward);
 }
 
-/// Fold one finished run into the learners that may see it: a coin-third
-/// run into both, a treated run into its own learner only, a probe into
-/// neither. The coin third is also where every reward's rate per direction
-/// is read.
+/// Fold one finished run into the learners that may see it: a coin-quarter
+/// run into every learner, a treated run into its own learner only, a
+/// probe into none. The coin quarter is also where every reward's rate per
+/// direction, and the step of the first request-caused entry, are read.
 pub fn observe(cell: Cell, run_id: i64, arms: &ArmSet, rewards: &Rewards) {
-    let Some(third) = third(run_id) else {
+    let Some(quarter) = quarter(run_id) else {
         return;
     };
     let value = |reward: Reward| match reward {
         Reward::OvertakenGhost => Some(rewards.overtaken_ghost),
         Reward::AbsorberCycle => Some(rewards.absorber_cycle),
+        Reward::MutualAbsorberCycle => Some(rewards.mutual_absorber_cycle),
         Reward::GhostSignal => rewards.ghost_signal,
         Reward::EitherShape => Some(rewards.overtaken_ghost || rewards.absorber_cycle),
+        Reward::CycleBeforeRequest => Some(rewards.cycle_before_request),
+        Reward::ExchangeBeforeRequest => Some(rewards.exchange_before_request),
     };
     util_stats::record_arm_selector_run_observed(cell.0, rewards.overtaken_ghost);
-    match third {
-        Third::Coin => {
+    match quarter {
+        Quarter::Coin => {
             for learner in Learner::ALL {
                 credit(learner, cell, arms, rewards_of(learner, rewards));
             }
@@ -315,8 +338,11 @@ pub fn observe(cell: Cell, run_id: i64, arms: &ArmSet, rewards: &Rewards) {
                     util_stats::record_arm_selector_observation(reward, false, arms, r);
                 }
             }
+            if let Some(step) = rewards.first_post_fault_request_entry_step {
+                util_stats::record_client_anchor_first_post_fault_entry(arms, step);
+            }
         }
-        Third::Learned(learner) => {
+        Quarter::Learned(learner) => {
             let r = rewards_of(learner, rewards);
             credit(learner, cell, arms, r);
             util_stats::record_arm_selector_observation(learner.reward(), true, arms, r);
@@ -328,6 +354,7 @@ fn rewards_of(learner: Learner, rewards: &Rewards) -> bool {
     match learner {
         Learner::OvertakenGhost => rewards.overtaken_ghost,
         Learner::AbsorberCycle => rewards.absorber_cycle,
+        Learner::CycleBeforeRequest => rewards.cycle_before_request,
     }
 }
 
@@ -374,11 +401,11 @@ mod tests {
     impl StreamRng for CountingRng {}
 
     fn id_where(pred: impl Fn(i64) -> bool) -> i64 {
-        (0..1_000_000i64).find(|&id| pred(id)).expect("every third is reachable")
+        (0..1_000_000i64).find(|&id| pred(id)).expect("every quarter is reachable")
     }
 
     fn coin_id() -> i64 {
-        id_where(|id| third(id) == Some(Third::Coin))
+        id_where(|id| quarter(id) == Some(Quarter::Coin))
     }
 
     fn learned_id(l: Learner) -> i64 {
@@ -390,54 +417,61 @@ mod tests {
             overtaken_ghost,
             absorber_cycle,
             ghost_signal: Some(false),
+            ..Rewards::default()
         }
     }
 
-    /// Feed `n` coin-third observations of `arms` with both rewards set to
-    /// `reward`.
+    /// Feed `n` coin-quarter observations of `arms` with every learner's
+    /// reward set to `reward`.
     fn feed(cell: Cell, n: usize, arms: &ArmSet, reward: bool) {
         let id = coin_id();
         for _ in 0..n {
-            observe(cell, id, arms, &rewarded(reward, reward));
+            observe(
+                cell,
+                id,
+                arms,
+                &Rewards {
+                    cycle_before_request: reward,
+                    ..rewarded(reward, reward)
+                },
+            );
         }
     }
 
     #[test]
-    fn the_thirds_partition_the_unprobed_ids_and_spare_every_probe() {
+    fn the_quarters_partition_the_unprobed_ids_and_spare_every_probe() {
         let n = 64_000i64;
-        let mut counts = [0i64; 3];
+        let mut counts = [0i64; 4];
         for id in 0..n {
             let probe = run_cap::is_probe(id)
                 || timer_context::run_mode(id) == timer_context::RunMode::Probe;
-            match third(id) {
-                None => assert!(probe, "run {id}: an unprobed run has no third"),
-                Some(t) => {
-                    assert!(!probe, "run {id}: a probe has a third");
-                    counts[match t {
-                        Third::Coin => 0,
-                        Third::Learned(Learner::OvertakenGhost) => 1,
-                        Third::Learned(Learner::AbsorberCycle) => 2,
+            match quarter(id) {
+                None => assert!(probe, "run {id}: an unprobed run has no quarter"),
+                Some(q) => {
+                    assert!(!probe, "run {id}: a probe has a quarter");
+                    counts[match q {
+                        Quarter::Coin => 0,
+                        Quarter::Learned(l) => 1 + l.index(),
                     }] += 1;
                 }
             }
             assert_eq!(is_treated(id), learner(id).is_some());
-            assert_eq!(
-                learner(id) == Some(Learner::OvertakenGhost),
-                third(id) == Some(Third::Learned(Learner::OvertakenGhost))
-            );
+            for l in Learner::ALL {
+                assert_eq!(learner(id) == Some(l), quarter(id) == Some(Quarter::Learned(l)));
+            }
         }
         let unprobed: i64 = counts.iter().sum();
         assert!(unprobed > 50_000, "unprobed {unprobed} of {n}");
         for (i, c) in counts.iter().enumerate() {
             let share = *c as f64 / unprobed as f64;
-            assert!((share - 1.0 / 3.0).abs() < 0.02, "third {i} holds {share}");
+            assert!((share - 0.25).abs() < 0.02, "quarter {i} holds {share}");
         }
-        let treated = counts[1] + counts[2];
-        assert!(treated > 20_000 && treated < 50_000, "treated {treated} of {n}");
+        let treated = counts[1] + counts[2] + counts[3];
+        assert!(treated > 30_000 && treated < 56_000, "treated {treated} of {n}");
     }
 
     #[test]
-    fn no_third_touches_the_schedule_stream_and_the_draw_is_reproducible() {
+    fn no_quarter_touches_the_schedule_stream_and_the_draw_is_reproducible() {
         let _serial = config_override::exclusive_session();
         fault_timing::reset();
         reset();
@@ -445,6 +479,7 @@ mod tests {
         let coin = coin_id();
         let a = learned_id(Learner::OvertakenGhost);
         let b = learned_id(Learner::AbsorberCycle);
+        let c = learned_id(Learner::CycleBeforeRequest);
         let schedule = CountingRng {
             inner: SmallRng::seed_from_u64(1),
             draws: 0,
@@ -452,49 +487,56 @@ mod tests {
         assert_eq!(choose(coin, 5, cell), ArmSet::coins(coin));
         assert_eq!(choose(a, 5, cell), ArmSet::coins(a), "below warmup: coins");
         assert_eq!(choose(b, 5, cell), ArmSet::coins(b), "below warmup: coins");
+        assert_eq!(choose(c, 5, cell), ArmSet::coins(c), "below warmup: coins");
         feed(cell, WARMUP_OBSERVATIONS as usize, &ArmSet::default(), false);
         let first = choose(a, 5, cell);
         assert_eq!(choose(a, 5, cell), first, "the same seed and state draw alike");
         let first_b = choose(b, 5, cell);
         assert_eq!(choose(b, 5, cell), first_b, "the same seed and state draw alike");
+        let first_c = choose(c, 5, cell);
+        assert_eq!(choose(c, 5, cell), first_c, "the same seed and state draw alike");
         assert_eq!(choose(coin, 5, cell), ArmSet::coins(coin));
         assert_eq!(schedule.draws, 0, "the selector must not read the run's stream");
         reset();
     }
 
     #[test]
-    fn each_learner_sees_the_coin_third_and_its_own_third_only() {
+    fn each_learner_sees_the_coin_quarter_and_its_own_quarter_only() {
         let _serial = config_override::exclusive_session();
         fault_timing::reset();
         reset();
         let cell = (4, 4);
-        let a = learned_id(Learner::OvertakenGhost);
-        let b = learned_id(Learner::AbsorberCycle);
         let arms = ArmSet::default();
-        // Treated runs of learner B never reach learner A's cell, and a
-        // coin-third run reaches both.
-        for _ in 0..WARMUP_OBSERVATIONS {
-            observe(cell, b, &arms, &rewarded(true, true));
+        let observations =
+            |l: Learner| CELLS[l.index()].get(&cell).map_or(0, |state| state.observations);
+        // A learner's treated runs reach its own cell and no other's.
+        for l in Learner::ALL {
+            let id = learned_id(l);
+            for _ in 0..WARMUP_OBSERVATIONS {
+                observe(cell, id, &arms, &rewarded(true, true));
+            }
+            for other in Learner::ALL {
+                let want = if other.index() <= l.index() { WARMUP_OBSERVATIONS } else { 0 };
+                assert_eq!(observations(other), want, "{other:?} after {l:?}'s quarter");
+            }
         }
-        assert!(CELLS[0].get(&cell).is_none(), "learner A saw learner B's third");
-        assert_eq!(CELLS[1].get(&cell).unwrap().observations, WARMUP_OBSERVATIONS);
-        for _ in 0..WARMUP_OBSERVATIONS {
-            observe(cell, a, &arms, &rewarded(true, true));
-        }
-        assert_eq!(CELLS[0].get(&cell).unwrap().observations, WARMUP_OBSERVATIONS);
-        assert_eq!(CELLS[1].get(&cell).unwrap().observations, WARMUP_OBSERVATIONS);
+        // A coin-quarter run reaches every learner.
         observe(cell, coin_id(), &arms, &rewarded(true, false));
-        assert_eq!(CELLS[0].get(&cell).unwrap().observations, WARMUP_OBSERVATIONS + 1);
-        assert_eq!(CELLS[1].get(&cell).unwrap().observations, WARMUP_OBSERVATIONS + 1);
+        for l in Learner::ALL {
+            assert_eq!(observations(l), WARMUP_OBSERVATIONS + 1, "{l:?} after a coin run");
+        }
         // Each learner is credited with its own reward: the coin run above
-        // rewarded A and not B.
+        // rewarded A and neither B nor C.
         let d = arms.directions()[0];
-        assert!(CELLS[0].get(&cell).unwrap().alpha[d] > CELLS[1].get(&cell).unwrap().alpha[d]);
-        // A probe is observed by neither.
+        let alpha = |l: Learner| CELLS[l.index()].get(&cell).unwrap().alpha[d];
+        assert!(alpha(Learner::OvertakenGhost) > alpha(Learner::AbsorberCycle));
+        assert!(alpha(Learner::OvertakenGhost) > alpha(Learner::CycleBeforeRequest));
+        // A probe is observed by none.
         let probe = id_where(run_cap::is_probe);
         observe(cell, probe, &arms, &rewarded(true, true));
-        assert_eq!(CELLS[0].get(&cell).unwrap().observations, WARMUP_OBSERVATIONS + 1);
-        assert_eq!(CELLS[1].get(&cell).unwrap().observations, WARMUP_OBSERVATIONS + 1);
+        for l in Learner::ALL {
+            assert_eq!(observations(l), WARMUP_OBSERVATIONS + 1, "{l:?} after a probe");
+        }
         reset();
     }
 
@@ -547,7 +589,7 @@ mod tests {
 
         // Reward only runs that took stock crashes and the rush: the cell's
         // posteriors then favour those directions over the coin. Learner A
-        // is rewarded on its own reward only, so learner B's third stays
+        // is rewarded on its own reward only, so learner B's quarter stays
         // at the coins.
         reset();
         let rewarded_arms = ArmSet {
@@ -566,9 +608,9 @@ mod tests {
             };
             observe(cell, coin_id(), &arms, &rewarded(i % 2 == 0, i % 4 == 1));
         }
-        let mut stock = [0usize; 2];
-        let mut rush = [0usize; 2];
-        let mut m = [0usize; 2];
+        let mut stock = [0usize; 3];
+        let mut rush = [0usize; 3];
+        let mut m = [0usize; 3];
         for id in 0..100_000i64 {
             let Some(l) = learner(id) else { continue };
             let arms = choose(id, 11, cell);
@@ -632,26 +674,84 @@ mod tests {
     }
 
     #[test]
-    fn the_rewards_are_counted_on_the_third_they_came_from() {
+    fn the_rewards_are_counted_on_the_quarter_they_came_from() {
         let _serial = config_override::exclusive_session();
         util_stats::set_enabled(true);
         reset();
         let cell = (2, 2);
-        let before = util_stats::snapshot().arm_selector_axis;
+        let before = util_stats::snapshot();
         let arms = ArmSet::from_index(COMBINATIONS - 1);
         let coin = coin_id();
         let a = learned_id(Learner::OvertakenGhost);
         let b = learned_id(Learner::AbsorberCycle);
+        let c = learned_id(Learner::CycleBeforeRequest);
         observe(cell, coin, &arms, &rewarded(true, false));
-        observe(cell, coin, &arms, &Rewards { ghost_signal: Some(true), ..rewarded(false, true) });
+        observe(
+            cell,
+            coin,
+            &arms,
+            &Rewards {
+                ghost_signal: Some(true),
+                mutual_absorber_cycle: true,
+                cycle_before_request: true,
+                first_post_fault_request_entry_step: Some(40),
+                ..rewarded(false, true)
+            },
+        );
         // A replay child is not read for the ghost signal.
-        observe(cell, coin, &arms, &Rewards { ghost_signal: None, ..rewarded(false, false) });
+        observe(
+            cell,
+            coin,
+            &arms,
+            &Rewards {
+                ghost_signal: None,
+                exchange_before_request: true,
+                first_post_fault_request_entry_step: Some(10),
+                ..rewarded(false, false)
+            },
+        );
         observe(cell, a, &arms, &rewarded(true, true));
         observe(cell, b, &arms, &rewarded(true, true));
         observe(cell, b, &arms, &rewarded(false, false));
-        let after = util_stats::snapshot().arm_selector_axis;
+        // A treated run's request entry step is not read.
+        observe(
+            cell,
+            c,
+            &arms,
+            &Rewards {
+                mutual_absorber_cycle: true,
+                cycle_before_request: true,
+                first_post_fault_request_entry_step: Some(99),
+                ..rewarded(true, true)
+            },
+        );
+        observe(cell, c, &arms, &rewarded(true, true));
+        let snapshot = util_stats::snapshot();
         util_stats::set_enabled(false);
-        assert_eq!(after.observations - before.observations, 6);
+        let after = snapshot.arm_selector_axis;
+        let entry = &snapshot.client_anchor.first_post_fault_entry;
+        let entry0 = &before.client_anchor.first_post_fault_entry;
+        let before = before.arm_selector_axis;
+        for d in arms.directions() {
+            assert_eq!(entry.runs[d] - entry0.runs[d], 2);
+            assert_eq!(entry.steps_sum[d] - entry0.steps_sum[d], 50);
+        }
+        let cr = &after.cycle_before_request;
+        let cr0 = &before.cycle_before_request;
+        assert_eq!(cr.reward_runs_control - cr0.reward_runs_control, 3);
+        assert_eq!(cr.reward_positive_control - cr0.reward_positive_control, 1);
+        assert_eq!(cr.reward_runs_treated - cr0.reward_runs_treated, 2);
+        assert_eq!(cr.reward_positive_treated - cr0.reward_positive_treated, 1);
+        assert_eq!(cr.cells, 1);
+        let mc = &after.mutual_absorber_cycle;
+        let mc0 = &before.mutual_absorber_cycle;
+        assert_eq!(mc.reward_runs_control - mc0.reward_runs_control, 3);
+        assert_eq!(mc.reward_positive_control - mc0.reward_positive_control, 1);
+        let er = &after.exchange_before_request;
+        let er0 = &before.exchange_before_request;
+        assert_eq!(er.reward_runs_control - er0.reward_runs_control, 3);
+        assert_eq!(er.reward_positive_control - er0.reward_positive_control, 1);
+        assert_eq!(after.observations - before.observations, 8);
         // Learner A at the top level and under its reward name.
         assert_eq!(after.reward_runs_control - before.reward_runs_control, 3);
         assert_eq!(after.reward_positive_control - before.reward_positive_control, 1);
@@ -679,8 +779,8 @@ mod tests {
         assert_eq!(es.reward_positive_control - es0.reward_positive_control, 2);
         assert_eq!(after.cells, 1);
         assert_eq!(after.absorber_cycle.cells, 1);
-        assert_eq!(after.reward_runs_by_arm[3] - before.reward_runs_by_arm[3], 6);
-        assert_eq!(after.reward_positive_by_arm[3] - before.reward_positive_by_arm[3], 3);
+        assert_eq!(after.reward_runs_by_arm[3] - before.reward_runs_by_arm[3], 8);
+        assert_eq!(after.reward_positive_by_arm[3] - before.reward_positive_by_arm[3], 5);
         assert_eq!(
             after.control_runs_by_combination[COMBINATIONS - 1]
                 - before.control_runs_by_combination[COMBINATIONS - 1],
@@ -704,5 +804,6 @@ mod tests {
         reset();
         assert_eq!(util_stats::snapshot().arm_selector_axis.cells, 0);
         assert_eq!(util_stats::snapshot().arm_selector_axis.absorber_cycle.cells, 0);
+        assert_eq!(util_stats::snapshot().arm_selector_axis.cycle_before_request.cells, 0);
     }
 }

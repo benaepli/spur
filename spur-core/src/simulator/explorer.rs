@@ -1136,7 +1136,13 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &arm_selector::Rewards {
             overtaken_ghost: path_state.state.overtaken_ghost_acted,
             absorber_cycle: path_state.state.absorber_cycle_fresh_peer,
+            mutual_absorber_cycle: path_state.state.mutual_absorber_cycle,
             ghost_signal: (!replay_slot).then_some(path_state.state.replay_cut.is_some()),
+            cycle_before_request: path_state.state.cycle_before_request(),
+            exchange_before_request: path_state.state.exchange_before_request,
+            first_post_fault_request_entry_step: path_state
+                .state
+                .first_post_fault_request_entry_step,
         },
     );
 

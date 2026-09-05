@@ -16,7 +16,8 @@ use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, ArmSelectorAxisStats,
     ArmSelectorLearnerStats, ArmSelectorRewardStats, ClientAnchorArmRuns,
     ClientAnchorAxisStats, ClientAnchorCensusStats, ClientAnchorDistance,
-    ClientAnchorFirstDelivery, ClientAnchorHalfStats, ClientAnchorHeldHist,
+    ClientAnchorFirstDelivery, ClientAnchorFirstEntry, ClientAnchorHalfStats,
+    ClientAnchorHeldHist,
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
@@ -852,8 +853,11 @@ fn arm_selector_axis(m: &mut Marks) -> ArmSelectorAxisStats {
         control_reward_positive_by_combination: marks_vec(m, 72),
         overtaken_ghost: arm_selector_learner(m),
         absorber_cycle: arm_selector_learner(m),
+        cycle_before_request: arm_selector_learner(m),
         ghost_signal: arm_selector_reward(m),
         either_shape: arm_selector_reward(m),
+        mutual_absorber_cycle: arm_selector_reward(m),
+        exchange_before_request: arm_selector_reward(m),
     }
 }
 
@@ -970,8 +974,11 @@ fn arm_selector_axis_leaves(prefix: &str, a: &ArmSelectorAxisStats) -> Vec<(Stri
         control_reward_positive_by_combination,
         overtaken_ghost,
         absorber_cycle,
+        mutual_absorber_cycle,
         ghost_signal,
         either_shape,
+        cycle_before_request,
+        exchange_before_request,
     } = a;
     let mut out = vec![
         leaf(prefix, "treated_runs", *treated_runs),
@@ -1006,8 +1013,20 @@ fn arm_selector_axis_leaves(prefix: &str, a: &ArmSelectorAxisStats) -> Vec<(Stri
     ));
     out.extend(arm_selector_learner_leaves(&format!("{prefix}.overtaken_ghost"), overtaken_ghost));
     out.extend(arm_selector_learner_leaves(&format!("{prefix}.absorber_cycle"), absorber_cycle));
+    out.extend(arm_selector_learner_leaves(
+        &format!("{prefix}.cycle_before_request"),
+        cycle_before_request,
+    ));
     out.extend(arm_selector_reward_leaves(&format!("{prefix}.ghost_signal"), ghost_signal));
     out.extend(arm_selector_reward_leaves(&format!("{prefix}.either_shape"), either_shape));
+    out.extend(arm_selector_reward_leaves(
+        &format!("{prefix}.mutual_absorber_cycle"),
+        mutual_absorber_cycle,
+    ));
+    out.extend(arm_selector_reward_leaves(
+        &format!("{prefix}.exchange_before_request"),
+        exchange_before_request,
+    ));
     out
 }
 
@@ -1216,6 +1235,10 @@ fn client_anchor(m: &mut Marks) -> ClientAnchorStats {
                 },
             },
         },
+        first_post_fault_entry: ClientAnchorFirstEntry {
+            runs: marks_vec(m, 12),
+            steps_sum: marks_vec(m, 12),
+        },
     }
 }
 
@@ -1241,6 +1264,7 @@ fn client_anchor_leaves(prefix: &str, c: &ClientAnchorStats) -> Vec<(String, Val
         hold_steps_sum,
         census,
         axis,
+        first_post_fault_entry,
     } = c;
     let ClientAnchorReleaseStats { expiry, dry_queue } = released;
     let ClientAnchorHeldHist {
@@ -1293,6 +1317,10 @@ fn client_anchor_leaves(prefix: &str, c: &ClientAnchorStats) -> Vec<(String, Val
     out.extend(client_anchor_distance_leaves(&format!("{d}.hold"), hold_distance));
     out.extend(client_anchor_distance_leaves(&format!("{d}.rush"), rush_distance));
     out.extend(client_anchor_distance_leaves(&format!("{d}.stock"), stock_distance));
+    let ClientAnchorFirstEntry { runs, steps_sum } = first_post_fault_entry;
+    let e = format!("{prefix}.first_post_fault_entry");
+    out.extend(vec_leaves(&e, "runs", runs));
+    out.extend(vec_leaves(&e, "steps_sum", steps_sum));
     out
 }
 

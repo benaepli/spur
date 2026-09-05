@@ -17,7 +17,7 @@
 //! an `ArmSet`. On most runs the arm set is the one the run id's coins name;
 //! a run the arm selector treats takes a learned arm set instead, and its
 //! tag carries the chosen bits plus the bit of the learner that drew them,
-//! `ARM_SELECTOR_AXIS` or `ARM_SELECTOR_AXIS_B`.
+//! `ARM_SELECTOR_AXIS`, `ARM_SELECTOR_AXIS_B` or `ARM_SELECTOR_AXIS_C`.
 
 use crate::simulator::arm_selector;
 use crate::simulator::client_anchor;
@@ -78,8 +78,12 @@ pub const FRESH_FIRST_PAIR: i32 = 1 << 24;
 /// arms.
 pub const ARM_SELECTOR_AXIS: i32 = 1 << 6;
 /// As `ARM_SELECTOR_AXIS`, for the selector's second learner. A run carries
-/// at most one of the two.
+/// at most one of the three learner bits.
 pub const ARM_SELECTOR_AXIS_B: i32 = 1 << 5;
+/// As `ARM_SELECTOR_AXIS`, for the selector's third learner.
+pub const ARM_SELECTOR_AXIS_C: i32 = 1 << 7;
+/// Every learner's bit.
+pub const ARM_SELECTOR_BITS: i32 = ARM_SELECTOR_AXIS | ARM_SELECTOR_AXIS_B | ARM_SELECTOR_AXIS_C;
 
 /// The direction a run takes on the crash-timing axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -272,12 +276,13 @@ pub fn selector_bit(run_id: i64) -> i32 {
     match arm_selector::learner(run_id) {
         Some(arm_selector::Learner::OvertakenGhost) => ARM_SELECTOR_AXIS,
         Some(arm_selector::Learner::AbsorberCycle) => ARM_SELECTOR_AXIS_B,
+        Some(arm_selector::Learner::CycleBeforeRequest) => ARM_SELECTOR_AXIS_C,
         None => 0,
     }
 }
 
-/// The bits that name a run's probe roles and its selector third, all pure
-/// functions of the run id.
+/// The bits that name a run's probe roles and its selector quarter, all
+/// pure functions of the run id.
 pub fn probe_bits(run_id: i64) -> i32 {
     let mut v = 0;
     if run_cap::is_probe(run_id) {
@@ -297,7 +302,7 @@ pub fn of(run_id: i64, arms: &ArmSet, crash_hold_drawn: bool) -> i32 {
 
 /// The bits the run id's coins alone would name, read straight from each
 /// mechanism's own coin. A run under its coin arm set carries exactly these
-/// bits plus its selector half.
+/// bits plus its selector bit.
 pub fn from_run_id(run_id: i64) -> i32 {
     let mut v = 0;
     if fault_timing::is_placed(run_id) {
@@ -390,7 +395,7 @@ mod tests {
         let _serial = config_override::exclusive_session();
         fault_timing::reset();
         let mut treated = 0i64;
-        let mut by_bit = [0i64; 2];
+        let mut by_bit = [0i64; 3];
         for id in -32_000..32_000i64 {
             let coins = ArmSet::coins(id);
             assert_eq!(coins.placed(), fault_timing::is_placed(id), "run {id}: placed");
@@ -406,10 +411,9 @@ mod tests {
             let tag = of(id, &coins, false);
             let third = selector_bit(id);
             assert_eq!(tag, from_run_id(id) | third, "run {id}: tag");
-            assert_ne!(
-                tag & (ARM_SELECTOR_AXIS | ARM_SELECTOR_AXIS_B),
-                ARM_SELECTOR_AXIS | ARM_SELECTOR_AXIS_B,
-                "run {id}: a run carries both learners' bits"
+            assert!(
+                (tag & ARM_SELECTOR_BITS).count_ones() <= 1,
+                "run {id}: a run carries two learners' bits"
             );
             assert_eq!(
                 tag & ARM_SELECTOR_AXIS != 0,
@@ -421,6 +425,11 @@ mod tests {
                 arm_selector::learner(id) == Some(arm_selector::Learner::AbsorberCycle),
                 "run {id}: the second learner's bit"
             );
+            assert_eq!(
+                tag & ARM_SELECTOR_AXIS_C != 0,
+                arm_selector::learner(id) == Some(arm_selector::Learner::CycleBeforeRequest),
+                "run {id}: the third learner's bit"
+            );
             assert_eq!(ArmSet::from_index(coins.index()), coins, "run {id}: index round trip");
             let probe = run_cap::is_probe(id)
                 || timer_context::run_mode(id) == timer_context::RunMode::Probe;
@@ -430,9 +439,13 @@ mod tests {
             treated += (third != 0) as i64;
             by_bit[0] += (third == ARM_SELECTOR_AXIS) as i64;
             by_bit[1] += (third == ARM_SELECTOR_AXIS_B) as i64;
+            by_bit[2] += (third == ARM_SELECTOR_AXIS_C) as i64;
         }
-        assert!(treated > 30_000 && treated < 50_000, "the selector split leaves no contrast");
-        assert!(by_bit[0] > 15_000 && by_bit[1] > 15_000, "a learner's third is empty {by_bit:?}");
+        assert!(treated > 36_000 && treated < 56_000, "the selector split leaves no contrast");
+        assert!(
+            by_bit.iter().all(|&n| n > 11_000),
+            "a learner's quarter is empty {by_bit:?}"
+        );
     }
 
     #[test]

@@ -256,6 +256,11 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
     if post_fault {
         let op_id = *op_id_counter;
         let step = path_state.state.crash_info.current_step;
+        path_state
+            .state
+            .client_anchor
+            .first_post_fault_op
+            .get_or_insert(op_id);
         if path_state.state.client_anchor.arm == client_anchor::Arm::Rush {
             path_state.state.client_anchor.rushed_ops.insert(op_id);
             util_stats::record_client_anchor_rush_op();

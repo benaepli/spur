@@ -1303,9 +1303,17 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                                 state.incarnation(record_dest) > 0,
                             );
                         }
-                        if state.fresh_peer_at_absorber(record_origin, r.origin_incarnation, record_dest)
+                        state.note_entry_at_absorber(
+                            record_origin,
+                            r.origin_incarnation,
+                            record_dest,
+                            entry_step,
+                        );
+                        let servers = topology.num_servers.max(0) as usize;
+                        if record_dest.index < servers
+                            && state.client_anchor.caused_post_fault(r.causal_operation_id)
                         {
-                            state.absorber_cycle_fresh_peer = true;
+                            state.note_post_fault_request_entry(record_dest.index, entry_step, servers);
                         }
                         state.fresh_first.note_entry(
                             record_dest.index,

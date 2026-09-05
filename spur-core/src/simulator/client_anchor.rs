@@ -136,11 +136,15 @@ pub fn fanout_window(ledgers: &[SendLedger], servers: usize, step: i32) -> bool 
 /// post-crash operation whose first delivery has not been counted yet, on
 /// all three directions, so the distance is comparable across them, and is
 /// filled only while the counters are on, since nothing else reads it.
+/// `first_post_fault_op` is the id of the first client operation invoked
+/// after the run's first crash; operation ids are assigned in increasing
+/// order, so every operation at or above it was invoked after that crash.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunState {
     pub arm: Arm,
     pub rushed_ops: HashSet<i32>,
     pub awaiting_delivery: HashMap<i32, i32>,
+    pub first_post_fault_op: Option<i32>,
 }
 
 impl RunState {
@@ -153,6 +157,15 @@ impl RunState {
     /// priority range.
     pub fn rushes(&self, causal_operation_id: Option<i32>) -> bool {
         causal_operation_id.is_some_and(|op| self.rushed_ops.contains(&op))
+    }
+
+    /// Whether a record caused by `causal_operation_id` was caused by a
+    /// client operation invoked after the run's first crash.
+    pub fn caused_post_fault(&self, causal_operation_id: Option<i32>) -> bool {
+        match (causal_operation_id, self.first_post_fault_op) {
+            (Some(op), Some(first)) => op >= first,
+            _ => false,
+        }
     }
 }
 
@@ -316,6 +329,17 @@ mod tests {
         assert!(st.rushes(Some(7)));
         assert!(!st.rushes(Some(8)));
         assert!(!st.rushes(None), "a record with no cause is never rushed");
+    }
+
+    #[test]
+    fn an_operation_at_or_above_the_first_post_fault_id_was_caused_post_fault() {
+        let mut st = RunState::default();
+        assert!(!st.caused_post_fault(Some(3)), "no crash has happened");
+        st.first_post_fault_op = Some(3);
+        assert!(!st.caused_post_fault(Some(2)));
+        assert!(st.caused_post_fault(Some(3)));
+        assert!(st.caused_post_fault(Some(9)));
+        assert!(!st.caused_post_fault(None), "a record with no cause was not caused by a request");
     }
 
     #[test]
