@@ -1106,8 +1106,8 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
 
     // The arms are drawn before the plan runs and read nothing from the
     // run's schedule stream.
-    let cell = (attribution.arm_index, attribution.config_index);
-    let choice = arm_selector::choose(run_id, schedule_seed, cell);
+    let cell = arm_selector::cell(attribution.arm_index, attribution.config_index);
+    let choice = arm_selector::choose(run_id, schedule_seed, attribution.arm_index, cell);
     let arms = choice.arms;
     let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
@@ -1132,6 +1132,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     // signal is not read on it.
     let replay_slot = attribution.variant_bits & run_variant::REPLAY_SLOT != 0;
     arm_selector::observe(
+        attribution.arm_index,
         cell,
         run_id,
         &choice,

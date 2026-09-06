@@ -14,7 +14,7 @@
 use serde_json::{Map, Value};
 use spur_core::simulator::util_stats::{
     self, AcceptanceDistanceBucket, AcceptanceDistanceStats, ArmSelectorAxisStats, ArmSelectorExploreStats,
-    ArmSelectorLearnerStats, ArmSelectorRewardStats, ClientAnchorArmRuns,
+    ArmSelectorLearnerStats, ArmSelectorPooledStats, ArmSelectorRewardStats, ClientAnchorArmRuns,
     ClientAnchorAxisStats, ClientAnchorCensusStats, ClientAnchorDistance,
     ClientAnchorFirstDelivery, ClientAnchorFirstEntry, ClientAnchorHalfStats,
     ClientAnchorHeldHist,
@@ -800,6 +800,8 @@ fn arm_selector_reward(m: &mut Marks) -> ArmSelectorRewardStats {
         reward_positive_control: m.int(),
         control_runs_by_direction: marks_vec(m, 12),
         control_reward_positive_by_direction: marks_vec(m, 12),
+        control_runs_by_arm_direction: marks_vec(m, 96),
+        control_reward_positive_by_arm_direction: marks_vec(m, 96),
         control_runs_by_combination: marks_vec(m, 72),
         control_reward_positive_by_combination: marks_vec(m, 72),
     }
@@ -821,6 +823,8 @@ fn arm_selector_learner(m: &mut Marks) -> ArmSelectorLearnerStats {
         leader_margin_micro: marks_vec(m, 5),
         control_runs_by_direction: marks_vec(m, 12),
         control_reward_positive_by_direction: marks_vec(m, 12),
+        control_runs_by_arm_direction: marks_vec(m, 96),
+        control_reward_positive_by_arm_direction: marks_vec(m, 96),
         chosen_by_combination: marks_vec(m, 72),
         control_runs_by_combination: marks_vec(m, 72),
         control_reward_positive_by_combination: marks_vec(m, 72),
@@ -839,7 +843,17 @@ fn arm_selector_explore(m: &mut Marks) -> ArmSelectorExploreStats {
         share_micro_by_learner: marks_vec(m, 3),
         draws_by_arm: marks_vec(m, 8),
         coin_runs_by_arm: marks_vec(m, 8),
+        margin_micro_by_arm: marks_vec(m, 8),
         share_hist: marks_vec(m, 10),
+    }
+}
+
+fn arm_selector_pooled(m: &mut Marks) -> ArmSelectorPooledStats {
+    ArmSelectorPooledStats {
+        draws: m.int(),
+        cells: m.int(),
+        cells_by_learner: marks_vec(m, 3),
+        observations_by_learner: marks_vec(m, 3),
     }
 }
 
@@ -862,10 +876,13 @@ fn arm_selector_axis(m: &mut Marks) -> ArmSelectorAxisStats {
         leader_margin_micro: marks_vec(m, 5),
         control_runs_by_direction: marks_vec(m, 12),
         control_reward_positive_by_direction: marks_vec(m, 12),
+        control_runs_by_arm_direction: marks_vec(m, 96),
+        control_reward_positive_by_arm_direction: marks_vec(m, 96),
         chosen_by_combination: marks_vec(m, 72),
         control_runs_by_combination: marks_vec(m, 72),
         control_reward_positive_by_combination: marks_vec(m, 72),
         explore: arm_selector_explore(m),
+        pooled: arm_selector_pooled(m),
         overtaken_ghost: arm_selector_learner(m),
         absorber_cycle: arm_selector_learner(m),
         cycle_before_request: arm_selector_learner(m),
@@ -890,6 +907,8 @@ fn arm_selector_reward_leaves(prefix: &str, r: &ArmSelectorRewardStats) -> Vec<(
         reward_positive_control,
         control_runs_by_direction,
         control_reward_positive_by_direction,
+        control_runs_by_arm_direction,
+        control_reward_positive_by_arm_direction,
         control_runs_by_combination,
         control_reward_positive_by_combination,
     } = r;
@@ -902,6 +921,12 @@ fn arm_selector_reward_leaves(prefix: &str, r: &ArmSelectorRewardStats) -> Vec<(
         prefix,
         "control_reward_positive_by_direction",
         control_reward_positive_by_direction,
+    ));
+    out.extend(vec_leaves(prefix, "control_runs_by_arm_direction", control_runs_by_arm_direction));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_arm_direction",
+        control_reward_positive_by_arm_direction,
     ));
     out.extend(vec_leaves(prefix, "control_runs_by_combination", control_runs_by_combination));
     out.extend(vec_leaves(
@@ -928,6 +953,8 @@ fn arm_selector_learner_leaves(prefix: &str, l: &ArmSelectorLearnerStats) -> Vec
         leader_margin_micro,
         control_runs_by_direction,
         control_reward_positive_by_direction,
+        control_runs_by_arm_direction,
+        control_reward_positive_by_arm_direction,
         chosen_by_combination,
         control_runs_by_combination,
         control_reward_positive_by_combination,
@@ -952,6 +979,12 @@ fn arm_selector_learner_leaves(prefix: &str, l: &ArmSelectorLearnerStats) -> Vec
         "control_reward_positive_by_direction",
         control_reward_positive_by_direction,
     ));
+    out.extend(vec_leaves(prefix, "control_runs_by_arm_direction", control_runs_by_arm_direction));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_arm_direction",
+        control_reward_positive_by_arm_direction,
+    ));
     out.extend(vec_leaves(prefix, "chosen_by_combination", chosen_by_combination));
     out.extend(vec_leaves(prefix, "control_runs_by_combination", control_runs_by_combination));
     out.extend(vec_leaves(
@@ -974,6 +1007,7 @@ fn arm_selector_explore_leaves(prefix: &str, e: &ArmSelectorExploreStats) -> Vec
         share_micro_by_learner,
         draws_by_arm,
         coin_runs_by_arm,
+        margin_micro_by_arm,
         share_hist,
     } = e;
     let mut out = vec![
@@ -988,7 +1022,21 @@ fn arm_selector_explore_leaves(prefix: &str, e: &ArmSelectorExploreStats) -> Vec
     out.extend(vec_leaves(prefix, "share_micro_by_learner", share_micro_by_learner));
     out.extend(vec_leaves(prefix, "draws_by_arm", draws_by_arm));
     out.extend(vec_leaves(prefix, "coin_runs_by_arm", coin_runs_by_arm));
+    out.extend(vec_leaves(prefix, "margin_micro_by_arm", margin_micro_by_arm));
     out.extend(vec_leaves(prefix, "share_hist", share_hist));
+    out
+}
+
+fn arm_selector_pooled_leaves(prefix: &str, p: &ArmSelectorPooledStats) -> Vec<(String, Value)> {
+    let ArmSelectorPooledStats {
+        draws,
+        cells,
+        cells_by_learner,
+        observations_by_learner,
+    } = p;
+    let mut out = vec![leaf(prefix, "draws", *draws), leaf(prefix, "cells", *cells)];
+    out.extend(vec_leaves(prefix, "cells_by_learner", cells_by_learner));
+    out.extend(vec_leaves(prefix, "observations_by_learner", observations_by_learner));
     out
 }
 
@@ -1011,10 +1059,13 @@ fn arm_selector_axis_leaves(prefix: &str, a: &ArmSelectorAxisStats) -> Vec<(Stri
         leader_margin_micro,
         control_runs_by_direction,
         control_reward_positive_by_direction,
+        control_runs_by_arm_direction,
+        control_reward_positive_by_arm_direction,
         chosen_by_combination,
         control_runs_by_combination,
         control_reward_positive_by_combination,
         explore,
+        pooled,
         overtaken_ghost,
         absorber_cycle,
         mutual_absorber_cycle,
@@ -1046,6 +1097,12 @@ fn arm_selector_axis_leaves(prefix: &str, a: &ArmSelectorAxisStats) -> Vec<(Stri
         "control_reward_positive_by_direction",
         control_reward_positive_by_direction,
     ));
+    out.extend(vec_leaves(prefix, "control_runs_by_arm_direction", control_runs_by_arm_direction));
+    out.extend(vec_leaves(
+        prefix,
+        "control_reward_positive_by_arm_direction",
+        control_reward_positive_by_arm_direction,
+    ));
     out.extend(vec_leaves(prefix, "chosen_by_combination", chosen_by_combination));
     out.extend(vec_leaves(prefix, "control_runs_by_combination", control_runs_by_combination));
     out.extend(vec_leaves(
@@ -1054,6 +1111,7 @@ fn arm_selector_axis_leaves(prefix: &str, a: &ArmSelectorAxisStats) -> Vec<(Stri
         control_reward_positive_by_combination,
     ));
     out.extend(arm_selector_explore_leaves(&format!("{prefix}.explore"), explore));
+    out.extend(arm_selector_pooled_leaves(&format!("{prefix}.pooled"), pooled));
     out.extend(arm_selector_learner_leaves(&format!("{prefix}.overtaken_ghost"), overtaken_ghost));
     out.extend(arm_selector_learner_leaves(&format!("{prefix}.absorber_cycle"), absorber_cycle));
     out.extend(arm_selector_learner_leaves(

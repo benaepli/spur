@@ -226,9 +226,16 @@ struct AxCounters {
     leader_margin_micro: [AtomicU64; run_variant::AXES],
     control_runs_by_direction: [AtomicU64; run_variant::DIRECTIONS],
     control_reward_positive_by_direction: [AtomicU64; run_variant::DIRECTIONS],
+    /// The coin-drawn runs and rewards per direction split by campaign
+    /// arm, row `arm_index + 1` of `AX_ARM_SLOTS`, flattened row-major.
+    control_runs_by_arm_direction: [AtomicU64; AX_ARM_DIRECTION_CELLS],
+    control_reward_positive_by_arm_direction: [AtomicU64; AX_ARM_DIRECTION_CELLS],
     chosen_by_combination: [AtomicU64; run_variant::COMBINATIONS],
     control_runs_by_combination: [AtomicU64; run_variant::COMBINATIONS],
     control_reward_positive_by_combination: [AtomicU64; run_variant::COMBINATIONS],
+    /// Gauge: the cells of this reward's learner that are keyed by a
+    /// configuration and shared across campaign arms.
+    pooled_cells: AtomicU64,
 }
 
 impl AxCounters {
@@ -240,6 +247,7 @@ impl AxCounters {
             axis_draws: AtomicU64::new(0),
             chosen_placed_runs: AtomicU64::new(0),
             cells: AtomicU64::new(0),
+            pooled_cells: AtomicU64::new(0),
             reward_runs: [const { AtomicU64::new(0) }; 2],
             reward_positive: [const { AtomicU64::new(0) }; 2],
             chosen_by_direction: [const { AtomicU64::new(0) }; run_variant::DIRECTIONS],
@@ -247,6 +255,9 @@ impl AxCounters {
             control_runs_by_direction: [const { AtomicU64::new(0) }; run_variant::DIRECTIONS],
             control_reward_positive_by_direction: [const { AtomicU64::new(0) };
                 run_variant::DIRECTIONS],
+            control_runs_by_arm_direction: [const { AtomicU64::new(0) }; AX_ARM_DIRECTION_CELLS],
+            control_reward_positive_by_arm_direction: [const { AtomicU64::new(0) };
+                AX_ARM_DIRECTION_CELLS],
             chosen_by_combination: [const { AtomicU64::new(0) }; run_variant::COMBINATIONS],
             control_runs_by_combination: [const { AtomicU64::new(0) }; run_variant::COMBINATIONS],
             control_reward_positive_by_combination: [const { AtomicU64::new(0) };
@@ -261,6 +272,8 @@ static AX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 /// slot `arm_index + 1` so an unattributed run lands in slot zero; arms
 /// past the width share the last slot.
 const AX_ARM_SLOTS: usize = 8;
+/// Size of a per-arm, per-direction table, row `arm_index + 1`.
+const AX_ARM_DIRECTION_CELLS: usize = AX_ARM_SLOTS * run_variant::DIRECTIONS;
 static AX_REWARD_RUNS_BY_ARM: [AtomicU64; AX_ARM_SLOTS] = [const { AtomicU64::new(0) }; AX_ARM_SLOTS];
 static AX_REWARD_POSITIVE_BY_ARM: [AtomicU64; AX_ARM_SLOTS] =
     [const { AtomicU64::new(0) }; AX_ARM_SLOTS];
@@ -285,6 +298,7 @@ struct AxExploreCounters {
     share_micro_by_learner: [AtomicU64; AX_LEARNERS],
     draws_by_arm: [AtomicU64; AX_ARM_SLOTS],
     coin_runs_by_arm: [AtomicU64; AX_ARM_SLOTS],
+    margin_micro_by_arm: [AtomicU64; AX_ARM_SLOTS],
     share_hist: [AtomicU64; AX_SHARE_BINS],
 }
 
@@ -301,12 +315,26 @@ impl AxExploreCounters {
             share_micro_by_learner: [const { AtomicU64::new(0) }; AX_LEARNERS],
             draws_by_arm: [const { AtomicU64::new(0) }; AX_ARM_SLOTS],
             coin_runs_by_arm: [const { AtomicU64::new(0) }; AX_ARM_SLOTS],
+            margin_micro_by_arm: [const { AtomicU64::new(0) }; AX_ARM_SLOTS],
             share_hist: [const { AtomicU64::new(0) }; AX_SHARE_BINS],
         }
     }
 }
 
 static AX_EXPLORE: AxExploreCounters = AxExploreCounters::new();
+
+/// The arm selector's traffic on the cells keyed by a configuration and
+/// shared across campaign arms: the draws served from such a cell and,
+/// per learner, the runs credited into one.
+struct AxPooledCounters {
+    draws: AtomicU64,
+    observations_by_learner: [AtomicU64; AX_LEARNERS],
+}
+
+static AX_POOLED: AxPooledCounters = AxPooledCounters {
+    draws: AtomicU64::new(0),
+    observations_by_learner: [const { AtomicU64::new(0) }; AX_LEARNERS],
+};
 static RP_PARENTS_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN: AtomicU64 = AtomicU64::new(0);
 static RP_CHILDREN_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -2197,14 +2225,17 @@ fn micro(x: f64) -> u64 {
 }
 
 /// A run assigned to the arm selector's learner at `learner` (its position
-/// among the three) was drawn against exploration share `share` in a cell
-/// of campaign arm `arm_index`; `coin` says it came out coin-drawn.
-/// `leader_margin` is the highest per-axis pairwise probability that the
-/// axis's highest-mean direction leads the next, which the share was read
-/// from, or None below the cell's warmup, where the share is one.
+/// among the three) was drawn against exploration share `share` on
+/// campaign arm `arm_index`; `pooled` says the cell it was read from is
+/// keyed by a configuration and shared across arms, and `coin` that it
+/// came out coin-drawn. `leader_margin` is the highest per-axis pairwise
+/// probability that the axis's highest-mean direction leads the next,
+/// which the share was read from, or None below the cell's warmup, where
+/// the share is one.
 pub fn record_arm_selector_draw(
     learner: usize,
     arm_index: i32,
+    pooled: bool,
     share: f64,
     leader_margin: Option<f64>,
     coin: bool,
@@ -2217,6 +2248,9 @@ pub fn record_arm_selector_draw(
     let learner = learner.min(AX_LEARNERS - 1);
     let share_micro = micro(share);
     e.draws.fetch_add(1, Ordering::Relaxed);
+    if pooled {
+        AX_POOLED.draws.fetch_add(1, Ordering::Relaxed);
+    }
     e.share_micro.fetch_add(share_micro, Ordering::Relaxed);
     e.draws_by_learner[learner].fetch_add(1, Ordering::Relaxed);
     e.share_micro_by_learner[learner].fetch_add(share_micro, Ordering::Relaxed);
@@ -2226,6 +2260,7 @@ pub fn record_arm_selector_draw(
     match leader_margin {
         Some(m) => {
             e.margin_micro.fetch_add(micro(m), Ordering::Relaxed);
+            e.margin_micro_by_arm[slot].fetch_add(micro(m), Ordering::Relaxed);
         }
         None => {
             e.warmup_coin_runs.fetch_add(1, Ordering::Relaxed);
@@ -2288,11 +2323,13 @@ pub fn record_arm_selector_run_observed(arm_index: i32, overtaken_ghost: bool) {
 }
 
 /// One reward was read on a run: `treated` says whether the run was a
-/// learner run of the reward's learner rather than coin-drawn, `arms` the
-/// set the run carried, and `positive` the reward's value.
+/// learner run of the reward's learner rather than coin-drawn, `arm_index`
+/// the campaign arm the run ran under, `arms` the set the run carried, and
+/// `positive` the reward's value.
 pub fn record_arm_selector_observation(
     reward: Reward,
     treated: bool,
+    arm_index: i32,
     arms: &run_variant::ArmSet,
     positive: bool,
 ) {
@@ -2308,10 +2345,13 @@ pub fn record_arm_selector_observation(
     if treated {
         return;
     }
+    let row = ((arm_index + 1).max(0) as usize).min(AX_ARM_SLOTS - 1) * run_variant::DIRECTIONS;
     for d in arms.directions() {
         ax.control_runs_by_direction[d].fetch_add(1, Ordering::Relaxed);
+        ax.control_runs_by_arm_direction[row + d].fetch_add(1, Ordering::Relaxed);
         if positive {
             ax.control_reward_positive_by_direction[d].fetch_add(1, Ordering::Relaxed);
+            ax.control_reward_positive_by_arm_direction[row + d].fetch_add(1, Ordering::Relaxed);
         }
     }
     let c = arms.index();
@@ -2322,15 +2362,30 @@ pub fn record_arm_selector_observation(
 }
 
 /// A gauge, not a counter, so it reads with stats off: a cell was created
-/// in the learner trained on `reward`.
-pub fn record_arm_selector_cell_created(reward: Reward) {
-    AX[reward.index()].cells.fetch_add(1, Ordering::Relaxed);
+/// in the learner trained on `reward`; `pooled` says the cell is keyed by
+/// a configuration and shared across campaign arms.
+pub fn record_arm_selector_cell_created(reward: Reward, pooled: bool) {
+    let ax = &AX[reward.index()];
+    ax.cells.fetch_add(1, Ordering::Relaxed);
+    if pooled {
+        ax.pooled_cells.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A run was credited into a cell shared across campaign arms by the
+/// learner at `learner` (its position among the three).
+pub fn record_arm_selector_pooled_credit(learner: usize) {
+    if !enabled() {
+        return;
+    }
+    AX_POOLED.observations_by_learner[learner.min(AX_LEARNERS - 1)].fetch_add(1, Ordering::Relaxed);
 }
 
 /// The learners were cleared, so their gauges read empty.
 pub fn reset_arm_selector_gauges() {
     for ax in &AX {
         ax.cells.store(0, Ordering::Relaxed);
+        ax.pooled_cells.store(0, Ordering::Relaxed);
     }
 }
 
@@ -4576,13 +4631,18 @@ impl ClientAnchorStats {
 /// `reward_runs_control` and `reward_positive_control` are the coin-drawn
 /// runs and rewards; the per-direction and per-combination arrays follow
 /// `run_variant::AXIS_START` and `ArmSet::index` and say what each coin
-/// direction earned.
+/// direction earned. The `by_arm_direction` arrays split the per-direction
+/// pair by campaign arm: row `arm_index + 1` of eight, twelve directions
+/// per row, flattened row-major, so entry `(arm_index + 1) * 12 + d` is
+/// direction `d` on that arm.
 #[derive(Serialize, Debug, Clone)]
 pub struct ArmSelectorRewardStats {
     pub reward_runs_control: u64,
     pub reward_positive_control: u64,
     pub control_runs_by_direction: Vec<u64>,
     pub control_reward_positive_by_direction: Vec<u64>,
+    pub control_runs_by_arm_direction: Vec<u64>,
+    pub control_reward_positive_by_arm_direction: Vec<u64>,
     pub control_runs_by_combination: Vec<u64>,
     pub control_reward_positive_by_combination: Vec<u64>,
 }
@@ -4596,6 +4656,10 @@ impl ArmSelectorRewardStats {
             reward_positive_control: ax.reward_positive[0].load(Ordering::Relaxed),
             control_runs_by_direction: load(&ax.control_runs_by_direction),
             control_reward_positive_by_direction: load(&ax.control_reward_positive_by_direction),
+            control_runs_by_arm_direction: load(&ax.control_runs_by_arm_direction),
+            control_reward_positive_by_arm_direction: load(
+                &ax.control_reward_positive_by_arm_direction,
+            ),
             control_runs_by_combination: load(&ax.control_runs_by_combination),
             control_reward_positive_by_combination: load(
                 &ax.control_reward_positive_by_combination,
@@ -4615,7 +4679,8 @@ impl ArmSelectorRewardStats {
 /// `leader_margin_micro` is, per axis, the sum in millionths over the
 /// learner runs of the pairwise probability that the axis's highest-mean
 /// direction leads the next; divided by `chosen_runs` it is the mean
-/// margin the pick saw.
+/// margin the pick saw. The `by_arm_direction` arrays are laid out as in
+/// `ArmSelectorRewardStats`.
 #[derive(Serialize, Debug, Clone)]
 pub struct ArmSelectorLearnerStats {
     pub chosen_runs: u64,
@@ -4632,6 +4697,8 @@ pub struct ArmSelectorLearnerStats {
     pub leader_margin_micro: Vec<u64>,
     pub control_runs_by_direction: Vec<u64>,
     pub control_reward_positive_by_direction: Vec<u64>,
+    pub control_runs_by_arm_direction: Vec<u64>,
+    pub control_reward_positive_by_arm_direction: Vec<u64>,
     pub chosen_by_combination: Vec<u64>,
     pub control_runs_by_combination: Vec<u64>,
     pub control_reward_positive_by_combination: Vec<u64>,
@@ -4656,6 +4723,10 @@ impl ArmSelectorLearnerStats {
             leader_margin_micro: load(&ax.leader_margin_micro),
             control_runs_by_direction: load(&ax.control_runs_by_direction),
             control_reward_positive_by_direction: load(&ax.control_reward_positive_by_direction),
+            control_runs_by_arm_direction: load(&ax.control_runs_by_arm_direction),
+            control_reward_positive_by_arm_direction: load(
+                &ax.control_reward_positive_by_arm_direction,
+            ),
             chosen_by_combination: load(&ax.chosen_by_combination),
             control_runs_by_combination: load(&ax.control_runs_by_combination),
             control_reward_positive_by_combination: load(
@@ -4675,8 +4746,10 @@ impl ArmSelectorLearnerStats {
 /// `arm_selector::Learner::ALL`, so `share_micro_by_learner[l] /
 /// draws_by_learner[l]` is learner `l`'s own mean share; the `by_arm`
 /// arrays use slot `arm_index + 1`, so `coin_runs_by_arm / draws_by_arm` is
-/// the coin share per campaign arm; `share_hist` bins the share at draw
-/// time into ten equal tenths, a share of one in the last.
+/// the coin share per campaign arm and `margin_micro_by_arm / (draws_by_arm
+/// - the arm's warmup draws)` its mean top margin past warmup;
+/// `share_hist` bins the share at draw time into ten equal tenths, a share
+/// of one in the last.
 #[derive(Serialize, Debug, Clone)]
 pub struct ArmSelectorExploreStats {
     pub draws: u64,
@@ -4689,6 +4762,7 @@ pub struct ArmSelectorExploreStats {
     pub share_micro_by_learner: Vec<u64>,
     pub draws_by_arm: Vec<u64>,
     pub coin_runs_by_arm: Vec<u64>,
+    pub margin_micro_by_arm: Vec<u64>,
     pub share_hist: Vec<u64>,
 }
 
@@ -4707,7 +4781,44 @@ impl ArmSelectorExploreStats {
             share_micro_by_learner: load(&e.share_micro_by_learner),
             draws_by_arm: load(&e.draws_by_arm),
             coin_runs_by_arm: load(&e.coin_runs_by_arm),
+            margin_micro_by_arm: load(&e.margin_micro_by_arm),
             share_hist: load(&e.share_hist),
+        }
+    }
+}
+
+/// The arm selector's cells keyed by a configuration and shared across
+/// campaign arms. `draws` counts the draws served from such a cell;
+/// `cells` is a gauge of the first learner's shared cells and
+/// `cells_by_learner` the same for each learner in
+/// `arm_selector::Learner::ALL` order; `observations_by_learner` counts
+/// the runs each learner credited into a shared cell, so divided by that
+/// learner's `cells_by_learner` it is the mean observations per shared
+/// cell.
+#[derive(Serialize, Debug, Clone)]
+pub struct ArmSelectorPooledStats {
+    pub draws: u64,
+    pub cells: u64,
+    pub cells_by_learner: Vec<u64>,
+    pub observations_by_learner: Vec<u64>,
+}
+
+impl ArmSelectorPooledStats {
+    fn read() -> Self {
+        let cells_by_learner: Vec<u64> =
+            [Reward::OvertakenGhost, Reward::AbsorberCycle, Reward::CycleBeforeRequest]
+                .iter()
+                .map(|r| AX[r.index()].pooled_cells.load(Ordering::Relaxed))
+                .collect();
+        Self {
+            draws: AX_POOLED.draws.load(Ordering::Relaxed),
+            cells: cells_by_learner[0],
+            cells_by_learner,
+            observations_by_learner: AX_POOLED
+                .observations_by_learner
+                .iter()
+                .map(|n| n.load(Ordering::Relaxed))
+                .collect(),
         }
     }
 }
@@ -4723,7 +4834,8 @@ impl ArmSelectorExploreStats {
 /// coin-drawn or learner run; `reward_runs_by_arm` and
 /// `reward_positive_by_arm` split the first learner's reward over those
 /// runs by campaign arm, slot `arm_index + 1`, so a young arm's rate can be
-/// read against a mature one.
+/// read against a mature one. `pooled` is the traffic on the cells shared
+/// across campaign arms; `cells` counts every cell, shared or not.
 #[derive(Serialize, Debug, Clone)]
 pub struct ArmSelectorAxisStats {
     pub chosen_runs: u64,
@@ -4743,10 +4855,13 @@ pub struct ArmSelectorAxisStats {
     pub leader_margin_micro: Vec<u64>,
     pub control_runs_by_direction: Vec<u64>,
     pub control_reward_positive_by_direction: Vec<u64>,
+    pub control_runs_by_arm_direction: Vec<u64>,
+    pub control_reward_positive_by_arm_direction: Vec<u64>,
     pub chosen_by_combination: Vec<u64>,
     pub control_runs_by_combination: Vec<u64>,
     pub control_reward_positive_by_combination: Vec<u64>,
     pub explore: ArmSelectorExploreStats,
+    pub pooled: ArmSelectorPooledStats,
     pub overtaken_ghost: ArmSelectorLearnerStats,
     pub absorber_cycle: ArmSelectorLearnerStats,
     pub cycle_before_request: ArmSelectorLearnerStats,
@@ -4778,12 +4893,17 @@ impl ArmSelectorAxisStats {
             leader_margin_micro: a.leader_margin_micro.clone(),
             control_runs_by_direction: a.control_runs_by_direction.clone(),
             control_reward_positive_by_direction: a.control_reward_positive_by_direction.clone(),
+            control_runs_by_arm_direction: a.control_runs_by_arm_direction.clone(),
+            control_reward_positive_by_arm_direction: a
+                .control_reward_positive_by_arm_direction
+                .clone(),
             chosen_by_combination: a.chosen_by_combination.clone(),
             control_runs_by_combination: a.control_runs_by_combination.clone(),
             control_reward_positive_by_combination: a
                 .control_reward_positive_by_combination
                 .clone(),
             explore: ArmSelectorExploreStats::read(),
+            pooled: ArmSelectorPooledStats::read(),
             overtaken_ghost: a,
             absorber_cycle: ArmSelectorLearnerStats::read(Reward::AbsorberCycle),
             cycle_before_request: ArmSelectorLearnerStats::read(Reward::CycleBeforeRequest),

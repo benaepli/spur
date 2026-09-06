@@ -5,7 +5,8 @@
 //! `ArmSet`). Each run that is not a probe of either kind is assigned by
 //! its id, under a salt of its own, to one of three learners. A learner
 //! keeps one discounted Beta posterior per direction for every cell, a
-//! cell being one campaign arm at one configuration. The assigned learner
+//! cell being one configuration of the grid, shared by every campaign arm
+//! that walks the grid, or one arm without a configuration. The assigned learner
 //! decides from its cell's state whether the run explores or exploits: its
 //! exploration share is the posterior odds against the leader on the
 //! cell's most decided axis, and a unit draw from the run id under a
@@ -77,9 +78,31 @@ pub const DISCOUNT: f64 = 0.998;
 /// from the posteriors; below it every run of the cell is coin-drawn.
 pub const WARMUP_OBSERVATIONS: u64 = 24;
 
-/// A cell: the campaign arm index and the configuration index the run is
-/// attributed to.
+/// A cell key: a campaign arm index and a configuration index. A run at a
+/// configuration of the grid is keyed by the configuration alone, under
+/// `POOLED_ARM`, so every campaign arm walking the grid (and standard mode,
+/// whose arm index is -1) reads and credits one learner state per
+/// configuration; a run without a configuration keeps its arm's own cell.
 pub type Cell = (i32, i32);
+
+/// The arm slot of every configuration-keyed cell. Below every arm index,
+/// so it never collides with an arm's own cell.
+pub const POOLED_ARM: i32 = i32::MIN;
+
+/// The cell a run is read from and credited to: `(POOLED_ARM, config_index)`
+/// when the run has a configuration, `(arm_index, -1)` otherwise.
+pub fn cell(arm_index: i32, config_index: i32) -> Cell {
+    if config_index >= 0 {
+        (POOLED_ARM, config_index)
+    } else {
+        (arm_index, -1)
+    }
+}
+
+/// Whether a cell is shared by every arm at its configuration.
+pub fn is_pooled(cell: Cell) -> bool {
+    cell.0 == POOLED_ARM
+}
 
 /// The three learners, each assigned one third of the runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,24 +386,27 @@ static CELLS: [LazyLock<DashMap<Cell, CellLearner>>; 3] = [
 /// when its unit draw under `EXPLORE_SALT` falls below that learner's
 /// exploration share in the cell, which is one below warmup, and takes its
 /// learner's pick on every axis otherwise. The draw reads nothing from the
-/// run's schedule stream.
-pub fn choose(run_id: i64, schedule_seed: u64, cell: Cell) -> Choice {
+/// run's schedule stream. `arm_index` is the campaign arm the run ran
+/// under, for the per-arm counters; `cell` is where its learner state
+/// lives, which several arms may share.
+pub fn choose(run_id: i64, schedule_seed: u64, arm_index: i32, cell: Cell) -> Choice {
     let coins = ArmSet::coins(run_id);
     let Some(learner) = learner(run_id) else {
         return Choice { arms: coins, learner: None };
     };
     let slot = learner.index();
+    let pooled = is_pooled(cell);
     let warmed = CELLS[slot]
         .get(&cell)
         .filter(|state| state.observations >= WARMUP_OBSERVATIONS);
     let Some(state) = warmed else {
-        util_stats::record_arm_selector_draw(slot, cell.0, 1.0, None, true);
+        util_stats::record_arm_selector_draw(slot, arm_index, pooled, 1.0, None, true);
         return Choice { arms: coins, learner: None };
     };
     let (share, margins) = state.explore_share();
     let coin = run_phase::salted_unit(run_id, EXPLORE_SALT) < share;
     let top_margin = margins.iter().copied().fold(0.0, f64::max);
-    util_stats::record_arm_selector_draw(slot, cell.0, share, Some(top_margin), coin);
+    util_stats::record_arm_selector_draw(slot, arm_index, pooled, share, Some(top_margin), coin);
     if coin {
         return Choice { arms: coins, learner: None };
     }
@@ -400,20 +426,26 @@ pub fn choose(run_id: i64, schedule_seed: u64, cell: Cell) -> Choice {
 }
 
 fn credit(learner: Learner, cell: Cell, arms: &ArmSet, reward: bool) {
+    let pooled = is_pooled(cell);
     CELLS[learner.index()]
         .entry(cell)
         .or_insert_with(|| {
-            util_stats::record_arm_selector_cell_created(learner.reward());
+            util_stats::record_arm_selector_cell_created(learner.reward(), pooled);
             CellLearner::new()
         })
         .credit(arms, reward);
+    if pooled {
+        util_stats::record_arm_selector_pooled_credit(learner.index());
+    }
 }
 
 /// Fold one finished run into the learners that may see it: a coin-drawn
 /// run into every learner, a learner run into its learner only, a probe
 /// into none. The coin-drawn runs are also where every reward's rate per
 /// direction, and the step of the first request-caused entry, are read.
-pub fn observe(cell: Cell, run_id: i64, choice: &Choice, rewards: &Rewards) {
+/// `arm_index` is the campaign arm the run ran under, for the per-arm
+/// counters; `cell` is where the credit lands.
+pub fn observe(arm_index: i32, cell: Cell, run_id: i64, choice: &Choice, rewards: &Rewards) {
     if learner(run_id).is_none() {
         return;
     }
@@ -427,7 +459,7 @@ pub fn observe(cell: Cell, run_id: i64, choice: &Choice, rewards: &Rewards) {
         Reward::CycleBeforeRequest => Some(rewards.cycle_before_request),
         Reward::ExchangeBeforeRequest => Some(rewards.exchange_before_request),
     };
-    util_stats::record_arm_selector_run_observed(cell.0, rewards.overtaken_ghost);
+    util_stats::record_arm_selector_run_observed(arm_index, rewards.overtaken_ghost);
     match choice.learner {
         None => {
             for learner in Learner::ALL {
@@ -435,7 +467,7 @@ pub fn observe(cell: Cell, run_id: i64, choice: &Choice, rewards: &Rewards) {
             }
             for reward in Reward::ALL {
                 if let Some(r) = value(reward) {
-                    util_stats::record_arm_selector_observation(reward, false, arms, r);
+                    util_stats::record_arm_selector_observation(reward, false, arm_index, arms, r);
                 }
             }
             if let Some(step) = rewards.first_post_fault_request_entry_step {
@@ -445,7 +477,7 @@ pub fn observe(cell: Cell, run_id: i64, choice: &Choice, rewards: &Rewards) {
         Some(learner) => {
             let r = rewards_of(learner, rewards);
             credit(learner, cell, arms, r);
-            util_stats::record_arm_selector_observation(learner.reward(), true, arms, r);
+            util_stats::record_arm_selector_observation(learner.reward(), true, arm_index, arms, r);
         }
     }
 }
@@ -541,6 +573,7 @@ mod tests {
         let id = unprobed_id();
         for _ in 0..n {
             observe(
+                cell.0,
                 cell,
                 id,
                 &coin(*arms),
@@ -566,6 +599,7 @@ mod tests {
                 ..ArmSet::default()
             };
             observe(
+                cell.0,
                 cell,
                 id,
                 &coin(arms),
@@ -605,6 +639,89 @@ mod tests {
     }
 
     #[test]
+    fn a_run_with_a_configuration_is_keyed_by_it_and_a_run_without_one_by_its_arm() {
+        assert!(POOLED_ARM < -1, "the shared slot sits below every arm index");
+        for k in 0..54 {
+            for arm in [-1, 0, 1, 2, 3, 7] {
+                assert_eq!(cell(arm, k), (POOLED_ARM, k), "arm {arm} at configuration {k}");
+                assert!(is_pooled(cell(arm, k)));
+            }
+        }
+        assert_ne!(cell(0, 0), cell(0, 1), "configurations keep separate cells");
+        assert_eq!(cell(4, -1), (4, -1));
+        assert_eq!(cell(-1, -1), (-1, -1));
+        assert_ne!(cell(4, -1), cell(5, -1), "arms without a configuration keep their own cells");
+        assert!(!is_pooled(cell(4, -1)));
+    }
+
+    #[test]
+    fn arms_at_one_configuration_share_a_cell_and_an_arm_without_one_keeps_its_own() {
+        let _serial = config_override::exclusive_session();
+        fault_timing::reset();
+        util_stats::set_enabled(true);
+        reset();
+        let before = util_stats::snapshot().arm_selector_axis;
+        let shared = cell(0, 5);
+        assert_eq!(shared, cell(1, 5));
+        let own = cell(4, -1);
+        let arms = ArmSet::default();
+        let id = unprobed_id();
+        // Half the warmup through one arm, the rest through another: the
+        // one cell warms up and every learner holds exactly one cell.
+        let half = WARMUP_OBSERVATIONS / 2;
+        for _ in 0..half {
+            observe(0, shared, id, &coin(arms), &rewarded(false, false));
+        }
+        for _ in half..WARMUP_OBSERVATIONS {
+            observe(1, shared, id, &coin(arms), &rewarded(false, false));
+        }
+        for l in Learner::ALL {
+            assert_eq!(CELLS[l.index()].len(), 1, "{l:?} holds more than the shared cell");
+            let state = CELLS[l.index()].get(&shared).expect("the shared cell exists");
+            assert_eq!(state.observations, WARMUP_OBSERVATIONS, "{l:?}");
+        }
+        // The arm without a configuration lands in a cell of its own.
+        observe(4, own, id, &coin(arms), &rewarded(false, false));
+        for l in Learner::ALL {
+            assert_eq!(CELLS[l.index()].len(), 2, "{l:?}");
+            assert_eq!(CELLS[l.index()].get(&own).expect("the arm's own cell exists").observations, 1);
+        }
+        // A third arm at the configuration reads the warmed shared cell and
+        // steers some of its runs; the young own cell steers none.
+        let assigned: Vec<i64> = (0..20_000i64).filter(|&r| learner(r).is_some()).collect();
+        let steered = assigned.iter().filter(|&&r| choose(r, 11, 2, shared).learner.is_some()).count();
+        assert!(steered > 0, "no run is steered from the shared cell past warmup");
+        for &r in &assigned {
+            assert_eq!(choose(r, 11, 4, own), coin(ArmSet::coins(r)), "run {r}: steered below warmup");
+        }
+        let after = util_stats::snapshot().arm_selector_axis;
+        util_stats::set_enabled(false);
+        assert_eq!(after.pooled.cells, 1);
+        assert_eq!(after.pooled.cells_by_learner, vec![1, 1, 1]);
+        assert_eq!(after.cells, 2);
+        assert_eq!(after.overtaken_ghost.cells, 2);
+        assert_eq!(after.cycle_before_request.cells, 2);
+        for l in 0..3 {
+            assert_eq!(
+                after.pooled.observations_by_learner[l] - before.pooled.observations_by_learner[l],
+                WARMUP_OBSERVATIONS,
+                "learner {l}: credits into the shared cell"
+            );
+        }
+        let draws = assigned.len() as u64;
+        assert_eq!(after.pooled.draws - before.pooled.draws, draws);
+        assert_eq!(after.explore.draws - before.explore.draws, 2 * draws);
+        assert_eq!(after.explore.draws_by_arm[3] - before.explore.draws_by_arm[3], draws, "arm 2");
+        assert_eq!(after.explore.draws_by_arm[5] - before.explore.draws_by_arm[5], draws, "arm 4");
+        assert_eq!(after.explore.warmup_coin_runs - before.explore.warmup_coin_runs, draws);
+        reset();
+        let cleared = util_stats::snapshot().arm_selector_axis;
+        assert_eq!(cleared.pooled.cells, 0);
+        assert_eq!(cleared.pooled.cells_by_learner, vec![0, 0, 0]);
+        assert_eq!(cleared.cells, 0);
+    }
+
+    #[test]
     fn no_run_touches_the_schedule_stream_and_the_choice_is_reproducible() {
         let _serial = config_override::exclusive_session();
         fault_timing::reset();
@@ -616,16 +733,16 @@ mod tests {
             inner: SmallRng::seed_from_u64(1),
             draws: 0,
         };
-        assert_eq!(choose(probe, 5, cell), coin(ArmSet::coins(probe)));
+        assert_eq!(choose(probe, 5, cell.0, cell), coin(ArmSet::coins(probe)));
         for id in assigned {
-            assert_eq!(choose(id, 5, cell), coin(ArmSet::coins(id)), "below warmup: coin-drawn");
+            assert_eq!(choose(id, 5, cell.0, cell), coin(ArmSet::coins(id)), "below warmup: coin-drawn");
         }
         feed(cell, WARMUP_OBSERVATIONS as usize, &ArmSet::default(), false);
         for id in assigned {
-            let first = choose(id, 5, cell);
-            assert_eq!(choose(id, 5, cell), first, "the same id and state choose alike");
+            let first = choose(id, 5, cell.0, cell);
+            assert_eq!(choose(id, 5, cell.0, cell), first, "the same id and state choose alike");
         }
-        assert_eq!(choose(probe, 5, cell), coin(ArmSet::coins(probe)));
+        assert_eq!(choose(probe, 5, cell.0, cell), coin(ArmSet::coins(probe)));
         assert_eq!(schedule.draws, 0, "the selector must not read the run's stream");
         reset();
     }
@@ -642,7 +759,7 @@ mod tests {
             assert!(state.observations < WARMUP_OBSERVATIONS);
         }
         for id in 0..20_000i64 {
-            let choice = choose(id, 11, cell);
+            let choice = choose(id, 11, cell.0, cell);
             assert_eq!(choice, coin(ArmSet::coins(id)), "run {id}: steered below warmup");
         }
         // The observation that completes the warmup lets the learners read
@@ -650,7 +767,7 @@ mod tests {
         // directions only and the others sit at the cell's rate.
         feed(cell, 1, &ArmSet::default(), false);
         let steered = (0..20_000i64)
-            .filter(|&id| choose(id, 11, cell).learner.is_some())
+            .filter(|&id| choose(id, 11, cell.0, cell).learner.is_some())
             .count();
         assert!(steered > 0, "no run is steered once the warmup is complete");
         reset();
@@ -669,7 +786,7 @@ mod tests {
         for l in Learner::ALL {
             let id = assigned_id(l);
             for _ in 0..WARMUP_OBSERVATIONS {
-                observe(cell, id, &learned(arms, l), &rewarded(true, true));
+                observe(cell.0, cell, id, &learned(arms, l), &rewarded(true, true));
             }
             for other in Learner::ALL {
                 let want = if other.index() <= l.index() { WARMUP_OBSERVATIONS } else { 0 };
@@ -677,7 +794,7 @@ mod tests {
             }
         }
         // A coin-drawn run reaches every learner, whichever third drew it.
-        observe(cell, assigned_id(Learner::AbsorberCycle), &coin(arms), &rewarded(true, false));
+        observe(cell.0, cell, assigned_id(Learner::AbsorberCycle), &coin(arms), &rewarded(true, false));
         for l in Learner::ALL {
             assert_eq!(observations(l), WARMUP_OBSERVATIONS + 1, "{l:?} after a coin-drawn run");
         }
@@ -689,7 +806,7 @@ mod tests {
         assert!(alpha(Learner::OvertakenGhost) > alpha(Learner::CycleBeforeRequest));
         // A probe is observed by none.
         let probe = id_where(run_cap::is_probe);
-        observe(cell, probe, &coin(arms), &rewarded(true, true));
+        observe(cell.0, cell, probe, &coin(arms), &rewarded(true, true));
         for l in Learner::ALL {
             assert_eq!(observations(l), WARMUP_OBSERVATIONS + 1, "{l:?} after a probe");
         }
@@ -710,6 +827,7 @@ mod tests {
         for pass in 0..4 {
             for i in 0..COMBINATIONS {
                 observe(
+                    cell.0,
                     cell,
                     unprobed_id(),
                     &coin(ArmSet::from_index(i)),
@@ -724,7 +842,7 @@ mod tests {
             if learner(id).is_none() {
                 continue;
             }
-            assert_eq!(choose(id, 11, cell), coin(ArmSet::coins(id)), "run {id}: steered on a flat cell");
+            assert_eq!(choose(id, 11, cell.0, cell), coin(ArmSet::coins(id)), "run {id}: steered on a flat cell");
         }
 
         // Reward only runs that took stock crashes and the rush: learner A's
@@ -744,7 +862,7 @@ mod tests {
             } else {
                 ArmSet::from_index(i % COMBINATIONS)
             };
-            observe(cell, unprobed_id(), &coin(arms), &rewarded(i % 2 == 0, i % 4 == 1));
+            observe(cell.0, cell, unprobed_id(), &coin(arms), &rewarded(i % 2 == 0, i % 4 == 1));
         }
         let mut coin_runs = [0usize; 3];
         let mut stock = [0usize; 3];
@@ -753,7 +871,7 @@ mod tests {
         let mut n = [0usize; 3];
         for id in 0..100_000i64 {
             let Some(l) = learner(id) else { continue };
-            let choice = choose(id, 11, cell);
+            let choice = choose(id, 11, cell.0, cell);
             n[l.index()] += 1;
             let Some(drew) = choice.learner else {
                 assert_eq!(choice.arms, ArmSet::coins(id), "run {id}: coin-drawn off its coins");
@@ -805,7 +923,7 @@ mod tests {
         let arms = ArmSet::default();
         let id = unprobed_id();
         for i in 0..200 {
-            observe(cell, id, &coin(arms), &rewarded(i % 20 == 0, false));
+            observe(cell.0, cell, id, &coin(arms), &rewarded(i % 20 == 0, false));
         }
         let state = CELLS[0].get(&cell).unwrap();
         let mu = state.mu();
@@ -946,7 +1064,7 @@ mod tests {
         let mut retarget = [0usize; 3];
         for run in 0..120_000i64 {
             let Some(l) = learner(run) else { continue };
-            let choice = choose(run, 11, cell);
+            let choice = choose(run, 11, cell.0, cell);
             runs[l.index()] += 1;
             match choice.learner {
                 None => {
@@ -987,8 +1105,8 @@ mod tests {
         let a = assigned_id(Learner::OvertakenGhost);
         // A probe draws nothing; a run below warmup is a coin-drawn draw at
         // share one, in the arm's slot and the learner's.
-        choose(probe, 3, cell);
-        choose(a, 3, cell);
+        choose(probe, 3, cell.0, cell);
+        choose(a, 3, cell.0, cell);
         let after = util_stats::snapshot().arm_selector_axis;
         let d = |x: u64, y: u64| x - y;
         let e = &after.explore;
@@ -1015,7 +1133,7 @@ mod tests {
             .collect();
         let mut coins = 0u64;
         for &id in &ids {
-            coins += choose(id, 4, cell).learner.is_none() as u64;
+            coins += choose(id, 4, cell.0, cell).learner.is_none() as u64;
         }
         let after = util_stats::snapshot().arm_selector_axis;
         util_stats::set_enabled(false);
@@ -1029,6 +1147,8 @@ mod tests {
         assert_eq!(micro, d(e.share_micro_by_learner[0], e0.share_micro_by_learner[0]) - 1_000_000);
         let margin = d(e.margin_micro, e0.margin_micro);
         assert!(margin >= 300 * 900_000 && margin <= 300 * 1_000_000, "margin micro {margin}");
+        assert_eq!(d(e.margin_micro_by_arm[7], e0.margin_micro_by_arm[7]), margin);
+        assert_eq!(d(e.margin_micro_by_arm[0], e0.margin_micro_by_arm[0]), 0);
         let hist: u64 = (0..10).map(|b| d(e.share_hist[b], e0.share_hist[b])).sum();
         assert_eq!(hist, 301);
         let bin = ((share * 10.0) as usize).min(9);
@@ -1069,8 +1189,9 @@ mod tests {
         let b = Learner::AbsorberCycle;
         let c = Learner::CycleBeforeRequest;
         let coin_run = coin(arms);
-        observe(cell, assigned_id(a), &coin_run, &rewarded(true, false));
+        observe(cell.0, cell, assigned_id(a), &coin_run, &rewarded(true, false));
         observe(
+            cell.0,
             cell,
             assigned_id(b),
             &coin_run,
@@ -1084,6 +1205,7 @@ mod tests {
         );
         // A replay child is not read for the ghost signal.
         observe(
+            cell.0,
             cell,
             assigned_id(c),
             &coin_run,
@@ -1094,11 +1216,12 @@ mod tests {
                 ..rewarded(false, false)
             },
         );
-        observe(cell, assigned_id(a), &learned(arms, a), &rewarded(true, true));
-        observe(cell, assigned_id(b), &learned(arms, b), &rewarded(true, true));
-        observe(cell, assigned_id(b), &learned(arms, b), &rewarded(false, false));
+        observe(cell.0, cell, assigned_id(a), &learned(arms, a), &rewarded(true, true));
+        observe(cell.0, cell, assigned_id(b), &learned(arms, b), &rewarded(true, true));
+        observe(cell.0, cell, assigned_id(b), &learned(arms, b), &rewarded(false, false));
         // A learner run's request entry step is not read.
         observe(
+            cell.0,
             cell,
             assigned_id(c),
             &learned(arms, c),
@@ -1109,7 +1232,7 @@ mod tests {
                 ..rewarded(true, true)
             },
         );
-        observe(cell, assigned_id(c), &learned(arms, c), &rewarded(true, true));
+        observe(cell.0, cell, assigned_id(c), &learned(arms, c), &rewarded(true, true));
         let snapshot = util_stats::snapshot();
         util_stats::set_enabled(false);
         let after = snapshot.arm_selector_axis;
@@ -1184,7 +1307,38 @@ mod tests {
                 gs.control_runs_by_direction[d] - gs0.control_runs_by_direction[d],
                 2
             );
+            // The per-arm table: the cell's arm is 2, row 3 of eight,
+            // twelve directions per row; every other row is untouched.
+            let row = 3 * DIRECTIONS + d;
+            let other = d;
+            assert_eq!(
+                after.control_runs_by_arm_direction[row] - before.control_runs_by_arm_direction[row],
+                3
+            );
+            assert_eq!(
+                after.control_reward_positive_by_arm_direction[row]
+                    - before.control_reward_positive_by_arm_direction[row],
+                1
+            );
+            assert_eq!(
+                cr.control_runs_by_arm_direction[row] - cr0.control_runs_by_arm_direction[row],
+                3
+            );
+            assert_eq!(
+                cr.control_reward_positive_by_arm_direction[row]
+                    - cr0.control_reward_positive_by_arm_direction[row],
+                1
+            );
+            assert_eq!(
+                gs.control_runs_by_arm_direction[row] - gs0.control_runs_by_arm_direction[row],
+                2
+            );
+            assert_eq!(
+                after.control_runs_by_arm_direction[other] - before.control_runs_by_arm_direction[other],
+                0
+            );
         }
+        assert_eq!(after.control_runs_by_arm_direction.len(), 8 * DIRECTIONS);
         reset();
         assert_eq!(util_stats::snapshot().arm_selector_axis.cells, 0);
         assert_eq!(util_stats::snapshot().arm_selector_axis.absorber_cycle.cells, 0);
