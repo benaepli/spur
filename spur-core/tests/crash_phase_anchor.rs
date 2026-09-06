@@ -101,6 +101,9 @@ fn run_session(run_ids: &[i64], out: &Path) {
     util_stats::set_enabled(true);
     util_stats::set_crash_census_enabled(true);
     for &run_id in run_ids {
+        // The arm selector steers a run only from a cell past its warmup;
+        // clearing it before every run keeps each run on its coins.
+        spur_core::simulator::arm_selector::reset();
         run_single_simulation::<NoFeedback, LiveRng>(
             &program,
             &writer,
@@ -169,7 +172,7 @@ fn check() {
     seed_span();
 
     let anchored: Vec<i64> = (0..1_000_000i64)
-        .filter(|&id| crash_phase::is_anchored(id) && !spur_core::simulator::arm_selector::is_treated(id))
+        .filter(|&id| crash_phase::is_anchored(id))
         .take(RUNS)
         .collect();
     assert_eq!(anchored.len(), RUNS, "not enough anchored run ids");
@@ -307,7 +310,6 @@ fn check_landing() {
         .filter(|&id| {
             crash_phase::is_anchored(id)
                 && ghost_absorber::is_treated(id)
-                && !spur_core::simulator::arm_selector::is_treated(id)
         })
         .take(RUNS)
         .collect();
@@ -315,7 +317,6 @@ fn check_landing() {
         .filter(|&id| {
             crash_phase::is_anchored(id)
                 && !ghost_absorber::is_treated(id)
-                && !spur_core::simulator::arm_selector::is_treated(id)
         })
         .take(RUNS)
         .collect();

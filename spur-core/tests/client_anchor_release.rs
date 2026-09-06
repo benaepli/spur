@@ -122,6 +122,9 @@ fn session(
     );
     let global_state = GlobalState::<NoFeedback>::new();
     for &run_id in ids {
+        // The arm selector steers a run only from a cell past its warmup;
+        // clearing it before every run keeps each run on its coins.
+        spur_core::simulator::arm_selector::reset();
         run_single_simulation::<NoFeedback, LiveRng>(
             program,
             &writer,
@@ -183,7 +186,6 @@ fn placed_ids(treated: bool, n: usize) -> Vec<i64> {
         .filter(|&id| {
             client_anchor::is_treated(id) == treated
                 && fault_timing::is_placed(id)
-                && !spur_core::simulator::arm_selector::is_treated(id)
         })
         .take(n)
         .collect();

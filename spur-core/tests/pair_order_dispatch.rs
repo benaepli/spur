@@ -130,6 +130,9 @@ fn session(
     let mut corrected_by_run = BTreeMap::new();
     for &run_id in ids {
         let before = util_stats::snapshot().pair_order.corrected;
+        // The arm selector steers a run only from a cell past its warmup;
+        // clearing it before every run keeps each run on its coins.
+        spur_core::simulator::arm_selector::reset();
         run_single_simulation::<NoFeedback, LiveRng>(
             program,
             &writer,
@@ -178,7 +181,6 @@ fn ids(treated: bool, census: bool, n: usize) -> Vec<i64> {
             pair_order::is_treated(id) == treated
                 && pair_order::is_census_run(id) == census
                 && fault_timing::is_placed(id)
-                && !spur_core::simulator::arm_selector::is_treated(id)
         })
         .take(n)
         .collect();

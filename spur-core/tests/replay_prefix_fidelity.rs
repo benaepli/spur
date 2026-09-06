@@ -140,6 +140,9 @@ fn run<S: RngSource>(
     schedule: u64,
     tape: Option<Recording>,
 ) -> RunResult {
+    // The arm selector steers a run only from a cell past its warmup;
+    // clearing it before every run keeps each run on its coins.
+    spur_core::simulator::arm_selector::reset();
     run_single_simulation::<NoFeedback, S>(
         program,
         writer,
@@ -188,14 +191,11 @@ fn check_prefix() {
     // Parent and child ids carry the same mechanism bits, so the only thing
     // that differs between the two runs is the schedule seed the child falls
     // back on once the replayed prefix runs out. Placed runs hold a queued
-    // crash back, which is what lets a delivery reach its node first. Runs
-    // on the arm selector's treated half take arms the id does not name,
-    // so they are left out.
+    // crash back, which is what lets a delivery reach its node first.
     let eligible = |id: i64| {
         let v = run_variant::from_run_id(id);
         v & run_variant::CRASH_PLACED != 0
             && v & (run_variant::RUN_CAP_PROBE | run_variant::TIMER_STEER_OFF) == 0
-            && !spur_core::simulator::arm_selector::is_treated(id)
     };
     let candidates: Vec<i64> = (0..1_000_000i64)
         .filter(|&id| eligible(id))

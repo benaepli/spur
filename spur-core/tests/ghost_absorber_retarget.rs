@@ -127,6 +127,9 @@ fn session(
     let mut applied_by_run = BTreeMap::new();
     for &run_id in ids {
         let before = util_stats::snapshot().victim_swap.applied;
+        // The arm selector steers a run only from a cell past its warmup;
+        // clearing it before every run keeps each run on its coins.
+        spur_core::simulator::arm_selector::reset();
         run_single_simulation::<NoFeedback, LiveRng>(
             program,
             &writer,
@@ -208,7 +211,6 @@ fn check_treated() {
         .filter(|&id| {
             ghost_absorber::is_treated(id)
                 && fault_timing::is_placed(id)
-                && !spur_core::simulator::arm_selector::is_treated(id)
         })
         .take(TREATED_RUNS)
         .collect();
@@ -316,7 +318,6 @@ fn check_untreated() {
         .filter(|&id| {
             !ghost_absorber::is_treated(id)
                 && fault_timing::is_placed(id)
-                && !spur_core::simulator::arm_selector::is_treated(id)
         })
         .take(UNTREATED_RUNS)
         .collect();

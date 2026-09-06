@@ -974,6 +974,7 @@ fn run_row(
     wall: std::time::Duration,
     timers: crate::simulator::core::state::TimerRunStats,
     arms: &ArmSet,
+    learner: Option<arm_selector::Learner>,
     crash_hold_drawn: bool,
 ) -> crate::simulator::history::PersistableRun {
     let (steps_used, end_reason) = match outcome {
@@ -1000,7 +1001,7 @@ fn run_row(
         timers_idle_fired: timers.idle_fired as i32,
         timers_idle_acted: timers.idle_acted as i32,
         max_inert_streak: timers.max_inert_streak as i32,
-        variant: crate::simulator::run_variant::of(run_id, arms, crash_hold_drawn)
+        variant: crate::simulator::run_variant::of(run_id, arms, learner, crash_hold_drawn)
             | attribution.variant_bits,
     }
 }
@@ -1106,7 +1107,8 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     // The arms are drawn before the plan runs and read nothing from the
     // run's schedule stream.
     let cell = (attribution.arm_index, attribution.config_index);
-    let arms = arm_selector::choose(run_id, schedule_seed, cell);
+    let choice = arm_selector::choose(run_id, schedule_seed, cell);
+    let arms = choice.arms;
     let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
         program.clone(),
@@ -1132,7 +1134,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     arm_selector::observe(
         cell,
         run_id,
-        &arms,
+        &choice,
         &arm_selector::Rewards {
             overtaken_ghost: path_state.state.overtaken_ghost_acted,
             absorber_cycle: path_state.state.absorber_cycle_fresh_peer,
@@ -1176,6 +1178,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         started.elapsed(),
         path_state.state.timer_stats,
         &arms,
+        choice.learner,
         path_state.state.crash_hold_drawn,
     ));
 
@@ -1488,6 +1491,7 @@ fn run_single_plan<F: Feedback>(
         started.elapsed(),
         path_state.state.timer_stats,
         &arms,
+        None,
         path_state.state.crash_hold_drawn,
     ));
 

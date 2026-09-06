@@ -29,6 +29,13 @@ pub fn salted_phase(run_id: i64, salt: u64, period: i64) -> i64 {
     (mix(run_id as u64 ^ salt) % period as u64) as i64
 }
 
+/// A uniform value in `[0, 1)` under a domain salt, a pure function of the
+/// run id: the top 53 bits of the mixed id over 2^53, so every double in
+/// the range is reachable and no two salts agree beyond chance.
+pub fn salted_unit(run_id: i64, salt: u64) -> f64 {
+    (mix(run_id as u64 ^ salt) >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// SplitMix64's finalizer over the id. Chosen for avalanche: every input
 /// bit reaches every output bit, which is what breaks the correlation with
 /// the grid width.
@@ -103,6 +110,30 @@ mod tests {
             let overlap = agree as f64 / n as f64;
             assert!((overlap - 0.5).abs() < 0.02, "the split agrees with {what} on {overlap}");
         }
+    }
+
+    #[test]
+    fn a_salted_unit_is_uniform_and_independent_of_a_phase_under_another_salt() {
+        const A: u64 = 0x_1122_3344_5566_7788;
+        const B: u64 = 0x_99AA_BBCC_DDEE_FF00;
+        let n = 20_000i64;
+        let mut sum = 0.0;
+        let mut below_half_on_phase_one = 0i64;
+        let mut phase_one = 0i64;
+        for id in -n / 2..n / 2 {
+            let u = salted_unit(id, A);
+            assert!((0.0..1.0).contains(&u), "id {id} gave {u}");
+            assert_eq!(u, salted_unit(id, A), "a salted unit must not vary");
+            sum += u;
+            if salted_phase(id, B, 2) == 1 {
+                phase_one += 1;
+                below_half_on_phase_one += (u < 0.5) as i64;
+            }
+        }
+        let mean = sum / n as f64;
+        assert!((mean - 0.5).abs() < 0.01, "the units average {mean}");
+        let share = below_half_on_phase_one as f64 / phase_one as f64;
+        assert!((share - 0.5).abs() < 0.02, "the unit follows another salt's phase on {share}");
     }
 
     #[test]
