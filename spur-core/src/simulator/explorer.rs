@@ -28,6 +28,7 @@ use crate::simulator::rng::{
 use crate::simulator::arm_selector;
 use crate::simulator::fault_timing;
 use crate::simulator::run_cap;
+use crate::simulator::stall_cap;
 use crate::simulator::recover_deps::RecoverDeps;
 use crate::simulator::run_variant::{self, ArmSet};
 use crate::simulator::timer_context;
@@ -983,6 +984,7 @@ fn run_row(
         RunOutcome::Deadlock { step, .. } => (*step, "deadlock"),
         RunOutcome::IterationsExhausted { .. } => (max_iterations, "iterations_exhausted"),
         RunOutcome::LearnedCapReached { cap, .. } => (*cap, "learned_cap_reached"),
+        RunOutcome::StallCapReached { step, .. } => (*step, "stall_cap_reached"),
     };
     crate::simulator::history::PersistableRun {
         run_id,
@@ -2400,6 +2402,7 @@ impl<F: Feedback> Strategy<F> for CurriculumExplorer<F> {
         if self.decay_factor < 1.0 {
             F::decay(&self.global_state.feedback, self.decay_factor);
             run_cap::decay(self.decay_factor);
+            stall_cap::decay(self.decay_factor);
             fault_timing::decay(self.decay_factor);
             timer_context::decay(self.decay_factor);
         }

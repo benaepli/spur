@@ -543,8 +543,13 @@ pub enum ScheduleResult<H: HashPolicy> {
     Crash { node_id: NodeId, planned: NodeId },
     /// A recovery was executed on the given node.
     Recover { node_id: NodeId },
-    /// A labeled timer fired.
-    TimerFired { node_id: NodeId, label: String },
+    /// A labeled timer fired; `acted` says whether the firing itself left
+    /// the node's state changed.
+    TimerFired {
+        node_id: NodeId,
+        label: String,
+        acted: bool,
+    },
     /// A network partition was activated.
     Partition {
         #[allow(dead_code)]
@@ -553,10 +558,14 @@ pub enum ScheduleResult<H: HashPolicy> {
     /// A network partition was healed.
     Heal,
     /// A non-client Record runnable was executed (internal RPC delivery).
+    /// `acted` says whether the segment left its node's state changed, and
+    /// `timer_entry` whether the segment is one a timer firing woke.
     RecordExecuted {
         entry_pc: Vertex,
         origin_node: NodeId,
         dest_node: NodeId,
+        acted: bool,
+        timer_entry: bool,
     },
 }
 

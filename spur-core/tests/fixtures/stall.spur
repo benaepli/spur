@@ -1,0 +1,32 @@
+// A node whose write never succeeds: the client interface retries the same
+// request forever, and no handler writes state, so a run of one write makes
+// no progress mark after the request is issued. The role and client-interface
+// names are the ones the explorer looks up.
+
+role Node {
+    var ready: bool = false;
+
+    async fn Try(key: string, uid: int): bool {
+        return ready;
+    }
+
+    async fn Read(key: string): int {
+        return 0;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        var ok: bool = false;
+        for ;; {
+            ok = <-dest->Try(key, uid);
+            if (ok) {
+                return;
+            }
+        }
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

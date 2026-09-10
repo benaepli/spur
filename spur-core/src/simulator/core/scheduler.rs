@@ -1180,6 +1180,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             if state.crash_info.currently_crashed.contains(&timer.node) {
                 return Ok(ScheduleResult::None);
             }
+            let token_before = state.node_state_token(timer.node);
 
             if let Some(chan) = state.channels.get_mut(&timer.channel) {
                 match chan.pop_waiting_reader() {
@@ -1208,6 +1209,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 Ok(ScheduleResult::TimerFired {
                     node_id: timer.node,
                     label,
+                    acted: state.node_state_token(timer.node) != token_before,
                 })
             } else {
                 Ok(ScheduleResult::None)
@@ -1278,6 +1280,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     // node counts, not the continuations it is re-queued as.
                     let message_entry = record_origin != record_dest && r.pc == record_entry_pc;
                     let entry_step = state.crash_info.current_step;
+                    // Read at every entry, not only on probes: the compare
+                    // after the segment is the progress mark the stall clock
+                    // takes, and the token every probe compares against.
+                    let token_before = state.node_state_token(record_dest);
                     // Whether a ghost reached a destination that had already
                     // heard from the sender's current incarnation, read off
                     // the per-destination table before this entry is added.
@@ -1369,7 +1375,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     // state from an incarnation that no longer exists.
                     let ghost = (message_entry
                         && state.fault_crossing(record_origin, r.origin_incarnation))
-                    .then(|| state.node_state_token(record_dest));
+                    .then_some(token_before);
                     if ghost.is_some()
                         && !state.retarget.signal_counted
                         && state
@@ -1389,11 +1395,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         if r.origin_incarnation != state.incarnation(record_origin) {
                             bias.insert(DeliveryBias::SENDER_RESTARTED);
                         }
-                        (
-                            bias,
-                            state.node_state_token(record_dest),
-                            state.entries_since_restart(record_dest.index),
-                        )
+                        (bias, state.entries_since_restart(record_dest.index))
                     });
                     // The segment a timer firing woke, measured the same way
                     // as a delivery: the token counts state writes, so a
@@ -1420,7 +1422,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                             state.incarnation(record_dest) > 0
                                 && state.entries_since_restart(record_dest.index) < 8,
                         );
-                        (r.pc, key, inflight, cell, state.node_state_token(record_dest))
+                        (r.pc, key, inflight, cell)
                     });
                     if message_entry {
                         state.note_handler_entry(record_dest.index, HandlerTrigger::Delivery);
@@ -1438,21 +1440,20 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         purgatory_config,
                         rng,
                     )?;
+                    let acted = state.node_state_token(record_dest) != token_before;
                     if let Some(before) = ghost {
                         state.note_ghost_delivery(record_dest.index, entry_step, before);
                         // A dead-incarnation record is a ghost, so the
                         // token taken for the mark serves the reward too.
-                        if overtaken_at_restarted && state.node_state_token(record_dest) != before {
+                        if overtaken_at_restarted && acted {
                             state.overtaken_ghost_acted = true;
                         }
                     }
-                    if let Some((bias, before, distance)) = probe {
-                        let acted = state.node_state_token(record_dest) != before;
+                    if let Some((bias, distance)) = probe {
                         util_stats::record_delivery(bias, acted, distance);
                         util_stats::record_term_acted(chosen_mask, acted);
                     }
-                    if let Some((pc, key, inflight, cell, before)) = timer_probe {
-                        let acted = state.node_state_token(record_dest) != before;
+                    if let Some((pc, key, inflight, cell)) = timer_probe {
                         state.note_timer_effect(record_dest.index, pc, inflight, acted);
                         util_stats::record_timer(key, acted);
                         // Only steer-off probe runs feed the learner, so the
@@ -1470,6 +1471,8 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                             entry_pc: record_entry_pc,
                             origin_node: record_origin,
                             dest_node: record_dest,
+                            acted,
+                            timer_entry,
                         }),
                     }
                 }

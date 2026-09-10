@@ -19,8 +19,11 @@ use crate::simulator::pair_order as pair_order_split;
 use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
 use crate::simulator::run_variant::{ArmSet, CrashArm};
+use crate::simulator::stall_cap::{self, Marks, RunClock, RunEnding};
 use crate::simulator::timer_context;
-use crate::simulator::util_stats::{self, DeliveryBias, RunEnd, RunExtension, RunTermination};
+use crate::simulator::util_stats::{
+    self, DeliveryBias, RunEnd, RunExtension, RunTermination, StallCapCell,
+};
 use ecow::EcoString;
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
@@ -336,6 +339,14 @@ pub enum RunOutcome {
     /// The run reached the learned step cap, short of the configured budget,
     /// with planned events still outstanding.
     LearnedCapReached { cap: i32, outstanding_events: usize },
+    /// The run went `cap` steps past its last progress mark, short of its
+    /// step cap, with planned events still outstanding; `step` is the steps
+    /// it ran.
+    StallCapReached {
+        cap: i32,
+        step: i32,
+        outstanding_events: usize,
+    },
 }
 
 /// How a run spent its steps: how many released a runnable, how many offered
@@ -449,6 +460,12 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         run_cap::effective_cap(backup)
     };
     let timer_ctx_mode = timer_context::run_mode(run_id);
+    // The stall cap is frozen at run start like the step cap. Every cell
+    // keeps the clock; only the treated cell is cut by it.
+    let stall_cell = stall_cap::cell(run_id);
+    let stall_treated = stall_cell == StallCapCell::Treated;
+    let stall_cap_standing = stall_cap::effective_cap(backup);
+    let mut stall_clock = RunClock::default();
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
@@ -530,6 +547,17 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 recovered_nodes.len(),
                 &census,
             );
+            stall_cap::finish_run(
+                stall_cell,
+                &stall_clock,
+                stall_cap_standing,
+                RunEnding {
+                    run_id,
+                    backup,
+                    completed: true,
+                    steps_saved: None,
+                },
+            );
             if is_probe {
                 run_cap::merge_probe(backup, run_cap::Outcome::Completed, step);
                 fault_timing::merge_stock_probe(run_id, backup, run_cap::Outcome::Completed, step);
@@ -539,6 +567,8 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 
         path_state.state.crash_info.current_step = step;
         util_stats::record_steer_step_total();
+        let step_rows_start = path_state.history.len();
+        let mut marks = Marks::default();
 
         // Release delayed messages whose time has come
         path_state.state.release_from_purgatory(step);
@@ -561,6 +591,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         {
             due.push(dry);
         }
+        marks.release = !ready_events.is_empty() || !due.is_empty();
 
         if ready_events.is_empty()
             && path_state.state.all_queues_empty()
@@ -581,6 +612,17 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 max_iterations,
                 recovered_nodes.len(),
                 &census,
+            );
+            stall_cap::finish_run(
+                stall_cell,
+                &stall_clock,
+                stall_cap_standing,
+                RunEnding {
+                    run_id,
+                    backup,
+                    completed: false,
+                    steps_saved: None,
+                },
             );
             if is_probe {
                 run_cap::merge_probe(backup, run_cap::Outcome::Deadlocked, step);
@@ -825,7 +867,14 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         engine.mark_event_completed(plan_node);
                     }
                 }
-                ScheduleResult::TimerFired { node_id, label } => {
+                ScheduleResult::TimerFired {
+                    node_id,
+                    label,
+                    acted,
+                } => {
+                    if acted {
+                        marks.acted_timer = true;
+                    }
                     // Recorded beside crashes and recoveries so a consumer can
                     // order a timer against the deliveries and faults around
                     // it. The node goes in `client_id` and the label after the
@@ -880,7 +929,14 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     entry_pc,
                     origin_node,
                     dest_node,
+                    acted,
+                    timer_entry,
                 } => {
+                    if acted && timer_entry {
+                        marks.acted_timer = true;
+                    } else if acted {
+                        marks.acted_delivery = true;
+                    }
                     // Check if this record delivery matches any ready deliver event.
                     if let Some(&func_name) = entry_to_name.get(&entry_pc) {
                         let matched = ready_delivers
@@ -969,9 +1025,74 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         } else {
             no_progress_count = 0;
         }
+
+        // The clock holds while the run waits on a release the scheduler
+        // itself owns and will grant: a planned crash withheld by its
+        // placement hold or its phase wait, a held client request, or a
+        // delayed message. Each of those is bounded, so a run waiting on one
+        // is not stalled.
+        marks.row = path_state.history[step_rows_start..]
+            .iter()
+            .any(|op| !matches!(op.kind, OpKind::TimerFired));
+        let crash_withheld = pending_crash.keys().any(|&n| {
+            path_state
+                .state
+                .crash_hold_until
+                .get(n)
+                .is_some_and(|&until| step < until)
+                || path_state.state.crash_phase.awaits_release(n)
+        });
+        let suspended =
+            crash_withheld || !held.is_empty() || !path_state.state.purgatory.is_empty();
+        let gap = stall_clock.step(marks, suspended);
+        if stall_treated
+            && let Some(cap) = stall_cap_standing
+            && gap > cap
+            && !engine.is_complete()
+        {
+            let stop_step = step + 1;
+            util_stats::record_client_anchor_run_end(anchored, false, held.pending());
+            record_termination(
+                RunEnd::StallCapReached,
+                run_id,
+                &path_state.state,
+                &engine,
+                stop_step,
+                max_iterations,
+                recovered_nodes.len(),
+                &census,
+            );
+            stall_cap::finish_run(
+                stall_cell,
+                &stall_clock,
+                stall_cap_standing,
+                RunEnding {
+                    run_id,
+                    backup,
+                    completed: false,
+                    steps_saved: Some((effective_cap - stop_step).max(0) as u64),
+                },
+            );
+            return Ok(RunOutcome::StallCapReached {
+                cap,
+                step: stop_step,
+                outstanding_events: engine.outstanding_count(),
+            });
+        }
     }
 
     util_stats::record_client_anchor_run_end(anchored, false, held.pending());
+    stall_cap::finish_run(
+        stall_cell,
+        &stall_clock,
+        stall_cap_standing,
+        RunEnding {
+            run_id,
+            backup,
+            completed: false,
+            steps_saved: None,
+        },
+    );
     if effective_cap < backup {
         record_termination(
             RunEnd::LearnedCapReached,

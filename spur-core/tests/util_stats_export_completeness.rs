@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, RunCapStats, StallCapMarks, StallCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -116,6 +116,7 @@ fn termination_tally(m: &mut Marks) -> TerminationTally {
         iterations_exhausted: m.int(),
         deadlock: m.int(),
         learned_cap_reached: m.int(),
+        stall_cap_reached: m.int(),
         steps_used_sum: m.int(),
         step_budget_sum: m.int(),
         pending_work_at_exit_sum: m.int(),
@@ -131,6 +132,7 @@ fn termination_tally_leaves(prefix: &str, t: &TerminationTally) -> Vec<(String, 
         iterations_exhausted,
         deadlock,
         learned_cap_reached,
+        stall_cap_reached,
         steps_used_sum,
         step_budget_sum,
         pending_work_at_exit_sum,
@@ -147,6 +149,7 @@ fn termination_tally_leaves(prefix: &str, t: &TerminationTally) -> Vec<(String, 
         leaf(prefix, "iterations_exhausted", *iterations_exhausted),
         leaf(prefix, "deadlock", *deadlock),
         leaf(prefix, "learned_cap_reached", *learned_cap_reached),
+        leaf(prefix, "stall_cap_reached", *stall_cap_reached),
         leaf(prefix, "steps_used_sum", *steps_used_sum),
         leaf(prefix, "step_budget_sum", *step_budget_sum),
         leaf(prefix, "pending_work_at_exit_sum", *pending_work_at_exit_sum),
@@ -478,6 +481,77 @@ fn run_cap_leaves(prefix: &str, r: &RunCapStats) -> Vec<(String, Value)> {
         leaf(prefix, "scopes_learned", *scopes_learned),
         leaf(prefix, "current_cap_max_scope", *current_cap_max_scope),
     ]
+}
+
+fn stall_cap(m: &mut Marks) -> StallCapStats {
+    StallCapStats {
+        stops: m.int(),
+        treated_runs: m.int(),
+        untreated_runs: m.int(),
+        steps_saved_sum: m.int(),
+        suspended_steps_sum: m.int(),
+        marks: StallCapMarks {
+            rows: m.int(),
+            acted_deliveries: m.int(),
+            acted_timers: m.int(),
+            releases: m.int(),
+        },
+        probes_keyed: m.int(),
+        probe_over_cap_completions: m.int(),
+        scopes_learned: m.int(),
+        cap_max_scope: m.int(),
+        untreated_runs_capped: m.int(),
+        untreated_over_cap_runs: m.int(),
+        untreated_rows_dropped: m.int(),
+        untreated_gap_hist: vec![m.int(), m.int(), m.int()],
+    }
+}
+
+fn stall_cap_leaves(prefix: &str, s: &StallCapStats) -> Vec<(String, Value)> {
+    let StallCapStats {
+        stops,
+        treated_runs,
+        untreated_runs,
+        steps_saved_sum,
+        suspended_steps_sum,
+        marks,
+        probes_keyed,
+        probe_over_cap_completions,
+        scopes_learned,
+        cap_max_scope,
+        untreated_runs_capped,
+        untreated_over_cap_runs,
+        untreated_rows_dropped,
+        untreated_gap_hist,
+    } = s;
+    let StallCapMarks {
+        rows,
+        acted_deliveries,
+        acted_timers,
+        releases,
+    } = marks;
+    let mut out = vec![
+        leaf(prefix, "stops", *stops),
+        leaf(prefix, "treated_runs", *treated_runs),
+        leaf(prefix, "untreated_runs", *untreated_runs),
+        leaf(prefix, "steps_saved_sum", *steps_saved_sum),
+        leaf(prefix, "suspended_steps_sum", *suspended_steps_sum),
+        leaf(prefix, "marks.rows", *rows),
+        leaf(prefix, "marks.acted_deliveries", *acted_deliveries),
+        leaf(prefix, "marks.acted_timers", *acted_timers),
+        leaf(prefix, "marks.releases", *releases),
+        leaf(prefix, "probes_keyed", *probes_keyed),
+        leaf(prefix, "probe_over_cap_completions", *probe_over_cap_completions),
+        leaf(prefix, "scopes_learned", *scopes_learned),
+        leaf(prefix, "cap_max_scope", *cap_max_scope),
+        leaf(prefix, "untreated_runs_capped", *untreated_runs_capped),
+        leaf(prefix, "untreated_over_cap_runs", *untreated_over_cap_runs),
+        leaf(prefix, "untreated_rows_dropped", *untreated_rows_dropped),
+    ];
+    for (i, v) in untreated_gap_hist.iter().enumerate() {
+        out.push(leaf(prefix, &format!("untreated_gap_hist.{i}"), *v));
+    }
+    out
 }
 
 fn crash_place(m: &mut Marks) -> CrashPlaceStats {
@@ -1522,6 +1596,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         prefix_extension: _,
         quiet_stretch: _,
         run_cap: _,
+        stall_cap: _,
         crash_place: _,
         crash_phase: _,
         victim_swap: _,
@@ -1561,6 +1636,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "prefix_extension",
         "quiet_stretch",
         "run_cap",
+        "stall_cap",
         "crash_place",
         "crash_phase",
         "victim_swap",
@@ -1634,6 +1710,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.termination = termination(&mut m);
     s.delivery_effects = delivery_effects(&mut m);
     s.run_cap = run_cap(&mut m);
+    s.stall_cap = stall_cap(&mut m);
     s.crash_place = crash_place(&mut m);
     s.crash_phase = crash_phase(&mut m);
     s.victim_swap = victim_swap(&mut m);
@@ -1653,6 +1730,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
         &s.delivery_effects,
     ));
     expected.extend(run_cap_leaves("run_cap", &s.run_cap));
+    expected.extend(stall_cap_leaves("stall_cap", &s.stall_cap));
     expected.extend(crash_place_leaves("crash_place", &s.crash_place));
     expected.extend(crash_phase_leaves("crash_phase", &s.crash_phase));
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
@@ -1697,6 +1775,7 @@ fn every_counter_field_reaches_the_written_json() {
         "plan_deps",
         "delivery_effects",
         "run_cap",
+        "stall_cap",
         "crash_place",
         "crash_phase",
         "victim_swap",

@@ -555,6 +555,25 @@ static RUN_CAP_CAP_RECOMPUTES: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_SCOPES_LEARNED: AtomicU64 = AtomicU64::new(0);
 static RUN_CAP_CURRENT_CAP_MAX_SCOPE: AtomicU64 = AtomicU64::new(0);
 
+static SC_STOPS: AtomicU64 = AtomicU64::new(0);
+static SC_TREATED_RUNS: AtomicU64 = AtomicU64::new(0);
+static SC_UNTREATED_RUNS: AtomicU64 = AtomicU64::new(0);
+static SC_STEPS_SAVED_SUM: AtomicU64 = AtomicU64::new(0);
+static SC_SUSPENDED_STEPS_SUM: AtomicU64 = AtomicU64::new(0);
+static SC_MARK_ROWS: AtomicU64 = AtomicU64::new(0);
+static SC_MARK_ACTED_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+static SC_MARK_ACTED_TIMERS: AtomicU64 = AtomicU64::new(0);
+static SC_MARK_RELEASES: AtomicU64 = AtomicU64::new(0);
+static SC_PROBES_KEYED: AtomicU64 = AtomicU64::new(0);
+static SC_PROBE_OVER_CAP_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static SC_SCOPES_LEARNED: AtomicU64 = AtomicU64::new(0);
+static SC_CAP_MAX_SCOPE: AtomicU64 = AtomicU64::new(0);
+static SC_UNTREATED_RUNS_CAPPED: AtomicU64 = AtomicU64::new(0);
+static SC_UNTREATED_OVER_CAP_RUNS: AtomicU64 = AtomicU64::new(0);
+static SC_UNTREATED_ROWS_DROPPED: AtomicU64 = AtomicU64::new(0);
+static SC_UNTREATED_GAP_HIST: [AtomicU64; HIST_BUCKETS] =
+    [const { AtomicU64::new(0) }; HIST_BUCKETS];
+
 static CRASH_PLACE_DRAWS: AtomicU64 = AtomicU64::new(0);
 static CRASH_PLACE_CAPPED_DRAWS: AtomicU64 = AtomicU64::new(0);
 static CRASH_PLACE_HOLDS: AtomicU64 = AtomicU64::new(0);
@@ -786,6 +805,22 @@ pub fn set_enabled(on: bool) {
             &RUN_CAP_CAP_RECOMPUTES,
             &RUN_CAP_SCOPES_LEARNED,
             &RUN_CAP_CURRENT_CAP_MAX_SCOPE,
+            &SC_STOPS,
+            &SC_TREATED_RUNS,
+            &SC_UNTREATED_RUNS,
+            &SC_STEPS_SAVED_SUM,
+            &SC_SUSPENDED_STEPS_SUM,
+            &SC_MARK_ROWS,
+            &SC_MARK_ACTED_DELIVERIES,
+            &SC_MARK_ACTED_TIMERS,
+            &SC_MARK_RELEASES,
+            &SC_PROBES_KEYED,
+            &SC_PROBE_OVER_CAP_COMPLETIONS,
+            &SC_SCOPES_LEARNED,
+            &SC_CAP_MAX_SCOPE,
+            &SC_UNTREATED_RUNS_CAPPED,
+            &SC_UNTREATED_OVER_CAP_RUNS,
+            &SC_UNTREATED_ROWS_DROPPED,
             &CRASH_PLACE_DRAWS,
             &CRASH_PLACE_CAPPED_DRAWS,
             &CRASH_PLACE_HOLDS,
@@ -800,7 +835,11 @@ pub fn set_enabled(on: bool) {
         ] {
             c.store(0, Ordering::Relaxed);
         }
-        for c in TIMER_STREAK_FIRED.iter().chain(TIMER_STREAK_ACTED.iter()) {
+        for c in TIMER_STREAK_FIRED
+            .iter()
+            .chain(TIMER_STREAK_ACTED.iter())
+            .chain(SC_UNTREATED_GAP_HIST.iter())
+        {
             c.store(0, Ordering::Relaxed);
         }
         for c in CP_RUNS
@@ -2645,6 +2684,9 @@ pub enum RunEnd {
     /// The learned step cap, short of the configured budget, ended the run
     /// while planned events were outstanding.
     LearnedCapReached,
+    /// The learned stall cap ended the run: its clock ran past the cap
+    /// without a progress mark while planned events were outstanding.
+    StallCapReached,
 }
 
 /// Termination counts and running sums over one bucket of runs. `steps_used`
@@ -2660,6 +2702,7 @@ pub struct TerminationTally {
     pub iterations_exhausted: u64,
     pub deadlock: u64,
     pub learned_cap_reached: u64,
+    pub stall_cap_reached: u64,
     pub steps_used_sum: u64,
     pub step_budget_sum: u64,
     pub pending_work_at_exit_sum: u64,
@@ -2675,6 +2718,7 @@ impl TerminationTally {
             iterations_exhausted: 0,
             deadlock: 0,
             learned_cap_reached: 0,
+            stall_cap_reached: 0,
             steps_used_sum: 0,
             step_budget_sum: 0,
             pending_work_at_exit_sum: 0,
@@ -2694,6 +2738,7 @@ impl TerminationTally {
             RunEnd::IterationsExhausted => self.iterations_exhausted += 1,
             RunEnd::Deadlock => self.deadlock += 1,
             RunEnd::LearnedCapReached => self.learned_cap_reached += 1,
+            RunEnd::StallCapReached => self.stall_cap_reached += 1,
         }
         self.steps_used_sum += s.steps_used;
         self.step_budget_sum += s.step_budget;
@@ -2802,7 +2847,7 @@ impl RunExtension {
             RunEnd::Deadlock => PrefixStop::Deadlock,
             RunEnd::PlanComplete if self.pending_at_exit == 0 => PrefixStop::PlanCompleteQuiescent,
             RunEnd::PlanComplete => PrefixStop::PlanCompletePending,
-            RunEnd::IterationsExhausted | RunEnd::LearnedCapReached => {
+            RunEnd::IterationsExhausted | RunEnd::LearnedCapReached | RunEnd::StallCapReached => {
                 if self.pending_at_exit == 0 {
                     PrefixStop::BudgetIdle
                 } else if self.tail_without_release >= STALLED_TAIL_STEPS {
@@ -2921,7 +2966,7 @@ pub struct QuietStretchRun {
 struct QuietStretchState {
     /// Longest-stretch histograms indexed by how the run ended, in the order
     /// `RunEnd` is declared.
-    by_end: [[u64; HIST_BUCKETS]; 4],
+    by_end: [[u64; HIST_BUCKETS]; 5],
     per_run: Vec<QuietStretchRun>,
     dropped: u64,
 }
@@ -2929,7 +2974,7 @@ struct QuietStretchState {
 impl QuietStretchState {
     const fn new() -> Self {
         Self {
-            by_end: [[0; HIST_BUCKETS]; 4],
+            by_end: [[0; HIST_BUCKETS]; 5],
             per_run: Vec::new(),
             dropped: 0,
         }
@@ -2949,6 +2994,7 @@ pub struct QuietStretchStats {
     pub iterations_exhausted: Vec<u64>,
     pub deadlock: Vec<u64>,
     pub learned_cap_reached: Vec<u64>,
+    pub stall_cap_reached: Vec<u64>,
     pub per_run: Vec<QuietStretchRun>,
     pub per_run_dropped: u64,
 }
@@ -2964,6 +3010,7 @@ impl QuietStretchStats {
             iterations_exhausted: q.by_end[1].to_vec(),
             deadlock: q.by_end[2].to_vec(),
             learned_cap_reached: q.by_end[3].to_vec(),
+            stall_cap_reached: q.by_end[4].to_vec(),
             per_run: q.per_run.clone(),
             per_run_dropped: q.dropped,
         }
@@ -2985,6 +3032,7 @@ pub fn record_quiet_stretch(run_id: i64, end: RunEnd) {
         RunEnd::IterationsExhausted => 1,
         RunEnd::Deadlock => 2,
         RunEnd::LearnedCapReached => 3,
+        RunEnd::StallCapReached => 4,
     };
     if let Ok(mut q) = QUIET_STRETCH.lock() {
         q.by_end[row][hist_bucket(longest as usize)] += 1;
@@ -3035,6 +3083,98 @@ pub fn record_run_cap_recompute() {
 pub fn set_run_cap_learned(scopes: u64, cap_max_scope: u64) {
     RUN_CAP_SCOPES_LEARNED.store(scopes, Ordering::Relaxed);
     RUN_CAP_CURRENT_CAP_MAX_SCOPE.store(cap_max_scope, Ordering::Relaxed);
+}
+
+/// The cell a run occupies under the stall cap: cut once its clock exceeds
+/// the cap, measured but never cut, or exempt because it feeds a learner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallCapCell {
+    Treated,
+    Untreated,
+    Probe,
+}
+
+/// Progress marks of one run or of a session, by kind. A step carrying
+/// several kinds counts under each.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StallCapMarks {
+    pub rows: u64,
+    pub acted_deliveries: u64,
+    pub acted_timers: u64,
+    pub releases: u64,
+}
+
+/// One run's stall-cap facts, reported once when the run ends.
+pub struct StallCapRun {
+    pub cell: StallCapCell,
+    pub marks: StallCapMarks,
+    pub suspended_steps: u64,
+    /// Steps the stop saved against the run's frozen step cap, on a run the
+    /// stall cap ended.
+    pub steps_saved: Option<u64>,
+    /// The run's longest quiet gap, counting its final segment.
+    pub longest_gap: u32,
+    /// The cap standing for the run's scope when it ended, if any.
+    pub standing_cap: Option<u32>,
+    /// The untreated row was not kept because the row cap was reached.
+    pub row_dropped: bool,
+}
+
+/// One run finished under the stall cap, of any cell. Called once per run,
+/// off the scheduling hot path.
+pub fn record_stall_cap_run(r: &StallCapRun) {
+    if !enabled() {
+        return;
+    }
+    match r.cell {
+        StallCapCell::Treated => {
+            SC_TREATED_RUNS.fetch_add(1, Ordering::Relaxed);
+        }
+        StallCapCell::Untreated => {
+            SC_UNTREATED_RUNS.fetch_add(1, Ordering::Relaxed);
+            SC_UNTREATED_GAP_HIST[hist_bucket(r.longest_gap as usize)]
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(cap) = r.standing_cap {
+                SC_UNTREATED_RUNS_CAPPED.fetch_add(1, Ordering::Relaxed);
+                if r.longest_gap > cap {
+                    SC_UNTREATED_OVER_CAP_RUNS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if r.row_dropped {
+                SC_UNTREATED_ROWS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        StallCapCell::Probe => {}
+    }
+    if let Some(saved) = r.steps_saved {
+        SC_STOPS.fetch_add(1, Ordering::Relaxed);
+        SC_STEPS_SAVED_SUM.fetch_add(saved, Ordering::Relaxed);
+    }
+    SC_SUSPENDED_STEPS_SUM.fetch_add(r.suspended_steps, Ordering::Relaxed);
+    SC_MARK_ROWS.fetch_add(r.marks.rows, Ordering::Relaxed);
+    SC_MARK_ACTED_DELIVERIES.fetch_add(r.marks.acted_deliveries, Ordering::Relaxed);
+    SC_MARK_ACTED_TIMERS.fetch_add(r.marks.acted_timers, Ordering::Relaxed);
+    SC_MARK_RELEASES.fetch_add(r.marks.releases, Ordering::Relaxed);
+}
+
+/// One completed run-cap probe's longest gap was folded into the stall-cap
+/// learner; `over_cap` marks the probes whose gap exceeded the cap in effect
+/// when they merged, so a treated run in their place would have been cut.
+pub fn record_stall_cap_probe(over_cap: bool) {
+    if !enabled() {
+        return;
+    }
+    SC_PROBES_KEYED.fetch_add(1, Ordering::Relaxed);
+    if over_cap {
+        SC_PROBE_OVER_CAP_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Gauges of the stall-cap learner's current view, ungated like the step
+/// cap's.
+pub fn set_stall_cap_learned(scopes: u64, cap_max_scope: u64) {
+    SC_SCOPES_LEARNED.store(scopes, Ordering::Relaxed);
+    SC_CAP_MAX_SCOPE.store(cap_max_scope, Ordering::Relaxed);
 }
 
 /// One placed-posture run drew a crash hold `held_steps` past the crash's
@@ -4115,6 +4255,58 @@ impl RunCapStats {
     }
 }
 
+/// The stall-cap block. `stops` is the mechanism's firing count. The
+/// `untreated_*` fields read the measured-but-never-cut quarter: how many
+/// of its runs ended under a standing cap, how many of those had a longest
+/// gap above it, and the log2 histogram of the longest gaps; the per-run
+/// rows behind them are written beside the counters as a CSV.
+#[derive(Serialize)]
+pub struct StallCapStats {
+    pub stops: u64,
+    pub treated_runs: u64,
+    pub untreated_runs: u64,
+    pub steps_saved_sum: u64,
+    pub suspended_steps_sum: u64,
+    pub marks: StallCapMarks,
+    pub probes_keyed: u64,
+    pub probe_over_cap_completions: u64,
+    pub scopes_learned: u64,
+    pub cap_max_scope: u64,
+    pub untreated_runs_capped: u64,
+    pub untreated_over_cap_runs: u64,
+    pub untreated_rows_dropped: u64,
+    pub untreated_gap_hist: Vec<u64>,
+}
+
+impl StallCapStats {
+    fn read() -> Self {
+        Self {
+            stops: SC_STOPS.load(Ordering::Relaxed),
+            treated_runs: SC_TREATED_RUNS.load(Ordering::Relaxed),
+            untreated_runs: SC_UNTREATED_RUNS.load(Ordering::Relaxed),
+            steps_saved_sum: SC_STEPS_SAVED_SUM.load(Ordering::Relaxed),
+            suspended_steps_sum: SC_SUSPENDED_STEPS_SUM.load(Ordering::Relaxed),
+            marks: StallCapMarks {
+                rows: SC_MARK_ROWS.load(Ordering::Relaxed),
+                acted_deliveries: SC_MARK_ACTED_DELIVERIES.load(Ordering::Relaxed),
+                acted_timers: SC_MARK_ACTED_TIMERS.load(Ordering::Relaxed),
+                releases: SC_MARK_RELEASES.load(Ordering::Relaxed),
+            },
+            probes_keyed: SC_PROBES_KEYED.load(Ordering::Relaxed),
+            probe_over_cap_completions: SC_PROBE_OVER_CAP_COMPLETIONS.load(Ordering::Relaxed),
+            scopes_learned: SC_SCOPES_LEARNED.load(Ordering::Relaxed),
+            cap_max_scope: SC_CAP_MAX_SCOPE.load(Ordering::Relaxed),
+            untreated_runs_capped: SC_UNTREATED_RUNS_CAPPED.load(Ordering::Relaxed),
+            untreated_over_cap_runs: SC_UNTREATED_OVER_CAP_RUNS.load(Ordering::Relaxed),
+            untreated_rows_dropped: SC_UNTREATED_ROWS_DROPPED.load(Ordering::Relaxed),
+            untreated_gap_hist: SC_UNTREATED_GAP_HIST
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect(),
+        }
+    }
+}
+
 /// The crash-placement block: holds drawn by placed-posture runs, the
 /// subset whose span bound came from the step cap's recovery reserve, the
 /// per-step offers an active hold excluded, and the summed displacement of
@@ -5144,6 +5336,7 @@ pub struct UtilizationSnapshot {
     pub prefix_extension: PrefixExtensionStats,
     pub quiet_stretch: QuietStretchStats,
     pub run_cap: RunCapStats,
+    pub stall_cap: StallCapStats,
     pub crash_place: CrashPlaceStats,
     pub crash_phase: CrashPhaseStats,
     pub victim_swap: VictimSwapStats,
@@ -5353,6 +5546,7 @@ pub fn snapshot() -> UtilizationSnapshot {
             .unwrap_or_else(|p| *p.into_inner()),
         quiet_stretch: QuietStretchStats::read(),
         run_cap: RunCapStats::read(),
+        stall_cap: StallCapStats::read(),
         crash_place: CrashPlaceStats::read(),
         crash_phase: CrashPhaseStats::read(),
         victim_swap: VictimSwapStats::read(),
@@ -5868,6 +6062,7 @@ mod tests {
         record_run_extension(&run(RunEnd::IterationsExhausted, 500, 0, 1));
         record_run_extension(&run(RunEnd::PlanComplete, 0, 3, 2));
         record_run_extension(&run(RunEnd::PlanComplete, 0, 0, 0));
+        record_run_extension(&run(RunEnd::StallCapReached, 0, 7, 0));
 
         let s = snapshot().prefix_extension;
         set_prefix_extension_enabled(false);
@@ -5876,18 +6071,18 @@ mod tests {
         let after_off = snapshot().prefix_extension;
         set_enabled(false);
 
-        assert_eq!(s.all.runs, 5);
-        assert_eq!(s.all.budget_releasing, 1);
+        assert_eq!(s.all.runs, 6);
+        assert_eq!(s.all.budget_releasing, 2, "a stall-cap exit is a budget stop");
         assert_eq!(s.all.budget_blocked, 1);
         assert_eq!(s.all.budget_idle, 1);
         assert_eq!(s.all.plan_complete_pending, 1);
         assert_eq!(s.all.plan_complete_quiescent, 1);
-        assert_eq!(s.all.steps_sum, 5_000);
-        assert_eq!(s.all.steps_blocked_sum, 300);
+        assert_eq!(s.all.steps_sum, 6_000);
+        assert_eq!(s.all.steps_blocked_sum, 360);
         assert_eq!(s.by_recovered_nodes[2].runs, 2);
         assert_eq!(s.by_recovered_nodes[2].budget_blocked, 1);
         assert_eq!(s.by_recovered_nodes[2].plan_complete_pending, 1);
-        assert_eq!(after_off.all.runs, 5);
+        assert_eq!(after_off.all.runs, 6);
         assert_eq!(after_off.all.deadlock, 0);
     }
 
@@ -5907,9 +6102,111 @@ mod tests {
         );
         assert_eq!(t.runs, 1);
         assert_eq!(t.learned_cap_reached, 1);
+        assert_eq!(t.stall_cap_reached, 0);
         assert_eq!(t.plan_complete, 0);
         assert_eq!(t.iterations_exhausted, 0);
         assert_eq!(t.deadlock, 0);
+    }
+
+    #[test]
+    fn a_stall_cap_exit_counts_only_its_own_tally_field() {
+        let mut t = TerminationTally::new();
+        t.add(
+            RunEnd::StallCapReached,
+            &RunTermination {
+                end: RunEnd::StallCapReached,
+                steps_used: 10,
+                step_budget: 100,
+                pending_work_at_exit: 1,
+                planned_events_outstanding: 2,
+                recovered_nodes: 0,
+            },
+        );
+        assert_eq!(t.runs, 1);
+        assert_eq!(t.stall_cap_reached, 1);
+        assert_eq!(t.learned_cap_reached, 0);
+        assert_eq!(t.plan_complete, 0);
+        assert_eq!(t.iterations_exhausted, 0);
+        assert_eq!(t.deadlock, 0);
+        assert_eq!(t.steps_used_sum, 10);
+    }
+
+    #[test]
+    fn a_stall_cap_exit_classifies_as_a_budget_stop() {
+        let run = |tail_without_release, pending_at_exit| RunExtension {
+            end: RunEnd::StallCapReached,
+            steps: 100,
+            steps_released: 90,
+            steps_blocked: 6,
+            steps_idle: 4,
+            tail_without_release,
+            pending_at_exit,
+            recovered_nodes: 0,
+        };
+        assert_eq!(run(0, 0).stop(), PrefixStop::BudgetIdle);
+        assert_eq!(run(STALLED_TAIL_STEPS, 7).stop(), PrefixStop::BudgetBlocked);
+        assert_eq!(run(0, 7).stop(), PrefixStop::BudgetReleasing);
+    }
+
+    #[test]
+    fn stall_cap_counters_reach_the_snapshot_and_reset_with_enable() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        let run = |cell, steps_saved, longest_gap, standing_cap| StallCapRun {
+            cell,
+            marks: StallCapMarks {
+                rows: 2,
+                acted_deliveries: 3,
+                acted_timers: 5,
+                releases: 7,
+            },
+            suspended_steps: 11,
+            steps_saved,
+            longest_gap,
+            standing_cap,
+            row_dropped: false,
+        };
+        record_stall_cap_run(&run(StallCapCell::Treated, Some(100), 30, Some(20)));
+        record_stall_cap_run(&run(StallCapCell::Treated, None, 5, Some(20)));
+        record_stall_cap_run(&run(StallCapCell::Untreated, None, 30, Some(20)));
+        record_stall_cap_run(&run(StallCapCell::Untreated, None, 9, Some(20)));
+        record_stall_cap_run(&run(StallCapCell::Untreated, None, 40, None));
+        record_stall_cap_run(&run(StallCapCell::Probe, None, 40, None));
+        record_stall_cap_probe(false);
+        record_stall_cap_probe(true);
+        set_stall_cap_learned(2, 611);
+        let s = snapshot().stall_cap;
+        assert_eq!(s.stops, 1);
+        assert_eq!(s.treated_runs, 2);
+        assert_eq!(s.untreated_runs, 3);
+        assert_eq!(s.steps_saved_sum, 100);
+        assert_eq!(s.suspended_steps_sum, 66);
+        assert_eq!(s.marks.rows, 12);
+        assert_eq!(s.marks.acted_deliveries, 18);
+        assert_eq!(s.marks.acted_timers, 30);
+        assert_eq!(s.marks.releases, 42);
+        assert_eq!(s.probes_keyed, 2);
+        assert_eq!(s.probe_over_cap_completions, 1);
+        assert_eq!((s.scopes_learned, s.cap_max_scope), (2, 611));
+        assert_eq!(s.untreated_runs_capped, 2, "a run under no standing cap is not capped");
+        assert_eq!(s.untreated_over_cap_runs, 1);
+        assert_eq!(s.untreated_gap_hist[hist_bucket(30)], 1);
+        assert_eq!(s.untreated_gap_hist[hist_bucket(9)], 1);
+        assert_eq!(s.untreated_gap_hist[hist_bucket(40)], 1, "the probe's gap is not in the histogram");
+        assert_eq!(s.untreated_gap_hist.iter().sum::<u64>(), 3);
+        set_enabled(false);
+        record_stall_cap_run(&run(StallCapCell::Treated, Some(100), 30, Some(20)));
+        assert_eq!(snapshot().stall_cap.stops, 1, "recording is gated on stats");
+        set_enabled(true);
+        let z = snapshot().stall_cap;
+        set_enabled(false);
+        assert_eq!(z.stops, 0);
+        assert_eq!(z.treated_runs, 0);
+        assert_eq!(z.untreated_runs, 0);
+        assert_eq!(z.marks.releases, 0);
+        assert_eq!(z.probes_keyed, 0);
+        assert_eq!((z.scopes_learned, z.cap_max_scope), (0, 0));
+        assert_eq!(z.untreated_gap_hist.iter().sum::<u64>(), 0);
     }
 
     #[test]
@@ -6018,13 +6315,21 @@ mod tests {
         record_delivery(DeliveryBias::NONE, false, 0);
         record_delivery(DeliveryBias::NONE, false, 0);
         record_quiet_stretch(3, RunEnd::LearnedCapReached);
+        begin_run();
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_delivery(DeliveryBias::NONE, false, 0);
+        record_quiet_stretch(4, RunEnd::StallCapReached);
 
         let s = snapshot().quiet_stretch;
         set_quiet_stretch_enabled(false);
         set_enabled(false);
 
-        assert_eq!(s.runs, 1);
+        assert_eq!(s.runs, 2);
         assert_eq!(s.learned_cap_reached[hist_bucket(2)], 1);
+        assert_eq!(s.learned_cap_reached.iter().sum::<u64>(), 1);
+        assert_eq!(s.stall_cap_reached[hist_bucket(3)], 1);
+        assert_eq!(s.stall_cap_reached.iter().sum::<u64>(), 1);
         assert_eq!(s.plan_complete.iter().sum::<u64>(), 0);
         assert_eq!(s.iterations_exhausted.iter().sum::<u64>(), 0);
         assert_eq!(s.deadlock.iter().sum::<u64>(), 0);

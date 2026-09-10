@@ -21,6 +21,7 @@ pub mod replay_corpus;
 pub mod rng;
 pub mod run_cap;
 pub mod run_phase;
+pub mod stall_cap;
 pub mod run_variant;
 pub mod timer_context;
 pub mod util_stats;

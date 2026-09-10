@@ -10,6 +10,7 @@ use spur_core::simulator::explorer::{
     run_plan,
 };
 use spur_core::simulator::history::LogBackend;
+use spur_core::simulator::stall_cap;
 use spur_core::simulator::util_stats;
 use spur_core::visualization::{render_html_heatmap, render_svg, vertex_coverage_to_byte_coverage};
 use std::fs;
@@ -553,6 +554,7 @@ fn run_explore(
 
     // Dump opt-in utilization counters (enabled via `"stats": true` in the config)
     let util_paths = write_utilization_counters(&output_dir)?;
+    let stall_rows_path = write_stall_cap_rows(&output_dir)?;
     let session_paths = write_session_summary(&summary, &output_dir)?;
     let campaign_paths = write_campaign_report(&summary, &output_dir)?;
 
@@ -568,6 +570,9 @@ fn run_explore(
     println!("  - CFG: {}", cfg_path.display());
     for p in &util_paths {
         println!("  - Utilization counters: {}", p.display());
+    }
+    if let Some(p) = &stall_rows_path {
+        println!("  - Stall-cap rows: {}", p.display());
     }
     for p in &session_paths {
         println!("  - Session summary: {}", p.display());
@@ -663,6 +668,19 @@ fn write_utilization_counters(output_dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(written)
+}
+
+/// Writes the per-run rows of the stall cap's untreated quarter inside the
+/// output directory, so a measurement keyed by run id and taken outside the
+/// simulator can be joined to the gap each run measured. Sessions that
+/// recorded no row write nothing.
+fn write_stall_cap_rows(output_dir: &Path) -> Result<Option<PathBuf>> {
+    let Some(csv) = stall_cap::render_run_rows() else {
+        return Ok(None);
+    };
+    let path = output_dir.join("stall_cap_runs.csv");
+    fs::write(&path, csv).context("Failed to write stall_cap_runs.csv")?;
+    Ok(Some(path))
 }
 
 /// Renders the CFG coverage heatmap if the summary carries vertex coverage.
