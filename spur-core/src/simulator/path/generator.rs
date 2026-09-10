@@ -1,10 +1,12 @@
 use petgraph::algo::has_path_connecting;
-use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
+use petgraph::visit::EdgeRef;
 use rand::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::simulator::path::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlannedEvent};
 use crate::simulator::plan_config::PartitionSpec;
+use crate::simulator::recover_deps::RecoverDeps;
 
 #[derive(Debug, Clone)]
 enum ActionStub {
@@ -48,6 +50,11 @@ pub struct GeneratorConfig {
     /// survives the fault instead of all of it becoming eligible up front.
     /// 0 reserves nothing.
     pub post_fault_client_ops: i32,
+    /// Whether a restart may take a probabilistic edge from an earlier event.
+    /// The mandatory edges - crash before its own recover, one recover
+    /// before the same node's next crash, and the post-fault recover before
+    /// client edges - are the same under both values.
+    pub recover_deps: RecoverDeps,
 }
 
 /// Generates a bag of action stubs based on the config.
@@ -254,8 +261,15 @@ pub fn generate_plan(config: GeneratorConfig, rng: &mut impl Rng) -> ExecutionPl
     // whose target already has a path back to the source. This guards
     // against cycles with every mandatory edge (write-chain, crash/recover
     // serialization, partition/heal serialization).
+    //
+    // Under the exempt cell an edge into a recover is still added here and
+    // removed once the pass is over, so the cycle guard sees exactly the
+    // graph the stock cell sees: the exempt plan is the stock plan minus
+    // those edges and nothing else.
     let mut seen: Vec<(NodeIndex, Option<(i32, PairPos)>)> = Vec::new();
+    let mut exempt_edges: Vec<EdgeIndex> = Vec::new();
     for (current_idx, current_pair) in &nodes {
+        let current_is_recover = matches!(graph[*current_idx].action, EventAction::RecoverNode(_));
         for (prev_idx, _prev_pair) in &seen {
             if rng.random::<f64>() >= config.dependency_density {
                 continue;
@@ -263,12 +277,37 @@ pub fn generate_plan(config: GeneratorConfig, rng: &mut impl Rng) -> ExecutionPl
             if has_path_connecting(&graph, *current_idx, *prev_idx, None) {
                 continue;
             }
-            graph.add_edge(*prev_idx, *current_idx, ());
+            let edge = graph.add_edge(*prev_idx, *current_idx, ());
+            if current_is_recover && config.recover_deps == RecoverDeps::Exempt {
+                exempt_edges.push(edge);
+            }
         }
         seen.push((*current_idx, *current_pair));
     }
 
+    crate::simulator::util_stats::record_plan_deps_edges(exempt_edges.len() as u64);
+    if !exempt_edges.is_empty() {
+        graph = without_edges(&graph, &exempt_edges);
+    }
+
     graph
+}
+
+/// The same nodes, in the same order, with every edge but `dropped` in the
+/// order the source graph holds them. Node indices carry over unchanged.
+fn without_edges(graph: &ExecutionPlan, dropped: &[EdgeIndex]) -> ExecutionPlan {
+    let dropped: HashSet<EdgeIndex> = dropped.iter().copied().collect();
+    let mut out: ExecutionPlan =
+        DiGraph::with_capacity(graph.node_count(), graph.edge_count() - dropped.len());
+    for idx in graph.node_indices() {
+        out.add_node(graph[idx].clone());
+    }
+    for edge in graph.edge_references() {
+        if !dropped.contains(&edge.id()) {
+            out.add_edge(edge.source(), edge.target(), ());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -290,8 +329,154 @@ mod tests {
             dependency_density: 0.0,
             max_concurrent_writes: Some(2),
             post_fault_client_ops,
+            recover_deps: RecoverDeps::Stock,
         }
     }
+
+    fn cell_config(
+        dependency_density: f64,
+        num_crashes: i32,
+        max_concurrent_writes: Option<i32>,
+        recover_deps: RecoverDeps,
+    ) -> GeneratorConfig {
+        GeneratorConfig {
+            num_crashes,
+            dependency_density,
+            max_concurrent_writes,
+            recover_deps,
+            ..config(1)
+        }
+    }
+
+    fn plan(cfg: GeneratorConfig, seed: u64) -> ExecutionPlan {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        generate_plan(cfg, &mut rng)
+    }
+
+    /// A digest of the node list and the edge list in storage order, so two
+    /// plans agree only when they are the same graph laid out the same way.
+    fn fingerprint(plan: &ExecutionPlan) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut eat = |s: &str| {
+            for b in s.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        for idx in plan.node_indices() {
+            eat(&format!("{:?};", plan[idx].action));
+        }
+        for e in plan.raw_edges() {
+            eat(&format!("{}->{};", e.source().index(), e.target().index()));
+        }
+        h
+    }
+
+    fn edges(plan: &ExecutionPlan) -> std::collections::BTreeSet<(usize, usize)> {
+        plan.raw_edges()
+            .iter()
+            .map(|e| (e.source().index(), e.target().index()))
+            .collect()
+    }
+
+    fn is_recover(plan: &ExecutionPlan, i: usize) -> bool {
+        matches!(plan[NodeIndex::new(i)].action, EventAction::RecoverNode(_))
+    }
+
+    /// The generator's output before the cells existed, digested for eight
+    /// seeds of each of three configurations. A stock plan has to stay this.
+    const BASELINE_GENERAL: [u64; 8] = [
+        0xb6203e06a1dc1c7b,
+        0x5b8763bdd798e884,
+        0x6e245f972e045827,
+        0x9235bef08bc1bdd0,
+        0xbdb8de1717bdbdc1,
+        0x99a6384aec761aaa,
+        0x439255093333f427,
+        0x467c90ef8194cb25,
+    ];
+    const BASELINE_ZERO_DENSITY: [u64; 8] = [
+        0xef77e86a21f12354,
+        0xe49c0e0b617b7cdd,
+        0x463ff1437f93cbdb,
+        0xbef4b11f7f61c03d,
+        0xfe22b8f8e7663681,
+        0x8b58fe655944b767,
+        0xc6239220afa9f0fe,
+        0xe9724ba1d07816b5,
+    ];
+    const BASELINE_SINGLE_CRASH: [u64; 8] = [
+        0x490f43b45fe6eb3e,
+        0x89d5a7abeadf4131,
+        0x9d354b7b4a1a92db,
+        0x8e093d3215f24d6b,
+        0xe42832d525bf04e1,
+        0x4de8cb26d656bd57,
+        0xb8217c51eb24017e,
+        0x5b46babe3f2d1e2b,
+    ];
+
+    #[test]
+    fn a_stock_plan_is_the_baseline_plan_for_the_same_seed() {
+        for seed in 0..8u64 {
+            let general = plan(cell_config(0.3, 2, Some(2), RecoverDeps::Stock), seed);
+            assert_eq!(fingerprint(&general), BASELINE_GENERAL[seed as usize], "seed {seed}");
+            let zero = plan(cell_config(0.0, 2, Some(2), RecoverDeps::Stock), seed);
+            assert_eq!(fingerprint(&zero), BASELINE_ZERO_DENSITY[seed as usize], "seed {seed}");
+            let single = plan(cell_config(0.5, 1, None, RecoverDeps::Stock), seed);
+            assert_eq!(fingerprint(&single), BASELINE_SINGLE_CRASH[seed as usize], "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn exempt_drops_exactly_the_probabilistic_edges_into_a_recover() {
+        let mut dropped_somewhere = 0;
+        for seed in 0..64u64 {
+            let stock = plan(cell_config(0.3, 2, Some(2), RecoverDeps::Stock), seed);
+            let exempt = plan(cell_config(0.3, 2, Some(2), RecoverDeps::Exempt), seed);
+            let mandatory = plan(cell_config(0.0, 2, Some(2), RecoverDeps::Stock), seed);
+            for i in stock.node_indices() {
+                assert_eq!(stock[i], exempt[i], "seed {seed}: the events differ");
+                assert_eq!(stock[i], mandatory[i], "seed {seed}: the events differ");
+            }
+            let s = edges(&stock);
+            let e = edges(&exempt);
+            let m = edges(&mandatory);
+            assert!(m.is_subset(&s), "seed {seed}: stock lost a mandatory edge");
+            assert!(m.is_subset(&e), "seed {seed}: exempt lost a mandatory edge");
+            assert!(e.is_subset(&s), "seed {seed}: exempt has an edge stock lacks");
+            let removed: std::collections::BTreeSet<(usize, usize)> =
+                s.difference(&e).copied().collect();
+            let want: std::collections::BTreeSet<(usize, usize)> = s
+                .iter()
+                .filter(|(_, t)| is_recover(&stock, *t))
+                .filter(|edge| !m.contains(edge))
+                .copied()
+                .collect();
+            assert_eq!(removed, want, "seed {seed}: the removed set is not the recover-target set");
+            dropped_somewhere += removed.len();
+            for (src, dst) in &e {
+                if is_recover(&exempt, *dst) {
+                    assert!(
+                        matches!(exempt[NodeIndex::new(*src)].action, EventAction::CrashNode(_)),
+                        "seed {seed}: a recover still waits on something other than its crash"
+                    );
+                }
+            }
+            assert!(!petgraph::algo::is_cyclic_directed(&exempt), "seed {seed}");
+        }
+        assert!(dropped_somewhere > 0, "no seed had an edge into a recover to drop");
+    }
+
+    #[test]
+    fn exempt_changes_nothing_at_zero_density() {
+        for seed in 0..64u64 {
+            let stock = plan(cell_config(0.0, 2, Some(2), RecoverDeps::Stock), seed);
+            let exempt = plan(cell_config(0.0, 2, Some(2), RecoverDeps::Exempt), seed);
+            assert_eq!(fingerprint(&stock), fingerprint(&exempt), "seed {seed}");
+        }
+    }
+
 
     fn recovers_with_a_client_successor(plan: &ExecutionPlan) -> (usize, usize) {
         let mut recovers = 0;

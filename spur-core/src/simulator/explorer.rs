@@ -28,6 +28,7 @@ use crate::simulator::rng::{
 use crate::simulator::arm_selector;
 use crate::simulator::fault_timing;
 use crate::simulator::run_cap;
+use crate::simulator::recover_deps::RecoverDeps;
 use crate::simulator::run_variant::{self, ArmSet};
 use crate::simulator::timer_context;
 use crate::simulator::util_stats;
@@ -1002,6 +1003,7 @@ fn run_row(
         timers_idle_acted: timers.idle_acted as i32,
         max_inert_streak: timers.max_inert_streak as i32,
         variant: crate::simulator::run_variant::of(run_id, arms, learner, crash_hold_drawn)
+            | run_variant::recover_deps_bits(RecoverDeps::of_workload_seed(workload_seed))
             | attribution.variant_bits,
     }
 }
@@ -1024,6 +1026,10 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
 ) -> Result<RunResult, Box<dyn Error>> {
     let started = std::time::Instant::now();
     let snapshot = F::snapshot(&global_state.feedback);
+    // The plan cell is part of the plan, so it is drawn from the workload
+    // seed: a child that replays its parent's plan lands in the parent's
+    // cell.
+    let recover_deps = RecoverDeps::of_workload_seed(workload_seed);
     let gen_config = GeneratorConfig {
         num_servers: config.num_servers,
         num_write_ops: config.num_write_ops,
@@ -1035,7 +1041,9 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         dependency_density: config.dependency_density,
         max_concurrent_writes: config.max_concurrent_writes,
         post_fault_client_ops: config.post_fault_client_ops,
+        recover_deps,
     };
+    util_stats::record_plan_deps_run(recover_deps, config.dependency_density > 0.0);
     // Workload RNG: seeded separately from the scheduling RNG so the plan is
     // reproducible from its own seed and uncorrelated with schedule draws.
     let mut workload_rng = SmallRng::seed_from_u64(workload_seed);

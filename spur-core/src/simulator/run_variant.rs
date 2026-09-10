@@ -21,6 +21,12 @@
 //! `ARM_SELECTOR_AXIS_C`, and `ARM_SELECTOR_CONCENTRATED`. Whether a run is
 //! a learner run depends on the learner's state when the run was drawn, so
 //! those bits come from the selector's choice, not from the id.
+//!
+//! The plan-cell bit, `RECOVER_DEPS_EXEMPT`, names how the run's plan was
+//! generated. A plan is a function of the workload seed, and a child run
+//! keeps its parent's seed under a fresh id, so this bit follows the seed
+//! and never the id: it is joined where the tag is assembled with the seed
+//! at hand, and `from_run_id` cannot name it.
 
 use crate::simulator::arm_selector;
 use crate::simulator::client_anchor;
@@ -29,6 +35,7 @@ use crate::simulator::fault_timing;
 use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
 use crate::simulator::pair_order;
+use crate::simulator::recover_deps::RecoverDeps;
 use crate::simulator::replay_corpus;
 use crate::simulator::run_cap;
 use crate::simulator::timer_context;
@@ -91,6 +98,18 @@ pub const ARM_SELECTOR_BITS: i32 = ARM_SELECTOR_AXIS | ARM_SELECTOR_AXIS_B | ARM
 /// probability of leading the axis. Set together with a learner bit on
 /// every learner run and on no other run.
 pub const ARM_SELECTOR_CONCENTRATED: i32 = 1 << 8;
+/// The run's plan was generated with no probabilistic edge into a node
+/// restart. A function of the workload seed, not of the run id.
+pub const RECOVER_DEPS_EXEMPT: i32 = 1 << 13;
+
+/// The bit that names the cell a run's plan was generated under, or zero
+/// for the stock cell.
+pub fn recover_deps_bits(cell: RecoverDeps) -> i32 {
+    match cell {
+        RecoverDeps::Stock => 0,
+        RecoverDeps::Exempt => RECOVER_DEPS_EXEMPT,
+    }
+}
 
 /// The direction a run takes on the crash-timing axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -317,7 +336,8 @@ pub fn of(
 }
 
 /// The bits the run id's coins alone would name, read straight from each
-/// mechanism's own coin. A coin-drawn run carries exactly these bits.
+/// mechanism's own coin. A coin-drawn run carries exactly these bits plus
+/// the plan-cell bit its workload seed names, which no id can reproduce.
 pub fn from_run_id(run_id: i64) -> i32 {
     let mut v = 0;
     if fault_timing::is_placed(run_id) {
@@ -509,6 +529,30 @@ mod tests {
         assert!((placed - want).abs() < 0.01, "placed share {placed} against coin {want}");
         assert!(ArmSet::coin_probability(0) < 0.15, "the stock crash coin is small");
         assert_eq!(of_arms(&ArmSet::default()), 0, "the all-stock set names no bit");
+    }
+
+    #[test]
+    fn the_plan_cell_bit_is_disjoint_from_every_id_bit() {
+        let _serial = config_override::exclusive_session();
+        fault_timing::reset();
+        use crate::simulator::rng::{WORKLOAD_SALT, derive_seed};
+        let mut exempt = 0;
+        for id in 0..64_000i64 {
+            let id_bits = from_run_id(id) | grid_arm_bits(id);
+            assert_eq!(
+                id_bits & RECOVER_DEPS_EXEMPT,
+                0,
+                "run {id}: an id bit shares the plan-cell bit"
+            );
+            let seed = derive_seed(3, id, WORKLOAD_SALT);
+            let cell = recover_deps_bits(RecoverDeps::of_workload_seed(seed));
+            assert_eq!(cell & !RECOVER_DEPS_EXEMPT, 0);
+            let tag = of(id, &ArmSet::coins(id), None, false) | cell;
+            assert_eq!(tag & !cell, from_run_id(id), "run {id}: the cell bit touched an id bit");
+            exempt += (cell == RECOVER_DEPS_EXEMPT) as i64;
+        }
+        assert!(exempt > 30_000 && exempt < 34_000, "exempt takes {exempt} of 64000");
+        assert_eq!(recover_deps_bits(RecoverDeps::Stock), 0);
     }
 
     #[test]

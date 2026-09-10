@@ -7,6 +7,7 @@
 
 use crate::simulator::core::steer_terms::{Term, TERMS};
 use crate::simulator::client_anchor;
+use crate::simulator::recover_deps::RecoverDeps;
 use crate::simulator::run_variant;
 use crate::simulator::fresh_first;
 use serde::Serialize;
@@ -360,6 +361,7 @@ static OH3_WITH_OVERLAP: AtomicU64 = AtomicU64::new(0);
 static PFO_PAIRS_SEEN: AtomicU64 = AtomicU64::new(0);
 static PFO_EDGES_ADDED: AtomicU64 = AtomicU64::new(0);
 static PFO_OPS_AFTER_LAST_RECOVER: AtomicU64 = AtomicU64::new(0);
+static PD_RECOVER_EDGES_DROPPED: AtomicU64 = AtomicU64::new(0);
 static NOVELTY_ABLATED_RUNS: AtomicU64 = AtomicU64::new(0);
 static MA_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static MA_CONTESTED_DECISIONS: AtomicU64 = AtomicU64::new(0);
@@ -442,6 +444,9 @@ static ACCEPT_DIST_ACTED: [[AtomicU64; ACCEPT_DIST_BUCKETS]; ACCEPT_PATHS] =
 static ACCEPT_DIST_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static TERMINATION: Mutex<TerminationStats> = Mutex::new(TerminationStats::new());
+
+static PLAN_DEPS_CELLS: Mutex<[PlanDepsDensitySplit; 2]> =
+    Mutex::new([PlanDepsDensitySplit::new(); 2]);
 
 static PREFIX_EXTENSION: Mutex<PrefixExtensionStats> = Mutex::new(PrefixExtensionStats::new());
 static PREFIX_EXTENSION_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -688,6 +693,7 @@ pub fn set_enabled(on: bool) {
             &PFO_PAIRS_SEEN,
             &PFO_EDGES_ADDED,
             &PFO_OPS_AFTER_LAST_RECOVER,
+            &PD_RECOVER_EDGES_DROPPED,
             &NOVELTY_ABLATED_RUNS,
             &MA_DECISIONS,
             &MA_CONTESTED_DECISIONS,
@@ -753,6 +759,10 @@ pub fn set_enabled(on: bool) {
         if let Ok(mut t) = TERMINATION.lock() {
             *t = TerminationStats::new();
         }
+        if let Ok(mut c) = PLAN_DEPS_CELLS.lock() {
+            *c = [PlanDepsDensitySplit::new(); 2];
+        }
+        PLAN_DEPS_RUN.with(|r| r.set(None));
         if let Ok(mut p) = PREFIX_EXTENSION.lock() {
             *p = PrefixExtensionStats::new();
         }
@@ -1578,6 +1588,9 @@ struct RunCrossingState {
     recovered: HashSet<usize>,
     /// Crash and recover events applied in this run.
     fault_events: u32,
+    /// The crash events among `fault_events`, and the recover events.
+    crashes: u32,
+    recovers: u32,
     /// Some node crashed while another node's recovery window was open.
     crash_inside_recovery_window: bool,
     /// Client operations invoked since the most recent recover, or 0 while no
@@ -1603,6 +1616,8 @@ impl Default for RunCrossingState {
             recovery_open: HashMap::new(),
             recovered: HashSet::new(),
             fault_events: 0,
+            crashes: 0,
+            recovers: 0,
             crash_inside_recovery_window: false,
             client_ops_since_last_recover: 0,
             any_recover: false,
@@ -1617,6 +1632,11 @@ impl Default for RunCrossingState {
 
 thread_local! {
     static RUN_CROSSING: RefCell<RunCrossingState> = RefCell::new(RunCrossingState::default());
+    /// The cell the run about to execute on this thread generated its plan
+    /// under, and whether its dependency density is positive. Set before the
+    /// plan runs and consumed when the run terminates, so a run that never
+    /// registered contributes to no cell.
+    static PLAN_DEPS_RUN: std::cell::Cell<Option<(RecoverDeps, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Fold this thread's finished run into the per-run tallies. Idempotent, so it
@@ -1678,6 +1698,8 @@ pub fn begin_run() {
         c.recovery_open.clear();
         c.recovered.clear();
         c.fault_events = 0;
+        c.crashes = 0;
+        c.recovers = 0;
         c.crash_inside_recovery_window = false;
         c.client_ops_since_last_recover = 0;
         c.any_recover = false;
@@ -1697,6 +1719,116 @@ pub fn record_post_fault_ops(pairs_seen: u64, edges_added: u64) {
     }
     PFO_PAIRS_SEEN.fetch_add(pairs_seen, Ordering::Relaxed);
     PFO_EDGES_ADDED.fetch_add(edges_added, Ordering::Relaxed);
+}
+
+/// The plan generator finished one plan and left `dropped` probabilistic
+/// edges into a recover out of it under the exempt cell.
+#[inline]
+pub fn record_plan_deps_edges(dropped: u64) {
+    if !enabled() {
+        return;
+    }
+    PD_RECOVER_EDGES_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+}
+
+/// The run about to execute on this thread generated its plan under `cell`,
+/// with a positive dependency density or not. Its termination is then folded
+/// into that cell's tally.
+pub fn record_plan_deps_run(cell: RecoverDeps, density_positive: bool) {
+    if !enabled() {
+        return;
+    }
+    PLAN_DEPS_RUN.with(|r| r.set(Some((cell, density_positive))));
+}
+
+/// Termination and fault counts over the runs of one plan-dependency cell.
+/// A crash is unrecovered when its recover never applied before the run
+/// ended, so `unrecovered_crashes` over `crashes` is the same share as
+/// `crash_recovery.crashes` minus `crash_recovery.recovers` over the
+/// session's crashes; `zero_recovery_runs` counts the runs in which no node
+/// completed a crash-and-recover cycle, the same runs
+/// `termination.by_recovered_nodes[0]` holds.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PlanDepsTally {
+    pub runs: u64,
+    pub crashes: u64,
+    pub unrecovered_crashes: u64,
+    pub zero_recovery_runs: u64,
+    pub plan_complete: u64,
+    pub steps_used_sum: u64,
+}
+
+impl PlanDepsTally {
+    const fn new() -> Self {
+        Self {
+            runs: 0,
+            crashes: 0,
+            unrecovered_crashes: 0,
+            zero_recovery_runs: 0,
+            plan_complete: 0,
+            steps_used_sum: 0,
+        }
+    }
+
+    fn add(&mut self, s: &RunTermination, crashes: u64, recovers: u64) {
+        self.runs += 1;
+        self.crashes += crashes;
+        self.unrecovered_crashes += crashes.saturating_sub(recovers);
+        if s.recovered_nodes == 0 {
+            self.zero_recovery_runs += 1;
+        }
+        if matches!(s.end, RunEnd::PlanComplete) {
+            self.plan_complete += 1;
+        }
+        self.steps_used_sum += s.steps_used;
+    }
+}
+
+/// One cell's tallies, split by whether the run's dependency density was
+/// positive: the exempt rule can only act where the probabilistic pass adds
+/// edges, so the two halves are read apart.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PlanDepsDensitySplit {
+    pub density_zero: PlanDepsTally,
+    pub density_positive: PlanDepsTally,
+}
+
+impl PlanDepsDensitySplit {
+    const fn new() -> Self {
+        Self {
+            density_zero: PlanDepsTally::new(),
+            density_positive: PlanDepsTally::new(),
+        }
+    }
+}
+
+/// How the plan generator ordered node restarts against client work, and
+/// how the runs of each cell ended.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PlanDepsStats {
+    /// Probabilistic edges into a recover left out of exempt-cell plans.
+    pub recover_edges_dropped: u64,
+    pub stock: PlanDepsDensitySplit,
+    pub exempt: PlanDepsDensitySplit,
+}
+
+fn fold_plan_deps_run(s: &RunTermination) {
+    let Some((cell, density_positive)) = PLAN_DEPS_RUN.with(|r| r.take()) else {
+        return;
+    };
+    let (crashes, recovers) = RUN_CROSSING.with(|c| {
+        let c = c.borrow();
+        (c.crashes as u64, c.recovers as u64)
+    });
+    if let Ok(mut cells) = PLAN_DEPS_CELLS.lock() {
+        let split = &mut cells[cell.index()];
+        let tally = if density_positive {
+            &mut split.density_positive
+        } else {
+            &mut split.density_zero
+        };
+        tally.add(s, crashes, recovers);
+    }
 }
 
 /// A planned client operation was handed to a client node. Only invocations
@@ -1730,6 +1862,7 @@ pub fn record_crash(node_index: usize, held: u64, dropped: u64) {
             *c.held.entry(node_index).or_insert(0) += held;
         }
         c.fault_events += 1;
+        c.crashes += 1;
         // A node's own crash ends its recovery window without a width: no
         // message ever reached the incarnation that came back.
         let own = c.recovery_open.remove(&node_index).is_some();
@@ -1781,6 +1914,7 @@ pub fn record_recover(node_index: usize, step: i32, own_sends_inflight: bool) {
     let first_crossing_of_run = RUN_CROSSING.with(|c| {
         let mut c = c.borrow_mut();
         c.fault_events += 1;
+        c.recovers += 1;
         c.recovered.insert(node_index);
         c.recovery_open.insert(node_index, step);
         c.any_recover = true;
@@ -2611,6 +2745,7 @@ pub fn record_run_termination(s: &RunTermination) {
          counters are not reaching the scheduler",
         s.steps_used
     );
+    fold_plan_deps_run(s);
     finish_run();
     let bucket = s.recovered_nodes.min(2);
     if let Ok(mut t) = TERMINATION.lock() {
@@ -5000,6 +5135,7 @@ pub struct UtilizationSnapshot {
     pub recovery_window: RecoveryWindowStats,
     pub ordered_h3: OrderedH3Stats,
     pub post_fault_ops: PostFaultOpsStats,
+    pub plan_deps: PlanDepsStats,
     pub delivery_effects: DeliveryEffectStats,
     pub timer_effects: TimerEffectStats,
     pub timer_steer: TimerSteerStats,
@@ -5169,6 +5305,17 @@ pub fn snapshot() -> UtilizationSnapshot {
             pairs_seen: PFO_PAIRS_SEEN.load(Ordering::Relaxed),
             edges_added: PFO_EDGES_ADDED.load(Ordering::Relaxed),
             ops_invoked_after_last_recover: PFO_OPS_AFTER_LAST_RECOVER.load(Ordering::Relaxed),
+        },
+        plan_deps: {
+            let cells = PLAN_DEPS_CELLS
+                .lock()
+                .map(|c| *c)
+                .unwrap_or_else(|p| *p.into_inner());
+            PlanDepsStats {
+                recover_edges_dropped: PD_RECOVER_EDGES_DROPPED.load(Ordering::Relaxed),
+                stock: cells[RecoverDeps::Stock.index()],
+                exempt: cells[RecoverDeps::Exempt.index()],
+            }
         },
         delivery_effects: DeliveryEffectStats {
             all: DeliveryEffect::read(DELIVERY_ALL),
@@ -5763,6 +5910,84 @@ mod tests {
         assert_eq!(t.plan_complete, 0);
         assert_eq!(t.iterations_exhausted, 0);
         assert_eq!(t.deadlock, 0);
+    }
+
+    #[test]
+    fn plan_deps_folds_each_run_into_its_cell_by_density_and_resets() {
+        let _serial = config_override::exclusive_session();
+        set_enabled(true);
+        let termination = |end, steps_used, recovered_nodes| RunTermination {
+            end,
+            steps_used,
+            step_budget: 100,
+            pending_work_at_exit: 0,
+            planned_events_outstanding: 0,
+            recovered_nodes,
+        };
+        record_plan_deps_edges(3);
+        // An exempt-cell run at positive density: two crashes, one recover.
+        record_plan_deps_run(RecoverDeps::Exempt, true);
+        begin_run();
+        record_crash(0, 0, 0);
+        record_crash(1, 0, 0);
+        record_recover(0, 5, false);
+        record_run_termination(&termination(RunEnd::LearnedCapReached, 40, 1));
+        // A stock-cell run at zero density that completed without a fault.
+        record_plan_deps_run(RecoverDeps::Stock, false);
+        begin_run();
+        record_run_termination(&termination(RunEnd::PlanComplete, 7, 0));
+        // A run that registered no cell reaches the session counters only.
+        begin_run();
+        record_crash(2, 0, 0);
+        record_run_termination(&termination(RunEnd::IterationsExhausted, 9, 0));
+
+        let s = snapshot();
+        assert_eq!(s.plan_deps.recover_edges_dropped, 3);
+        let e = s.plan_deps.exempt.density_positive;
+        assert_eq!(e.runs, 1);
+        assert_eq!(e.crashes, 2);
+        assert_eq!(e.unrecovered_crashes, 1);
+        assert_eq!(e.zero_recovery_runs, 0);
+        assert_eq!(e.plan_complete, 0);
+        assert_eq!(e.steps_used_sum, 40);
+        assert_eq!(s.plan_deps.exempt.density_zero.runs, 0);
+        let f = s.plan_deps.stock.density_zero;
+        assert_eq!(f.runs, 1);
+        assert_eq!(f.crashes, 0);
+        assert_eq!(f.unrecovered_crashes, 0);
+        assert_eq!(f.zero_recovery_runs, 1);
+        assert_eq!(f.plan_complete, 1);
+        assert_eq!(f.steps_used_sum, 7);
+        assert_eq!(s.plan_deps.stock.density_positive.runs, 0);
+        // The cells and the session counters name the same crashes.
+        let cells = [s.plan_deps.stock, s.plan_deps.exempt];
+        let by_cell: u64 = cells
+            .iter()
+            .map(|c| c.density_zero.unrecovered_crashes + c.density_positive.unrecovered_crashes)
+            .sum();
+        assert_eq!(s.crash_recovery.crashes - s.crash_recovery.recovers, by_cell + 1);
+        let zero_by_cell: u64 = cells
+            .iter()
+            .map(|c| c.density_zero.zero_recovery_runs + c.density_positive.zero_recovery_runs)
+            .sum();
+        assert_eq!(s.termination.by_recovered_nodes[0].runs, zero_by_cell + 1);
+
+        record_plan_deps_run(RecoverDeps::Exempt, false);
+        set_enabled(true);
+        let s = snapshot();
+        assert_eq!(s.plan_deps.recover_edges_dropped, 0);
+        for c in [s.plan_deps.stock, s.plan_deps.exempt] {
+            assert_eq!(c.density_zero.runs, 0);
+            assert_eq!(c.density_positive.runs, 0);
+            assert_eq!(c.density_positive.crashes, 0);
+        }
+        // The registration does not outlive the reset either.
+        begin_run();
+        record_run_termination(&termination(RunEnd::PlanComplete, 1, 0));
+        let s = snapshot();
+        assert_eq!(s.plan_deps.exempt.density_zero.runs, 0);
+        assert_eq!(s.plan_deps.exempt.density_positive.runs, 0);
+        set_enabled(false);
     }
 
     #[test]

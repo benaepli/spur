@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, RunCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -181,6 +181,76 @@ fn termination_leaves(prefix: &str, t: &TerminationStats) -> Vec<(String, Value)
             tally,
         ));
     }
+    out
+}
+
+fn plan_deps_tally(m: &mut Marks) -> PlanDepsTally {
+    PlanDepsTally {
+        runs: m.int(),
+        crashes: m.int(),
+        unrecovered_crashes: m.int(),
+        zero_recovery_runs: m.int(),
+        plan_complete: m.int(),
+        steps_used_sum: m.int(),
+    }
+}
+
+fn plan_deps_tally_leaves(prefix: &str, t: &PlanDepsTally) -> Vec<(String, Value)> {
+    let PlanDepsTally {
+        runs,
+        crashes,
+        unrecovered_crashes,
+        zero_recovery_runs,
+        plan_complete,
+        steps_used_sum,
+    } = t;
+    vec![
+        leaf(prefix, "runs", *runs),
+        leaf(prefix, "crashes", *crashes),
+        leaf(prefix, "unrecovered_crashes", *unrecovered_crashes),
+        leaf(prefix, "zero_recovery_runs", *zero_recovery_runs),
+        leaf(prefix, "plan_complete", *plan_complete),
+        leaf(prefix, "steps_used_sum", *steps_used_sum),
+    ]
+}
+
+fn plan_deps_split(m: &mut Marks) -> PlanDepsDensitySplit {
+    PlanDepsDensitySplit {
+        density_zero: plan_deps_tally(m),
+        density_positive: plan_deps_tally(m),
+    }
+}
+
+fn plan_deps_split_leaves(prefix: &str, s: &PlanDepsDensitySplit) -> Vec<(String, Value)> {
+    let PlanDepsDensitySplit {
+        density_zero,
+        density_positive,
+    } = s;
+    let mut out = plan_deps_tally_leaves(&format!("{prefix}.density_zero"), density_zero);
+    out.extend(plan_deps_tally_leaves(
+        &format!("{prefix}.density_positive"),
+        density_positive,
+    ));
+    out
+}
+
+fn plan_deps(m: &mut Marks) -> PlanDepsStats {
+    PlanDepsStats {
+        recover_edges_dropped: m.int(),
+        stock: plan_deps_split(m),
+        exempt: plan_deps_split(m),
+    }
+}
+
+fn plan_deps_leaves(prefix: &str, p: &PlanDepsStats) -> Vec<(String, Value)> {
+    let PlanDepsStats {
+        recover_edges_dropped,
+        stock,
+        exempt,
+    } = p;
+    let mut out = vec![leaf(prefix, "recover_edges_dropped", *recover_edges_dropped)];
+    out.extend(plan_deps_split_leaves(&format!("{prefix}.stock"), stock));
+    out.extend(plan_deps_split_leaves(&format!("{prefix}.exempt"), exempt));
     out
 }
 
@@ -1443,6 +1513,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         recovery_window: _,
         ordered_h3: _,
         post_fault_ops: _,
+        plan_deps: _,
         delivery_effects: _,
         timer_effects: _,
         timer_steer: _,
@@ -1481,6 +1552,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "recovery_window",
         "ordered_h3",
         "post_fault_ops",
+        "plan_deps",
         "delivery_effects",
         "timer_effects",
         "timer_steer",
@@ -1572,8 +1644,10 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.arm_selector_axis = arm_selector_axis(&mut m);
     s.replay = replay(&mut m);
     s.timer_context = timer_context(&mut m);
+    s.plan_deps = plan_deps(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
+    expected.extend(plan_deps_leaves("plan_deps", &s.plan_deps));
     expected.extend(delivery_effects_leaves(
         "delivery_effects",
         &s.delivery_effects,
@@ -1620,6 +1694,7 @@ fn every_counter_field_reaches_the_written_json() {
     for block in [
         "steer_authority",
         "termination",
+        "plan_deps",
         "delivery_effects",
         "run_cap",
         "crash_place",
