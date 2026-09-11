@@ -27,6 +27,7 @@ use crate::simulator::rng::{
 };
 use crate::simulator::arm_selector;
 use crate::simulator::fault_timing;
+use crate::simulator::ghost_release;
 use crate::simulator::run_cap;
 use crate::simulator::stall_cap;
 use crate::simulator::recover_deps::RecoverDeps;
@@ -1230,6 +1231,7 @@ pub fn run_explorer(
     run_cap::reset();
     arm_selector::reset();
     fault_timing::reset();
+    ghost_release::reset();
     timer_context::reset();
     fault_timing::set_fraction(config.faults.crash_placement_fraction);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
@@ -1632,6 +1634,7 @@ pub fn run_explorer_genetic(
     run_cap::reset();
     arm_selector::reset();
     fault_timing::reset();
+    ghost_release::reset();
     timer_context::reset();
     fault_timing::set_fraction(config.faults.crash_placement_fraction);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
@@ -2074,6 +2077,7 @@ pub fn run_explorer_aos(
     run_cap::reset();
     arm_selector::reset();
     fault_timing::reset();
+    ghost_release::reset();
     timer_context::reset();
     fault_timing::set_fraction(config.faults.crash_placement_fraction);
     util_stats::set_acted_fraction_enabled(config.emit_acted_fraction);
@@ -2730,6 +2734,7 @@ pub fn run_explorer_continuous(
     run_cap::reset();
     arm_selector::reset();
     fault_timing::reset();
+    ghost_release::reset();
     timer_context::reset();
     fault_timing::set_fraction(config.envelope.faults.crash_placement_fraction);
     util_stats::set_acted_fraction_enabled(config.envelope.emit_acted_fraction);

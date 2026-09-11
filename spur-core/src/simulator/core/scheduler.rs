@@ -16,6 +16,7 @@ use crate::simulator::crash_phase;
 use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
 use crate::simulator::pair_order;
+use crate::simulator::ghost_release;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
@@ -707,6 +708,7 @@ fn crash_hold_mask<H: HashPolicy>(
     rng: &mut impl StreamRng,
 ) -> u64 {
     let step_now = state.crash_info.current_step;
+    expire_release_trigger(state, step_now);
     let mut mask = 0u64;
     let width = state.crash_hold_until.len().min(u64::BITS as usize);
     for n in 0..width {
@@ -736,6 +738,265 @@ fn crash_hold_mask<H: HashPolicy>(
         }
     }
     mask
+}
+
+/// The trigger a restart armed runs out at the bound: nothing is released
+/// after it and every held crash keeps its target.
+fn expire_release_trigger<H: HashPolicy>(state: &mut State<H>, step_now: i32) {
+    if let Some(t) = state.ghost_release.trigger
+        && step_now >= t.expires
+    {
+        state.ghost_release.trigger = None;
+        util_stats::record_ghost_release_trigger(util_stats::GhostReleaseTrigger::Expired);
+    }
+}
+
+/// A restart of `origin` at `restart_step` on a releasing run arms the
+/// trigger when some other node's planned crash is still held; a trigger
+/// still armed from an earlier restart is replaced. No hold moves here, and
+/// below the learner's floor nothing is armed. Nothing here reads a random
+/// stream.
+fn arm_release_trigger<H: HashPolicy>(state: &mut State<H>, origin: usize, restart_step: i32) {
+    if !state.ghost_release.releases() {
+        return;
+    }
+    if !ghost_release::any_other_held(
+        &state.crash_hold_until,
+        &state.send_ledger,
+        origin,
+        restart_step,
+    ) {
+        return;
+    }
+    util_stats::record_ghost_release_restart_with_held_crash();
+    let gr = &mut state.ghost_release;
+    let Some(bound) = gr.bound else {
+        return;
+    };
+    if gr.trigger.is_some() {
+        util_stats::record_ghost_release_trigger(util_stats::GhostReleaseTrigger::Superseded);
+    }
+    gr.trigger = Some(ghost_release::Trigger {
+        origin,
+        restart_step,
+        expires: restart_step.saturating_add(bound),
+    });
+    util_stats::record_ghost_release_trigger(util_stats::GhostReleaseTrigger::Armed);
+}
+
+/// What one firing released: how many holds moved and, over the first 64
+/// nodes, whose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Released {
+    count: u64,
+    mask: u64,
+}
+
+fn node_bit(n: usize) -> u64 {
+    if n < u64::BITS as usize {
+        1u64 << n
+    } else {
+        0
+    }
+}
+
+/// A message entry at `dest` sent by `origin` at incarnation `sent_at`
+/// landed at `step` and `acted` says whether it wrote `dest`'s state. An
+/// entry from a dead incarnation of a live origin at a live destination is
+/// a ghost lag sample - the step less the origin's last restart step - fed
+/// to the learner on the runs that feed it. On a releasing run the first
+/// such entry after the armed restart, from the restarted node and writing
+/// state, fires the trigger: every other held crash goes at the next step,
+/// or on the single half the one crash `release_one` names.
+fn note_ghost_release_entry<H: HashPolicy>(
+    state: &mut State<H>,
+    origin: NodeId,
+    sent_at: u32,
+    dest: NodeId,
+    step: i32,
+    acted: bool,
+    servers: usize,
+) {
+    if origin == dest || sent_at == state.incarnation(origin) {
+        return;
+    }
+    let down = &state.crash_info.currently_crashed;
+    if down.contains(&dest) {
+        return;
+    }
+    let last_restart = state
+        .send_ledger
+        .get(origin.index)
+        .map_or(-1, |l| l.last_restart_step);
+    if !down.contains(&origin) && last_restart >= 0 && state.ghost_release.feeds_learner {
+        ghost_release::merge_probe_lag(state.ghost_release.scope, step - last_restart);
+    }
+    let Some(t) = state.ghost_release.trigger else {
+        return;
+    };
+    if !acted || t.origin != origin.index || step <= t.restart_step {
+        return;
+    }
+    let released = if state.ghost_release.single() {
+        match release_one(state, t.origin, dest, step, servers) {
+            Some(r) => r,
+            None => {
+                util_stats::record_ghost_release_single(util_stats::SingleRelease::NoCase);
+                return;
+            }
+        }
+    } else {
+        release_all(state, t.origin, step)
+    };
+    let gr = &mut state.ghost_release;
+    gr.released_mask |= released.mask;
+    gr.ghost_node = Some(dest.index);
+    gr.trigger = None;
+    util_stats::record_ghost_release_trigger(if released.count > 0 {
+        util_stats::GhostReleaseTrigger::Fired {
+            steps_from_restart: (step - t.restart_step).max(0) as u64,
+            released: released.count,
+        }
+    } else {
+        util_stats::GhostReleaseTrigger::FiredNothingHeld
+    });
+}
+
+/// Every node other than `origin` whose planned crash is still held goes
+/// at the step after `step`.
+fn release_all<H: HashPolicy>(state: &mut State<H>, origin: usize, step: i32) -> Released {
+    let mut out = Released::default();
+    for n in 0..state.crash_hold_until.len() {
+        if n == origin
+            || !ghost_release::held(&state.crash_hold_until, &state.send_ledger, n, step)
+        {
+            continue;
+        }
+        if ghost_release::release(&mut state.crash_hold_until, n, step) {
+            out.count += 1;
+            out.mask |= node_bit(n);
+        }
+    }
+    out
+}
+
+/// The one crash a firing on `v` releases on the single half: `v`'s own
+/// held crash; else the first held crash by index that the absorber ranking
+/// would move onto `v`; else, when `v` has no pending pair, the first held
+/// crash by index, which is then applied to `v` instead of its planned
+/// victim. None when no case holds, and the trigger stays armed. The
+/// restarted node's own crash is never the one released.
+fn release_one<H: HashPolicy>(
+    state: &mut State<H>,
+    origin: usize,
+    v: NodeId,
+    step: i32,
+    servers: usize,
+) -> Option<Released> {
+    let is_held = |state: &State<H>, n: usize| {
+        n != origin && ghost_release::held(&state.crash_hold_until, &state.send_ledger, n, step)
+    };
+    let nodes = 0..state.crash_hold_until.len();
+    let via_ranking = |state: &State<H>| {
+        nodes.clone().filter(|&n| is_held(state, n)).find(|&n| {
+            let planned = NodeId {
+                role: v.role,
+                index: n,
+            };
+            matches!(
+                absorber_decision(state, planned, servers).choice,
+                ghost_absorber::Choice::Retarget { node, .. } if node == v.index
+            )
+        })
+    };
+    let (n, case) = if is_held(state, v.index) {
+        (v.index, util_stats::SingleRelease::OwnCrash)
+    } else if let Some(n) = state.retarget.enabled.then(|| via_ranking(state)).flatten() {
+        (n, util_stats::SingleRelease::ViaRanking)
+    } else if !state.retarget.has_pending_pair(v.index) {
+        let n = nodes.filter(|&n| is_held(state, n)).next()?;
+        (n, util_stats::SingleRelease::Forced)
+    } else {
+        return None;
+    };
+    if !ghost_release::release(&mut state.crash_hold_until, n, step) {
+        return Some(Released::default());
+    }
+    if case == util_stats::SingleRelease::Forced {
+        state.ghost_release.forced_victim = Some((n, v.index));
+    }
+    util_stats::record_ghost_release_single(case);
+    Some(Released {
+        count: 1,
+        mask: node_bit(n),
+    })
+}
+
+/// The node a planned crash of `planned` is applied to when a firing named
+/// one: the node whose entry fired the trigger, if it is still live and has
+/// no pending pair. None hands the crash to the stock path. The naming is
+/// consumed either way.
+fn forced_victim<H: HashPolicy>(state: &mut State<H>, planned: NodeId) -> Option<NodeId> {
+    let (n, v) = state.ghost_release.forced_victim?;
+    if n != planned.index {
+        return None;
+    }
+    state.ghost_release.forced_victim = None;
+    let victim = NodeId {
+        role: planned.role,
+        index: v,
+    };
+    if state.crash_info.currently_crashed.contains(&victim) || state.retarget.has_pending_pair(v) {
+        return None;
+    }
+    util_stats::record_victim_swap(util_stats::VictimSwap::ForcedOntoAbsorber, false);
+    Some(victim)
+}
+
+/// A planned crash of `planned` is being applied on `victim`: count where
+/// it landed against the run's most recent acted ghost entry and, for a
+/// crash a firing released, against the node whose entry fired it, the
+/// victim's sends in flight, and the released crash applied just before.
+fn note_ghost_release_apply<H: HashPolicy>(state: &mut State<H>, planned: NodeId, victim: NodeId) {
+    let step = state.crash_info.current_step;
+    let in_flight = state
+        .send_ledger
+        .get(victim.index)
+        .map_or(0, |l| l.in_flight);
+    let down = &state.crash_info.currently_crashed;
+    let gr = &mut state.ghost_release;
+    let later = gr.crashes_applied > 0;
+    gr.crashes_applied = gr.crashes_applied.saturating_add(1);
+    let bit = node_bit(planned.index);
+    let fired = gr.released_mask & bit != 0;
+    gr.released_mask &= !bit;
+    let double = gr.last_released_apply.take().is_some_and(|(v0, s0)| {
+        step - s0 <= 8
+            && down.contains(&NodeId {
+                role: victim.role,
+                index: v0,
+            })
+    });
+    if fired {
+        gr.last_released_apply = Some((victim.index, step));
+    }
+    if !util_stats::enabled() {
+        return;
+    }
+    let last_acted_ghost = state.last_acted_ghost_step;
+    util_stats::record_ghost_release_apply(
+        gr.cell,
+        util_stats::GhostReleaseApply {
+            later,
+            within_3_of_acted_ghost: last_acted_ghost >= 0 && step - last_acted_ghost <= 3,
+            fired,
+            anchored: gr.anchored,
+            retarget: state.retarget.enabled,
+            on_ghost_node: gr.ghost_node == Some(victim.index),
+            in_flight,
+            double_after_release: double,
+        },
+    );
 }
 
 /// The node whose ledger the fan-out phase of `n`'s waiting crash is read
@@ -1122,7 +1383,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             // is applied to, which may differ from the planned victim. Only
             // the phase arm is keyed on the planned node, the node the hold
             // was armed on.
-            let victim = retarget_crash(state, node_id, topology.num_servers.max(0) as usize);
+            let servers = topology.num_servers.max(0) as usize;
+            let victim = forced_victim(state, node_id)
+                .unwrap_or_else(|| retarget_crash(state, node_id, servers));
+            note_ghost_release_apply(state, node_id, victim);
             let ledger = state.send_ledger.get(victim.index).copied().unwrap_or_default();
             if util_stats::enabled() {
                 util_stats::record_crash_anchor_apply(ledger.in_flight > 0);
@@ -1270,6 +1534,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     let record_entry_pc = r.entry_pc;
                     let record_origin = r.origin_node;
                     let record_dest = r.node;
+                    let record_sent_at = r.origin_incarnation;
                     // Bump the link's deliver counter so the next FIFO message
                     // in this link becomes schedulable.
                     if let Some((link_id, seq)) = r.link_seq {
@@ -1441,8 +1706,22 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                         rng,
                     )?;
                     let acted = state.node_state_token(record_dest) != token_before;
+                    if message_entry {
+                        note_ghost_release_entry(
+                            state,
+                            record_origin,
+                            record_sent_at,
+                            record_dest,
+                            entry_step,
+                            acted,
+                            topology.num_servers.max(0) as usize,
+                        );
+                    }
                     if let Some(before) = ghost {
                         state.note_ghost_delivery(record_dest.index, entry_step, before);
+                        if acted {
+                            state.last_acted_ghost_step = entry_step;
+                        }
                         // A dead-incarnation record is a ghost, so the
                         // token taken for the mark serves the reward too.
                         if overtaken_at_restarted && acted {
@@ -1859,6 +2138,11 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
         .get(node_id.index)
         .is_some_and(|l| l.in_flight > 0);
     state.note_incarnation_bump(node_id.index);
+    let restart_step = state.crash_info.current_step;
+    if let Some(l) = state.send_ledger.get_mut(node_id.index) {
+        l.last_restart_step = restart_step;
+    }
+    arm_release_trigger(state, node_id.index, restart_step);
     state.fresh_first.clear_origin(node_id.index);
     state.note_handler_entry(node_id.index, HandlerTrigger::None);
     util_stats::record_recover(
@@ -2168,6 +2452,658 @@ mod tests {
             0,
             "the fan-out wait must not count as a placement hold"
         );
+    }
+
+    /// A state with `n` nodes, a queued crash on every node in `crashes`,
+    /// the given holds, and the ghost release in `cell` with `bound`.
+    fn release_state(
+        n: usize,
+        crashes: &[usize],
+        holds: Vec<i32>,
+        cell: util_stats::GhostReleaseCell,
+        bound: Option<i32>,
+    ) -> State<NoHashing> {
+        let mut state = State::<NoHashing>::new(&[(ROLE, n)], 1);
+        for &c in crashes {
+            state.push_runnable(Runnable::Crash {
+                node_id: node(c),
+                priority: 0.5,
+            });
+        }
+        state.crash_hold_until = holds;
+        state.ghost_release.cell = cell;
+        state.ghost_release.bound = bound;
+        state.crash_info.current_step = 100;
+        state
+    }
+
+    /// A restart that finds another node's crash still held arms the
+    /// trigger on the releasing cells and moves no hold; a restart that
+    /// finds none, a run outside the releasing cells, and a run below the
+    /// learner's floor arm nothing. A restart while armed replaces the
+    /// trigger.
+    #[test]
+    fn a_restart_with_another_node_s_crash_held_arms_the_trigger_and_moves_nothing() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_place.ghost_release;
+        let holds = vec![900, 500, 431, 110];
+        let armed = ghost_release::Trigger {
+            origin: 0,
+            restart_step: 100,
+            expires: 120,
+        };
+        for cell in [
+            util_stats::GhostReleaseCell::ReleaseAll,
+            util_stats::GhostReleaseCell::Single,
+        ] {
+            let mut state = release_state(4, &[0, 1, 2, 3], holds.clone(), cell, Some(20));
+            arm_release_trigger(&mut state, 0, 100);
+            assert_eq!(state.ghost_release.trigger, Some(armed), "{cell:?}");
+            assert_eq!(state.crash_hold_until, holds, "{cell:?}: arming moved a hold");
+            assert_eq!(state.ghost_release.released_mask, 0);
+        }
+        let mut control = release_state(
+            4,
+            &[0, 1, 2, 3],
+            holds.clone(),
+            util_stats::GhostReleaseCell::Untreated,
+            Some(20),
+        );
+        arm_release_trigger(&mut control, 0, 100);
+        assert_eq!(control.ghost_release.trigger, None, "the untreated cell armed");
+        let mut unplaced = release_state(
+            4,
+            &[0, 1, 2, 3],
+            holds.clone(),
+            util_stats::GhostReleaseCell::Unplaced,
+            Some(20),
+        );
+        arm_release_trigger(&mut unplaced, 0, 100);
+        assert_eq!(unplaced.ghost_release.trigger, None, "an unplaced run armed");
+        let mut unlearned = release_state(
+            4,
+            &[0, 1, 2, 3],
+            holds.clone(),
+            util_stats::GhostReleaseCell::ReleaseAll,
+            None,
+        );
+        arm_release_trigger(&mut unlearned, 0, 100);
+        assert_eq!(unlearned.ghost_release.trigger, None, "below the floor armed");
+        assert_eq!(unlearned.crash_hold_until, holds);
+
+        // Only the restarted node's own crash is held, or every other hold
+        // has passed: nothing to release, nothing armed.
+        let mut own = release_state(
+            3,
+            &[0, 1],
+            vec![900, 90, 0],
+            util_stats::GhostReleaseCell::ReleaseAll,
+            Some(20),
+        );
+        arm_release_trigger(&mut own, 0, 100);
+        assert_eq!(own.ghost_release.trigger, None, "nothing held, something armed");
+        // A held crash whose target lies inside the bound still arms: the
+        // arming asks only whether a hold is ahead.
+        let mut near = release_state(
+            3,
+            &[1],
+            vec![0, 105, 0],
+            util_stats::GhostReleaseCell::ReleaseAll,
+            Some(20),
+        );
+        arm_release_trigger(&mut near, 0, 100);
+        assert_eq!(near.ghost_release.trigger, Some(armed));
+        assert_eq!(near.crash_hold_until, vec![0, 105, 0]);
+
+        // A restart while armed replaces the trigger.
+        let mut twice = release_state(
+            3,
+            &[0, 1, 2],
+            vec![900, 500, 431],
+            util_stats::GhostReleaseCell::Single,
+            Some(20),
+        );
+        arm_release_trigger(&mut twice, 0, 100);
+        arm_release_trigger(&mut twice, 2, 105);
+        assert_eq!(
+            twice.ghost_release.trigger,
+            Some(ghost_release::Trigger {
+                origin: 2,
+                restart_step: 105,
+                expires: 125
+            })
+        );
+        assert_eq!(twice.crash_hold_until, vec![900, 500, 431]);
+
+        let after = util_stats::snapshot().crash_place.ghost_release;
+        util_stats::set_enabled(false);
+        assert_eq!(after.armed - before.armed, 5);
+        assert_eq!(after.superseded - before.superseded, 1);
+        assert_eq!(after.restarts_with_held_crash - before.restarts_with_held_crash, 6);
+        assert_eq!(after.fired, before.fired);
+        assert_eq!(after.expired, before.expired);
+    }
+
+    /// Entries that are not from the restarted node's dead incarnation,
+    /// that land on the restarted node, that leave the receiver's state
+    /// unchanged, or that land at the restart step do not fire the trigger.
+    /// The first entry that does moves every other held crash to the next
+    /// step, leaves the restarted node's own hold and a hold already passed
+    /// alone, and disarms; a later entry moves nothing.
+    #[test]
+    fn the_first_acted_dead_incarnation_entry_at_a_live_peer_releases_every_other_held_crash() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_place.ghost_release;
+        let mut state = release_state(
+            5,
+            &[0, 1, 2, 3, 4],
+            vec![900, 500, 431, 90, 700],
+            util_stats::GhostReleaseCell::ReleaseAll,
+            Some(20),
+        );
+        state.incarnations = vec![1, 1, 0, 0, 0];
+        state.send_ledger[0].last_restart_step = 100;
+        state.send_ledger[1].last_restart_step = 50;
+        arm_release_trigger(&mut state, 0, 100);
+        let armed = state.ghost_release.trigger;
+        assert!(armed.is_some());
+        // Another node's dead incarnation entering the restarted node.
+        note_ghost_release_entry(&mut state, node(1), 0, node(0), 103, true, 5);
+        // The restarted node's live incarnation entering a peer.
+        note_ghost_release_entry(&mut state, node(0), 1, node(2), 104, true, 5);
+        // The dead incarnation entering a peer without writing its state.
+        note_ghost_release_entry(&mut state, node(0), 0, node(2), 105, false, 5);
+        // The dead incarnation entering a peer at the restart step itself.
+        note_ghost_release_entry(&mut state, node(0), 0, node(2), 100, true, 5);
+        // The dead incarnation entering a peer that is down.
+        state.crash_info.currently_crashed.insert(node(4));
+        note_ghost_release_entry(&mut state, node(0), 0, node(4), 105, true, 5);
+        state.crash_info.currently_crashed.remove(&node(4));
+        assert_eq!(state.ghost_release.trigger, armed, "a non-firing entry disarmed");
+        assert_eq!(state.crash_hold_until, vec![900, 500, 431, 90, 700]);
+
+        note_ghost_release_entry(&mut state, node(0), 0, node(2), 106, true, 5);
+        assert_eq!(
+            state.crash_hold_until,
+            vec![900, 107, 107, 90, 107],
+            "the firing releases every other held crash at the next step"
+        );
+        assert_eq!(state.ghost_release.trigger, None);
+        assert_eq!(state.ghost_release.released_mask, 0b10110);
+        assert_eq!(state.ghost_release.ghost_node, Some(2));
+        note_ghost_release_entry(&mut state, node(0), 0, node(1), 108, true, 5);
+        assert_eq!(
+            state.crash_hold_until,
+            vec![900, 107, 107, 90, 107],
+            "a second entry moves nothing"
+        );
+        assert_eq!(state.ghost_release.ghost_node, Some(2));
+
+        let after = util_stats::snapshot().crash_place.ghost_release;
+        util_stats::set_enabled(false);
+        assert_eq!(after.fired - before.fired, 1);
+        assert_eq!(after.fired_nothing_held, before.fired_nothing_held);
+        assert_eq!(after.released_crashes - before.released_crashes, 3);
+        assert_eq!(after.steps_from_restart_sum - before.steps_from_restart_sum, 6);
+        assert_eq!(after.single.releases, before.single.releases);
+    }
+
+    /// A firing that finds every other hold already at or before the next
+    /// step moves nothing, disarms, and counts apart from the firings that
+    /// released something.
+    #[test]
+    fn a_firing_that_shortens_nothing_counts_under_fired_nothing_held() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_place.ghost_release;
+        let mut state = release_state(
+            3,
+            &[0, 1, 2],
+            vec![900, 500, 431],
+            util_stats::GhostReleaseCell::ReleaseAll,
+            Some(20),
+        );
+        state.incarnations = vec![1, 0, 0];
+        state.send_ledger[0].last_restart_step = 100;
+        arm_release_trigger(&mut state, 0, 100);
+        // Every other hold is at the next step already, or has passed.
+        state.crash_hold_until = vec![900, 107, 101];
+        note_ghost_release_entry(&mut state, node(0), 0, node(2), 106, true, 3);
+        assert_eq!(state.crash_hold_until, vec![900, 107, 101]);
+        assert_eq!(state.ghost_release.trigger, None, "the firing did not disarm");
+        assert_eq!(state.ghost_release.released_mask, 0);
+        assert_eq!(state.ghost_release.ghost_node, Some(2));
+        let after = util_stats::snapshot().crash_place.ghost_release;
+        util_stats::set_enabled(false);
+        assert_eq!(after.fired_nothing_held - before.fired_nothing_held, 1);
+        assert_eq!(after.fired, before.fired);
+        assert_eq!(after.released_crashes, before.released_crashes);
+    }
+
+    /// With no firing by the bound the trigger expires at the top of the
+    /// hold mask and every crash keeps its drawn target; an entry after
+    /// the expiry moves nothing.
+    #[test]
+    fn expiry_at_the_bound_leaves_every_target_untouched() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_place.ghost_release;
+        let mut idle = release_state(
+            3,
+            &[1, 2],
+            vec![0, 500, 431],
+            util_stats::GhostReleaseCell::ReleaseAll,
+            Some(20),
+        );
+        idle.incarnations = vec![1, 0, 0];
+        arm_release_trigger(&mut idle, 0, 100);
+        let armed = idle.ghost_release.trigger;
+        assert!(armed.is_some());
+        let mut rng = StdRng::seed_from_u64(1);
+        for step in 101..120 {
+            idle.crash_info.current_step = step;
+            assert_eq!(crash_hold_mask(&mut idle, 3, &mut rng), 0b110, "step {step}");
+            assert_eq!(idle.ghost_release.trigger, armed, "step {step}: expired early");
+        }
+        idle.crash_info.current_step = 120;
+        assert_eq!(crash_hold_mask(&mut idle, 3, &mut rng), 0b110);
+        assert_eq!(idle.ghost_release.trigger, None, "the bound expires the trigger");
+        assert_eq!(idle.crash_hold_until, vec![0, 500, 431], "expiry moved a hold");
+        note_ghost_release_entry(&mut idle, node(0), 0, node(2), 121, true, 3);
+        assert_eq!(idle.crash_hold_until, vec![0, 500, 431]);
+        let after = util_stats::snapshot().crash_place.ghost_release;
+        util_stats::set_enabled(false);
+        assert_eq!(after.expired - before.expired, 1);
+        assert_eq!(after.fired, before.fired);
+    }
+
+    /// A releasing twin and an untreated twin take the same restart and the
+    /// same firing entry: only the releasing twin's holds move, the release
+    /// takes no random value, and the twins' streams stay in step over the
+    /// offers that follow.
+    #[test]
+    fn the_untreated_twin_never_releases_and_keeps_its_streams() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        let holds = vec![900, 500, 431, 110];
+        let build = |cell| {
+            let mut state = release_state(4, &[0, 1, 2, 3], holds.clone(), cell, Some(20));
+            state.incarnations = vec![1, 0, 0, 0];
+            state.send_ledger[0].last_restart_step = 100;
+            state
+        };
+        let mut treated = build(util_stats::GhostReleaseCell::ReleaseAll);
+        let mut control = build(util_stats::GhostReleaseCell::Untreated);
+        for s in [&mut treated, &mut control] {
+            arm_release_trigger(s, 0, 100);
+            note_ghost_release_entry(s, node(0), 0, node(2), 106, true, 4);
+        }
+        assert_eq!(treated.crash_hold_until, vec![900, 107, 107, 107]);
+        assert_eq!(control.crash_hold_until, holds, "the untreated twin");
+        assert_eq!(control.ghost_release.trigger, None);
+        assert_eq!(control.ghost_release.released_mask, 0);
+
+        let mut rng_t = StdRng::seed_from_u64(3);
+        let mut rng_c = StdRng::seed_from_u64(3);
+        for step in 100..=200 {
+            treated.crash_info.current_step = step;
+            control.crash_info.current_step = step;
+            let held_t = crash_hold_mask(&mut treated, 4, &mut rng_t);
+            let held_c = crash_hold_mask(&mut control, 4, &mut rng_c);
+            let mut want_c = 1u64;
+            for (n, t) in [(1, 500), (2, 431), (3, 110)] {
+                if step < t {
+                    want_c |= 1 << n;
+                }
+            }
+            assert_eq!(held_c, want_c, "step {step}: the control twin");
+            let want_t = if step < 107 { 0b1111 } else { 0b0001 };
+            assert_eq!(held_t, want_t, "step {step}: the releasing twin");
+        }
+        assert_eq!(rng_t.next_u64(), rng_c.next_u64(), "the twins' streams parted");
+    }
+
+    /// On an anchored run a released crash's phase slot stays pending until
+    /// its new target and draws its arm at the first offer past it, as an
+    /// unreleased hold does at its drawn target.
+    #[test]
+    fn a_released_crash_s_phase_slot_draws_at_the_first_offer_past_its_new_target() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        let mut state = release_state(
+            2,
+            &[1],
+            vec![0, 500],
+            util_stats::GhostReleaseCell::ReleaseAll,
+            Some(20),
+        );
+        state.crash_phase.arm_node(1, 0);
+        // A segment with nothing issued meets no waiting arm's phase.
+        state.send_ledger[1].floor = state.send_ledger[1].issued;
+        state.incarnations = vec![1, 0];
+        arm_release_trigger(&mut state, 0, 100);
+        note_ghost_release_entry(&mut state, node(0), 0, node(1), 103, true, 2);
+        let target = state.crash_hold_until[1];
+        assert_eq!(target, 104);
+        let mut rng = StdRng::seed_from_u64(9);
+        for step in 100..target {
+            state.crash_info.current_step = step;
+            assert_eq!(crash_hold_mask(&mut state, 2, &mut rng), 1 << 1, "step {step}");
+            assert_eq!(state.crash_phase.arm_of(1), None, "the slot drew before its target");
+        }
+        state.crash_info.current_step = target;
+        let held = crash_hold_mask(&mut state, 2, &mut rng) != 0;
+        match state.crash_phase.arm_of(1) {
+            Some(util_stats::CrashPhaseArm::Stock) => assert!(!held, "a stock draw held"),
+            Some(_) => assert!(held, "a waiting arm released at once on a silent segment"),
+            None => panic!("the slot did not draw at the first offer past the new target"),
+        }
+    }
+
+    /// On the single half a firing on v releases exactly one crash: v's own
+    /// held crash when it has one; else the first held crash by index the
+    /// absorber ranking would move onto v; else, when v has no pending
+    /// pair, the first held crash by index, which is then to be applied to
+    /// v; and nothing when none of the three applies, the trigger staying
+    /// armed for a later entry.
+    #[test]
+    fn the_single_half_releases_exactly_the_crash_its_case_names() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_place.ghost_release;
+        let build = |crashes: &[usize], holds: Vec<i32>| {
+            let mut state = release_state(
+                4,
+                crashes,
+                holds,
+                util_stats::GhostReleaseCell::Single,
+                Some(20),
+            );
+            state.incarnations = vec![1, 0, 0, 0];
+            state.send_ledger[0].last_restart_step = 100;
+            arm_release_trigger(&mut state, 0, 100);
+            assert!(state.ghost_release.trigger.is_some());
+            state
+        };
+        let fire_on = |state: &mut State<NoHashing>, v: usize| {
+            note_ghost_release_entry(state, node(0), 0, node(v), 106, true, 4);
+        };
+
+        // (1) v's own held crash goes alone.
+        let mut own = build(&[0, 1, 2, 3], vec![900, 500, 431, 300]);
+        own.retarget.enabled = true;
+        own.send_ledger[1].last_ghost_step = 95;
+        own.send_ledger[1].last_ghost_acted = true;
+        fire_on(&mut own, 2);
+        assert_eq!(own.crash_hold_until, vec![900, 500, 107, 300]);
+        assert_eq!(own.ghost_release.trigger, None);
+        assert_eq!(own.ghost_release.released_mask, 0b0100);
+        assert_eq!(own.ghost_release.forced_victim, None);
+
+        // (2) v has no held crash; the ranking would move the crashes of
+        // nodes 1 and 3 onto v, so the first by index goes alone.
+        let mut ranked = build(&[0, 1, 3], vec![900, 500, 0, 300]);
+        ranked.retarget.enabled = true;
+        ranked.send_ledger[2].last_ghost_step = 95;
+        ranked.send_ledger[2].last_ghost_acted = true;
+        fire_on(&mut ranked, 2);
+        assert_eq!(ranked.crash_hold_until, vec![900, 107, 0, 300]);
+        assert_eq!(ranked.ghost_release.trigger, None);
+        assert_eq!(ranked.ghost_release.released_mask, 0b0010);
+        assert_eq!(ranked.ghost_release.forced_victim, None);
+
+        // (2) passes a held crash the ranking keeps where it is: node 1's
+        // own mark outranks v, so its crash stays on node 1, and node 3's
+        // crash is the first the ranking moves onto v.
+        let mut elsewhere = build(&[0, 1, 3], vec![900, 500, 0, 300]);
+        elsewhere.retarget.enabled = true;
+        elsewhere.send_ledger[1].last_ghost_step = 97;
+        elsewhere.send_ledger[1].last_ghost_acted = true;
+        elsewhere.send_ledger[2].last_ghost_step = 95;
+        elsewhere.send_ledger[2].last_ghost_acted = true;
+        fire_on(&mut elsewhere, 2);
+        assert_eq!(elsewhere.crash_hold_until, vec![900, 500, 0, 107]);
+        assert_eq!(elsewhere.ghost_release.released_mask, 0b1000);
+
+        // (3) no ranking reaches v and v has no pending pair: the first held
+        // crash by index goes alone and is to be applied to v. The
+        // restarted node's own crash, first by index, is never the one.
+        let mut forced = build(&[0, 1, 3], vec![900, 500, 0, 300]);
+        fire_on(&mut forced, 2);
+        assert_eq!(forced.crash_hold_until, vec![900, 107, 0, 300]);
+        assert_eq!(forced.ghost_release.trigger, None);
+        assert_eq!(forced.ghost_release.released_mask, 0b0010);
+        assert_eq!(forced.ghost_release.forced_victim, Some((1, 2)));
+        // The same on a retarget run whose ranking finds no absorber.
+        let mut unmarked = build(&[0, 1, 3], vec![900, 500, 0, 300]);
+        unmarked.retarget.enabled = true;
+        fire_on(&mut unmarked, 2);
+        assert_eq!(unmarked.crash_hold_until, vec![900, 107, 0, 300]);
+        assert_eq!(unmarked.ghost_release.forced_victim, Some((1, 2)));
+
+        // (4) v has a pending pair and no case applies: nothing moves and
+        // the trigger stays armed; an entry at another peer then fires.
+        let mut none = build(&[0, 1, 3], vec![900, 500, 0, 300]);
+        none.retarget.enabled = true;
+        none.retarget.pending_pair_mask = 1 << 2;
+        let armed = none.ghost_release.trigger;
+        fire_on(&mut none, 2);
+        assert_eq!(none.crash_hold_until, vec![900, 500, 0, 300]);
+        assert_eq!(none.ghost_release.trigger, armed, "no case, yet disarmed");
+        assert_eq!(none.ghost_release.released_mask, 0);
+        assert_eq!(none.ghost_release.forced_victim, None);
+        note_ghost_release_entry(&mut none, node(0), 0, node(3), 108, true, 4);
+        assert_eq!(none.crash_hold_until, vec![900, 500, 0, 109]);
+        assert_eq!(none.ghost_release.trigger, None);
+        assert_eq!(none.ghost_release.ghost_node, Some(3));
+
+        // A named crash whose hold is at the next step already: the firing
+        // disarms, moves nothing, and names no forced victim.
+        let mut at_next = build(&[0, 1], vec![900, 500, 0, 0]);
+        at_next.crash_hold_until[1] = 107;
+        fire_on(&mut at_next, 2);
+        assert_eq!(at_next.crash_hold_until, vec![900, 107, 0, 0]);
+        assert_eq!(at_next.ghost_release.trigger, None);
+        assert_eq!(at_next.ghost_release.forced_victim, None);
+        assert_eq!(at_next.ghost_release.released_mask, 0);
+
+        let after = util_stats::snapshot().crash_place.ghost_release;
+        util_stats::set_enabled(false);
+        assert_eq!(after.single.released_own_crash - before.single.released_own_crash, 2);
+        assert_eq!(after.single.released_via_ranking - before.single.released_via_ranking, 2);
+        assert_eq!(after.single.released_forced - before.single.released_forced, 2);
+        assert_eq!(after.single.releases - before.single.releases, 6);
+        assert_eq!(after.single.no_release_case - before.single.no_release_case, 1);
+        assert_eq!(after.fired - before.fired, 6);
+        assert_eq!(after.fired_nothing_held - before.fired_nothing_held, 1);
+        assert_eq!(after.released_crashes - before.released_crashes, 6);
+    }
+
+    /// At the apply site a planned crash a firing named for the peer whose
+    /// entry fired it lands there when that peer is still live with no
+    /// pending pair, and counts as a forced victim swap; otherwise, or for
+    /// any other planned crash, the stock path runs. The naming is consumed
+    /// by the crash it names.
+    #[test]
+    fn a_forced_victim_lands_the_named_crash_on_the_ghost_node() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().victim_swap;
+        let mut state = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        state.ghost_release.forced_victim = Some((1, 2));
+        assert_eq!(forced_victim(&mut state, node(0)), None, "another crash took the naming");
+        assert_eq!(state.ghost_release.forced_victim, Some((1, 2)));
+        assert_eq!(forced_victim(&mut state, node(1)), Some(node(2)));
+        assert_eq!(state.ghost_release.forced_victim, None, "the naming was not consumed");
+        assert_eq!(forced_victim(&mut state, node(1)), None);
+
+        state.ghost_release.forced_victim = Some((1, 2));
+        state.crash_info.currently_crashed.insert(node(2));
+        assert_eq!(forced_victim(&mut state, node(1)), None, "a down peer took the crash");
+        assert_eq!(state.ghost_release.forced_victim, None);
+        state.crash_info.currently_crashed.remove(&node(2));
+
+        state.ghost_release.forced_victim = Some((1, 2));
+        state.retarget.enabled = true;
+        state.retarget.pending_pair_mask = 1 << 2;
+        assert_eq!(forced_victim(&mut state, node(1)), None, "a pending pair took the crash");
+        assert_eq!(state.ghost_release.forced_victim, None);
+
+        let after = util_stats::snapshot().victim_swap;
+        util_stats::set_enabled(false);
+        assert_eq!(after.forced_onto_absorber - before.forced_onto_absorber, 1);
+        assert_eq!(after.applied - before.applied, 1);
+        assert_eq!(after.acted_absorber - before.acted_absorber, 1);
+    }
+
+    /// A ghost lag is sampled at an entry from a dead incarnation of a live
+    /// origin at a live destination, on a run that feeds the learner, and
+    /// nowhere else.
+    #[test]
+    fn only_dead_incarnation_entries_between_live_nodes_on_a_feeding_run_are_lag_samples() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        ghost_release::reset();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_place.ghost_release.lag_samples;
+        let mut state = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        state.incarnations[0] = 1;
+        state.send_ledger[0].last_restart_step = 40;
+        state.ghost_release.feeds_learner = true;
+        state.ghost_release.scope = 6000;
+        for _ in 0..199 {
+            note_ghost_release_entry(&mut state, node(0), 0, node(1), 52, true, 3);
+        }
+        note_ghost_release_entry(&mut state, node(0), 1, node(1), 52, true, 3);
+        state.crash_info.currently_crashed.insert(node(1));
+        note_ghost_release_entry(&mut state, node(0), 0, node(1), 52, true, 3);
+        state.crash_info.currently_crashed.remove(&node(1));
+        state.crash_info.currently_crashed.insert(node(0));
+        note_ghost_release_entry(&mut state, node(0), 0, node(2), 52, true, 3);
+        state.crash_info.currently_crashed.remove(&node(0));
+        state.ghost_release.feeds_learner = false;
+        note_ghost_release_entry(&mut state, node(0), 0, node(1), 52, true, 3);
+        state.ghost_release.feeds_learner = true;
+        assert_eq!(ghost_release::bound(6000), None, "a non-sample reached the learner");
+        note_ghost_release_entry(&mut state, node(0), 0, node(2), 52, false, 3);
+        assert_eq!(ghost_release::bound(6000), Some(12), "an inert entry is still a lag");
+        let after = util_stats::snapshot().crash_place.ghost_release.lag_samples;
+        util_stats::set_enabled(false);
+        assert_eq!(after - before, 200);
+        ghost_release::reset();
+    }
+
+    /// A crash apply counts under its run's cell, marks a later crash that
+    /// lands within three steps of the run's most recent acted ghost
+    /// entry, and counts a crash a firing released by where it landed: on
+    /// the node whose entry fired it, split by the retarget arm; within
+    /// three steps, split by the phase arm; by the victim's sends in
+    /// flight; and as a double crash when it follows a released crash
+    /// whose victim is still down. Enabling the counters again clears the
+    /// block.
+    #[test]
+    fn a_crash_apply_counts_its_landing() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().crash_place.ghost_release;
+        let mut state = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        state.ghost_release.cell = util_stats::GhostReleaseCell::ReleaseAll;
+        state.ghost_release.anchored = false;
+        state.retarget.enabled = false;
+        state.last_acted_ghost_step = 108;
+        // The first crash: never a later one.
+        state.crash_info.current_step = 110;
+        note_ghost_release_apply(&mut state, node(1), node(1));
+        // A later crash within three steps of the acted ghost.
+        state.crash_info.current_step = 111;
+        note_ghost_release_apply(&mut state, node(2), node(2));
+        // A later crash past three steps.
+        state.crash_info.current_step = 112;
+        note_ghost_release_apply(&mut state, node(1), node(1));
+        assert_eq!(state.ghost_release.crashes_applied, 3);
+
+        // Two released crashes: node 1's lands on the ghost node with two
+        // sends in flight, one step past the acted ghost, on the stock
+        // retarget arm; node 2's lands elsewhere, within eight steps of the
+        // first while node 2 is still down, on the retarget arm of an
+        // anchored run, and four steps past the acted ghost.
+        state.ghost_release.released_mask = 0b110;
+        state.ghost_release.ghost_node = Some(2);
+        state.send_ledger[2].in_flight = 2;
+        state.last_acted_ghost_step = 119;
+        state.crash_info.current_step = 120;
+        note_ghost_release_apply(&mut state, node(1), node(2));
+        assert_eq!(state.ghost_release.released_mask, 0b100);
+        assert_eq!(state.ghost_release.last_released_apply, Some((2, 120)));
+        state.crash_info.currently_crashed.insert(node(2));
+        state.retarget.enabled = true;
+        state.ghost_release.anchored = true;
+        state.crash_info.current_step = 123;
+        note_ghost_release_apply(&mut state, node(2), node(1));
+        assert_eq!(state.ghost_release.released_mask, 0);
+        assert_eq!(state.ghost_release.last_released_apply, Some((1, 123)));
+        // A crash more than eight steps after the released one is no
+        // double.
+        state.crash_info.currently_crashed.insert(node(1));
+        state.crash_info.current_step = 140;
+        note_ghost_release_apply(&mut state, node(0), node(0));
+        assert_eq!(state.ghost_release.last_released_apply, None);
+
+        let mut other = State::<NoHashing>::new(&[(ROLE, 3)], 1);
+        other.ghost_release.cell = util_stats::GhostReleaseCell::Untreated;
+        note_ghost_release_apply(&mut other, node(0), node(0));
+        other.ghost_release.cell = util_stats::GhostReleaseCell::Single;
+        note_ghost_release_apply(&mut other, node(0), node(0));
+        other.ghost_release.cell = util_stats::GhostReleaseCell::Unplaced;
+        note_ghost_release_apply(&mut other, node(0), node(0));
+
+        let after = util_stats::snapshot().crash_place.ghost_release;
+        let d = |f: fn(&util_stats::GhostReleaseCellStats) -> u64| {
+            (
+                f(&after.cells.untreated) - f(&before.cells.untreated),
+                f(&after.cells.release_all) - f(&before.cells.release_all),
+                f(&after.cells.single) - f(&before.cells.single),
+                f(&after.cells.treated) - f(&before.cells.treated),
+            )
+        };
+        assert_eq!(d(|c| c.crashes_applied), (1, 6, 1, 7));
+        assert_eq!(d(|c| c.later_crashes_applied), (0, 5, 1, 6));
+        assert_eq!(d(|c| c.applied_within_3_of_acted_ghost), (0, 2, 0, 2));
+        assert_eq!(d(|c| c.fired_crashes_applied), (0, 2, 0, 2));
+        assert_eq!(d(|c| c.fired_crashes_applied_within_3), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_crashes_on_ghost_node), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_crashes_applied_stock), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_crashes_on_ghost_node_stock), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_crashes_applied_retarget), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_crashes_on_ghost_node_retarget), (0, 0, 0, 0));
+        assert_eq!(d(|c| c.fired_crashes_applied_unanchored), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_crashes_applied_within_3_unanchored), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_crashes_applied_anchored), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_crashes_applied_within_3_anchored), (0, 0, 0, 0));
+        assert_eq!(d(|c| c.fired_inflight_bucket_0), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.fired_inflight_bucket_2), (0, 1, 0, 1));
+        assert_eq!(d(|c| c.double_crash_after_release), (0, 1, 0, 1));
+        let s = (&before.single.cells, &after.single.cells);
+        assert_eq!(s.1.release_all.crashes_applied - s.0.release_all.crashes_applied, 6);
+        assert_eq!(
+            s.1.release_all.double_crash_after_release - s.0.release_all.double_crash_after_release,
+            1
+        );
+        assert_eq!(s.1.single.crashes_applied - s.0.single.crashes_applied, 1);
+
+        util_stats::set_enabled(true);
+        let zero = util_stats::snapshot().crash_place.ghost_release;
+        util_stats::set_enabled(false);
+        assert_eq!(zero.armed, 0);
+        assert_eq!(zero.fired, 0);
+        assert_eq!(zero.released_crashes, 0);
+        assert_eq!(zero.cells.treated.crashes_applied, 0);
+        assert_eq!(zero.cells.untreated.crashes_applied, 0);
+        assert_eq!(zero.cells.release_all.fired_crashes_applied_stock, 0);
+        assert_eq!(zero.cells.single.double_crash_after_release, 0);
+        assert_eq!(zero.single.releases, 0);
+        assert_eq!(zero.single.no_release_case, 0);
+        assert_eq!(zero.lag_samples, 0);
+        assert_eq!((zero.lag_p50, zero.lag_p75, zero.lag_p90, zero.scopes_engaged), (0, 0, 0, 0));
     }
 
     /// The identity-weighted recovery term reads its predicate and reports

@@ -970,6 +970,7 @@ pub fn run_explorer_campaign(
     crate::simulator::stall_cap::reset();
     crate::simulator::arm_selector::reset();
     crate::simulator::fault_timing::reset();
+    crate::simulator::ghost_release::reset();
     crate::simulator::timer_context::reset();
     crate::simulator::fault_timing::set_fraction(
         config.envelope.faults.crash_placement_fraction,

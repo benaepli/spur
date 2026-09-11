@@ -10,6 +10,7 @@ use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
 use crate::simulator::client_anchor;
 use crate::simulator::pair_order;
+use crate::simulator::ghost_release;
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats::DeliveryBias;
@@ -633,6 +634,15 @@ pub struct State<H: HashPolicy> {
     /// once-per-run signal has been counted. Scheduling bookkeeping like
     /// `crash_hold_until`, excluded from `signature()`.
     pub retarget: ghost_absorber::RunState,
+    /// Where this run stands with the ghost release: its cell, the learned
+    /// bound, the trigger a restart armed and the crashes a firing released.
+    /// Scheduling bookkeeping like `crash_hold_until`, excluded from
+    /// `signature()`.
+    pub ghost_release: ghost_release::RunState,
+    /// The step of the run's most recent fault-crossing message entry that
+    /// wrote its receiver's state, -1 while there has been none. Read where
+    /// a crash is applied; excluded from `signature()`.
+    pub last_acted_ghost_step: i32,
     /// Same-step preference for a sender's current incarnation at a
     /// contested network step, and the census tables it is read against.
     pub fresh_first: fresh_first::RunState,
@@ -727,6 +737,8 @@ pub struct ReplayCut {
 /// entry from; `ghost_acted_since_restart` says whether a fault-crossing
 /// delivery wrote the node's state; `request_entered_since_restart` whether
 /// a message entry caused by a post-fault client operation has reached it.
+/// `last_restart_step` is the step the node last came back from a crash,
+/// -1 while it never has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendLedger {
     pub issued: u32,
@@ -745,6 +757,7 @@ pub struct SendLedger {
     pub absorber_peers_heard: u64,
     pub ghost_acted_since_restart: bool,
     pub request_entered_since_restart: bool,
+    pub last_restart_step: i32,
 }
 
 impl Default for SendLedger {
@@ -766,6 +779,7 @@ impl Default for SendLedger {
             absorber_peers_heard: 0,
             ghost_acted_since_restart: false,
             request_entered_since_restart: false,
+            last_restart_step: -1,
         }
     }
 }
@@ -832,6 +846,8 @@ impl<H: HashPolicy> State<H> {
             crash_phase: crash_phase::RunAnchor::with_nodes(num_nodes),
             crash_hold_drawn: false,
             retarget: ghost_absorber::RunState::default(),
+            ghost_release: ghost_release::RunState::default(),
+            last_acted_ghost_step: -1,
             fresh_first: fresh_first::RunState::default(),
             pair_order: pair_order::RunState::default(),
             client_anchor: client_anchor::RunState::default(),

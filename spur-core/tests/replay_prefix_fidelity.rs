@@ -197,12 +197,14 @@ fn check_prefix() {
         v & run_variant::CRASH_PLACED != 0
             && v & (run_variant::RUN_CAP_PROBE | run_variant::TIMER_STEER_OFF) == 0
     };
-    let candidates: Vec<i64> = (0..1_000_000i64)
+    let parents: Vec<i64> = (0..1_000_000i64)
         .filter(|&id| eligible(id))
-        .take(3 * PARENT_CANDIDATES)
+        .take(PARENT_CANDIDATES)
         .collect();
-    assert_eq!(candidates.len(), 3 * PARENT_CANDIDATES, "not enough placed run ids");
-    let (parents, children) = candidates.split_at(PARENT_CANDIDATES);
+    assert_eq!(parents.len(), PARENT_CANDIDATES, "not enough placed run ids");
+    // Children are drawn from every eligible id past the parents: the tag
+    // has many bit combinations, so a fixed pool could miss a parent's.
+    let first_child = parents.last().copied().expect("a parent pool") + 1;
 
     let mut checked = 0;
     for (i, &parent_id) in parents.iter().enumerate() {
@@ -228,9 +230,9 @@ fn check_prefix() {
         assert!(pos > 0, "the signal fired before any draw");
         let prefix: Recording = tape[..pos].into();
 
-        let child_id = *children
-            .iter()
-            .find(|&&id| run_variant::from_run_id(id) == run_variant::from_run_id(parent_id))
+        let child_id = (first_child..1_000_000i64)
+            .filter(|&id| eligible(id))
+            .find(|&id| run_variant::from_run_id(id) == run_variant::from_run_id(parent_id))
             .expect("a child id with the parent's mechanism bits");
         let child_dir = scratch(&format!("child_{i}"));
         let w = writer(&child_dir);

@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -629,12 +629,244 @@ fn stall_release_leaves(prefix: &str, s: &StallReleaseStats) -> Vec<(String, Val
     out
 }
 
+fn ghost_release_cell(m: &mut Marks) -> GhostReleaseCellStats {
+    GhostReleaseCellStats {
+        runs: m.int(),
+        steps_used_sum: m.int(),
+        crashes_applied: m.int(),
+        later_crashes_applied: m.int(),
+        applied_within_3_of_acted_ghost: m.int(),
+        fired_crashes_applied: m.int(),
+        fired_crashes_applied_within_3: m.int(),
+        fired_crashes_on_ghost_node: m.int(),
+        fired_crashes_applied_anchored: m.int(),
+        fired_crashes_applied_within_3_anchored: m.int(),
+        fired_crashes_applied_unanchored: m.int(),
+        fired_crashes_applied_within_3_unanchored: m.int(),
+        fired_crashes_applied_retarget: m.int(),
+        fired_crashes_on_ghost_node_retarget: m.int(),
+        fired_crashes_applied_stock: m.int(),
+        fired_crashes_on_ghost_node_stock: m.int(),
+        fired_inflight_bucket_0: m.int(),
+        fired_inflight_bucket_1: m.int(),
+        fired_inflight_bucket_2: m.int(),
+        fired_inflight_bucket_3plus: m.int(),
+        double_crash_after_release: m.int(),
+    }
+}
+
+fn ghost_release_cell_leaves(prefix: &str, c: &GhostReleaseCellStats) -> Vec<(String, Value)> {
+    let GhostReleaseCellStats {
+        runs,
+        steps_used_sum,
+        crashes_applied,
+        later_crashes_applied,
+        applied_within_3_of_acted_ghost,
+        fired_crashes_applied,
+        fired_crashes_applied_within_3,
+        fired_crashes_on_ghost_node,
+        fired_crashes_applied_anchored,
+        fired_crashes_applied_within_3_anchored,
+        fired_crashes_applied_unanchored,
+        fired_crashes_applied_within_3_unanchored,
+        fired_crashes_applied_retarget,
+        fired_crashes_on_ghost_node_retarget,
+        fired_crashes_applied_stock,
+        fired_crashes_on_ghost_node_stock,
+        fired_inflight_bucket_0,
+        fired_inflight_bucket_1,
+        fired_inflight_bucket_2,
+        fired_inflight_bucket_3plus,
+        double_crash_after_release,
+    } = c;
+    vec![
+        leaf(prefix, "runs", *runs),
+        leaf(prefix, "steps_used_sum", *steps_used_sum),
+        leaf(prefix, "crashes_applied", *crashes_applied),
+        leaf(prefix, "later_crashes_applied", *later_crashes_applied),
+        leaf(prefix, "applied_within_3_of_acted_ghost", *applied_within_3_of_acted_ghost),
+        leaf(prefix, "fired_crashes_applied", *fired_crashes_applied),
+        leaf(prefix, "fired_crashes_applied_within_3", *fired_crashes_applied_within_3),
+        leaf(prefix, "fired_crashes_on_ghost_node", *fired_crashes_on_ghost_node),
+        leaf(prefix, "fired_crashes_applied_anchored", *fired_crashes_applied_anchored),
+        leaf(
+            prefix,
+            "fired_crashes_applied_within_3_anchored",
+            *fired_crashes_applied_within_3_anchored,
+        ),
+        leaf(prefix, "fired_crashes_applied_unanchored", *fired_crashes_applied_unanchored),
+        leaf(
+            prefix,
+            "fired_crashes_applied_within_3_unanchored",
+            *fired_crashes_applied_within_3_unanchored,
+        ),
+        leaf(prefix, "fired_crashes_applied_retarget", *fired_crashes_applied_retarget),
+        leaf(
+            prefix,
+            "fired_crashes_on_ghost_node_retarget",
+            *fired_crashes_on_ghost_node_retarget,
+        ),
+        leaf(prefix, "fired_crashes_applied_stock", *fired_crashes_applied_stock),
+        leaf(prefix, "fired_crashes_on_ghost_node_stock", *fired_crashes_on_ghost_node_stock),
+        leaf(prefix, "fired_inflight_bucket_0", *fired_inflight_bucket_0),
+        leaf(prefix, "fired_inflight_bucket_1", *fired_inflight_bucket_1),
+        leaf(prefix, "fired_inflight_bucket_2", *fired_inflight_bucket_2),
+        leaf(prefix, "fired_inflight_bucket_3plus", *fired_inflight_bucket_3plus),
+        leaf(prefix, "double_crash_after_release", *double_crash_after_release),
+    ]
+}
+
+fn ghost_release_single_cell(m: &mut Marks) -> GhostReleaseSingleCellStats {
+    GhostReleaseSingleCellStats {
+        runs: m.int(),
+        steps_used_sum: m.int(),
+        crashes_applied: m.int(),
+        fired_crashes_applied: m.int(),
+        fired_crashes_on_ghost_node: m.int(),
+        double_crash_after_release: m.int(),
+    }
+}
+
+fn ghost_release_single_cell_leaves(
+    prefix: &str,
+    c: &GhostReleaseSingleCellStats,
+) -> Vec<(String, Value)> {
+    let GhostReleaseSingleCellStats {
+        runs,
+        steps_used_sum,
+        crashes_applied,
+        fired_crashes_applied,
+        fired_crashes_on_ghost_node,
+        double_crash_after_release,
+    } = c;
+    vec![
+        leaf(prefix, "runs", *runs),
+        leaf(prefix, "steps_used_sum", *steps_used_sum),
+        leaf(prefix, "crashes_applied", *crashes_applied),
+        leaf(prefix, "fired_crashes_applied", *fired_crashes_applied),
+        leaf(prefix, "fired_crashes_on_ghost_node", *fired_crashes_on_ghost_node),
+        leaf(prefix, "double_crash_after_release", *double_crash_after_release),
+    ]
+}
+
+fn ghost_release(m: &mut Marks) -> GhostReleaseStats {
+    GhostReleaseStats {
+        armed: m.int(),
+        fired: m.int(),
+        fired_nothing_held: m.int(),
+        expired: m.int(),
+        superseded: m.int(),
+        steps_from_restart_sum: m.int(),
+        released_crashes: m.int(),
+        restarts_with_held_crash: m.int(),
+        lag_samples: m.int(),
+        lag_p50: m.int(),
+        lag_p75: m.int(),
+        lag_p90: m.int(),
+        scopes_engaged: m.int(),
+        cells: GhostReleaseCellsStats {
+            untreated: ghost_release_cell(m),
+            release_all: ghost_release_cell(m),
+            single: ghost_release_cell(m),
+            treated: ghost_release_cell(m),
+        },
+        single: GhostReleaseSingleStats {
+            releases: m.int(),
+            released_own_crash: m.int(),
+            released_via_ranking: m.int(),
+            released_forced: m.int(),
+            no_release_case: m.int(),
+            cells: GhostReleaseSingleCellsStats {
+                release_all: ghost_release_single_cell(m),
+                single: ghost_release_single_cell(m),
+            },
+        },
+    }
+}
+
+fn ghost_release_leaves(prefix: &str, r: &GhostReleaseStats) -> Vec<(String, Value)> {
+    let GhostReleaseStats {
+        armed,
+        fired,
+        fired_nothing_held,
+        expired,
+        superseded,
+        steps_from_restart_sum,
+        released_crashes,
+        restarts_with_held_crash,
+        lag_samples,
+        lag_p50,
+        lag_p75,
+        lag_p90,
+        scopes_engaged,
+        cells,
+        single,
+    } = r;
+    let GhostReleaseCellsStats {
+        untreated,
+        release_all,
+        single: single_cell,
+        treated,
+    } = cells;
+    let GhostReleaseSingleStats {
+        releases,
+        released_own_crash,
+        released_via_ranking,
+        released_forced,
+        no_release_case,
+        cells: single_cells,
+    } = single;
+    let GhostReleaseSingleCellsStats {
+        release_all: single_release_all,
+        single: single_single,
+    } = single_cells;
+    let mut out = vec![
+        leaf(prefix, "armed", *armed),
+        leaf(prefix, "fired", *fired),
+        leaf(prefix, "fired_nothing_held", *fired_nothing_held),
+        leaf(prefix, "expired", *expired),
+        leaf(prefix, "superseded", *superseded),
+        leaf(prefix, "steps_from_restart_sum", *steps_from_restart_sum),
+        leaf(prefix, "released_crashes", *released_crashes),
+        leaf(prefix, "restarts_with_held_crash", *restarts_with_held_crash),
+        leaf(prefix, "lag_samples", *lag_samples),
+        leaf(prefix, "lag_p50", *lag_p50),
+        leaf(prefix, "lag_p75", *lag_p75),
+        leaf(prefix, "lag_p90", *lag_p90),
+        leaf(prefix, "scopes_engaged", *scopes_engaged),
+    ];
+    for (name, cell) in [
+        ("untreated", untreated),
+        ("release_all", release_all),
+        ("single", single_cell),
+        ("treated", treated),
+    ] {
+        out.extend(ghost_release_cell_leaves(&format!("{prefix}.cells.{name}"), cell));
+    }
+    let s = format!("{prefix}.single");
+    out.extend([
+        leaf(&s, "releases", *releases),
+        leaf(&s, "released_own_crash", *released_own_crash),
+        leaf(&s, "released_via_ranking", *released_via_ranking),
+        leaf(&s, "released_forced", *released_forced),
+        leaf(&s, "no_release_case", *no_release_case),
+    ]);
+    for (name, cell) in [
+        ("release_all", single_release_all),
+        ("single", single_single),
+    ] {
+        out.extend(ghost_release_single_cell_leaves(&format!("{s}.cells.{name}"), cell));
+    }
+    out
+}
+
 fn crash_place(m: &mut Marks) -> CrashPlaceStats {
     CrashPlaceStats {
         draws: m.int(),
         capped_draws: m.int(),
         holds: m.int(),
         held_steps_sum: m.int(),
+        ghost_release: ghost_release(m),
     }
 }
 
@@ -644,13 +876,16 @@ fn crash_place_leaves(prefix: &str, c: &CrashPlaceStats) -> Vec<(String, Value)>
         capped_draws,
         holds,
         held_steps_sum,
+        ghost_release,
     } = c;
-    vec![
+    let mut out = vec![
         leaf(prefix, "draws", *draws),
         leaf(prefix, "capped_draws", *capped_draws),
         leaf(prefix, "holds", *holds),
         leaf(prefix, "held_steps_sum", *held_steps_sum),
-    ]
+    ];
+    out.extend(ghost_release_leaves(&format!("{prefix}.ghost_release"), ghost_release));
+    out
 }
 
 fn crash_phase_moved(m: &mut Marks) -> CrashPhaseMovedStats {
@@ -855,6 +1090,7 @@ fn victim_swap(m: &mut Marks) -> VictimSwapStats {
         no_absorber: m.int(),
         skipped_pending_pair: m.int(),
         victim_crashed_holds: m.int(),
+        forced_onto_absorber: m.int(),
         census: VictimSwapCensusStats {
             treated: victim_swap_half(m),
             control: victim_swap_half(m),
@@ -870,6 +1106,7 @@ fn victim_swap_leaves(prefix: &str, v: &VictimSwapStats) -> Vec<(String, Value)>
         no_absorber,
         skipped_pending_pair,
         victim_crashed_holds,
+        forced_onto_absorber,
         census,
     } = v;
     let VictimSwapCensusStats { treated, control } = census;
@@ -880,6 +1117,7 @@ fn victim_swap_leaves(prefix: &str, v: &VictimSwapStats) -> Vec<(String, Value)>
         leaf(prefix, "no_absorber", *no_absorber),
         leaf(prefix, "skipped_pending_pair", *skipped_pending_pair),
         leaf(prefix, "victim_crashed_holds", *victim_crashed_holds),
+        leaf(prefix, "forced_onto_absorber", *forced_onto_absorber),
     ];
     out.extend(victim_swap_half_leaves(
         &format!("{prefix}.census.treated"),

@@ -37,10 +37,12 @@ use crate::simulator::ghost_absorber;
 use crate::simulator::pair_order;
 use crate::simulator::recover_deps::RecoverDeps;
 use crate::simulator::replay_corpus;
+use crate::simulator::ghost_release;
 use crate::simulator::run_cap;
 use crate::simulator::stall_cap;
 use crate::simulator::stall_release;
 use crate::simulator::timer_context;
+use crate::simulator::util_stats;
 
 /// The run draws crash holds over the learned completed-run span.
 pub const CRASH_PLACED: i32 = 1 << 0;
@@ -54,6 +56,16 @@ pub const TIMER_STEER_OFF: i32 = 1 << 2;
 /// floor, or one whose span is already spent, is selected and inert; only
 /// this bit separates the two.
 pub const CRASH_HOLD_DRAWN: i32 = 1 << 3;
+/// A restart that finds another node's planned crash still held arms a
+/// trigger: the first entry from the restarted node's dead incarnation that
+/// changes a live peer's state releases every other held crash to the next
+/// step, within a learned bound. Drawn over the placed runs, so never set
+/// on a run-cap probe.
+pub const GHOST_RELEASED_CRASH: i32 = 1 << 4;
+/// A firing releases one crash, landed on the peer whose entry fired it,
+/// instead of every held crash. Drawn over the releasing runs, so it
+/// implies `GHOST_RELEASED_CRASH`.
+pub const GHOST_RELEASE_SINGLE_ONTO_ABSORBER: i32 = 1 << 28;
 /// The run's placed crashes wait for a drawn phase of the victim's own
 /// fan-out once their step hold expires, instead of competing at once.
 pub const CRASH_PHASE: i32 = 1 << 9;
@@ -341,6 +353,7 @@ pub fn of(
 ) -> i32 {
     probe_bits(run_id)
         | stall_cap_bits(run_id)
+        | ghost_release_cell_bits(ghost_release::cell_of(arms.placed(), run_id))
         | selector_bits(learner)
         | of_arms(arms)
         | if crash_hold_drawn { CRASH_HOLD_DRAWN } else { 0 }
@@ -355,6 +368,25 @@ pub fn stall_cap_bits(run_id: i64) -> i32 {
         STALL_CAP
     } else {
         0
+    }
+}
+
+/// The ghost-release bit and the single bit the run id's coins alone name.
+/// The release is nested in the crash axis, so like `CRASH_PHASE` the bits
+/// a run actually carries follow its arm set in `of`; only a coin-drawn run
+/// carries exactly these.
+pub fn ghost_release_bits(run_id: i64) -> i32 {
+    ghost_release_cell_bits(ghost_release::cell(run_id))
+}
+
+/// The bits a ghost-release cell names.
+fn ghost_release_cell_bits(cell: util_stats::GhostReleaseCell) -> i32 {
+    match cell {
+        util_stats::GhostReleaseCell::Single => {
+            GHOST_RELEASED_CRASH | GHOST_RELEASE_SINGLE_ONTO_ABSORBER
+        }
+        util_stats::GhostReleaseCell::ReleaseAll => GHOST_RELEASED_CRASH,
+        util_stats::GhostReleaseCell::Untreated | util_stats::GhostReleaseCell::Unplaced => 0,
     }
 }
 
@@ -390,7 +422,7 @@ pub fn from_run_id(run_id: i64) -> i32 {
     if client_anchor::is_rushed(run_id) {
         v |= CLIENT_RUSH_PRIORITY;
     }
-    v | stall_cap_bits(run_id)
+    v | stall_cap_bits(run_id) | ghost_release_bits(run_id)
 }
 
 /// The bits a grid arm joins to the tag of every run it issues. A slot whose
@@ -432,6 +464,11 @@ mod tests {
             assert_eq!(v & CLIENT_RUSH_PRIORITY != 0, client_anchor::is_rushed(id));
             assert_eq!(v & STALL_CAP != 0, stall_cap::is_treated(id));
             assert_eq!(v & STALL_RELEASE != 0, stall_release::is_treated(id));
+            assert_eq!(v & GHOST_RELEASED_CRASH != 0, ghost_release::is_treated(id));
+            assert_eq!(
+                v & GHOST_RELEASE_SINGLE_ONTO_ABSORBER != 0,
+                ghost_release::is_single(id)
+            );
             assert_ne!(
                 v & (CLIENT_FANOUT_RELEASE | CLIENT_RUSH_PRIORITY),
                 CLIENT_FANOUT_RELEASE | CLIENT_RUSH_PRIORITY,
@@ -735,5 +772,77 @@ mod tests {
             "the stall release treats {release_share} of the stall cap's treated runs"
         );
         assert_eq!(released_without_cap, 0, "the release bit implies the stall-cap bit");
+    }
+
+    #[test]
+    fn the_release_bit_takes_half_the_placed_runs_and_the_single_bit_half_of_those() {
+        let _serial = config_override::exclusive_session();
+        fault_timing::reset();
+        let n = 64_000i64;
+        let tags: Vec<i32> = (0..n).map(from_run_id).collect();
+        let placed = tags.iter().filter(|&&v| v & CRASH_PLACED != 0).count();
+        let released = tags.iter().filter(|&&v| v & GHOST_RELEASED_CRASH != 0).count();
+        let single = tags
+            .iter()
+            .filter(|&&v| v & GHOST_RELEASE_SINGLE_ONTO_ABSORBER != 0)
+            .count();
+        let share = released as f64 / placed as f64;
+        assert!((share - 0.5).abs() < 0.02, "the release bit is on {share} of the placed runs");
+        let nested = single as f64 / released as f64;
+        assert!((nested - 0.5).abs() < 0.02, "the single bit is on {nested} of the releasing runs");
+        assert_eq!(
+            tags.iter()
+                .filter(|&&v| v & GHOST_RELEASED_CRASH != 0 && v & CRASH_PLACED == 0)
+                .count(),
+            0,
+            "the release bit implies the placed bit"
+        );
+        assert_eq!(
+            tags.iter()
+                .filter(|&&v| v & GHOST_RELEASED_CRASH != 0 && v & RUN_CAP_PROBE != 0)
+                .count(),
+            0,
+            "a run-cap probe must never release"
+        );
+        assert_eq!(
+            tags.iter()
+                .filter(|&&v| v & GHOST_RELEASE_SINGLE_ONTO_ABSORBER != 0
+                    && v & GHOST_RELEASED_CRASH == 0)
+                .count(),
+            0,
+            "the single bit implies the release bit"
+        );
+        let release_bits = GHOST_RELEASED_CRASH | GHOST_RELEASE_SINGLE_ONTO_ABSORBER;
+        assert_eq!(ghost_release_bits(0) & !release_bits, 0);
+        assert_eq!(
+            of_arms(&ArmSet::coins(0)) & release_bits,
+            0,
+            "the arm set alone names no release bit"
+        );
+        // The release is nested in the crash axis: a learner run whose arm
+        // set draws no holds carries no release bit whatever its coins say,
+        // and one placed by the learner carries the bits its coins name.
+        let learner = Some(arm_selector::Learner::OvertakenGhost);
+        let treated = (0..n).find(|&id| ghost_release::is_single(id)).unwrap();
+        let stock_arms = ArmSet::default();
+        assert_eq!(of(treated, &stock_arms, learner, false) & release_bits, 0);
+        let unplaced_coin = (0..n)
+            .find(|&id| !fault_timing::is_placed(id) && !run_cap::is_probe(id))
+            .unwrap();
+        let placed_arms = ArmSet {
+            crash: CrashArm::Placed,
+            ..ArmSet::default()
+        };
+        let learned = of(unplaced_coin, &placed_arms, learner, false) & release_bits;
+        assert_eq!(
+            learned,
+            ghost_release_cell_bits(ghost_release::cell_of(true, unplaced_coin)),
+            "a learner-placed run takes the release cell its coins name"
+        );
+        assert_eq!(
+            from_run_id(unplaced_coin) & release_bits,
+            0,
+            "the id alone names no release"
+        );
     }
 }

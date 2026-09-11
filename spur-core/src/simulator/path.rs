@@ -16,6 +16,7 @@ use crate::simulator::path::plan::{
 };
 use crate::simulator::fault_timing;
 use crate::simulator::pair_order as pair_order_split;
+use crate::simulator::ghost_release;
 use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
 use crate::simulator::run_variant::{ArmSet, CrashArm};
@@ -474,6 +475,7 @@ fn record_termination<H: HashPolicy>(
         pending_at_exit: pending as u64,
         recovered_nodes,
     });
+    util_stats::record_ghost_release_run(state.ghost_release.cell, steps_used);
 }
 
 pub fn exec_plan<H: HashPolicy, F: Feedback>(
@@ -497,6 +499,14 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
     path_state.state.retarget.enabled = arms.retarget;
+    // The bound is read once here so the scheduler needs no learner access
+    // of its own.
+    path_state.state.ghost_release = ghost_release::RunState::at_run_start(
+        run_id,
+        max_iterations,
+        arms.placed(),
+        arms.crash == CrashArm::PlacedPhase,
+    );
     path_state.state.fresh_first.enabled = arms.fresh_first;
     path_state.state.pair_order.enabled = arms.pair_order;
     path_state.state.client_anchor.arm = arms.request;

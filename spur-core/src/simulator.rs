@@ -10,6 +10,7 @@ pub mod explorer;
 pub mod fault_timing;
 pub mod fresh_first;
 pub mod ghost_absorber;
+pub mod ghost_release;
 pub mod pair_order;
 mod feedback;
 mod hash_utils;
@@ -18,6 +19,7 @@ mod path;
 pub mod plan_config;
 pub mod recover_deps;
 pub mod replay_corpus;
+
 pub mod rng;
 pub mod run_cap;
 pub mod run_phase;

@@ -91,6 +91,7 @@ static VS_SAME_VICTIM: AtomicU64 = AtomicU64::new(0);
 static VS_NO_ABSORBER: AtomicU64 = AtomicU64::new(0);
 static VS_SKIPPED_PENDING_PAIR: AtomicU64 = AtomicU64::new(0);
 static VS_VICTIM_CRASHED_HOLDS: AtomicU64 = AtomicU64::new(0);
+static VS_FORCED_ONTO_ABSORBER: AtomicU64 = AtomicU64::new(0);
 static GS_FIRED_RUNS: AtomicU64 = AtomicU64::new(0);
 static FF_SWAPS: AtomicU64 = AtomicU64::new(0);
 static FF_REPEAT_SWAPS: AtomicU64 = AtomicU64::new(0);
@@ -596,6 +597,49 @@ static CRASH_PLACE_CAPPED_DRAWS: AtomicU64 = AtomicU64::new(0);
 static CRASH_PLACE_HOLDS: AtomicU64 = AtomicU64::new(0);
 static CRASH_PLACE_HELD_STEPS_SUM: AtomicU64 = AtomicU64::new(0);
 
+static GR_ARMED: AtomicU64 = AtomicU64::new(0);
+static GR_FIRED: AtomicU64 = AtomicU64::new(0);
+static GR_FIRED_NOTHING_HELD: AtomicU64 = AtomicU64::new(0);
+static GR_EXPIRED: AtomicU64 = AtomicU64::new(0);
+static GR_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+static GR_STEPS_FROM_RESTART_SUM: AtomicU64 = AtomicU64::new(0);
+static GR_RELEASED_CRASHES: AtomicU64 = AtomicU64::new(0);
+static GR_RESTARTS_WITH_HELD_CRASH: AtomicU64 = AtomicU64::new(0);
+static GR_LAG_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static GR_LAG_P50: AtomicU64 = AtomicU64::new(0);
+static GR_LAG_P75: AtomicU64 = AtomicU64::new(0);
+static GR_LAG_P90: AtomicU64 = AtomicU64::new(0);
+static GR_SCOPES_ENGAGED: AtomicU64 = AtomicU64::new(0);
+static GR_SINGLE_OWN_CRASH: AtomicU64 = AtomicU64::new(0);
+static GR_SINGLE_VIA_RANKING: AtomicU64 = AtomicU64::new(0);
+static GR_SINGLE_FORCED: AtomicU64 = AtomicU64::new(0);
+static GR_SINGLE_NO_CASE: AtomicU64 = AtomicU64::new(0);
+/// One column per placed cell of the ghost release, indexed by
+/// `GhostReleaseCell::index`.
+const GR_CELLS: usize = 3;
+static GR_CELL_RUNS: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+static GR_CELL_STEPS_USED_SUM: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+static GR_CELL_CRASHES_APPLIED: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+static GR_CELL_LATER_CRASHES: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+static GR_CELL_WITHIN_3: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+static GR_CELL_FIRED_APPLIED: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+static GR_CELL_FIRED_WITHIN_3: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+static GR_CELL_FIRED_ON_GHOST_NODE: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+static GR_CELL_DOUBLE_CRASH: [AtomicU64; GR_CELLS] = [const { AtomicU64::new(0) }; GR_CELLS];
+/// Indexed by cell, then by whether the run's crashes wait for a fan-out
+/// phase.
+static GR_CELL_FIRED_APPLIED_PHASE: [[AtomicU64; 2]; GR_CELLS] =
+    [const { [const { AtomicU64::new(0) }; 2] }; GR_CELLS];
+static GR_CELL_FIRED_WITHIN_3_PHASE: [[AtomicU64; 2]; GR_CELLS] =
+    [const { [const { AtomicU64::new(0) }; 2] }; GR_CELLS];
+/// Indexed by cell, then by whether the run retargets its crashes.
+static GR_CELL_FIRED_APPLIED_RETARGET: [[AtomicU64; 2]; GR_CELLS] =
+    [const { [const { AtomicU64::new(0) }; 2] }; GR_CELLS];
+static GR_CELL_FIRED_ON_GHOST_NODE_RETARGET: [[AtomicU64; 2]; GR_CELLS] =
+    [const { [const { AtomicU64::new(0) }; 2] }; GR_CELLS];
+static GR_CELL_FIRED_INFLIGHT: [[AtomicU64; CC_INFLIGHT_SLOTS]; GR_CELLS] =
+    [const { [const { AtomicU64::new(0) }; CC_INFLIGHT_SLOTS] }; GR_CELLS];
+
 /// One column per arm of the fan-out anchor, indexed by `CrashPhaseArm`.
 const CP_ARMS: usize = 3;
 static CP_RUNS: [AtomicU64; CP_ARMS] = [const { AtomicU64::new(0) }; CP_ARMS];
@@ -703,6 +747,7 @@ pub fn set_enabled(on: bool) {
             &VS_NO_ABSORBER,
             &VS_SKIPPED_PENDING_PAIR,
             &VS_VICTIM_CRASHED_HOLDS,
+            &VS_FORCED_ONTO_ABSORBER,
             &GS_FIRED_RUNS,
             &FF_SWAPS,
             &FF_REPEAT_SWAPS,
@@ -858,6 +903,23 @@ pub fn set_enabled(on: bool) {
             &CRASH_PLACE_CAPPED_DRAWS,
             &CRASH_PLACE_HOLDS,
             &CRASH_PLACE_HELD_STEPS_SUM,
+            &GR_ARMED,
+            &GR_FIRED,
+            &GR_FIRED_NOTHING_HELD,
+            &GR_EXPIRED,
+            &GR_SUPERSEDED,
+            &GR_STEPS_FROM_RESTART_SUM,
+            &GR_RELEASED_CRASHES,
+            &GR_RESTARTS_WITH_HELD_CRASH,
+            &GR_LAG_SAMPLES,
+            &GR_LAG_P50,
+            &GR_LAG_P75,
+            &GR_LAG_P90,
+            &GR_SCOPES_ENGAGED,
+            &GR_SINGLE_OWN_CRASH,
+            &GR_SINGLE_VIA_RANKING,
+            &GR_SINGLE_FORCED,
+            &GR_SINGLE_NO_CASE,
             &TIMER_CONTEXT_PROBE_FIRINGS,
             &TIMER_CONTEXT_PROBE_ACTED,
             &TIMER_CONTEXT_BIASED_STEPS,
@@ -888,6 +950,20 @@ pub fn set_enabled(on: bool) {
             .chain(CP_APPLY_INFLIGHT.iter())
             .chain(CP_CRASHES_APPLIED.iter())
             .chain(CP_INFLIGHT.iter().flatten())
+            .chain(GR_CELL_RUNS.iter())
+            .chain(GR_CELL_STEPS_USED_SUM.iter())
+            .chain(GR_CELL_CRASHES_APPLIED.iter())
+            .chain(GR_CELL_LATER_CRASHES.iter())
+            .chain(GR_CELL_WITHIN_3.iter())
+            .chain(GR_CELL_FIRED_APPLIED.iter())
+            .chain(GR_CELL_FIRED_WITHIN_3.iter())
+            .chain(GR_CELL_FIRED_ON_GHOST_NODE.iter())
+            .chain(GR_CELL_DOUBLE_CRASH.iter())
+            .chain(GR_CELL_FIRED_APPLIED_PHASE.iter().flatten())
+            .chain(GR_CELL_FIRED_WITHIN_3_PHASE.iter().flatten())
+            .chain(GR_CELL_FIRED_APPLIED_RETARGET.iter().flatten())
+            .chain(GR_CELL_FIRED_ON_GHOST_NODE_RETARGET.iter().flatten())
+            .chain(GR_CELL_FIRED_INFLIGHT.iter().flatten())
         {
             c.store(0, Ordering::Relaxed);
         }
@@ -2091,6 +2167,9 @@ pub fn record_crash_census(victim_inflight: u32, any_candidate_inflight: bool) {
 pub enum VictimSwap {
     /// The crash moved to another node; `acted` is that node's mark.
     Applied { acted: bool },
+    /// The crash moved to the node a ghost-release firing named, whose
+    /// mark had written state. Counted as `Applied` with `acted` as well.
+    ForcedOntoAbsorber,
     /// The best absorber was the planned victim.
     SameVictim,
     /// No live node carried a usable mark.
@@ -2111,6 +2190,11 @@ pub fn record_victim_swap(outcome: VictimSwap, skipped_pending_pair: bool) {
             if acted {
                 VS_ACTED_ABSORBER.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        VictimSwap::ForcedOntoAbsorber => {
+            VS_APPLIED.fetch_add(1, Ordering::Relaxed);
+            VS_ACTED_ABSORBER.fetch_add(1, Ordering::Relaxed);
+            VS_FORCED_ONTO_ABSORBER.fetch_add(1, Ordering::Relaxed);
         }
         VictimSwap::SameVictim => {
             VS_SAME_VICTIM.fetch_add(1, Ordering::Relaxed);
@@ -3324,6 +3408,215 @@ pub fn record_crash_place_hold() {
     CRASH_PLACE_HOLDS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The cell a run occupies under the ghost release: the placed runs whose
+/// restarts arm the trigger, split into the half whose firing releases every
+/// other held crash and the half that releases one; the placed runs that
+/// never release; and the runs outside the placed posture, which no cell
+/// counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GhostReleaseCell {
+    #[default]
+    Unplaced,
+    Untreated,
+    ReleaseAll,
+    Single,
+}
+
+impl GhostReleaseCell {
+    /// The column a placed cell counts under, or None outside the posture.
+    #[inline]
+    fn index(self) -> Option<usize> {
+        match self {
+            GhostReleaseCell::Unplaced => None,
+            GhostReleaseCell::Untreated => Some(0),
+            GhostReleaseCell::ReleaseAll => Some(1),
+            GhostReleaseCell::Single => Some(2),
+        }
+    }
+}
+
+/// The lag learner's quantiles for one scope, in steps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LagGauges {
+    pub p50: u64,
+    pub p75: u64,
+    pub p90: u64,
+}
+
+/// One restart on a releasing run found some other node's planned crash
+/// still held.
+#[inline]
+pub fn record_ghost_release_restart_with_held_crash() {
+    if !enabled() {
+        return;
+    }
+    GR_RESTARTS_WITH_HELD_CRASH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One ghost lag from a run that feeds the learner was folded into its
+/// scope.
+#[inline]
+pub fn record_ghost_release_lag_sample() {
+    if !enabled() {
+        return;
+    }
+    GR_LAG_SAMPLES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Gauges, not counters: overwritten with the lag learner's current view,
+/// ungated so it is visible with stats off.
+pub fn set_ghost_release_learned(scopes_engaged: u64, lag: LagGauges) {
+    GR_SCOPES_ENGAGED.store(scopes_engaged, Ordering::Relaxed);
+    GR_LAG_P50.store(lag.p50, Ordering::Relaxed);
+    GR_LAG_P75.store(lag.p75, Ordering::Relaxed);
+    GR_LAG_P90.store(lag.p90, Ordering::Relaxed);
+}
+
+/// What happened to the trigger a restart arms on a releasing run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GhostReleaseTrigger {
+    /// A restart found a held crash and armed the trigger.
+    Armed,
+    /// An entry from the restarted node's dead incarnation changed a live
+    /// peer's state `steps_from_restart` steps after the restart and moved
+    /// `released` holds to the next step.
+    Fired { steps_from_restart: u64, released: u64 },
+    /// Such an entry arrived but no hold was still ahead of the next step.
+    FiredNothingHeld,
+    /// The bound ended with no such entry.
+    Expired,
+    /// Another restart re-armed the trigger while it was still armed.
+    Superseded,
+}
+
+#[inline]
+pub fn record_ghost_release_trigger(event: GhostReleaseTrigger) {
+    if !enabled() {
+        return;
+    }
+    match event {
+        GhostReleaseTrigger::Armed => {
+            GR_ARMED.fetch_add(1, Ordering::Relaxed);
+        }
+        GhostReleaseTrigger::Fired {
+            steps_from_restart,
+            released,
+        } => {
+            GR_FIRED.fetch_add(1, Ordering::Relaxed);
+            GR_STEPS_FROM_RESTART_SUM.fetch_add(steps_from_restart, Ordering::Relaxed);
+            GR_RELEASED_CRASHES.fetch_add(released, Ordering::Relaxed);
+        }
+        GhostReleaseTrigger::FiredNothingHeld => {
+            GR_FIRED_NOTHING_HELD.fetch_add(1, Ordering::Relaxed);
+        }
+        GhostReleaseTrigger::Expired => {
+            GR_EXPIRED.fetch_add(1, Ordering::Relaxed);
+        }
+        GhostReleaseTrigger::Superseded => {
+            GR_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Which crash a firing on the single half released, or that no case
+/// applied and nothing was released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SingleRelease {
+    /// The held crash of the node whose entry fired the trigger.
+    OwnCrash,
+    /// The first held crash the absorber ranking would move onto that node.
+    ViaRanking,
+    /// The first held crash by index, to be applied to that node.
+    Forced,
+    NoCase,
+}
+
+#[inline]
+pub fn record_ghost_release_single(case: SingleRelease) {
+    if !enabled() {
+        return;
+    }
+    let c = match case {
+        SingleRelease::OwnCrash => &GR_SINGLE_OWN_CRASH,
+        SingleRelease::ViaRanking => &GR_SINGLE_VIA_RANKING,
+        SingleRelease::Forced => &GR_SINGLE_FORCED,
+        SingleRelease::NoCase => &GR_SINGLE_NO_CASE,
+    };
+    c.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Where one applied crash landed. `later` marks a crash that is not the
+/// run's first; `within_3_of_acted_ghost` one applied at most three steps
+/// after the run's most recent fault-crossing entry that wrote state, read
+/// on later crashes only; `fired` a crash a firing released, for which
+/// `on_ghost_node` says it landed on the node whose entry fired the
+/// trigger and `in_flight` counts the victim's undelivered sends;
+/// `double_after_release` a crash applied within eight steps of a released
+/// one whose victim is still down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GhostReleaseApply {
+    pub later: bool,
+    pub within_3_of_acted_ghost: bool,
+    pub fired: bool,
+    pub anchored: bool,
+    pub retarget: bool,
+    pub on_ghost_node: bool,
+    pub in_flight: u32,
+    pub double_after_release: bool,
+}
+
+/// One crash was applied on a run in `cell`.
+#[inline]
+pub fn record_ghost_release_apply(cell: GhostReleaseCell, a: GhostReleaseApply) {
+    if !enabled() {
+        return;
+    }
+    let Some(i) = cell.index() else {
+        return;
+    };
+    GR_CELL_CRASHES_APPLIED[i].fetch_add(1, Ordering::Relaxed);
+    if a.later {
+        GR_CELL_LATER_CRASHES[i].fetch_add(1, Ordering::Relaxed);
+        if a.within_3_of_acted_ghost {
+            GR_CELL_WITHIN_3[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if a.double_after_release {
+        GR_CELL_DOUBLE_CRASH[i].fetch_add(1, Ordering::Relaxed);
+    }
+    if !a.fired {
+        return;
+    }
+    let phase = a.anchored as usize;
+    let retarget = a.retarget as usize;
+    GR_CELL_FIRED_APPLIED[i].fetch_add(1, Ordering::Relaxed);
+    GR_CELL_FIRED_APPLIED_PHASE[i][phase].fetch_add(1, Ordering::Relaxed);
+    GR_CELL_FIRED_APPLIED_RETARGET[i][retarget].fetch_add(1, Ordering::Relaxed);
+    if a.within_3_of_acted_ghost {
+        GR_CELL_FIRED_WITHIN_3[i].fetch_add(1, Ordering::Relaxed);
+        GR_CELL_FIRED_WITHIN_3_PHASE[i][phase].fetch_add(1, Ordering::Relaxed);
+    }
+    if a.on_ghost_node {
+        GR_CELL_FIRED_ON_GHOST_NODE[i].fetch_add(1, Ordering::Relaxed);
+        GR_CELL_FIRED_ON_GHOST_NODE_RETARGET[i][retarget].fetch_add(1, Ordering::Relaxed);
+    }
+    let slot = (a.in_flight as usize).min(CC_INFLIGHT_SLOTS - 1);
+    GR_CELL_FIRED_INFLIGHT[i][slot].fetch_add(1, Ordering::Relaxed);
+}
+
+/// One run in `cell` ended after `steps_used` steps.
+#[inline]
+pub fn record_ghost_release_run(cell: GhostReleaseCell, steps_used: u64) {
+    if !enabled() {
+        return;
+    }
+    let Some(i) = cell.index() else {
+        return;
+    };
+    GR_CELL_RUNS[i].fetch_add(1, Ordering::Relaxed);
+    GR_CELL_STEPS_USED_SUM[i].fetch_add(steps_used, Ordering::Relaxed);
+}
+
 /// Which phase of its victim's fan-out a placed crash's release waits for.
 /// `Stock` waits for nothing and releases where it would have without the
 /// anchor, so it is the control the other two are read against.
@@ -4505,6 +4798,7 @@ pub struct CrashPlaceStats {
     pub capped_draws: u64,
     pub holds: u64,
     pub held_steps_sum: u64,
+    pub ghost_release: GhostReleaseStats,
 }
 
 impl CrashPlaceStats {
@@ -4514,6 +4808,211 @@ impl CrashPlaceStats {
             capped_draws: CRASH_PLACE_CAPPED_DRAWS.load(Ordering::Relaxed),
             holds: CRASH_PLACE_HOLDS.load(Ordering::Relaxed),
             held_steps_sum: CRASH_PLACE_HELD_STEPS_SUM.load(Ordering::Relaxed),
+            ghost_release: GhostReleaseStats::read(),
+        }
+    }
+}
+
+/// One cell of the ghost release. `runs` and `steps_used_sum` describe the
+/// runs that ended in the cell; `crashes_applied` its crashes,
+/// `later_crashes_applied` those after each run's first, and
+/// `applied_within_3_of_acted_ghost` the later crashes applied at most
+/// three steps after the run's most recent fault-crossing entry that wrote
+/// state. The `fired_crashes_*` fields count the crashes a firing released
+/// as they were applied: those within three steps of such an entry, those
+/// landing on the node whose entry fired the trigger, each split by the
+/// run's fan-out phase arm (anchored or not) or its crash-retarget arm, and
+/// a histogram of the victim's undelivered sends at the apply.
+/// `double_crash_after_release` counts crashes applied within eight steps
+/// of a released one whose victim was still down.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GhostReleaseCellStats {
+    pub runs: u64,
+    pub steps_used_sum: u64,
+    pub crashes_applied: u64,
+    pub later_crashes_applied: u64,
+    pub applied_within_3_of_acted_ghost: u64,
+    pub fired_crashes_applied: u64,
+    pub fired_crashes_applied_within_3: u64,
+    pub fired_crashes_on_ghost_node: u64,
+    pub fired_crashes_applied_anchored: u64,
+    pub fired_crashes_applied_within_3_anchored: u64,
+    pub fired_crashes_applied_unanchored: u64,
+    pub fired_crashes_applied_within_3_unanchored: u64,
+    pub fired_crashes_applied_retarget: u64,
+    pub fired_crashes_on_ghost_node_retarget: u64,
+    pub fired_crashes_applied_stock: u64,
+    pub fired_crashes_on_ghost_node_stock: u64,
+    pub fired_inflight_bucket_0: u64,
+    pub fired_inflight_bucket_1: u64,
+    pub fired_inflight_bucket_2: u64,
+    pub fired_inflight_bucket_3plus: u64,
+    pub double_crash_after_release: u64,
+}
+
+impl GhostReleaseCellStats {
+    /// The columns in `cols` summed.
+    fn read(cols: &[usize]) -> Self {
+        let sum = |a: &[AtomicU64; GR_CELLS]| -> u64 {
+            cols.iter().map(|&i| a[i].load(Ordering::Relaxed)).sum()
+        };
+        let sum2 = |a: &[[AtomicU64; 2]; GR_CELLS], j: usize| -> u64 {
+            cols.iter().map(|&i| a[i][j].load(Ordering::Relaxed)).sum()
+        };
+        let sum_slot = |j: usize| -> u64 {
+            cols.iter()
+                .map(|&i| GR_CELL_FIRED_INFLIGHT[i][j].load(Ordering::Relaxed))
+                .sum()
+        };
+        Self {
+            runs: sum(&GR_CELL_RUNS),
+            steps_used_sum: sum(&GR_CELL_STEPS_USED_SUM),
+            crashes_applied: sum(&GR_CELL_CRASHES_APPLIED),
+            later_crashes_applied: sum(&GR_CELL_LATER_CRASHES),
+            applied_within_3_of_acted_ghost: sum(&GR_CELL_WITHIN_3),
+            fired_crashes_applied: sum(&GR_CELL_FIRED_APPLIED),
+            fired_crashes_applied_within_3: sum(&GR_CELL_FIRED_WITHIN_3),
+            fired_crashes_on_ghost_node: sum(&GR_CELL_FIRED_ON_GHOST_NODE),
+            fired_crashes_applied_anchored: sum2(&GR_CELL_FIRED_APPLIED_PHASE, 1),
+            fired_crashes_applied_within_3_anchored: sum2(&GR_CELL_FIRED_WITHIN_3_PHASE, 1),
+            fired_crashes_applied_unanchored: sum2(&GR_CELL_FIRED_APPLIED_PHASE, 0),
+            fired_crashes_applied_within_3_unanchored: sum2(&GR_CELL_FIRED_WITHIN_3_PHASE, 0),
+            fired_crashes_applied_retarget: sum2(&GR_CELL_FIRED_APPLIED_RETARGET, 1),
+            fired_crashes_on_ghost_node_retarget: sum2(&GR_CELL_FIRED_ON_GHOST_NODE_RETARGET, 1),
+            fired_crashes_applied_stock: sum2(&GR_CELL_FIRED_APPLIED_RETARGET, 0),
+            fired_crashes_on_ghost_node_stock: sum2(&GR_CELL_FIRED_ON_GHOST_NODE_RETARGET, 0),
+            fired_inflight_bucket_0: sum_slot(0),
+            fired_inflight_bucket_1: sum_slot(1),
+            fired_inflight_bucket_2: sum_slot(2),
+            fired_inflight_bucket_3plus: sum_slot(3),
+            double_crash_after_release: sum(&GR_CELL_DOUBLE_CRASH),
+        }
+    }
+}
+
+/// The ghost release's cells. `treated` is `release_all` and `single`
+/// together, the half the release is read against `untreated`.
+#[derive(Serialize, Debug)]
+pub struct GhostReleaseCellsStats {
+    pub untreated: GhostReleaseCellStats,
+    pub release_all: GhostReleaseCellStats,
+    pub single: GhostReleaseCellStats,
+    pub treated: GhostReleaseCellStats,
+}
+
+/// The fields of a releasing cell the single half is read on.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GhostReleaseSingleCellStats {
+    pub runs: u64,
+    pub steps_used_sum: u64,
+    pub crashes_applied: u64,
+    pub fired_crashes_applied: u64,
+    pub fired_crashes_on_ghost_node: u64,
+    pub double_crash_after_release: u64,
+}
+
+impl GhostReleaseSingleCellStats {
+    fn of(c: &GhostReleaseCellStats) -> Self {
+        Self {
+            runs: c.runs,
+            steps_used_sum: c.steps_used_sum,
+            crashes_applied: c.crashes_applied,
+            fired_crashes_applied: c.fired_crashes_applied,
+            fired_crashes_on_ghost_node: c.fired_crashes_on_ghost_node,
+            double_crash_after_release: c.double_crash_after_release,
+        }
+    }
+}
+
+/// The two releasing cells as the single half is read: against the half
+/// that releases every held crash.
+#[derive(Serialize, Debug)]
+pub struct GhostReleaseSingleCellsStats {
+    pub release_all: GhostReleaseSingleCellStats,
+    pub single: GhostReleaseSingleCellStats,
+}
+
+/// The single half's block. `releases` is the number that half is read as
+/// having fired: firings that released exactly one crash, split by which
+/// case named it; `no_release_case` counts the firings on which no case
+/// applied and the trigger stayed armed.
+#[derive(Serialize, Debug)]
+pub struct GhostReleaseSingleStats {
+    pub releases: u64,
+    pub released_own_crash: u64,
+    pub released_via_ranking: u64,
+    pub released_forced: u64,
+    pub no_release_case: u64,
+    pub cells: GhostReleaseSingleCellsStats,
+}
+
+/// The ghost-release block. `fired` is the number the mechanism is read as
+/// having fired: firings that moved at least one hold; `fired_nothing_held`
+/// the firings that moved none; `armed`, `expired` and `superseded` how
+/// the other armings ended; `steps_from_restart_sum` over `fired` how long
+/// a firing took; `released_crashes` the holds the firings moved.
+/// `restarts_with_held_crash` counts the restarts on releasing runs that
+/// found another node's crash still held. `lag_samples` counts the ghost
+/// lags fed to the learner; the `lag_p*` gauges are the widest engaged
+/// scope's quantiles and `scopes_engaged` how many scopes are past their
+/// floor.
+#[derive(Serialize, Debug)]
+pub struct GhostReleaseStats {
+    pub armed: u64,
+    pub fired: u64,
+    pub fired_nothing_held: u64,
+    pub expired: u64,
+    pub superseded: u64,
+    pub steps_from_restart_sum: u64,
+    pub released_crashes: u64,
+    pub restarts_with_held_crash: u64,
+    pub lag_samples: u64,
+    pub lag_p50: u64,
+    pub lag_p75: u64,
+    pub lag_p90: u64,
+    pub scopes_engaged: u64,
+    pub cells: GhostReleaseCellsStats,
+    pub single: GhostReleaseSingleStats,
+}
+
+impl GhostReleaseStats {
+    fn read() -> Self {
+        let release_all = GhostReleaseCellStats::read(&[1]);
+        let single = GhostReleaseCellStats::read(&[2]);
+        let own = GR_SINGLE_OWN_CRASH.load(Ordering::Relaxed);
+        let ranking = GR_SINGLE_VIA_RANKING.load(Ordering::Relaxed);
+        let forced = GR_SINGLE_FORCED.load(Ordering::Relaxed);
+        Self {
+            armed: GR_ARMED.load(Ordering::Relaxed),
+            fired: GR_FIRED.load(Ordering::Relaxed),
+            fired_nothing_held: GR_FIRED_NOTHING_HELD.load(Ordering::Relaxed),
+            expired: GR_EXPIRED.load(Ordering::Relaxed),
+            superseded: GR_SUPERSEDED.load(Ordering::Relaxed),
+            steps_from_restart_sum: GR_STEPS_FROM_RESTART_SUM.load(Ordering::Relaxed),
+            released_crashes: GR_RELEASED_CRASHES.load(Ordering::Relaxed),
+            restarts_with_held_crash: GR_RESTARTS_WITH_HELD_CRASH.load(Ordering::Relaxed),
+            lag_samples: GR_LAG_SAMPLES.load(Ordering::Relaxed),
+            lag_p50: GR_LAG_P50.load(Ordering::Relaxed),
+            lag_p75: GR_LAG_P75.load(Ordering::Relaxed),
+            lag_p90: GR_LAG_P90.load(Ordering::Relaxed),
+            scopes_engaged: GR_SCOPES_ENGAGED.load(Ordering::Relaxed),
+            cells: GhostReleaseCellsStats {
+                untreated: GhostReleaseCellStats::read(&[0]),
+                release_all,
+                single,
+                treated: GhostReleaseCellStats::read(&[1, 2]),
+            },
+            single: GhostReleaseSingleStats {
+                releases: own + ranking + forced,
+                released_own_crash: own,
+                released_via_ranking: ranking,
+                released_forced: forced,
+                no_release_case: GR_SINGLE_NO_CASE.load(Ordering::Relaxed),
+                cells: GhostReleaseSingleCellsStats {
+                    release_all: GhostReleaseSingleCellStats::of(&release_all),
+                    single: GhostReleaseSingleCellStats::of(&single),
+                },
+            },
         }
     }
 }
@@ -4701,7 +5200,9 @@ pub struct VictimSwapCensusStats {
 /// the victim, `skipped_pending_pair` the releases where a better-ranked
 /// node was passed over for an outstanding pair, and
 /// `victim_crashed_holds` the eligibility tests that withheld a planned
-/// crash whose victim was already down.
+/// crash whose victim was already down. `forced_onto_absorber` is the
+/// subset of `applied` landed by a ghost-release firing rather than the
+/// ranking.
 #[derive(Serialize, Debug)]
 pub struct VictimSwapStats {
     pub applied: u64,
@@ -4710,6 +5211,7 @@ pub struct VictimSwapStats {
     pub no_absorber: u64,
     pub skipped_pending_pair: u64,
     pub victim_crashed_holds: u64,
+    pub forced_onto_absorber: u64,
     pub census: VictimSwapCensusStats,
 }
 
@@ -4722,6 +5224,7 @@ impl VictimSwapStats {
             no_absorber: VS_NO_ABSORBER.load(Ordering::Relaxed),
             skipped_pending_pair: VS_SKIPPED_PENDING_PAIR.load(Ordering::Relaxed),
             victim_crashed_holds: VS_VICTIM_CRASHED_HOLDS.load(Ordering::Relaxed),
+            forced_onto_absorber: VS_FORCED_ONTO_ABSORBER.load(Ordering::Relaxed),
             census: VictimSwapCensusStats {
                 treated: VictimSwapHalfStats::read(true),
                 control: VictimSwapHalfStats::read(false),
