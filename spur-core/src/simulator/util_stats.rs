@@ -574,6 +574,23 @@ static SC_UNTREATED_ROWS_DROPPED: AtomicU64 = AtomicU64::new(0);
 static SC_UNTREATED_GAP_HIST: [AtomicU64; HIST_BUCKETS] =
     [const { AtomicU64::new(0) }; HIST_BUCKETS];
 
+static SR_RELEASES: AtomicU64 = AtomicU64::new(0);
+static SR_OPS_SETTLED: AtomicU64 = AtomicU64::new(0);
+static SR_DEPENDENTS_CLIENT: AtomicU64 = AtomicU64::new(0);
+static SR_DEPENDENTS_FAULT: AtomicU64 = AtomicU64::new(0);
+static SR_DEPENDENTS_OTHER: AtomicU64 = AtomicU64::new(0);
+static SR_LATE_RESPONSES: AtomicU64 = AtomicU64::new(0);
+static SR_PLAN_COMPLETED_AFTER_RELEASE: AtomicU64 = AtomicU64::new(0);
+static SR_SECOND_STALL_STOPS: AtomicU64 = AtomicU64::new(0);
+static SR_STEPS_AFTER_RELEASE_SUM: AtomicU64 = AtomicU64::new(0);
+static SR_STALLS_WITHOUT_OPS: AtomicU64 = AtomicU64::new(0);
+static SR_RELEASE_RUNS: AtomicU64 = AtomicU64::new(0);
+static SR_RELEASE_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+static SR_RELEASE_PLAN_COMPLETE: AtomicU64 = AtomicU64::new(0);
+static SR_CUT_RUNS: AtomicU64 = AtomicU64::new(0);
+static SR_CUT_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+static SR_CUT_PLAN_COMPLETE: AtomicU64 = AtomicU64::new(0);
+
 static CRASH_PLACE_DRAWS: AtomicU64 = AtomicU64::new(0);
 static CRASH_PLACE_CAPPED_DRAWS: AtomicU64 = AtomicU64::new(0);
 static CRASH_PLACE_HOLDS: AtomicU64 = AtomicU64::new(0);
@@ -821,6 +838,22 @@ pub fn set_enabled(on: bool) {
             &SC_UNTREATED_RUNS_CAPPED,
             &SC_UNTREATED_OVER_CAP_RUNS,
             &SC_UNTREATED_ROWS_DROPPED,
+            &SR_RELEASES,
+            &SR_OPS_SETTLED,
+            &SR_DEPENDENTS_CLIENT,
+            &SR_DEPENDENTS_FAULT,
+            &SR_DEPENDENTS_OTHER,
+            &SR_LATE_RESPONSES,
+            &SR_PLAN_COMPLETED_AFTER_RELEASE,
+            &SR_SECOND_STALL_STOPS,
+            &SR_STEPS_AFTER_RELEASE_SUM,
+            &SR_STALLS_WITHOUT_OPS,
+            &SR_RELEASE_RUNS,
+            &SR_RELEASE_INVOCATIONS,
+            &SR_RELEASE_PLAN_COMPLETE,
+            &SR_CUT_RUNS,
+            &SR_CUT_INVOCATIONS,
+            &SR_CUT_PLAN_COMPLETE,
             &CRASH_PLACE_DRAWS,
             &CRASH_PLACE_CAPPED_DRAWS,
             &CRASH_PLACE_HOLDS,
@@ -3177,6 +3210,95 @@ pub fn set_stall_cap_learned(scopes: u64, cap_max_scope: u64) {
     SC_CAP_MAX_SCOPE.store(cap_max_scope, Ordering::Relaxed);
 }
 
+/// The cell a run occupies under the stall release: a stall-cap-treated run
+/// whose first stall settles its in-progress client operations for the plan
+/// and goes on, a stall-cap-treated run its first stall ends, or a run the
+/// stall cap does not treat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallReleaseCell {
+    Release,
+    Cut,
+    Exempt,
+}
+
+/// One run's first stall settled its in-progress client operations; the
+/// dependents are the planned events that became ready as a result, by
+/// kind.
+pub struct StallReleaseSettlement {
+    pub ops_settled: u64,
+    pub dependents_client: u64,
+    pub dependents_fault: u64,
+    pub dependents_other: u64,
+}
+
+/// One run ended, as far as the stall release is concerned.
+pub struct StallReleaseRun {
+    pub cell: StallReleaseCell,
+    /// Steps the run had run when its stall released it, on a released run.
+    pub release_step: Option<u64>,
+    /// Steps the run ran in all.
+    pub steps: u64,
+    /// Every planned event completed.
+    pub completed: bool,
+    /// The stall cap ended the run.
+    pub stalled: bool,
+    /// ClientInterface invocations the run issued.
+    pub invocations: u64,
+}
+
+/// One run's first stall released it. Called once per released run.
+pub fn record_stall_release(s: &StallReleaseSettlement) {
+    if !enabled() {
+        return;
+    }
+    SR_RELEASES.fetch_add(1, Ordering::Relaxed);
+    SR_OPS_SETTLED.fetch_add(s.ops_settled, Ordering::Relaxed);
+    SR_DEPENDENTS_CLIENT.fetch_add(s.dependents_client, Ordering::Relaxed);
+    SR_DEPENDENTS_FAULT.fetch_add(s.dependents_fault, Ordering::Relaxed);
+    SR_DEPENDENTS_OTHER.fetch_add(s.dependents_other, Ordering::Relaxed);
+}
+
+/// A release-cell run stalled for the first time with no client operation
+/// in progress, so there was nothing to settle and the stall ended it.
+pub fn record_stall_release_without_ops() {
+    if !enabled() {
+        return;
+    }
+    SR_STALLS_WITHOUT_OPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A settled client operation's real response arrived after the release.
+#[inline]
+pub fn record_stall_release_late_response() {
+    if !enabled() {
+        return;
+    }
+    SR_LATE_RESPONSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One run finished, of any cell and outcome. Called once per run, off the
+/// scheduling hot path.
+pub fn record_stall_release_run(r: &StallReleaseRun) {
+    if !enabled() {
+        return;
+    }
+    let (runs, invocations, plan_complete) = match r.cell {
+        StallReleaseCell::Release => {
+            (&SR_RELEASE_RUNS, &SR_RELEASE_INVOCATIONS, &SR_RELEASE_PLAN_COMPLETE)
+        }
+        StallReleaseCell::Cut => (&SR_CUT_RUNS, &SR_CUT_INVOCATIONS, &SR_CUT_PLAN_COMPLETE),
+        StallReleaseCell::Exempt => return,
+    };
+    runs.fetch_add(1, Ordering::Relaxed);
+    invocations.fetch_add(r.invocations, Ordering::Relaxed);
+    plan_complete.fetch_add(r.completed as u64, Ordering::Relaxed);
+    if let Some(at) = r.release_step {
+        SR_STEPS_AFTER_RELEASE_SUM.fetch_add(r.steps.saturating_sub(at), Ordering::Relaxed);
+        SR_PLAN_COMPLETED_AFTER_RELEASE.fetch_add(r.completed as u64, Ordering::Relaxed);
+        SR_SECOND_STALL_STOPS.fetch_add(r.stalled as u64, Ordering::Relaxed);
+    }
+}
+
 /// One placed-posture run drew a crash hold `held_steps` past the crash's
 /// readiness; `capped` marks the draws whose span bound came from the step
 /// cap's recovery reserve rather than the learned median.
@@ -4307,6 +4429,72 @@ impl StallCapStats {
     }
 }
 
+/// Planned events a release made ready, by kind: client requests, faults
+/// (crash, recover, partition, heal), and the rest.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StallReleaseDependents {
+    pub client: u64,
+    pub fault: u64,
+    pub other: u64,
+}
+
+/// Runs of one stall-release cell, the ClientInterface invocations they
+/// issued, and how many completed their plan.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StallReleaseCellStats {
+    pub runs: u64,
+    pub invocations: u64,
+    pub plan_complete: u64,
+}
+
+/// The stall-release block. `releases` is the mechanism's firing count: runs
+/// whose first stall settled their in-progress client operations instead of
+/// ending them. `stalls_without_ops` counts release-cell runs whose first
+/// stall found nothing to settle and ended them as a cut run's would. The
+/// two cells are the stall cap's treated runs with and without the release.
+#[derive(Serialize)]
+pub struct StallReleaseStats {
+    pub releases: u64,
+    pub ops_settled: u64,
+    pub dependents_released: StallReleaseDependents,
+    pub late_responses: u64,
+    pub plan_completed_after_release: u64,
+    pub second_stall_stops: u64,
+    pub steps_after_release_sum: u64,
+    pub stalls_without_ops: u64,
+    pub release_cell: StallReleaseCellStats,
+    pub cut_cell: StallReleaseCellStats,
+}
+
+impl StallReleaseStats {
+    fn read() -> Self {
+        Self {
+            releases: SR_RELEASES.load(Ordering::Relaxed),
+            ops_settled: SR_OPS_SETTLED.load(Ordering::Relaxed),
+            dependents_released: StallReleaseDependents {
+                client: SR_DEPENDENTS_CLIENT.load(Ordering::Relaxed),
+                fault: SR_DEPENDENTS_FAULT.load(Ordering::Relaxed),
+                other: SR_DEPENDENTS_OTHER.load(Ordering::Relaxed),
+            },
+            late_responses: SR_LATE_RESPONSES.load(Ordering::Relaxed),
+            plan_completed_after_release: SR_PLAN_COMPLETED_AFTER_RELEASE.load(Ordering::Relaxed),
+            second_stall_stops: SR_SECOND_STALL_STOPS.load(Ordering::Relaxed),
+            steps_after_release_sum: SR_STEPS_AFTER_RELEASE_SUM.load(Ordering::Relaxed),
+            stalls_without_ops: SR_STALLS_WITHOUT_OPS.load(Ordering::Relaxed),
+            release_cell: StallReleaseCellStats {
+                runs: SR_RELEASE_RUNS.load(Ordering::Relaxed),
+                invocations: SR_RELEASE_INVOCATIONS.load(Ordering::Relaxed),
+                plan_complete: SR_RELEASE_PLAN_COMPLETE.load(Ordering::Relaxed),
+            },
+            cut_cell: StallReleaseCellStats {
+                runs: SR_CUT_RUNS.load(Ordering::Relaxed),
+                invocations: SR_CUT_INVOCATIONS.load(Ordering::Relaxed),
+                plan_complete: SR_CUT_PLAN_COMPLETE.load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
 /// The crash-placement block: holds drawn by placed-posture runs, the
 /// subset whose span bound came from the step cap's recovery reserve, the
 /// per-step offers an active hold excluded, and the summed displacement of
@@ -5337,6 +5525,7 @@ pub struct UtilizationSnapshot {
     pub quiet_stretch: QuietStretchStats,
     pub run_cap: RunCapStats,
     pub stall_cap: StallCapStats,
+    pub stall_release: StallReleaseStats,
     pub crash_place: CrashPlaceStats,
     pub crash_phase: CrashPhaseStats,
     pub victim_swap: VictimSwapStats,
@@ -5547,6 +5736,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         quiet_stretch: QuietStretchStats::read(),
         run_cap: RunCapStats::read(),
         stall_cap: StallCapStats::read(),
+        stall_release: StallReleaseStats::read(),
         crash_place: CrashPlaceStats::read(),
         crash_phase: CrashPhaseStats::read(),
         victim_swap: VictimSwapStats::read(),

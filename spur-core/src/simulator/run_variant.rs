@@ -39,6 +39,7 @@ use crate::simulator::recover_deps::RecoverDeps;
 use crate::simulator::replay_corpus;
 use crate::simulator::run_cap;
 use crate::simulator::stall_cap;
+use crate::simulator::stall_release;
 use crate::simulator::timer_context;
 
 /// The run draws crash holds over the learned completed-run span.
@@ -105,6 +106,11 @@ pub const RECOVER_DEPS_EXEMPT: i32 = 1 << 13;
 /// The run ends once it has gone the learned stall cap's worth of steps
 /// without a progress mark. Never set on a run-cap or timer-context probe.
 pub const STALL_CAP: i32 = 1 << 10;
+/// The run's first stall settles its in-progress client operations for the
+/// plan and releases the events behind them instead of ending the run.
+/// Drawn over the stall cap's treated runs only, so it implies `STALL_CAP`
+/// and is never set on a probe.
+pub const STALL_RELEASE: i32 = 1 << 12;
 
 /// The bit that names the cell a run's plan was generated under, or zero
 /// for the stock cell.
@@ -340,9 +346,12 @@ pub fn of(
         | if crash_hold_drawn { CRASH_HOLD_DRAWN } else { 0 }
 }
 
-/// The stall-cap bit, a pure function of the run id.
+/// The stall-cap bit and the stall-release bit, pure functions of the run
+/// id.
 pub fn stall_cap_bits(run_id: i64) -> i32 {
-    if stall_cap::is_treated(run_id) {
+    if stall_release::is_treated(run_id) {
+        STALL_CAP | STALL_RELEASE
+    } else if stall_cap::is_treated(run_id) {
         STALL_CAP
     } else {
         0
@@ -422,6 +431,7 @@ mod tests {
             assert_eq!(v & CLIENT_FANOUT_RELEASE != 0, client_anchor::is_treated(id));
             assert_eq!(v & CLIENT_RUSH_PRIORITY != 0, client_anchor::is_rushed(id));
             assert_eq!(v & STALL_CAP != 0, stall_cap::is_treated(id));
+            assert_eq!(v & STALL_RELEASE != 0, stall_release::is_treated(id));
             assert_ne!(
                 v & (CLIENT_FANOUT_RELEASE | CLIENT_RUSH_PRIORITY),
                 CLIENT_FANOUT_RELEASE | CLIENT_RUSH_PRIORITY,
@@ -710,5 +720,20 @@ mod tests {
             "the stall cap treats {share} of the runs outside both probe streams"
         );
         assert_eq!(stall_capped_probes, 0, "a probe must never be cut by the stall cap");
+        let stall_released = (0..64_000i64)
+            .filter(|&id| from_run_id(id) & STALL_RELEASE != 0)
+            .count();
+        let released_without_cap = (0..64_000i64)
+            .filter(|&id| {
+                let v = from_run_id(id);
+                v & STALL_RELEASE != 0 && v & STALL_CAP == 0
+            })
+            .count();
+        let release_share = stall_released as f64 / stall_capped as f64;
+        assert!(
+            (release_share - 0.5).abs() < 0.02,
+            "the stall release treats {release_share} of the stall cap's treated runs"
+        );
+        assert_eq!(released_without_cap, 0, "the release bit implies the stall-cap bit");
     }
 }

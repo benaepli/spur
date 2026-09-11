@@ -20,9 +20,11 @@ use crate::simulator::rng::StreamRng;
 use crate::simulator::run_cap;
 use crate::simulator::run_variant::{ArmSet, CrashArm};
 use crate::simulator::stall_cap::{self, Marks, RunClock, RunEnding};
+use crate::simulator::stall_release;
 use crate::simulator::timer_context;
 use crate::simulator::util_stats::{
-    self, DeliveryBias, RunEnd, RunExtension, RunTermination, StallCapCell,
+    self, DeliveryBias, RunEnd, RunExtension, RunTermination, StallCapCell, StallReleaseCell,
+    StallReleaseRun, StallReleaseSettlement,
 };
 use ecow::EcoString;
 use log::{info, warn};
@@ -378,6 +380,64 @@ impl StepCensus {
     }
 }
 
+/// Settle every client operation still in progress for the plan's
+/// dependency purposes: its plan node completes, so the events ordered
+/// behind it become ready, while the operation itself stays in progress so
+/// its real response, if one arrives, is recorded as any other. Operations
+/// are settled in id order so the run stays a function of its seed.
+fn settle_in_progress(
+    engine: &mut PlanEngine,
+    in_progress: &HashMap<i32, NodeIndex>,
+    settled: &mut HashSet<i32>,
+) -> StallReleaseSettlement {
+    let mut settlement = StallReleaseSettlement {
+        ops_settled: 0,
+        dependents_client: 0,
+        dependents_fault: 0,
+        dependents_other: 0,
+    };
+    let mut ids: Vec<i32> = in_progress.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        settled.insert(id);
+        settlement.ops_settled += 1;
+        for child in engine.mark_event_completed(in_progress[&id]) {
+            match engine.event(child).action {
+                EventAction::ClientRequest(_) => settlement.dependents_client += 1,
+                EventAction::CrashNode(_)
+                | EventAction::RecoverNode(_)
+                | EventAction::Partition(_)
+                | EventAction::Heal => settlement.dependents_fault += 1,
+                EventAction::AllowTimer(..) | EventAction::Deliver(_) => {
+                    settlement.dependents_other += 1
+                }
+            }
+        }
+    }
+    settlement
+}
+
+/// One run ended, reported to the stall-release counters with the steps it
+/// ran, whether its plan completed, whether the stall cap ended it, and the
+/// client requests it issued.
+fn finish_release_run(
+    cell: StallReleaseCell,
+    release_step: Option<i32>,
+    steps: i32,
+    completed: bool,
+    stalled: bool,
+    invocations: i32,
+) {
+    util_stats::record_stall_release_run(&StallReleaseRun {
+        cell,
+        release_step: release_step.map(|s| s.max(0) as u64),
+        steps: steps.max(0) as u64,
+        completed,
+        stalled,
+        invocations: invocations.max(0) as u64,
+    });
+}
+
 /// Record why one plan execution stopped, together with the work that was
 /// still queued at that moment. Observation only.
 fn record_termination<H: HashPolicy>(
@@ -466,6 +526,12 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     let stall_treated = stall_cell == StallCapCell::Treated;
     let stall_cap_standing = stall_cap::effective_cap(backup);
     let mut stall_clock = RunClock::default();
+    // A released run settles its in-progress operations once, at its first
+    // stall; `settled` holds their ids so a later real response completes
+    // no plan node twice.
+    let release_cell = stall_release::cell(run_id);
+    let mut release_step: Option<i32> = None;
+    let mut settled: HashSet<i32> = HashSet::new();
     let mut selector = queue_policy.to_selector();
     let mut op_id_counter = 0i32;
     let mut in_progress: HashMap<i32, NodeIndex> = HashMap::new();
@@ -558,6 +624,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     steps_saved: None,
                 },
             );
+            finish_release_run(release_cell, release_step, step, true, false, op_id_counter);
             if is_probe {
                 run_cap::merge_probe(backup, run_cap::Outcome::Completed, step);
                 fault_timing::merge_stock_probe(run_id, backup, run_cap::Outcome::Completed, step);
@@ -624,6 +691,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     steps_saved: None,
                 },
             );
+            finish_release_run(release_cell, release_step, step, false, false, op_id_counter);
             if is_probe {
                 run_cap::merge_probe(backup, run_cap::Outcome::Deadlocked, step);
                 fault_timing::merge_stock_probe(run_id, backup, run_cap::Outcome::Deadlocked, step);
@@ -991,7 +1059,11 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             .filter(|op| matches!(op.kind, OpKind::Response))
             .filter_map(|op| {
                 in_progress.get(&op.unique_id).map(|&node_idx| {
-                    engine.mark_event_completed(node_idx);
+                    if settled.remove(&op.unique_id) {
+                        util_stats::record_stall_release_late_response();
+                    } else {
+                        engine.mark_event_completed(node_idx);
+                    }
                     op.unique_id
                 })
             })
@@ -1051,6 +1123,17 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             && !engine.is_complete()
         {
             let stop_step = step + 1;
+            if release_cell == StallReleaseCell::Release && release_step.is_none() {
+                if in_progress.is_empty() {
+                    util_stats::record_stall_release_without_ops();
+                } else {
+                    let settlement = settle_in_progress(&mut engine, &in_progress, &mut settled);
+                    stall_clock.release();
+                    release_step = Some(stop_step);
+                    util_stats::record_stall_release(&settlement);
+                    continue;
+                }
+            }
             util_stats::record_client_anchor_run_end(anchored, false, held.pending());
             record_termination(
                 RunEnd::StallCapReached,
@@ -1073,6 +1156,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     steps_saved: Some((effective_cap - stop_step).max(0) as u64),
                 },
             );
+            finish_release_run(release_cell, release_step, stop_step, false, true, op_id_counter);
             return Ok(RunOutcome::StallCapReached {
                 cap,
                 step: stop_step,
@@ -1093,6 +1177,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             steps_saved: None,
         },
     );
+    finish_release_run(release_cell, release_step, effective_cap, false, false, op_id_counter);
     if effective_cap < backup {
         record_termination(
             RunEnd::LearnedCapReached,

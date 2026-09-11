@@ -1,0 +1,53 @@
+// A node whose first write is stuck until a second write reaches it: the
+// first request's retries make no progress mark once the node has noted it,
+// the second request succeeds at once and lets the first one succeed on its
+// next retry, and any later write succeeds only once the first has been
+// answered. The role and client-interface names are the ones the explorer
+// looks up.
+
+role Node {
+    var first: int = -1;
+    var second: int = -1;
+    var released: bool = false;
+    var first_done: bool = false;
+
+    async fn Try(key: string, uid: int): bool {
+        if (first == -1) {
+            first = uid;
+            return false;
+        }
+        if (uid == first) {
+            if (released) {
+                first_done = true;
+                return true;
+            }
+            return false;
+        }
+        if (second == -1) {
+            second = uid;
+            released = true;
+            return true;
+        }
+        return first_done;
+    }
+
+    async fn Read(key: string): int {
+        return 0;
+    }
+}
+
+ClientInterface {
+    async fn Write(dest: Node, key: string, uid: int) {
+        var ok: bool = false;
+        for ;; {
+            ok = <-dest->Try(key, uid);
+            if (ok) {
+                return;
+            }
+        }
+    }
+
+    async fn Read(dest: Node, key: string): int {
+        return <-dest->Read(key);
+    }
+}

@@ -101,8 +101,9 @@ impl PlanEngine {
             .collect()
     }
 
-    /// Marks an event as completed and updates dependencies.
-    pub fn mark_event_completed(&mut self, idx: NodeIndex) {
+    /// Marks an event as completed and updates dependencies, returning the
+    /// dependents this completion made ready.
+    pub fn mark_event_completed(&mut self, idx: NodeIndex) -> Vec<NodeIndex> {
         self.statuses.insert(idx, EventStatus::Completed);
 
         // Notify dependents
@@ -111,6 +112,7 @@ impl PlanEngine {
             .neighbors_directed(idx, Direction::Outgoing)
             .collect();
 
+        let mut released = Vec::new();
         for child in children {
             let all_deps_done = self
                 .graph
@@ -119,8 +121,14 @@ impl PlanEngine {
 
             if all_deps_done && self.statuses.get(&child) == Some(&EventStatus::Pending) {
                 self.statuses.insert(child, EventStatus::Ready);
+                released.push(child);
             }
         }
+        released
+    }
+
+    pub fn event(&self, idx: NodeIndex) -> &PlannedEvent {
+        &self.graph[idx]
     }
 
     /// Reverts an InProgress event back to Ready.

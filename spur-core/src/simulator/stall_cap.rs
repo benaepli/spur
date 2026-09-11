@@ -247,18 +247,28 @@ impl RunClock {
     /// the gap whether or not it was suspended.
     pub fn step(&mut self, marks: Marks, suspended: bool) -> i32 {
         if marks.any() {
-            self.longest = self.longest.max(self.gap);
-            self.gap = 0;
-            self.marks.rows += marks.row as u64;
-            self.marks.acted_deliveries += marks.acted_delivery as u64;
-            self.marks.acted_timers += marks.acted_timer as u64;
-            self.marks.releases += marks.release as u64;
+            self.close_gap(marks);
         } else if suspended {
             self.suspended_steps += 1;
         } else {
             self.gap += 1;
         }
         self.gap
+    }
+
+    /// A plan release made outside a step's own marks: closes the open gap
+    /// as a released step does.
+    pub fn release(&mut self) {
+        self.close_gap(Marks { release: true, ..Marks::default() });
+    }
+
+    fn close_gap(&mut self, marks: Marks) {
+        self.longest = self.longest.max(self.gap);
+        self.gap = 0;
+        self.marks.rows += marks.row as u64;
+        self.marks.acted_deliveries += marks.acted_delivery as u64;
+        self.marks.acted_timers += marks.acted_timer as u64;
+        self.marks.releases += marks.release as u64;
     }
 
     /// The longest gap so far, counting the open segment.

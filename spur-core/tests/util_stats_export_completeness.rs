@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, RunCapStats, StallCapMarks, StallCapStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -551,6 +551,81 @@ fn stall_cap_leaves(prefix: &str, s: &StallCapStats) -> Vec<(String, Value)> {
     for (i, v) in untreated_gap_hist.iter().enumerate() {
         out.push(leaf(prefix, &format!("untreated_gap_hist.{i}"), *v));
     }
+    out
+}
+
+fn stall_release_cell(m: &mut Marks) -> StallReleaseCellStats {
+    StallReleaseCellStats {
+        runs: m.int(),
+        invocations: m.int(),
+        plan_complete: m.int(),
+    }
+}
+
+fn stall_release_cell_leaves(prefix: &str, c: &StallReleaseCellStats) -> Vec<(String, Value)> {
+    let StallReleaseCellStats {
+        runs,
+        invocations,
+        plan_complete,
+    } = c;
+    vec![
+        leaf(prefix, "runs", *runs),
+        leaf(prefix, "invocations", *invocations),
+        leaf(prefix, "plan_complete", *plan_complete),
+    ]
+}
+
+fn stall_release(m: &mut Marks) -> StallReleaseStats {
+    StallReleaseStats {
+        releases: m.int(),
+        ops_settled: m.int(),
+        dependents_released: StallReleaseDependents {
+            client: m.int(),
+            fault: m.int(),
+            other: m.int(),
+        },
+        late_responses: m.int(),
+        plan_completed_after_release: m.int(),
+        second_stall_stops: m.int(),
+        steps_after_release_sum: m.int(),
+        stalls_without_ops: m.int(),
+        release_cell: stall_release_cell(m),
+        cut_cell: stall_release_cell(m),
+    }
+}
+
+fn stall_release_leaves(prefix: &str, s: &StallReleaseStats) -> Vec<(String, Value)> {
+    let StallReleaseStats {
+        releases,
+        ops_settled,
+        dependents_released,
+        late_responses,
+        plan_completed_after_release,
+        second_stall_stops,
+        steps_after_release_sum,
+        stalls_without_ops,
+        release_cell,
+        cut_cell,
+    } = s;
+    let StallReleaseDependents {
+        client,
+        fault,
+        other,
+    } = dependents_released;
+    let mut out = vec![
+        leaf(prefix, "releases", *releases),
+        leaf(prefix, "ops_settled", *ops_settled),
+        leaf(prefix, "dependents_released.client", *client),
+        leaf(prefix, "dependents_released.fault", *fault),
+        leaf(prefix, "dependents_released.other", *other),
+        leaf(prefix, "late_responses", *late_responses),
+        leaf(prefix, "plan_completed_after_release", *plan_completed_after_release),
+        leaf(prefix, "second_stall_stops", *second_stall_stops),
+        leaf(prefix, "steps_after_release_sum", *steps_after_release_sum),
+        leaf(prefix, "stalls_without_ops", *stalls_without_ops),
+    ];
+    out.extend(stall_release_cell_leaves(&format!("{prefix}.release_cell"), release_cell));
+    out.extend(stall_release_cell_leaves(&format!("{prefix}.cut_cell"), cut_cell));
     out
 }
 
@@ -1597,6 +1672,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         quiet_stretch: _,
         run_cap: _,
         stall_cap: _,
+        stall_release: _,
         crash_place: _,
         crash_phase: _,
         victim_swap: _,
@@ -1637,6 +1713,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "quiet_stretch",
         "run_cap",
         "stall_cap",
+        "stall_release",
         "crash_place",
         "crash_phase",
         "victim_swap",
@@ -1711,6 +1788,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.delivery_effects = delivery_effects(&mut m);
     s.run_cap = run_cap(&mut m);
     s.stall_cap = stall_cap(&mut m);
+    s.stall_release = stall_release(&mut m);
     s.crash_place = crash_place(&mut m);
     s.crash_phase = crash_phase(&mut m);
     s.victim_swap = victim_swap(&mut m);
@@ -1731,6 +1809,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     ));
     expected.extend(run_cap_leaves("run_cap", &s.run_cap));
     expected.extend(stall_cap_leaves("stall_cap", &s.stall_cap));
+    expected.extend(stall_release_leaves("stall_release", &s.stall_release));
     expected.extend(crash_place_leaves("crash_place", &s.crash_place));
     expected.extend(crash_phase_leaves("crash_phase", &s.crash_phase));
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
@@ -1776,6 +1855,7 @@ fn every_counter_field_reaches_the_written_json() {
         "delivery_effects",
         "run_cap",
         "stall_cap",
+        "stall_release",
         "crash_place",
         "crash_phase",
         "victim_swap",
