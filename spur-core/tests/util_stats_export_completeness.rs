@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    FrameStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1234,6 +1234,27 @@ fn ghost_signal_leaves(prefix: &str, g: &GhostSignalStats) -> Vec<(String, Value
     vec![leaf(prefix, "fired_runs", *fired_runs)]
 }
 
+fn frame(m: &mut Marks) -> FrameStats {
+    FrameStats {
+        calls: m.int(),
+        slots_built: m.int(),
+        entry_frame_copies: m.int(),
+    }
+}
+
+fn frame_leaves(prefix: &str, f: &FrameStats) -> Vec<(String, Value)> {
+    let FrameStats {
+        calls,
+        slots_built,
+        entry_frame_copies,
+    } = f;
+    vec![
+        leaf(prefix, "calls", *calls),
+        leaf(prefix, "slots_built", *slots_built),
+        leaf(prefix, "entry_frame_copies", *entry_frame_copies),
+    ]
+}
+
 fn replay(m: &mut Marks) -> ReplayStats {
     ReplayStats {
         parents_admitted: m.int(),
@@ -1915,6 +1936,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         crash_phase: _,
         victim_swap: _,
         ghost_signal: _,
+        frame: _,
         fresh_first: _,
         pair_order: _,
         client_anchor: _,
@@ -1956,6 +1978,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "crash_phase",
         "victim_swap",
         "ghost_signal",
+        "frame",
         "fresh_first",
         "pair_order",
         "client_anchor",
@@ -2031,6 +2054,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.crash_phase = crash_phase(&mut m);
     s.victim_swap = victim_swap(&mut m);
     s.ghost_signal = ghost_signal(&mut m);
+    s.frame = frame(&mut m);
     s.fresh_first = fresh_first(&mut m);
     s.pair_order = pair_order(&mut m);
     s.client_anchor = client_anchor(&mut m);
@@ -2052,6 +2076,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(crash_phase_leaves("crash_phase", &s.crash_phase));
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
     expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
+    expected.extend(frame_leaves("frame", &s.frame));
     expected.extend(fresh_first_leaves("fresh_first", &s.fresh_first));
     expected.extend(pair_order_leaves("pair_order", &s.pair_order));
     expected.extend(client_anchor_leaves("client_anchor", &s.client_anchor));
@@ -2098,6 +2123,7 @@ fn every_counter_field_reaches_the_written_json() {
         "crash_phase",
         "victim_swap",
         "ghost_signal",
+        "frame",
         "fresh_first",
         "pair_order",
         "client_anchor",

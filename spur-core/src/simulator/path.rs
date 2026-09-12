@@ -2,10 +2,10 @@ use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Program, Vertex};
 use crate::simulator::core::steer_terms::ResolvedTerms;
 use crate::simulator::core::{
-    Continuation, Env, LogEntry, Logger, NodeId, OpKind, Operation, PurgatoryConfig,
+    Continuation, LogEntry, Logger, NodeId, OpKind, Operation, PurgatoryConfig,
     QueuePolicyConfig, Record, Reservation, Runnable, RunnableCategory,
     RuntimeError, SchedulePolicy, ScheduleResult, State, TraceEntry, Value, WithinQueueSelector,
-    make_local_env, schedule_runnable,
+    build_frame, schedule_runnable,
 };
 use crate::simulator::client_anchor::{self, HoldQueue, Released};
 use crate::simulator::coverage::GlobalState;
@@ -27,7 +27,7 @@ use crate::simulator::util_stats::{
     self, DeliveryBias, RunEnd, RunExtension, RunTermination, StallCapCell, StallReleaseCell,
     StallReleaseRun, StallReleaseSettlement,
 };
-use ecow::EcoString;
+use ecow::{EcoString, EcoVec};
 use log::{info, warn};
 use petgraph::graph::NodeIndex;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -171,13 +171,8 @@ fn schedule_client_op<H: HashPolicy>(
     let op_func = prog
         .get_func_by_name(op_name)
         .ok_or_else(|| RuntimeError::MissingRequiredFunction(op_name.to_string()))?;
-    let env = make_local_env(
-        op_func,
-        actuals.clone(),
-        &Env::default(),
-        &state.nodes[client_node_id.index],
-        &prog.id_to_name,
-    );
+    let initial_args: EcoVec<Value<H>> = actuals.iter().cloned().collect();
+    let env = build_frame(op_func, &initial_args);
 
     history.push(Operation {
         client_id,
@@ -201,7 +196,8 @@ fn schedule_client_op<H: HashPolicy>(
             unique_id: op_id,
         },
         entry_pc: op_func.entry,
-        initial_env: env.clone(),
+        initial_args,
+        entry_func: op_func.name,
         env,
         priority: state.record_priority(Some(op_id), drawn_priority),
         causal_operation_id: Some(op_id),
@@ -284,13 +280,7 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
     let (client_node_id, is_new) = path_state.client_pool.get(&mut path_state.state);
 
     if is_new && let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
-        let mut env = make_local_env(
-            init_fn,
-            vec![],
-            &Env::<H>::default(),
-            &path_state.state.nodes[client_node_id.index],
-            &program.id_to_name,
-        );
+        let mut env = build_frame::<H>(init_fn, &[]);
         if let Err(e) = crate::simulator::core::exec_sync_on_node::<H, _, F>(
             &mut path_state.state,
             &mut path_state.logs,
@@ -476,6 +466,7 @@ fn record_termination<H: HashPolicy>(
         recovered_nodes,
     });
     util_stats::record_ghost_release_run(state.ghost_release.cell, steps_used);
+    util_stats::flush_frame_stats();
 }
 
 pub fn exec_plan<H: HashPolicy, F: Feedback>(

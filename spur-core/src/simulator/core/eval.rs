@@ -1,11 +1,12 @@
 use crate::analysis::resolver::NameId;
-use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, VarSlot};
+use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, SlotDefault, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::values::{
     Decimal, Env, Value, ValueKind, ValueMap, ValueSeq, hash_map_entry,
 };
 use crate::simulator::hash_utils::HashPolicy;
-use ecow::EcoString;
+use crate::simulator::util_stats;
+use ecow::{EcoString, EcoVec};
 use std::collections::HashMap;
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
@@ -27,9 +28,19 @@ pub fn store_slot<H: HashPolicy>(
     node_env: &mut Env<H>,
 ) {
     match slot {
-        VarSlot::Local(idx, _) => local_env.set(idx, val),
+        VarSlot::Local(idx, _) => set_local(local_env, idx, val),
         VarSlot::Node(idx, _) => node_env.set(idx, val),
     }
+}
+
+/// Write one slot of a local call frame. A frame that is still shared when
+/// it is written is copied by the write, which is counted here.
+#[inline(always)]
+pub fn set_local<H: HashPolicy>(local_env: &mut Env<H>, slot: u32, val: Value<H>) {
+    if !local_env.slots.is_unique() {
+        util_stats::record_entry_frame_copy();
+    }
+    local_env.set(slot, val);
 }
 
 pub fn store<H: HashPolicy>(
@@ -46,30 +57,60 @@ pub fn store<H: HashPolicy>(
     }
 }
 
-/// Create a fresh local environment for calling a function
-pub fn make_local_env<H: HashPolicy>(
-    func: &FunctionInfo,
-    args: Vec<Value<H>>,
-    local_env: &Env<H>,
-    node_env: &Env<H>,
-    role_names: &HashMap<NameId, String>,
-) -> Env<H> {
-    let mut env = Env::<H>::with_slots(func.local_slot_count as usize);
+/// Builds a local call frame slot by slot: the caller pushes the argument
+/// values, then `finish` appends the declared starting value of every
+/// remaining slot. The buffer is sized once and each slot written once.
+pub struct FrameBuilder<H: HashPolicy> {
+    slots: EcoVec<Value<H>>,
+    sig: u64,
+}
 
-    // Set arguments in parameter slots
-    for (i, arg) in args.into_iter().enumerate() {
-        env.set(i as u32, arg);
-    }
-
-    // Initialize other locals to their defaults
-    for (i, default_expr) in func.local_defaults.iter().enumerate() {
-        let slot = func.param_count + i as u32;
-        if let Ok(val) = eval(local_env, node_env, default_expr, role_names) {
-            env.set(slot, val);
+impl<H: HashPolicy> FrameBuilder<H> {
+    pub fn new(func: &FunctionInfo) -> Self {
+        Self {
+            slots: EcoVec::with_capacity(func.local_slot_count as usize),
+            sig: 0,
         }
     }
 
-    env
+    #[inline]
+    pub fn push(&mut self, value: Value<H>) {
+        if H::EAGER {
+            self.sig ^= H::mix(value.sig, self.slots.len() as u32);
+        }
+        self.slots.push(value);
+    }
+
+    pub fn finish(mut self, func: &FunctionInfo) -> Env<H> {
+        let total = func.local_slot_count as usize;
+        while self.slots.len() < (func.param_count as usize).min(total) {
+            self.push(Value::<H>::unit());
+        }
+        for default in &func.local_defaults {
+            if self.slots.len() >= total {
+                break;
+            }
+            self.push(match default {
+                SlotDefault::Unit => Value::<H>::unit(),
+                SlotDefault::Nil => Value::<H>::option_none(),
+            });
+        }
+        while self.slots.len() < total {
+            self.push(Value::<H>::unit());
+        }
+        util_stats::record_frame_build(total as u64);
+        Env::from_slots(self.slots, self.sig)
+    }
+}
+
+/// The local call frame for `func` with `args` in its parameter slots.
+pub fn build_frame<H: HashPolicy>(func: &FunctionInfo, args: &[Value<H>]) -> Env<H> {
+    let mut builder = FrameBuilder::<H>::new(func);
+    let params = (func.param_count as usize).min(func.local_slot_count as usize);
+    for arg in args.iter().take(params) {
+        builder.push(arg.clone());
+    }
+    builder.finish(func)
 }
 
 fn update_collection<H: HashPolicy>(
@@ -898,22 +939,28 @@ mod tests {
     }
 
     #[test]
-    fn test_make_local_env() {
+    fn test_build_frame() {
         let func = FunctionInfo {
             entry: 0,
             name: NameId(0),
             param_count: 1,
             local_slot_count: 2,
-            local_defaults: vec![Expr::Int(10)],
+            local_defaults: vec![SlotDefault::Nil],
             is_sync: true,
             debug_slot_names: vec!["a".into(), "b".into()],
         };
-        let args = vec![Value::<WithHashing>::int(5)];
-        let env = Env::<WithHashing>::with_slots(0);
-        let roles = HashMap::new();
-        let local = make_local_env(&func, args, &env, &env, &roles);
+        let args = [Value::<WithHashing>::int(5)];
+        let local = build_frame(&func, &args);
         assert_eq!(local.get(0), &Value::<WithHashing>::int(5));
-        assert_eq!(local.get(1), &Value::<WithHashing>::int(10));
+        assert_eq!(local.get(1), &Value::<WithHashing>::option_none());
+        let mut reference = Env::<WithHashing>::with_slots(2);
+        reference.set(0, Value::<WithHashing>::int(5));
+        reference.set(1, Value::<WithHashing>::option_none());
+        assert_eq!(
+            local.sig, reference.sig,
+            "the frame carries the signature a slot-by-slot build would give it"
+        );
+        assert_eq!(local, reference, "the frame holds the same slots");
     }
     #[test]
     fn test_role_to_string() {

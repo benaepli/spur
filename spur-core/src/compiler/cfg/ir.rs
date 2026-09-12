@@ -98,6 +98,13 @@ pub enum Instr {
 
 pub type Vertex = usize;
 
+/// The value a local slot holds before anything is stored into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum SlotDefault {
+    Unit,
+    Nil,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FunctionInfo {
     pub entry: Vertex,
@@ -109,8 +116,9 @@ pub struct FunctionInfo {
     /// Total local slots needed (params + locals + temps)
     pub local_slot_count: u32,
 
-    /// Default values for locals, indexed by (slot - param_count)
-    pub local_defaults: Vec<Expr>,
+    /// Starting value of each local, indexed by (slot - param_count), so a
+    /// call frame is built in one pass without evaluating anything.
+    pub local_defaults: Vec<SlotDefault>,
 
     pub is_sync: bool,
 
@@ -168,7 +176,7 @@ pub enum Label {
     ),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Cfg {
     pub graph: Vec<Label>,
 }
@@ -179,7 +187,7 @@ impl Cfg {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Program {
     // The CFG is just a list of all vertices.
     // The `Vertex` indices in `Label` and `FunctionInfo`

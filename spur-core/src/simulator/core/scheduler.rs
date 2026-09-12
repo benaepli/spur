@@ -1,6 +1,6 @@
 use crate::compiler::cfg::{Program, Vertex};
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::core::eval::make_local_env;
+use crate::simulator::core::eval::build_frame;
 use crate::simulator::core::exec::{exec, exec_sync_on_node};
 use crate::simulator::core::partition::{activate_partition, heal_partition};
 use crate::simulator::core::queue_selector::{
@@ -12,6 +12,7 @@ use crate::simulator::core::state::{
 };
 use crate::simulator::core::steer_terms::{ResolvedTerms, Term, TERMS};
 use crate::simulator::core::values::{Env, Value};
+use ecow::EcoVec;
 use crate::simulator::crash_phase;
 use crate::simulator::fresh_first;
 use crate::simulator::ghost_absorber;
@@ -1410,7 +1411,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     ledger.in_flight > 0,
                 );
             }
-            crash_node(state, victim);
+            crash_node(state, program, victim);
             Ok(ScheduleResult::Crash {
                 node_id: victim,
                 planned: node_id,
@@ -1433,7 +1434,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             Ok(ScheduleResult::Recover { node_id })
         }
         Runnable::Partition { partition_type, .. } => {
-            activate_partition(state, partition_type.clone());
+            activate_partition(state, program, partition_type.clone());
             Ok(ScheduleResult::Partition { partition_type })
         }
         Runnable::Heal { .. } => {
@@ -1494,7 +1495,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 if let Runnable::Record(r) = other
                     && src_node != dest_node {
                         let mut r = r;
-                        r.reset();
+                        r.reset(program);
                         state.crash_info.queued_messages.push_back((dest_node, r));
                     }
                 return Ok(ScheduleResult::None);
@@ -1504,7 +1505,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 match other {
                     Runnable::Record(r) => {
                         let mut r = r;
-                        r.reset();
+                        r.reset(program);
                         state.partition_info.buffer_record(dest_node, r);
                     }
                     Runnable::ChannelSend {
@@ -2038,7 +2039,7 @@ fn pair_order_dispatch<H: HashPolicy>(state: &State<H>, eligible: &[usize], pick
     }
 }
 
-fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
+fn crash_node<H: HashPolicy>(state: &mut State<H>, program: &Program, node_id: NodeId) {
     if state.crash_info.currently_crashed.contains(&node_id) {
         warn!("Node {} is already crashed", node_id);
         return;
@@ -2062,7 +2063,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
         if let Runnable::Record(record) = task
             && record.origin_node != record.node {
                 let mut record = record;
-                record.reset();
+                record.reset(program);
                 held += 1;
                 state
                     .crash_info
@@ -2082,7 +2083,7 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, node_id: NodeId) {
                 state.net_leave(&task);
                 if r.origin_node != r.node {
                     let mut r = r.clone();
-                    r.reset();
+                    r.reset(program);
                     held += 1;
                     state.crash_info.queued_messages.push_back((node_id, r));
                 } else {
@@ -2203,14 +2204,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
         state.nodes[node_id.index].set(self_idx, Value::<H>::node(node_id));
     }
 
-    let node_env = &state.nodes[node_id.index];
-    let mut env = make_local_env(
-        init_fn,
-        vec![],
-        &Env::<H>::default(),
-        node_env,
-        &prog.id_to_name,
-    );
+    let mut env = build_frame::<H>(init_fn, &[]);
 
     exec_sync_on_node::<H, L, F>(
         state,
@@ -2274,14 +2268,8 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         ],
     };
 
-    let node_env = &state.nodes[node_id.index];
-    let env = make_local_env(
-        recover_fn,
-        actuals,
-        &Env::<H>::default(),
-        node_env,
-        &prog.id_to_name,
-    );
+    let initial_args: EcoVec<Value<H>> = actuals.into_iter().collect();
+    let env = build_frame(recover_fn, &initial_args);
 
     let record = Record {
         pc: recover_fn.entry,
@@ -2289,7 +2277,8 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         origin_node: node_id,
         continuation: Continuation::Recover,
         entry_pc: recover_fn.entry,
-        initial_env: env.clone(),
+        initial_args,
+        entry_func: recover_fn.name,
         env,
         priority: policy.sample(rng, RunnableCategory::Record),
         causal_operation_id: None,
@@ -3464,7 +3453,7 @@ mod tests {
         assert_eq!(phase_read_node(&state, 0, 3), 2, "an outstanding pair is passed over");
         assert_eq!(phase_read_node(&state, 0, 3), retarget_crash(&state, planned, 3).index);
         state.retarget.pending_pair_mask = 0;
-        crash_node(&mut state, node(1));
+        crash_node(&mut state, &Program::default(), node(1));
         assert_eq!(phase_read_node(&state, 0, 3), 2, "a node that is down is not read");
         assert_eq!(phase_read_node(&state, 0, 3), retarget_crash(&state, planned, 3).index);
 
@@ -3597,7 +3586,7 @@ mod tests {
         state.send_ledger[2].crash_pending = 1;
         assert_eq!(retarget_crash(&state, NodeId { role, index: 1 }, 3), NodeId { role, index: 1 });
 
-        crash_node(&mut state, NodeId { role, index: 1 });
+        crash_node(&mut state, &Program::default(), NodeId { role, index: 1 });
         assert_eq!(state.send_ledger[1].last_ghost_step, -1);
         assert!(!state.send_ledger[1].last_ghost_acted);
         assert_eq!(state.send_ledger[2].last_ghost_step, 9, "another node's mark stays");
@@ -3631,7 +3620,8 @@ mod tests {
             origin_node: node(origin),
             continuation: Continuation::Recover,
             entry_pc: 0,
-            initial_env: env.clone(),
+            initial_args: EcoVec::new(),
+            entry_func: crate::analysis::resolver::NameId(0),
             env,
             priority,
             causal_operation_id: None,

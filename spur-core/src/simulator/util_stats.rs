@@ -93,6 +93,9 @@ static VS_SKIPPED_PENDING_PAIR: AtomicU64 = AtomicU64::new(0);
 static VS_VICTIM_CRASHED_HOLDS: AtomicU64 = AtomicU64::new(0);
 static VS_FORCED_ONTO_ABSORBER: AtomicU64 = AtomicU64::new(0);
 static GS_FIRED_RUNS: AtomicU64 = AtomicU64::new(0);
+static FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
+static FRAME_SLOTS_BUILT: AtomicU64 = AtomicU64::new(0);
+static FRAME_ENTRY_COPIES: AtomicU64 = AtomicU64::new(0);
 static FF_SWAPS: AtomicU64 = AtomicU64::new(0);
 static FF_REPEAT_SWAPS: AtomicU64 = AtomicU64::new(0);
 /// How many times a ghost was displaced before it was taken: once, twice,
@@ -1785,6 +1788,10 @@ thread_local! {
     /// plan runs and consumed when the run terminates, so a run that never
     /// registered contributes to no cell.
     static PLAN_DEPS_RUN: std::cell::Cell<Option<(RecoverDeps, bool)>> = const { std::cell::Cell::new(None) };
+    /// Frame counts for the run executing on this thread, folded into the
+    /// session totals once the run ends. A thread runs one run at a time, so
+    /// no atomic is taken on the interpreter's path.
+    static FRAME_RUN: std::cell::Cell<FrameTally> = const { std::cell::Cell::new(FrameTally::new()) };
 }
 
 /// Fold this thread's finished run into the per-run tallies. Idempotent, so it
@@ -1838,6 +1845,7 @@ pub fn begin_run() {
         return;
     }
     finish_run();
+    flush_frame_stats();
     CR_RUNS.fetch_add(1, Ordering::Relaxed);
     RUN_CROSSING.with(|c| {
         let mut c = c.borrow_mut();
@@ -5233,6 +5241,87 @@ impl VictimSwapStats {
     }
 }
 
+/// Local call frames built by the interpreter. `calls` counts the frames,
+/// `slots_built` sums their slot counts, and `entry_frame_copies` counts the
+/// writes to a local frame that found it shared and therefore copied it.
+#[derive(Serialize, Debug)]
+pub struct FrameStats {
+    pub calls: u64,
+    pub slots_built: u64,
+    pub entry_frame_copies: u64,
+}
+
+impl FrameStats {
+    fn read() -> Self {
+        Self {
+            calls: FRAME_CALLS.load(Ordering::Relaxed),
+            slots_built: FRAME_SLOTS_BUILT.load(Ordering::Relaxed),
+            entry_frame_copies: FRAME_ENTRY_COPIES.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One run's frame counts, held on the running thread.
+#[derive(Clone, Copy)]
+struct FrameTally {
+    calls: u64,
+    slots_built: u64,
+    entry_frame_copies: u64,
+}
+
+impl FrameTally {
+    const fn new() -> Self {
+        Self {
+            calls: 0,
+            slots_built: 0,
+            entry_frame_copies: 0,
+        }
+    }
+}
+
+/// One local call frame of `slots` slots was built.
+#[inline]
+pub fn record_frame_build(slots: u64) {
+    if !enabled() {
+        return;
+    }
+    FRAME_RUN.with(|f| {
+        let mut t = f.get();
+        t.calls += 1;
+        t.slots_built += slots;
+        f.set(t);
+    });
+}
+
+/// A write to a local call frame found it shared, so the write copied it.
+#[inline]
+pub fn record_entry_frame_copy() {
+    if !enabled() {
+        return;
+    }
+    FRAME_RUN.with(|f| {
+        let mut t = f.get();
+        t.entry_frame_copies += 1;
+        f.set(t);
+    });
+}
+
+/// Fold the running thread's frame counts into the session totals. Called
+/// where a run ends, so the totals are exact once every run has ended.
+pub fn flush_frame_stats() {
+    if !enabled() {
+        return;
+    }
+    let t = FRAME_RUN.with(|f| f.replace(FrameTally::new()));
+    if t.calls != 0 {
+        FRAME_CALLS.fetch_add(t.calls, Ordering::Relaxed);
+        FRAME_SLOTS_BUILT.fetch_add(t.slots_built, Ordering::Relaxed);
+    }
+    if t.entry_frame_copies != 0 {
+        FRAME_ENTRY_COPIES.fetch_add(t.entry_frame_copies, Ordering::Relaxed);
+    }
+}
+
 /// Runs in which a fault-crossing delivery entered a node whose own crash
 /// was queued: the situation the retarget exists to act on, counted on both
 /// halves.
@@ -6033,6 +6122,7 @@ pub struct UtilizationSnapshot {
     pub crash_phase: CrashPhaseStats,
     pub victim_swap: VictimSwapStats,
     pub ghost_signal: GhostSignalStats,
+    pub frame: FrameStats,
     pub fresh_first: FreshFirstStats,
     pub pair_order: PairOrderStats,
     pub client_anchor: ClientAnchorStats,
@@ -6244,6 +6334,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         crash_phase: CrashPhaseStats::read(),
         victim_swap: VictimSwapStats::read(),
         ghost_signal: GhostSignalStats::read(),
+        frame: FrameStats::read(),
         fresh_first: FreshFirstStats::read(),
         pair_order: PairOrderStats::read(),
         client_anchor: ClientAnchorStats::read(),

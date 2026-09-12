@@ -151,7 +151,7 @@ fn test_compile_assignment() {
     compiler.begin_function(&[]);
 
     let var_name = id(10);
-    compiler.alloc_local_slot(var_name, "x", Expr::Nil);
+    compiler.alloc_local_slot(var_name, "x", SlotDefault::Nil);
     let var_slot = compiler.resolve_slot(var_name);
 
     let next = dummy_vertex();

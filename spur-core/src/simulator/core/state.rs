@@ -1,7 +1,7 @@
 use crate::analysis::resolver::NameId;
 use crate::analysis::type_id::TypeId;
-use crate::compiler::cfg::{Lhs, Vertex};
-use crate::simulator::core::eval::store;
+use crate::compiler::cfg::{Lhs, Program, Vertex};
+use crate::simulator::core::eval::{build_frame, store};
 use crate::simulator::core::partition::{PartitionInfo, PartitionType};
 use crate::simulator::core::steer_terms::Term;
 use crate::simulator::core::values::{ChannelId, Env, LinkId, Value};
@@ -14,6 +14,7 @@ use crate::simulator::ghost_release;
 use crate::simulator::hash_utils::{HashPolicy, compute_hash};
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::util_stats::DeliveryBias;
+use ecow::EcoVec;
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use rand_distr::{Beta, Distribution};
 use rustc_hash::FxHasher;
@@ -264,8 +265,12 @@ pub struct Record<H: HashPolicy> {
     pub env: Env<H>, // Just local env, node env is in State
     /// Original entry point for crash re-delivery.
     pub entry_pc: Vertex,
-    /// Original local env for crash re-delivery.
-    pub initial_env: Env<H>,
+    /// Argument values the entry frame was built from, so crash re-delivery
+    /// can rebuild that frame instead of carrying a second copy of it.
+    pub initial_args: EcoVec<Value<H>>,
+    /// The function whose frame `initial_args` fills. Always a key of
+    /// `Program::rpc`, since it is taken from a function read out of it.
+    pub entry_func: NameId,
     pub priority: f64,
     /// Links this record (and its traces) back to the client operation that caused it.
     pub causal_operation_id: Option<i32>,
@@ -298,9 +303,11 @@ pub struct Record<H: HashPolicy> {
 
 impl<H: HashPolicy> Record<H> {
     /// Reset pc and env to their initial values for crash re-delivery.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, program: &Program) {
         self.pc = self.entry_pc;
-        self.env = self.initial_env.clone();
+        if let Some(func) = program.rpc.get(&self.entry_func) {
+            self.env = build_frame(func, &self.initial_args);
+        }
     }
 }
 
@@ -312,7 +319,8 @@ impl<H: HashPolicy> Hash for Record<H> {
         self.continuation.hash(state);
         self.env.hash(state);
         self.entry_pc.hash(state);
-        self.initial_env.hash(state);
+        self.entry_func.hash(state);
+        self.initial_args.hash(state);
         self.link_seq.hash(state);
     }
 }
@@ -1659,7 +1667,8 @@ mod ledger_tests {
             origin_node: origin,
             continuation: Continuation::Recover,
             entry_pc: 0,
-            initial_env: env.clone(),
+            initial_args: ecow::EcoVec::new(),
+            entry_func: NameId(0),
             env,
             priority: 0.5,
             causal_operation_id: None,

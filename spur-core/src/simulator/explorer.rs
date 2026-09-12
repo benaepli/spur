@@ -2,8 +2,8 @@ use crate::compiler::cfg::Program;
 use crate::simulator::config_override;
 use crate::simulator::core::steer_terms::{ResolvedTerms, SteerTerms};
 use crate::simulator::core::{
-    Env, Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
-    Value, WithinQueueSelector, exec_sync_on_node, make_local_env,
+    Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
+    Value, WithinQueueSelector, build_frame, exec_sync_on_node,
 };
 pub use crate::simulator::core::ReplayCut;
 pub use crate::simulator::coverage::GlobalState;
@@ -803,14 +803,7 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: F
                 role: server_role,
                 index: i,
             };
-            let node_env = &state.nodes[i];
-            let mut env = make_local_env(
-                init_fn,
-                vec![],
-                &Env::<H>::default(),
-                node_env,
-                &program.id_to_name,
-            );
+            let mut env = build_frame::<H>(init_fn, &[]);
             exec_sync_on_node::<H, _, F>(
                 &mut state,
                 logger,
@@ -869,15 +862,8 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feed
             role: server_role,
             index: i,
         };
-        let actuals = vec![Value::<H>::int(i as i64), peer_list.clone()];
-        let node_env = &state.nodes[i];
-        let mut env = make_local_env(
-            init_fn,
-            actuals,
-            &Env::<H>::default(),
-            node_env,
-            &program.id_to_name,
-        );
+        let actuals = [Value::<H>::int(i as i64), peer_list.clone()];
+        let mut env = build_frame(init_fn, &actuals);
 
         exec_sync_on_node::<H, _, F>(
             state,

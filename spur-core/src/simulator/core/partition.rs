@@ -224,6 +224,7 @@ impl<H: HashPolicy> PartitionInfo<H> {
 /// Only scans network_queue since local and timer items cannot be cross-node.
 pub fn activate_partition<H: HashPolicy>(
     state: &mut crate::simulator::core::state::State<H>,
+    program: &crate::compiler::cfg::Program,
     partition: PartitionType,
 ) {
     if state.partition_info.active.is_some() {
@@ -241,7 +242,7 @@ pub fn activate_partition<H: HashPolicy>(
                 state.flight_leave(&task);
                 state.net_leave(&task);
                 let mut r = r.clone();
-                r.reset();
+                r.reset(program);
                 state.partition_info.buffer_record(r.node, r);
             }
             Runnable::ChannelSend {

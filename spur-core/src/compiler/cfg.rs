@@ -59,7 +59,7 @@ pub struct Compiler {
     current_slot_names: Vec<String>,
 
     /// Default values for current function's local slots
-    current_local_defaults: Vec<Expr>,
+    current_local_defaults: Vec<SlotDefault>,
 
     /// Maximum number of node-level slots encountered so far
     max_node_slots: u32,
@@ -133,7 +133,7 @@ impl Compiler {
     }
 
     /// Allocate a local slot for a variable declaration
-    fn alloc_local_slot(&mut self, name_id: NameId, name_str: &str, default: Expr) -> u32 {
+    fn alloc_local_slot(&mut self, name_id: NameId, name_str: &str, default: SlotDefault) -> u32 {
         let slot = self.next_local_slot;
         self.next_local_slot += 1;
         self.local_slots.insert(name_id, slot);
@@ -149,7 +149,7 @@ impl Compiler {
         let name_str = format!("_tmp{}", slot);
         let name_id = self.alloc_name_id(name_str);
         self.current_slot_names.push(format!("_tmp{}", slot));
-        self.current_local_defaults.push(Expr::Unit);
+        self.current_local_defaults.push(SlotDefault::Unit);
         VarSlot::Local(slot, name_id)
     }
 
@@ -440,7 +440,7 @@ impl Compiler {
                     .get(&init.name)
                     .cloned()
                     .unwrap_or_else(|| format!("var_{}", init.name.0));
-                self.alloc_local_slot(init.name, &name_str, Expr::Nil);
+                self.alloc_local_slot(init.name, &name_str, SlotDefault::Nil);
                 self.scan_expr_slots(&init.value);
             }
             LStatementKind::Assignment(assign) => {
@@ -458,7 +458,7 @@ impl Compiler {
                                 .get(&vi.name)
                                 .cloned()
                                 .unwrap_or_else(|| format!("var_{}", vi.name.0));
-                            self.alloc_local_slot(vi.name, &name_str, Expr::Nil);
+                            self.alloc_local_slot(vi.name, &name_str, SlotDefault::Nil);
                             self.scan_expr_slots(&vi.value);
                         }
                         LForLoopInit::Assignment(a) => {
@@ -482,7 +482,7 @@ impl Compiler {
                     .get(&fil.binding_name)
                     .cloned()
                     .unwrap_or_else(|| format!("var_{}", fil.binding_name.0));
-                self.alloc_local_slot(fil.binding_name, &name_str, Expr::Nil);
+                self.alloc_local_slot(fil.binding_name, &name_str, SlotDefault::Nil);
                 self.scan_expr_slots(&fil.iterable);
                 for stmt in &fil.body {
                     self.scan_stmt_slots(stmt);

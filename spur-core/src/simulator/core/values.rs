@@ -653,6 +653,17 @@ impl<H: HashPolicy> Default for Env<H> {
 }
 
 impl<H: HashPolicy> Env<H> {
+    /// Wrap slots that are already laid out, with the signature they carry.
+    /// The signature must be the one `set` would have produced for them.
+    pub fn from_slots(slots: Slots<H>, sig: u64) -> Self {
+        Self {
+            slots,
+            sig,
+            writes: 0,
+            _marker: PhantomData,
+        }
+    }
+
     /// Create an environment with `n` slots, all initialized to Unit
     pub fn with_slots(n: usize) -> Self {
         // Single exact-size allocation; no per-element push/grow.

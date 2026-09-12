@@ -1,11 +1,12 @@
 use crate::compiler::cfg::{Instr, Label, Program, VarSlot};
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::core::eval::{eval, make_local_env, store};
+use crate::simulator::core::eval::{FrameBuilder, build_frame, eval, set_local, store};
 use crate::simulator::core::state::{
     ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, PurgatoryConfig, Record,
     Runnable, RunnableCategory, SchedulePolicy, State, Timer, TraceEntry, TraceKind,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind, ValueSeq};
+use ecow::EcoVec;
 use rand::Rng;
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::feedback::Feedback;
@@ -166,11 +167,6 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                 Ok(Some(StepOutcome::Continue(*next)))
             }
             Instr::SyncCall(lhs, func_name, args) => {
-                let arg_vals: Result<Vec<Value<H>>, _> = args
-                    .iter()
-                    .map(|a| eval(local_env, node_env, a, &program.id_to_name))
-                    .collect();
-                let arg_vals = arg_vals?;
                 let func_name_id = program
                     .func_name_to_id
                     .get(func_name)
@@ -184,13 +180,11 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     return Err(RuntimeError::SyncCallToAsyncFunction(func_name.clone()));
                 }
 
-                let mut callee_local = make_local_env(
-                    func_info,
-                    arg_vals,
-                    local_env,
-                    node_env,
-                    &program.id_to_name,
-                );
+                let mut builder = FrameBuilder::<H>::new(func_info);
+                for a in args {
+                    builder.push(eval(local_env, node_env, a, &program.id_to_name)?);
+                }
+                let mut callee_local = builder.finish(func_info);
 
                 let val = exec_sync_inner::<H, L, F>(
                     state,
@@ -214,11 +208,10 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             Instr::Async(lhs, node_expr, func_name, args) => {
                 let target_val = eval(local_env, node_env, node_expr, &program.id_to_name)?;
                 let (target_node, link_id) = target_val.as_rpc_target()?;
-                let arg_vals: Result<Vec<Value<H>>, _> = args
-                    .iter()
-                    .map(|a| eval(local_env, node_env, a, &program.id_to_name))
-                    .collect();
-                let arg_vals = arg_vals?;
+                let mut arg_vals: EcoVec<Value<H>> = EcoVec::with_capacity(args.len());
+                for a in args {
+                    arg_vals.push(eval(local_env, node_env, a, &program.id_to_name)?);
+                }
 
                 let chan_id = ChannelId {
                     node: node_id,
@@ -236,13 +229,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     .rpc
                     .get(func_name_id)
                     .ok_or_else(|| RuntimeError::FunctionNotFound(func_name.clone()))?;
-                let callee_locals = make_local_env(
-                    func_info,
-                    arg_vals,
-                    local_env,
-                    node_env,
-                    &program.id_to_name,
-                );
+                let callee_locals = build_frame(func_info, &arg_vals);
 
                 // Tag with FIFO sequence number if routed through a FIFO link.
                 // Allocates the next sender-side seq for this link.
@@ -260,7 +247,8 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     origin_node: node_id,
                     continuation: Continuation::Async { chan_id },
                     entry_pc: func_info.entry,
-                    initial_env: callee_locals.clone(),
+                    initial_args: arg_vals,
+                    entry_func: func_info.name,
                     env: callee_locals,
                     priority: state.record_priority(causal_operation_id, drawn_priority),
                     causal_operation_id,
@@ -385,7 +373,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                 let current = local_env.get(iter_slot_idx).clone();
                 if matches!(current.kind, ValueKind::Unit) {
                     let original_collection = eval(local_env, node_env, expr, &program.id_to_name)?;
-                    local_env.set(iter_slot_idx, original_collection.clone());
+                    set_local(local_env, iter_slot_idx, original_collection.clone());
                     original_collection
                 } else {
                     current
@@ -395,12 +383,12 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             match col_val.kind {
                 ValueKind::List(l) => {
                     if l.is_empty() {
-                        local_env.set(iter_slot_idx, Value::unit());
+                        set_local(local_env, iter_slot_idx, Value::unit());
                         Ok(Some(StepOutcome::Continue(*next)))
                     } else {
                         let item = l.first().ok_or(RuntimeError::EmptyCollection)?.clone();
                         let new_l = Value::list(ValueSeq::from(&l[1..]));
-                        local_env.set(iter_slot_idx, new_l);
+                        set_local(local_env, iter_slot_idx, new_l);
 
                         store(lhs, item, local_env, node_env)?;
                         Ok(Some(StepOutcome::Continue(*body)))
@@ -408,7 +396,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                 }
                 ValueKind::Map(m) => {
                     if m.is_empty() {
-                        local_env.set(iter_slot_idx, Value::unit());
+                        set_local(local_env, iter_slot_idx, Value::unit());
                         Ok(Some(StepOutcome::Continue(*next)))
                     } else {
                         let (k, v) = m.iter().next().ok_or(RuntimeError::EmptyCollection)?;
@@ -416,7 +404,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                         let v = v.clone();
 
                         let new_m = m.without(&k);
-                        local_env.set(iter_slot_idx, Value::map(new_m));
+                        set_local(local_env, iter_slot_idx, Value::map(new_m));
 
                         let pair = Value::tuple(ValueSeq::from([k, v]));
                         store(lhs, pair, local_env, node_env)?;
