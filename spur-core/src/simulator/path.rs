@@ -1241,6 +1241,17 @@ mod tests {
     /// a window in between writes nothing.
     #[test]
     fn a_held_request_is_recorded_at_the_step_it_is_issued() {
+        // The path state this builds does not fit a default test thread
+        // stack in an unoptimized build.
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(held_request_recording)
+            .expect("the test thread starts")
+            .join()
+            .expect("the test thread completes");
+    }
+
+    fn held_request_recording() {
         let program = crate::compiler::compile(SPEC, "canchor.spur")
             .into_program()
             .expect("the fixture compiles");
