@@ -275,6 +275,11 @@ pub struct Record<H: HashPolicy> {
     /// Links this record (and its traces) back to the client operation that caused it.
     pub causal_operation_id: Option<i32>,
     pub trace_id: Option<i64>,
+    /// Payload text of the dispatch that allocated `trace_id`, so the entry
+    /// row of the handler need not format the same arguments again. Set and
+    /// taken together with the pending trace id. Excluded from `Hash`: it is
+    /// text derived from `initial_args`.
+    pub trace_payload: Option<Box<str>>,
     /// FIFO link tag: `Some((link_id, seq))` if this RPC was sent through a
     /// FIFO link. Delivery is gated on `seq == link_deliver_seq[link_id]`.
     pub link_seq: Option<(LinkId, u32)>,
@@ -1673,6 +1678,7 @@ mod ledger_tests {
             priority: 0.5,
             causal_operation_id: None,
             trace_id: None,
+            trace_payload: None,
             link_seq: None,
             origin_incarnation: state.incarnation(origin),
             bias: DeliveryBias::NONE,

@@ -244,12 +244,27 @@ impl LocalTimeline {
     /// sequence) gives the same tuple set, since the `HashSet` already
     /// collapses duplicates, but scales with the number of distinct handlers.
     pub fn note_delivery(&mut self, dest: NodeId, handler: Vertex) {
-        let generation = self.generation(dest);
         let granularity = self.granularity;
+        // Under the constant key every tuple is that one key, and `tuples`
+        // never shrinks within a run, so once it is non-empty no delivery can
+        // change it. `per_dest_seen` is then read only by the branch below.
+        if granularity.is_constant() && !self.tuples.is_empty() {
+            debug_assert!(
+                self.tuples.len() == 1
+                    && self.tuples.contains(&granularity.key(dest, 0, 0, 0))
+            );
+            util_stats::record_timeline_constant_short_circuit();
+            return;
+        }
+        let generation = self.generation(dest);
         if let Some(priors) = self.per_dest_seen.get(&dest) {
             for &prior in priors {
-                self.tuples
+                let inserted = self
+                    .tuples
                     .insert(granularity.key(dest, prior, handler, generation));
+                if inserted && granularity.is_constant() {
+                    util_stats::record_timeline_constant_insert();
+                }
             }
         }
         self.per_dest_seen.entry(dest).or_default().insert(handler);

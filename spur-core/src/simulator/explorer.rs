@@ -1108,7 +1108,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     let arms = choice.arms;
     let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
-        program.clone(),
+        program,
         plan,
         config.max_iterations,
         topology_info,
@@ -1448,7 +1448,7 @@ fn run_single_plan<F: Feedback>(
     let arms = ArmSet::crash_coin_only(run_id);
     let outcome = exec_plan::<crate::simulator::hash_utils::NoHashing, F>(
         &mut path_state,
-        program.clone(),
+        program,
         plan.clone(),
         max_iterations,
         topology_info,

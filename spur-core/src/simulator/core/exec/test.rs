@@ -142,6 +142,7 @@ fn make_record_with_cont(
         priority: 0.5,
         causal_operation_id: None,
         trace_id: None,
+        trace_payload: None,
         link_seq: None,
         origin_incarnation: 0,
         send_ordinal: 0,

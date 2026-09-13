@@ -202,6 +202,7 @@ fn schedule_client_op<H: HashPolicy>(
         priority: state.record_priority(Some(op_id), drawn_priority),
         causal_operation_id: Some(op_id),
         trace_id: None,
+        trace_payload: None,
         link_seq: None,
         origin_incarnation: state.incarnation(client_node_id),
         bias: DeliveryBias::NONE,
@@ -471,7 +472,7 @@ fn record_termination<H: HashPolicy>(
 
 pub fn exec_plan<H: HashPolicy, F: Feedback>(
     path_state: &mut PathState<H, F>,
-    program: Program,
+    program: &Program,
     plan: ExecutionPlan,
     max_iterations: i32,
     topology: TopologyInfo,
@@ -489,6 +490,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     rng: &mut impl StreamRng,
 ) -> Result<RunOutcome, RuntimeError> {
     util_stats::begin_run();
+    util_stats::record_program_clone_avoided();
     path_state.state.retarget.enabled = arms.retarget;
     // The bound is read once here so the scheduler needs no learner access
     // of its own.
@@ -713,7 +715,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             util_stats::record_client_anchor_post_fault_invocation(anchored, in_window);
             invoke_client_request(
                 path_state,
-                &program,
+                program,
                 snapshot,
                 policy,
                 purgatory_config,
@@ -747,7 +749,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     }
                     invoke_client_request(
                         path_state,
-                        &program,
+                        program,
                         snapshot,
                         policy,
                         purgatory_config,
@@ -864,7 +866,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
             let result = schedule_runnable::<H, _, _, F>(
                 &mut path_state.state,
                 &mut path_state.logs,
-                &program,
+                program,
                 snapshot,
                 &mut path_state.feedback,
                 &topology,

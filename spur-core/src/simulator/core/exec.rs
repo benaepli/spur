@@ -157,6 +157,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
     purgatory_config: &PurgatoryConfig,
     causal_operation_id: Option<i32>,
     pending_trace_id: &mut Option<i64>,
+    pending_trace_payload: &mut Option<Box<str>>,
     rng: &mut impl StreamRng,
 ) -> Result<Option<StepOutcome<H>>, RuntimeError> {
     match label {
@@ -253,6 +254,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     priority: state.record_priority(causal_operation_id, drawn_priority),
                     causal_operation_id,
                     trace_id: pending_trace_id.take(),
+                    trace_payload: pending_trace_payload.take(),
                     link_seq,
                     origin_incarnation: state.incarnation(node_id),
                     bias: DeliveryBias::NONE,
@@ -417,15 +419,28 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             }
         }
         Label::TraceEnter(func_name, param_exprs, trace_id_lhs, next) => {
-            let id = pending_trace_id
-                .take()
-                .unwrap_or_else(|| state.alloc_unique_id() as i64);
+            let pending_id = pending_trace_id.take();
+            let carried = pending_trace_payload.take();
+            let id = pending_id.unwrap_or_else(|| state.alloc_unique_id() as i64);
             store(trace_id_lhs, Value::int(id), local_env, node_env)?;
-            let payload = trace_payload(
-                param_exprs
-                    .iter()
-                    .map(|e| eval(local_env, node_env, e, &program.id_to_name)),
-            );
+            // A carried payload was formatted by the dispatch that allocated
+            // the pending id, from the argument values this frame's
+            // parameters were built from, so it is the text formatting them
+            // here would produce.
+            let payload = match (pending_id, carried) {
+                (Some(_), Some(text)) => {
+                    util_stats::record_trace_enter_payload(true);
+                    text.into_string()
+                }
+                _ => {
+                    util_stats::record_trace_enter_payload(false);
+                    trace_payload(
+                        param_exprs
+                            .iter()
+                            .map(|e| eval(local_env, node_env, e, &program.id_to_name)),
+                    )
+                }
+            };
             logger.log_trace(TraceEntry {
                 node: node_id,
                 function_name: func_name.clone(),
@@ -462,6 +477,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     .iter()
                     .map(|e| eval(local_env, node_env, e, &program.id_to_name)),
             );
+            *pending_trace_payload = Some(Box::from(payload.as_str()));
             logger.log_trace(TraceEntry {
                 node: node_id,
                 function_name: func_name.clone(),
@@ -496,6 +512,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger, F: Feedback>(
     let mut pc = start_pc;
     let mut prev_pc = pc;
     let mut pending_trace_id = None;
+    let mut pending_trace_payload = None;
     loop {
         if pc != prev_pc {
             F::record_transition(feedback, prev_pc, pc, snapshot);
@@ -517,6 +534,7 @@ fn exec_sync_inner<H: HashPolicy, L: Logger, F: Feedback>(
             purgatory_config,
             causal_operation_id,
             &mut pending_trace_id,
+            &mut pending_trace_payload,
             rng,
         )? {
             match outcome {
@@ -548,6 +566,10 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
 ) -> Result<Option<ClientOpResult<H>>, RuntimeError> {
     let causal_operation_id = record.causal_operation_id;
     let mut pending_trace_id = record.trace_id;
+    // The payload moves out rather than being copied: only the entry row
+    // reads it, so a record stored again after that row carries none, and a
+    // re-delivery of it formats its entry row from the parameters.
+    let mut pending_trace_payload = record.trace_payload.take();
     let mut local_env = record.env;
     let mut node_env = state.nodes[record.node.index].clone();
 
@@ -591,6 +613,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
             purgatory_config,
             causal_operation_id,
             &mut pending_trace_id,
+            &mut pending_trace_payload,
             rng,
         )? {
             match outcome {

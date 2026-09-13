@@ -106,6 +106,12 @@ static HW_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
 static STATS_GENERATION: AtomicU64 = AtomicU64::new(0);
 static STATS_LOCAL_FOLDS: AtomicU64 = AtomicU64::new(0);
 static STATS_LOCAL_FOLDED_INCREMENTS: AtomicU64 = AtomicU64::new(0);
+static TIMELINE_CONSTANT_SHORT_CIRCUITS: AtomicU64 = AtomicU64::new(0);
+static TIMELINE_CONSTANT_INSERTS: AtomicU64 = AtomicU64::new(0);
+static RUN_SETUP_PROGRAM_CLONES_AVOIDED: AtomicU64 = AtomicU64::new(0);
+static TRACE_FORMAT_ENTER_REUSED: AtomicU64 = AtomicU64::new(0);
+static TRACE_FORMAT_ENTER_FORMATTED: AtomicU64 = AtomicU64::new(0);
+static HISTORY_FORMAT_OPS_STREAMED: AtomicU64 = AtomicU64::new(0);
 static FF_SWAPS: AtomicU64 = AtomicU64::new(0);
 static FF_REPEAT_SWAPS: AtomicU64 = AtomicU64::new(0);
 /// How many times a ghost was displaced before it was taken: once, twice,
@@ -808,6 +814,12 @@ pub fn set_enabled(on: bool) {
             &HW_BUSY_NS,
             &HW_QUEUE_FULL_SENDS,
             &HW_BLOCKED_NS,
+            &TIMELINE_CONSTANT_SHORT_CIRCUITS,
+            &TIMELINE_CONSTANT_INSERTS,
+            &RUN_SETUP_PROGRAM_CLONES_AVOIDED,
+            &TRACE_FORMAT_ENTER_REUSED,
+            &TRACE_FORMAT_ENTER_FORMATTED,
+            &HISTORY_FORMAT_OPS_STREAMED,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -5405,6 +5417,121 @@ impl StatsLocalStats {
     }
 }
 
+/// Timeline deliveries under the constant key: those that returned at once
+/// because the key was already held, and the inserts that added the key.
+#[derive(Serialize, Debug)]
+pub struct TimelineStats {
+    pub constant_short_circuits: u64,
+    pub constant_inserts: u64,
+}
+
+impl TimelineStats {
+    fn read() -> Self {
+        Self {
+            constant_short_circuits: TIMELINE_CONSTANT_SHORT_CIRCUITS.load(Ordering::Relaxed),
+            constant_inserts: TIMELINE_CONSTANT_INSERTS.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Plan executions that read the session's compiled program in place
+/// rather than from a copy of it.
+#[derive(Serialize, Debug)]
+pub struct RunSetupStats {
+    pub program_clones_avoided: u64,
+}
+
+impl RunSetupStats {
+    fn read() -> Self {
+        Self {
+            program_clones_avoided: RUN_SETUP_PROGRAM_CLONES_AVOIDED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Handler-entry trace rows whose payload text was carried over from the
+/// dispatch that sent the record, and those formatted from the parameters.
+/// Together they are every entry row.
+#[derive(Serialize, Debug)]
+pub struct TraceFormatStats {
+    pub enter_payload_reused: u64,
+    pub enter_payload_formatted: u64,
+}
+
+impl TraceFormatStats {
+    fn read() -> Self {
+        Self {
+            enter_payload_reused: TRACE_FORMAT_ENTER_REUSED.load(Ordering::Relaxed),
+            enter_payload_formatted: TRACE_FORMAT_ENTER_FORMATTED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Operations whose payload was written as JSON text directly from the
+/// values, one per row of the executions table.
+#[derive(Serialize, Debug)]
+pub struct HistoryFormatStats {
+    pub ops_streamed: u64,
+}
+
+impl HistoryFormatStats {
+    fn read() -> Self {
+        Self {
+            ops_streamed: HISTORY_FORMAT_OPS_STREAMED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A timeline delivery under the constant key found the key already held.
+#[inline]
+pub fn record_timeline_constant_short_circuit() {
+    if !enabled() {
+        return;
+    }
+    bump(|b| &b.timeline_constant_short_circuits, &TIMELINE_CONSTANT_SHORT_CIRCUITS, 1);
+}
+
+/// A timeline delivery under the constant key added the key.
+#[inline]
+pub fn record_timeline_constant_insert() {
+    if !enabled() {
+        return;
+    }
+    bump(|b| &b.timeline_constant_inserts, &TIMELINE_CONSTANT_INSERTS, 1);
+}
+
+/// A plan execution read the compiled program without copying it.
+#[inline]
+pub fn record_program_clone_avoided() {
+    if !enabled() {
+        return;
+    }
+    bump(|b| &b.run_setup_program_clones_avoided, &RUN_SETUP_PROGRAM_CLONES_AVOIDED, 1);
+}
+
+/// A handler-entry trace row was written, with its payload carried over
+/// from the dispatch when `reused`, formatted from the parameters otherwise.
+#[inline]
+pub fn record_trace_enter_payload(reused: bool) {
+    if !enabled() {
+        return;
+    }
+    if reused {
+        bump(|b| &b.trace_format_enter_reused, &TRACE_FORMAT_ENTER_REUSED, 1);
+    } else {
+        bump(|b| &b.trace_format_enter_formatted, &TRACE_FORMAT_ENTER_FORMATTED, 1);
+    }
+}
+
+/// `ops` operations had their payload written as JSON text from the values.
+#[inline]
+pub fn record_history_ops_streamed(ops: u64) {
+    if !enabled() {
+        return;
+    }
+    bump(|b| &b.history_format_ops_streamed, &HISTORY_FORMAT_OPS_STREAMED, ops);
+}
+
 /// One run's frame counts, held on the running thread.
 #[derive(Clone, Copy)]
 struct FrameTally {
@@ -5518,6 +5645,12 @@ struct RunCounters {
     timers_inflight_acted: Cell<u64>,
     timer_streak_fired: [Cell<u64>; STREAK_BUCKETS],
     timer_streak_acted: [Cell<u64>; STREAK_BUCKETS],
+    timeline_constant_short_circuits: Cell<u64>,
+    timeline_constant_inserts: Cell<u64>,
+    run_setup_program_clones_avoided: Cell<u64>,
+    trace_format_enter_reused: Cell<u64>,
+    trace_format_enter_formatted: Cell<u64>,
+    history_format_ops_streamed: Cell<u64>,
 }
 
 impl RunCounters {
@@ -5570,6 +5703,12 @@ impl RunCounters {
             timers_inflight_acted: Cell::new(0),
             timer_streak_fired: [const { Cell::new(0) }; STREAK_BUCKETS],
             timer_streak_acted: [const { Cell::new(0) }; STREAK_BUCKETS],
+            timeline_constant_short_circuits: Cell::new(0),
+            timeline_constant_inserts: Cell::new(0),
+            run_setup_program_clones_avoided: Cell::new(0),
+            trace_format_enter_reused: Cell::new(0),
+            trace_format_enter_formatted: Cell::new(0),
+            history_format_ops_streamed: Cell::new(0),
         }
     }
 
@@ -5613,6 +5752,12 @@ impl RunCounters {
             (&self.timers_acted, &TIMERS_ACTED),
             (&self.timers_inflight_fired, &TIMERS_INFLIGHT_FIRED),
             (&self.timers_inflight_acted, &TIMERS_INFLIGHT_ACTED),
+            (&self.timeline_constant_short_circuits, &TIMELINE_CONSTANT_SHORT_CIRCUITS),
+            (&self.timeline_constant_inserts, &TIMELINE_CONSTANT_INSERTS),
+            (&self.run_setup_program_clones_avoided, &RUN_SETUP_PROGRAM_CLONES_AVOIDED),
+            (&self.trace_format_enter_reused, &TRACE_FORMAT_ENTER_REUSED),
+            (&self.trace_format_enter_formatted, &TRACE_FORMAT_ENTER_FORMATTED),
+            (&self.history_format_ops_streamed, &HISTORY_FORMAT_OPS_STREAMED),
         ] {
             f(local, global);
         }
@@ -6517,6 +6662,10 @@ pub struct UtilizationSnapshot {
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
     pub history_writer: HistoryWriterStats,
+    pub timeline: TimelineStats,
+    pub run_setup: RunSetupStats,
+    pub trace_format: TraceFormatStats,
+    pub history_format: HistoryFormatStats,
 }
 
 /// The snapshot as JSON, for readers that difference or accumulate it.
@@ -6732,6 +6881,10 @@ pub fn snapshot() -> UtilizationSnapshot {
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),
         history_writer: HistoryWriterStats::read(),
+        timeline: TimelineStats::read(),
+        run_setup: RunSetupStats::read(),
+        trace_format: TraceFormatStats::read(),
+        history_format: HistoryFormatStats::read(),
     }
 }
 

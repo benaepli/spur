@@ -10,7 +10,11 @@ use log::error;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use rayon::prelude::*;
+use crate::simulator::core::state::NodeId;
+use crate::simulator::core::values::ValueMap;
+use crate::simulator::hash_utils::HashPolicy;
+use serde::ser::{Serialize, SerializeMap, Serializer};
+#[cfg(test)]
 use serde_json::{Value as JsonValue, json};
 use std::error::Error;
 use std::fs::File;
@@ -118,6 +122,7 @@ pub struct PersistableRun {
     pub variant: i32,
 }
 
+#[cfg(test)]
 fn json_of_value<H: crate::simulator::hash_utils::HashPolicy>(v: &Value<H>) -> JsonValue {
     match &v.kind {
         ValueKind::Int(i) => json!({
@@ -199,20 +204,162 @@ fn json_of_value<H: crate::simulator::hash_utils::HashPolicy>(v: &Value<H>) -> J
     }
 }
 
-fn payload_to_json_string<H: crate::simulator::hash_utils::HashPolicy>(
-    payload: &[Value<H>],
-) -> String {
-    let json_list: Vec<JsonValue> = payload.iter().map(json_of_value::<H>).collect();
-    serde_json::to_string(&json_list).unwrap_or_else(|_| "[]".to_string())
+/// A spec value written as the JSON object `{"type":..,"value":..}`. Every
+/// object is written with its keys in sorted order, the order a
+/// `serde_json::Value` object holds them in, so the text is byte for byte
+/// what serializing the equivalent `serde_json::Value` produces.
+struct ValueJson<'a, H: HashPolicy>(&'a Value<H>);
+
+/// A node written as `{"index":..,"role":..}`. The derived `Serialize` of
+/// `NodeId` writes its fields in declaration order, which is not sorted, so
+/// it must not be used here.
+struct NodeJson(NodeId);
+
+struct SeqJson<'a, H: HashPolicy>(&'a [Value<H>]);
+
+struct MapJson<'a, H: HashPolicy>(&'a ValueMap<H>);
+
+struct ChannelJson(ChannelId);
+
+struct FifoLinkJson {
+    link_id: usize,
+    peer: NodeId,
 }
 
-/// Serializes a list of Operations into PersistableOps.
-/// This should be called from worker threads to distribute CPU work.
-pub fn serialize_history<H: crate::simulator::hash_utils::HashPolicy>(
-    history: &[Operation<H>],
-) -> Vec<PersistableOp> {
+struct VariantJson<'a, H: HashPolicy> {
+    enum_id: u32,
+    name: &'a str,
+    payload: Option<&'a Value<H>>,
+}
+
+impl Serialize for NodeJson {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut m = serializer.serialize_map(Some(2))?;
+        m.serialize_entry("index", &self.0.index)?;
+        m.serialize_entry("role", &self.0.role)?;
+        m.end()
+    }
+}
+
+impl<H: HashPolicy> Serialize for SeqJson<'_, H> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(ValueJson))
+    }
+}
+
+impl<H: HashPolicy> Serialize for MapJson<'_, H> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|(k, v)| (ValueJson(k), ValueJson(v))))
+    }
+}
+
+impl Serialize for ChannelJson {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut m = serializer.serialize_map(Some(2))?;
+        m.serialize_entry("id", &self.0.id)?;
+        m.serialize_entry("node", &NodeJson(self.0.node))?;
+        m.end()
+    }
+}
+
+impl Serialize for FifoLinkJson {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut m = serializer.serialize_map(Some(2))?;
+        m.serialize_entry("link_id", &self.link_id)?;
+        m.serialize_entry("peer", &NodeJson(self.peer))?;
+        m.end()
+    }
+}
+
+impl<H: HashPolicy> Serialize for VariantJson<'_, H> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut m = serializer.serialize_map(Some(3))?;
+        m.serialize_entry("enum_id", &self.enum_id)?;
+        m.serialize_entry("name", self.name)?;
+        m.serialize_entry("payload", &self.payload.map(ValueJson))?;
+        m.end()
+    }
+}
+
+impl<H: HashPolicy> Serialize for ValueJson<'_, H> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut m = serializer.serialize_map(Some(2))?;
+        match &self.0.kind {
+            ValueKind::Int(i) => {
+                m.serialize_entry("type", "VInt")?;
+                m.serialize_entry("value", i)?;
+            }
+            ValueKind::Bool(b) => {
+                m.serialize_entry("type", "VBool")?;
+                m.serialize_entry("value", b)?;
+            }
+            ValueKind::String(s) => {
+                m.serialize_entry("type", "VString")?;
+                m.serialize_entry("value", s.as_str())?;
+            }
+            ValueKind::Node(n) => {
+                m.serialize_entry("type", "VNode")?;
+                m.serialize_entry("value", &NodeJson(*n))?;
+            }
+            ValueKind::Channel(c) => {
+                m.serialize_entry("type", "VChannel")?;
+                m.serialize_entry("value", &ChannelJson(*c))?;
+            }
+            ValueKind::FifoLink(link_id, peer) => {
+                m.serialize_entry("type", "VFifoLink")?;
+                m.serialize_entry(
+                    "value",
+                    &FifoLinkJson {
+                        link_id: link_id.0,
+                        peer: *peer,
+                    },
+                )?;
+            }
+            ValueKind::Map(map) => {
+                m.serialize_entry("type", "VMap")?;
+                m.serialize_entry("value", &MapJson(map))?;
+            }
+            ValueKind::Option(opt) => {
+                m.serialize_entry("type", "VOption")?;
+                m.serialize_entry("value", &opt.as_deref().map(ValueJson))?;
+            }
+            ValueKind::List(l) => {
+                m.serialize_entry("type", "VList")?;
+                m.serialize_entry("value", &SeqJson(l.as_slice()))?;
+            }
+            ValueKind::Unit => {
+                m.serialize_entry("type", "VUnit")?;
+                m.serialize_entry("value", &())?;
+            }
+            ValueKind::Tuple(t) => {
+                m.serialize_entry("type", "VTuple")?;
+                m.serialize_entry("value", &SeqJson(t.as_slice()))?;
+            }
+            ValueKind::Variant(enum_id, name, payload) => {
+                m.serialize_entry("type", "VVariant")?;
+                m.serialize_entry(
+                    "value",
+                    &VariantJson {
+                        enum_id: *enum_id,
+                        name: name.as_str(),
+                        payload: payload.as_deref(),
+                    },
+                )?;
+            }
+        }
+        m.end()
+    }
+}
+
+fn payload_to_json_string<H: HashPolicy>(payload: &[Value<H>]) -> String {
+    serde_json::to_string(&SeqJson(payload)).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Serializes a list of Operations into PersistableOps, in order.
+pub fn serialize_history<H: HashPolicy>(history: &[Operation<H>]) -> Vec<PersistableOp> {
+    util_stats::record_history_ops_streamed(history.len() as u64);
     history
-        .par_iter()
+        .iter()
         .map(|op| PersistableOp {
             unique_id: op.unique_id as i64,
             client_id: op.client_id as i64,
@@ -1050,5 +1197,104 @@ pub fn create_writer(
             std::fs::create_dir_all(&dir)?;
             Ok(Box::new(ParquetWriter::new(&dir)?))
         }
+    }
+}
+
+#[cfg(test)]
+mod payload_json_tests {
+    use super::*;
+    use crate::analysis::resolver::NameId;
+    use crate::simulator::core::values::{LinkId, ValueSeq};
+    use crate::simulator::hash_utils::{NoHashing, WithHashing};
+
+    fn node(role: usize, index: usize) -> NodeId {
+        NodeId {
+            role: NameId(role),
+            index,
+        }
+    }
+
+    fn tree_text<H: HashPolicy>(payload: &[Value<H>]) -> String {
+        let list: Vec<JsonValue> = payload.iter().map(json_of_value::<H>).collect();
+        serde_json::to_string(&list).unwrap()
+    }
+
+    /// One value of every kind, alone and nested inside every container kind,
+    /// with strings that need escaping and nodes whose role and index differ.
+    fn every_kind<H: HashPolicy>() -> Vec<Value<H>> {
+        let chan = Value::<H>::channel(ChannelId {
+            node: node(3, 11),
+            id: 42,
+        });
+        let link = Value::<H>::fifo_link(LinkId(9), node(1, 4));
+        let leaves = vec![
+            Value::int(0),
+            Value::int(-17),
+            Value::int(i64::MIN),
+            Value::int(i64::MAX),
+            Value::bool(true),
+            Value::bool(false),
+            Value::string("".into()),
+            Value::string("quote \" backslash \\ newline \n tab \t ctrl \u{1} e-acute \u{e9}".into()),
+            Value::node(node(7, 2)),
+            chan.clone(),
+            link.clone(),
+            Value::unit(),
+            Value::option_none(),
+            Value::option_some(Value::int(5)),
+            Value::list(ValueSeq::new()),
+            Value::tuple(ValueSeq::new()),
+            Value::map(ValueMap::<H>::default()),
+            Value::variant(3, "Empty".into(), None),
+        ];
+        let mut map = ValueMap::<H>::default();
+        for (i, leaf) in leaves.iter().enumerate() {
+            map.insert(Value::int(i as i64), leaf.clone());
+        }
+        map.insert(Value::string("k\"ey".into()), Value::node(node(0, 5)));
+        map.insert(Value::node(node(2, 1)), chan.clone());
+        map.insert(link.clone(), Value::option_some(link.clone()));
+        let list = Value::list(leaves.iter().cloned().collect());
+        let tuple = Value::tuple(ValueSeq::from([
+            Value::node(node(4, 0)),
+            link.clone(),
+            Value::unit(),
+            list.clone(),
+        ]));
+        let nested_map = Value::map(map);
+        let variant = Value::variant(
+            12,
+            "With\"Payload".into(),
+            Some(std::sync::Arc::new(Value::tuple(ValueSeq::from([
+                nested_map.clone(),
+                Value::option_some(Value::option_some(chan.clone())),
+            ])))),
+        );
+        let mut out = leaves;
+        out.push(list);
+        out.push(tuple);
+        out.push(nested_map);
+        out.push(variant.clone());
+        out.push(Value::option_some(variant.clone()));
+        out.push(Value::list(ValueSeq::from([variant, Value::option_none()])));
+        out
+    }
+
+    fn check<H: HashPolicy>() {
+        let values = every_kind::<H>();
+        for v in &values {
+            let one = std::slice::from_ref(v);
+            assert_eq!(payload_to_json_string(one), tree_text(one));
+        }
+        assert_eq!(payload_to_json_string(&values), tree_text(&values));
+        assert_eq!(payload_to_json_string::<H>(&[]), tree_text::<H>(&[]));
+        let node_text = payload_to_json_string::<H>(&[Value::node(node(7, 2))]);
+        assert_eq!(node_text, r#"[{"type":"VNode","value":{"index":2,"role":7}}]"#);
+    }
+
+    #[test]
+    fn streamed_payload_is_byte_identical_to_the_json_tree_text() {
+        check::<NoHashing>();
+        check::<WithHashing>();
     }
 }
