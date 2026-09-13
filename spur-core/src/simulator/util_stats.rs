@@ -11,7 +11,7 @@ use crate::simulator::recover_deps::RecoverDeps;
 use crate::simulator::run_variant;
 use crate::simulator::fresh_first;
 use serde::Serialize;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -96,6 +96,13 @@ static GS_FIRED_RUNS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
 static FRAME_SLOTS_BUILT: AtomicU64 = AtomicU64::new(0);
 static FRAME_ENTRY_COPIES: AtomicU64 = AtomicU64::new(0);
+
+/// Advanced by every session reset. A per-thread counter block remembers the
+/// value it was activated under and is dropped rather than folded when the
+/// two differ.
+static STATS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static STATS_LOCAL_FOLDS: AtomicU64 = AtomicU64::new(0);
+static STATS_LOCAL_FOLDED_INCREMENTS: AtomicU64 = AtomicU64::new(0);
 static FF_SWAPS: AtomicU64 = AtomicU64::new(0);
 static FF_REPEAT_SWAPS: AtomicU64 = AtomicU64::new(0);
 /// How many times a ghost was displaced before it was taken: once, twice,
@@ -690,6 +697,8 @@ const TIMELINE_MAX_BUCKETS: usize = 512;
 /// counters so repeated sessions in one process don't bleed into each other.
 pub fn set_enabled(on: bool) {
     if on {
+        STATS_GENERATION.fetch_add(1, Ordering::Relaxed);
+        fold_run_counters();
         for c in [
             &STEER_EVALUATIONS,
             &STEER_DIVERGENT_PICKS,
@@ -791,6 +800,8 @@ pub fn set_enabled(on: bool) {
             &RWP_CONTESTED,
             &RWP_WON,
             &RWP_FLIPPED,
+            &STATS_LOCAL_FOLDS,
+            &STATS_LOCAL_FOLDED_INCREMENTS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -1260,17 +1271,19 @@ pub fn record_recovery_placebo(
     if !recovery_weight_placebo_enabled() {
         return;
     }
-    RWP_DECISIONS.fetch_add(1, Ordering::Relaxed);
-    RWP_EVALUATED.fetch_add(evaluated, Ordering::Relaxed);
-    for (flag, counter) in [
-        (present, &RWP_PRESENT),
-        (contested, &RWP_CONTESTED),
-        (won, &RWP_WON),
-        (flipped, &RWP_FLIPPED),
-    ] {
-        if flag {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
+    bump(|b| &b.rwp_decisions, &RWP_DECISIONS, 1);
+    bump(|b| &b.rwp_evaluated, &RWP_EVALUATED, evaluated);
+    if present {
+        bump(|b| &b.rwp_present, &RWP_PRESENT, 1);
+    }
+    if contested {
+        bump(|b| &b.rwp_contested, &RWP_CONTESTED, 1);
+    }
+    if won {
+        bump(|b| &b.rwp_won, &RWP_WON, 1);
+    }
+    if flipped {
+        bump(|b| &b.rwp_flipped, &RWP_FLIPPED, 1);
     }
 }
 
@@ -1285,14 +1298,14 @@ pub fn record_multiplier_decision(contested: bool, quick_fire_present: bool) {
     if !multiplier_audit_enabled() {
         return;
     }
-    MA_DECISIONS.fetch_add(1, Ordering::Relaxed);
+    bump(|b| &b.ma_decisions, &MA_DECISIONS, 1);
     if contested {
-        MA_CONTESTED_DECISIONS.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.ma_contested_decisions, &MA_CONTESTED_DECISIONS, 1);
     }
     if quick_fire_present {
-        MA_QUICK_FIRE_OFFERS.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.ma_quick_fire_offers, &MA_QUICK_FIRE_OFFERS, 1);
         if contested {
-            MA_QUICK_FIRE_DECISIONS.fetch_add(1, Ordering::Relaxed);
+            bump(|b| &b.ma_quick_fire_decisions, &MA_QUICK_FIRE_DECISIONS, 1);
         }
     }
 }
@@ -1310,13 +1323,21 @@ pub fn record_multiplier_flips(
     if !multiplier_audit_enabled() {
         return;
     }
-    add_f64(&MA_CONFIGURED_SUM, configured_multiplier);
+    RUN_COUNTERS.with(|b| {
+        if b.active.get() {
+            b.ma_configured_sum
+                .set(b.ma_configured_sum.get() + configured_multiplier);
+            b.writes.set(b.writes.get() + 1);
+        } else {
+            add_f64(&MA_CONFIGURED_SUM, configured_multiplier);
+        }
+    });
     if configured_flipped {
-        MA_FLIPPED_CONFIGURED.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.ma_flipped_configured, &MA_FLIPPED_CONFIGURED, 1);
     }
-    for (counter, &f) in MA_FLIPPED.iter().zip(flipped.iter()) {
+    for (i, &f) in flipped.iter().enumerate() {
         if f {
-            counter.fetch_add(1, Ordering::Relaxed);
+            bump(|b| &b.ma_flipped[i], &MA_FLIPPED[i], 1);
         }
     }
 }
@@ -1353,7 +1374,7 @@ pub fn record_steer_step_total() {
     if !steer_audit_enabled() {
         return;
     }
-    SA_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    bump(|b| &b.sa_steps_total, &SA_STEPS_TOTAL, 1);
 }
 
 /// One budget step reached the point where the run's preference is read and
@@ -1366,7 +1387,7 @@ pub fn record_steer_step() {
     if !steer_audit_enabled() {
         return;
     }
-    SA_STEPS.fetch_add(1, Ordering::Relaxed);
+    bump(|b| &b.sa_steps, &SA_STEPS, 1);
 }
 
 /// A scheduling decision asked what the run prefers. Recorded at every site
@@ -1383,9 +1404,13 @@ pub fn record_preference_consultation(source_present: bool) {
     if !steer_audit_enabled() {
         return;
     }
-    SA_PREFERENCE_CONSULTED.fetch_add(1, Ordering::Relaxed);
+    bump(|b| &b.sa_preference_consulted, &SA_PREFERENCE_CONSULTED, 1);
     if !source_present {
-        SA_PREFERENCE_SOURCE_ABSENT.fetch_add(1, Ordering::Relaxed);
+        bump(
+            |b| &b.sa_preference_source_absent,
+            &SA_PREFERENCE_SOURCE_ABSENT,
+            1,
+        );
     }
 }
 
@@ -1447,15 +1472,24 @@ pub fn record_steer_reach(reach: SteerReach) {
     if !enabled() {
         return;
     }
-    let counter = match reach {
-        SteerReach::NoScheduleAttempt => &SR_NO_SCHEDULE_ATTEMPT,
-        SteerReach::AuditDisabled => &SR_AUDIT_DISABLED,
-        SteerReach::NoWeightedPredicate => &SR_NO_WEIGHTED_PREDICATE,
-        SteerReach::SingleCandidate => &SR_SINGLE_CANDIDATE,
-        SteerReach::RankingAgreedWithPriority => &SR_RANKING_AGREED,
-        SteerReach::PreferenceExpressed => &SR_PREFERENCE_EXPRESSED,
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
+    match reach {
+        SteerReach::NoScheduleAttempt => {
+            bump(|b| &b.sr_no_schedule_attempt, &SR_NO_SCHEDULE_ATTEMPT, 1)
+        }
+        SteerReach::AuditDisabled => bump(|b| &b.sr_audit_disabled, &SR_AUDIT_DISABLED, 1),
+        SteerReach::NoWeightedPredicate => {
+            bump(|b| &b.sr_no_weighted_predicate, &SR_NO_WEIGHTED_PREDICATE, 1)
+        }
+        SteerReach::SingleCandidate => {
+            bump(|b| &b.sr_single_candidate, &SR_SINGLE_CANDIDATE, 1)
+        }
+        SteerReach::RankingAgreedWithPriority => {
+            bump(|b| &b.sr_ranking_agreed, &SR_RANKING_AGREED, 1)
+        }
+        SteerReach::PreferenceExpressed => {
+            bump(|b| &b.sr_preference_expressed, &SR_PREFERENCE_EXPRESSED, 1)
+        }
+    }
 }
 
 /// Which scheduler perturbations a message was carrying when it was delivered.
@@ -1536,10 +1570,10 @@ pub fn record_delivery(bias: DeliveryBias, acted: bool, receiver_distance: u32) 
             len += 1;
         }
     }
-    for &b in &buckets[..len] {
-        DELIVERIES[b].fetch_add(1, Ordering::Relaxed);
+    for &i in &buckets[..len] {
+        bump(|b| &b.deliveries[i], &DELIVERIES[i], 1);
         if acted {
-            DELIVERIES_ACTED[b].fetch_add(1, Ordering::Relaxed);
+            bump(|b| &b.deliveries_acted[i], &DELIVERIES_ACTED[i], 1);
         }
     }
     if QUIET_STRETCH_ENABLED.load(Ordering::Relaxed) {
@@ -1573,9 +1607,13 @@ pub fn record_delivery(bias: DeliveryBias, acted: bool, receiver_distance: u32) 
         }
     }
     for &p in &paths[..plen] {
-        ACCEPT_DIST[p][slot].fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.accept_dist[p][slot], &ACCEPT_DIST[p][slot], 1);
         if acted {
-            ACCEPT_DIST_ACTED[p][slot].fetch_add(1, Ordering::Relaxed);
+            bump(
+                |b| &b.accept_dist_acted[p][slot],
+                &ACCEPT_DIST_ACTED[p][slot],
+                1,
+            );
         }
     }
 }
@@ -1599,9 +1637,9 @@ pub fn record_steer_evaluation(divergent: bool) {
     if !enabled() {
         return;
     }
-    STEER_EVALUATIONS.fetch_add(1, Ordering::Relaxed);
+    bump(|b| &b.steer_evaluations, &STEER_EVALUATIONS, 1);
     if divergent {
-        STEER_DIVERGENT_PICKS.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.steer_divergent_picks, &STEER_DIVERGENT_PICKS, 1);
     }
 }
 
@@ -1631,12 +1669,13 @@ pub fn record_empty_slice_skip(stage: EmptySliceStage) {
     if !enabled() {
         return;
     }
-    let counter = match stage {
-        EmptySliceStage::CandidateMask => &ES_CANDIDATE_MASK,
-        EmptySliceStage::RankingPass => &ES_RANKING_PASS,
-        EmptySliceStage::QueueAudit => &ES_QUEUE_AUDIT,
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
+    match stage {
+        EmptySliceStage::CandidateMask => {
+            bump(|b| &b.es_candidate_mask, &ES_CANDIDATE_MASK, 1)
+        }
+        EmptySliceStage::RankingPass => bump(|b| &b.es_ranking_pass, &ES_RANKING_PASS, 1),
+        EmptySliceStage::QueueAudit => bump(|b| &b.es_queue_audit, &ES_QUEUE_AUDIT, 1),
+    }
 }
 
 /// A run built its scheduling random source; `isolated` means the run drew
@@ -1792,6 +1831,14 @@ thread_local! {
     /// session totals once the run ends. A thread runs one run at a time, so
     /// no atomic is taken on the interpreter's path.
     static FRAME_RUN: std::cell::Cell<FrameTally> = const { std::cell::Cell::new(FrameTally::new()) };
+    /// Counters written at every scheduling step, delivery or timer firing
+    /// of the run executing on this thread, folded into the session totals
+    /// once the run ends. Each counter is its own cell so a write touches
+    /// only that counter's memory.
+    static RUN_COUNTERS: RunCounters = const { RunCounters::new() };
+    /// Timer effects of the run executing on this thread, merged into the
+    /// session table when its counter block folds.
+    static RUN_TIMER_EFFECTS: RefCell<HashMap<TimerKey, (u64, u64)>> = RefCell::new(HashMap::new());
 }
 
 /// Fold this thread's finished run into the per-run tallies. Idempotent, so it
@@ -1846,6 +1893,11 @@ pub fn begin_run() {
     }
     finish_run();
     flush_frame_stats();
+    fold_run_counters();
+    RUN_COUNTERS.with(|b| {
+        b.generation.set(STATS_GENERATION.load(Ordering::Relaxed));
+        b.active.set(true);
+    });
     CR_RUNS.fetch_add(1, Ordering::Relaxed);
     RUN_CROSSING.with(|c| {
         let mut c = c.borrow_mut();
@@ -2102,10 +2154,14 @@ pub fn record_crash_anchor_offer(crash_eligible: bool, anchored: bool) {
         return;
     }
     if crash_eligible {
-        CA_STEPS_WITH_CRASH_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
+        bump(
+            |b| &b.ca_steps_with_crash_eligible,
+            &CA_STEPS_WITH_CRASH_ELIGIBLE,
+            1,
+        );
     }
     if anchored {
-        CA_OFFERED.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.ca_offered, &CA_OFFERED, 1);
     }
 }
 
@@ -2909,6 +2965,7 @@ pub fn record_run_termination(s: &RunTermination) {
     if !enabled() {
         return;
     }
+    fold_run_counters();
     debug_assert!(
         !(steer_audit_enabled() && s.steps_used > 0 && SA_STEPS_TOTAL.load(Ordering::Relaxed) == 0),
         "a run took {} scheduling steps and none was counted; the steer-authority \
@@ -4136,30 +4193,51 @@ pub fn record_timer(key: TimerKey, acted: bool) {
     if !acted_fraction_enabled() {
         return;
     }
-    TIMERS_FIRED.fetch_add(1, Ordering::Relaxed);
+    bump(|b| &b.timers_fired, &TIMERS_FIRED, 1);
     if acted {
-        TIMERS_ACTED.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.timers_acted, &TIMERS_ACTED, 1);
     }
     if key.inflight {
-        TIMERS_INFLIGHT_FIRED.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.timers_inflight_fired, &TIMERS_INFLIGHT_FIRED, 1);
         if acted {
-            TIMERS_INFLIGHT_ACTED.fetch_add(1, Ordering::Relaxed);
+            bump(|b| &b.timers_inflight_acted, &TIMERS_INFLIGHT_ACTED, 1);
         }
     }
     let bucket = usize::from(key.inert_streak).min(STREAK_BUCKETS - 1);
-    TIMER_STREAK_FIRED[bucket].fetch_add(1, Ordering::Relaxed);
+    bump(
+        |b| &b.timer_streak_fired[bucket],
+        &TIMER_STREAK_FIRED[bucket],
+        1,
+    );
     if acted {
-        TIMER_STREAK_ACTED[bucket].fetch_add(1, Ordering::Relaxed);
+        bump(
+            |b| &b.timer_streak_acted[bucket],
+            &TIMER_STREAK_ACTED[bucket],
+            1,
+        );
     }
-    if let Ok(mut t) = TIMER_EFFECTS.lock() {
-        if let Some(e) = t.get_mut(&key) {
-            e.0 += 1;
-            if acted {
-                e.1 += 1;
-            }
-        } else if t.len() < TIMER_KEY_CAP {
-            t.insert(key, (1, u64::from(acted)));
-        }
+    if RUN_COUNTERS.with(|b| b.active.get()) {
+        RUN_TIMER_EFFECTS.with(|m| {
+            add_timer_effect(&mut m.borrow_mut(), key, 1, u64::from(acted));
+        });
+    } else if let Ok(mut t) = TIMER_EFFECTS.lock() {
+        add_timer_effect(&mut t, key, 1, u64::from(acted));
+    }
+}
+
+/// Adds firings to one key of a timer effect table. A key not yet present is
+/// admitted only while the table is below its cap.
+fn add_timer_effect(
+    table: &mut HashMap<TimerKey, (u64, u64)>,
+    key: TimerKey,
+    fired: u64,
+    acted: u64,
+) {
+    if let Some(e) = table.get_mut(&key) {
+        e.0 += fired;
+        e.1 += acted;
+    } else if table.len() < TIMER_KEY_CAP {
+        table.insert(key, (fired, acted));
     }
 }
 
@@ -4262,11 +4340,11 @@ pub fn record_timer_admission(chose_timer: bool) {
     if !enabled() {
         return;
     }
-    TIMER_STEER_EVALUATED.fetch_add(1, Ordering::Relaxed);
+    bump(|b| &b.timer_steer_evaluated, &TIMER_STEER_EVALUATED, 1);
     if chose_timer {
-        TIMER_STEER_RAISED.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.timer_steer_raised, &TIMER_STEER_RAISED, 1);
     } else {
-        TIMER_STEER_LOWERED.fetch_add(1, Ordering::Relaxed);
+        bump(|b| &b.timer_steer_lowered, &TIMER_STEER_LOWERED, 1);
     }
 }
 
@@ -5261,6 +5339,23 @@ impl FrameStats {
     }
 }
 
+/// Counter blocks folded into the session totals at run end, and the writes
+/// they carried.
+#[derive(Serialize, Debug)]
+pub struct StatsLocalStats {
+    pub folds: u64,
+    pub folded_increments: u64,
+}
+
+impl StatsLocalStats {
+    fn read() -> Self {
+        Self {
+            folds: STATS_LOCAL_FOLDS.load(Ordering::Relaxed),
+            folded_increments: STATS_LOCAL_FOLDED_INCREMENTS.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// One run's frame counts, held on the running thread.
 #[derive(Clone, Copy)]
 struct FrameTally {
@@ -5320,6 +5415,246 @@ pub fn flush_frame_stats() {
     if t.entry_frame_copies != 0 {
         FRAME_ENTRY_COPIES.fetch_add(t.entry_frame_copies, Ordering::Relaxed);
     }
+}
+
+/// One run's counters, held on the running thread. While `active` is false
+/// every write goes straight to the session counter, so a thread that is not
+/// inside a run never holds counts a snapshot cannot see.
+struct RunCounters {
+    active: Cell<bool>,
+    /// The `STATS_GENERATION` the block was activated under.
+    generation: Cell<u64>,
+    /// Writes made to the block since it was activated.
+    writes: Cell<u64>,
+    steer_evaluations: Cell<u64>,
+    steer_divergent_picks: Cell<u64>,
+    sa_steps: Cell<u64>,
+    sa_steps_total: Cell<u64>,
+    sa_preference_consulted: Cell<u64>,
+    sa_preference_source_absent: Cell<u64>,
+    es_candidate_mask: Cell<u64>,
+    es_ranking_pass: Cell<u64>,
+    es_queue_audit: Cell<u64>,
+    sr_no_schedule_attempt: Cell<u64>,
+    sr_audit_disabled: Cell<u64>,
+    sr_no_weighted_predicate: Cell<u64>,
+    sr_single_candidate: Cell<u64>,
+    sr_ranking_agreed: Cell<u64>,
+    sr_preference_expressed: Cell<u64>,
+    ma_decisions: Cell<u64>,
+    ma_contested_decisions: Cell<u64>,
+    ma_quick_fire_offers: Cell<u64>,
+    ma_quick_fire_decisions: Cell<u64>,
+    ma_flipped_configured: Cell<u64>,
+    ma_flipped: [Cell<u64>; MULTIPLIER_SWEEP.len()],
+    ma_configured_sum: Cell<f64>,
+    rwp_decisions: Cell<u64>,
+    rwp_evaluated: Cell<u64>,
+    rwp_present: Cell<u64>,
+    rwp_contested: Cell<u64>,
+    rwp_won: Cell<u64>,
+    rwp_flipped: Cell<u64>,
+    ca_steps_with_crash_eligible: Cell<u64>,
+    ca_offered: Cell<u64>,
+    timer_steer_evaluated: Cell<u64>,
+    timer_steer_raised: Cell<u64>,
+    timer_steer_lowered: Cell<u64>,
+    deliveries: [Cell<u64>; DELIVERY_BUCKETS],
+    deliveries_acted: [Cell<u64>; DELIVERY_BUCKETS],
+    accept_dist: [[Cell<u64>; ACCEPT_DIST_BUCKETS]; ACCEPT_PATHS],
+    accept_dist_acted: [[Cell<u64>; ACCEPT_DIST_BUCKETS]; ACCEPT_PATHS],
+    timers_fired: Cell<u64>,
+    timers_acted: Cell<u64>,
+    timers_inflight_fired: Cell<u64>,
+    timers_inflight_acted: Cell<u64>,
+    timer_streak_fired: [Cell<u64>; STREAK_BUCKETS],
+    timer_streak_acted: [Cell<u64>; STREAK_BUCKETS],
+}
+
+impl RunCounters {
+    const fn new() -> Self {
+        Self {
+            active: Cell::new(false),
+            generation: Cell::new(0),
+            writes: Cell::new(0),
+            steer_evaluations: Cell::new(0),
+            steer_divergent_picks: Cell::new(0),
+            sa_steps: Cell::new(0),
+            sa_steps_total: Cell::new(0),
+            sa_preference_consulted: Cell::new(0),
+            sa_preference_source_absent: Cell::new(0),
+            es_candidate_mask: Cell::new(0),
+            es_ranking_pass: Cell::new(0),
+            es_queue_audit: Cell::new(0),
+            sr_no_schedule_attempt: Cell::new(0),
+            sr_audit_disabled: Cell::new(0),
+            sr_no_weighted_predicate: Cell::new(0),
+            sr_single_candidate: Cell::new(0),
+            sr_ranking_agreed: Cell::new(0),
+            sr_preference_expressed: Cell::new(0),
+            ma_decisions: Cell::new(0),
+            ma_contested_decisions: Cell::new(0),
+            ma_quick_fire_offers: Cell::new(0),
+            ma_quick_fire_decisions: Cell::new(0),
+            ma_flipped_configured: Cell::new(0),
+            ma_flipped: [const { Cell::new(0) }; MULTIPLIER_SWEEP.len()],
+            ma_configured_sum: Cell::new(0.0),
+            rwp_decisions: Cell::new(0),
+            rwp_evaluated: Cell::new(0),
+            rwp_present: Cell::new(0),
+            rwp_contested: Cell::new(0),
+            rwp_won: Cell::new(0),
+            rwp_flipped: Cell::new(0),
+            ca_steps_with_crash_eligible: Cell::new(0),
+            ca_offered: Cell::new(0),
+            timer_steer_evaluated: Cell::new(0),
+            timer_steer_raised: Cell::new(0),
+            timer_steer_lowered: Cell::new(0),
+            deliveries: [const { Cell::new(0) }; DELIVERY_BUCKETS],
+            deliveries_acted: [const { Cell::new(0) }; DELIVERY_BUCKETS],
+            accept_dist: [const { [const { Cell::new(0) }; ACCEPT_DIST_BUCKETS] }; ACCEPT_PATHS],
+            accept_dist_acted: [const { [const { Cell::new(0) }; ACCEPT_DIST_BUCKETS] };
+                ACCEPT_PATHS],
+            timers_fired: Cell::new(0),
+            timers_acted: Cell::new(0),
+            timers_inflight_fired: Cell::new(0),
+            timers_inflight_acted: Cell::new(0),
+            timer_streak_fired: [const { Cell::new(0) }; STREAK_BUCKETS],
+            timer_streak_acted: [const { Cell::new(0) }; STREAK_BUCKETS],
+        }
+    }
+
+    /// Every integer counter of the block paired with the session counter it
+    /// folds into. A counter missing here would be zeroed without being
+    /// folded.
+    fn for_each_slot(&self, mut f: impl FnMut(&Cell<u64>, &AtomicU64)) {
+        for (local, global) in [
+            (&self.steer_evaluations, &STEER_EVALUATIONS),
+            (&self.steer_divergent_picks, &STEER_DIVERGENT_PICKS),
+            (&self.sa_steps, &SA_STEPS),
+            (&self.sa_steps_total, &SA_STEPS_TOTAL),
+            (&self.sa_preference_consulted, &SA_PREFERENCE_CONSULTED),
+            (&self.sa_preference_source_absent, &SA_PREFERENCE_SOURCE_ABSENT),
+            (&self.es_candidate_mask, &ES_CANDIDATE_MASK),
+            (&self.es_ranking_pass, &ES_RANKING_PASS),
+            (&self.es_queue_audit, &ES_QUEUE_AUDIT),
+            (&self.sr_no_schedule_attempt, &SR_NO_SCHEDULE_ATTEMPT),
+            (&self.sr_audit_disabled, &SR_AUDIT_DISABLED),
+            (&self.sr_no_weighted_predicate, &SR_NO_WEIGHTED_PREDICATE),
+            (&self.sr_single_candidate, &SR_SINGLE_CANDIDATE),
+            (&self.sr_ranking_agreed, &SR_RANKING_AGREED),
+            (&self.sr_preference_expressed, &SR_PREFERENCE_EXPRESSED),
+            (&self.ma_decisions, &MA_DECISIONS),
+            (&self.ma_contested_decisions, &MA_CONTESTED_DECISIONS),
+            (&self.ma_quick_fire_offers, &MA_QUICK_FIRE_OFFERS),
+            (&self.ma_quick_fire_decisions, &MA_QUICK_FIRE_DECISIONS),
+            (&self.ma_flipped_configured, &MA_FLIPPED_CONFIGURED),
+            (&self.rwp_decisions, &RWP_DECISIONS),
+            (&self.rwp_evaluated, &RWP_EVALUATED),
+            (&self.rwp_present, &RWP_PRESENT),
+            (&self.rwp_contested, &RWP_CONTESTED),
+            (&self.rwp_won, &RWP_WON),
+            (&self.rwp_flipped, &RWP_FLIPPED),
+            (&self.ca_steps_with_crash_eligible, &CA_STEPS_WITH_CRASH_ELIGIBLE),
+            (&self.ca_offered, &CA_OFFERED),
+            (&self.timer_steer_evaluated, &TIMER_STEER_EVALUATED),
+            (&self.timer_steer_raised, &TIMER_STEER_RAISED),
+            (&self.timer_steer_lowered, &TIMER_STEER_LOWERED),
+            (&self.timers_fired, &TIMERS_FIRED),
+            (&self.timers_acted, &TIMERS_ACTED),
+            (&self.timers_inflight_fired, &TIMERS_INFLIGHT_FIRED),
+            (&self.timers_inflight_acted, &TIMERS_INFLIGHT_ACTED),
+        ] {
+            f(local, global);
+        }
+        for (local, global) in self
+            .ma_flipped
+            .iter()
+            .zip(MA_FLIPPED.iter())
+            .chain(self.deliveries.iter().zip(DELIVERIES.iter()))
+            .chain(self.deliveries_acted.iter().zip(DELIVERIES_ACTED.iter()))
+            .chain(
+                self.accept_dist
+                    .iter()
+                    .flatten()
+                    .zip(ACCEPT_DIST.iter().flatten()),
+            )
+            .chain(
+                self.accept_dist_acted
+                    .iter()
+                    .flatten()
+                    .zip(ACCEPT_DIST_ACTED.iter().flatten()),
+            )
+            .chain(self.timer_streak_fired.iter().zip(TIMER_STREAK_FIRED.iter()))
+            .chain(self.timer_streak_acted.iter().zip(TIMER_STREAK_ACTED.iter()))
+        {
+            f(local, global);
+        }
+    }
+}
+
+/// Adds `n` to one counter: to the running thread's block while a run is
+/// active on it, otherwise to the session counter.
+#[inline]
+fn bump(local: impl FnOnce(&RunCounters) -> &Cell<u64>, global: &AtomicU64, n: u64) {
+    RUN_COUNTERS.with(|b| {
+        if b.active.get() {
+            let c = local(b);
+            c.set(c.get() + n);
+            b.writes.set(b.writes.get() + 1);
+        } else {
+            global.fetch_add(n, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Fold the running thread's counter block into the session totals and
+/// deactivate it. Idempotent, so it can be called where a run ends, at the
+/// start of the next run for runs that ended without reaching that point, and
+/// before a snapshot. A block activated under an earlier session is emptied
+/// without being added.
+fn fold_run_counters() {
+    let Some(current) = RUN_COUNTERS.with(|b| {
+        if !b.active.get() {
+            return None;
+        }
+        b.active.set(false);
+        let writes = b.writes.replace(0);
+        let current = b.generation.get() == STATS_GENERATION.load(Ordering::Relaxed);
+        b.for_each_slot(|local, global| {
+            let v = local.replace(0);
+            if current && v != 0 {
+                global.fetch_add(v, Ordering::Relaxed);
+            }
+        });
+        let configured_sum = b.ma_configured_sum.replace(0.0);
+        if current {
+            if configured_sum != 0.0 {
+                add_f64(&MA_CONFIGURED_SUM, configured_sum);
+            }
+            if writes > 0 {
+                STATS_LOCAL_FOLDS.fetch_add(1, Ordering::Relaxed);
+                STATS_LOCAL_FOLDED_INCREMENTS.fetch_add(writes, Ordering::Relaxed);
+            }
+        }
+        Some(current)
+    }) else {
+        return;
+    };
+    RUN_TIMER_EFFECTS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.is_empty() {
+            return;
+        }
+        if current {
+            if let Ok(mut t) = TIMER_EFFECTS.lock() {
+                for (key, (fired, acted)) in m.drain() {
+                    add_timer_effect(&mut t, key, fired, acted);
+                }
+            }
+        }
+        m.clear();
+    });
 }
 
 /// Runs in which a fault-crossing delivery entered a node whose own crash
@@ -6123,6 +6458,7 @@ pub struct UtilizationSnapshot {
     pub victim_swap: VictimSwapStats,
     pub ghost_signal: GhostSignalStats,
     pub frame: FrameStats,
+    pub stats_local: StatsLocalStats,
     pub fresh_first: FreshFirstStats,
     pub pair_order: PairOrderStats,
     pub client_anchor: ClientAnchorStats,
@@ -6200,6 +6536,7 @@ pub fn add(acc: &mut serde_json::Value, delta: &serde_json::Value) {
 }
 
 pub fn snapshot() -> UtilizationSnapshot {
+    fold_run_counters();
     UtilizationSnapshot {
         rng_streams: RngStreamStats {
             isolated_runs: RNG_ISOLATED_RUNS.load(Ordering::Relaxed),
@@ -6335,6 +6672,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         victim_swap: VictimSwapStats::read(),
         ghost_signal: GhostSignalStats::read(),
         frame: FrameStats::read(),
+        stats_local: StatsLocalStats::read(),
         fresh_first: FreshFirstStats::read(),
         pair_order: PairOrderStats::read(),
         client_anchor: ClientAnchorStats::read(),
