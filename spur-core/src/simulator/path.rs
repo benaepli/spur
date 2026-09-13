@@ -22,6 +22,8 @@ use crate::simulator::run_cap;
 use crate::simulator::run_variant::{ArmSet, CrashArm};
 use crate::simulator::stall_cap::{self, Marks, RunClock, RunEnding};
 use crate::simulator::stall_release;
+use crate::simulator::history::{RunRows, serialize_history, serialize_logs, serialize_traces};
+use crate::simulator::text_buffer::{TextBuffer, TextBuffers};
 use crate::simulator::timer_context;
 use crate::simulator::util_stats::{
     self, DeliveryBias, RunEnd, RunExtension, RunTermination, StallCapCell, StallReleaseCell,
@@ -46,14 +48,21 @@ pub struct TopologyInfo {
     pub num_servers: i32,
 }
 
-/// Newtype wrapper for log and trace entries that implements Logger.
+/// A run's log and trace rows and the text they point into.
 #[derive(Debug, Default)]
 pub struct Logs {
     pub entries: Vec<LogEntry>,
     pub traces: Vec<TraceEntry>,
+    pub text: TextBuffers,
 }
 
 impl Logger for Logs {
+    fn log_text(&mut self) -> &mut TextBuffer {
+        &mut self.text.log_content
+    }
+    fn trace_text(&mut self) -> &mut TextBuffer {
+        &mut self.text.trace_payload
+    }
     fn log(&mut self, entry: LogEntry) {
         if self.entries.len() == self.entries.capacity() {
             util_stats::record_log_vec_grow();
@@ -95,12 +104,14 @@ pub fn channel_table_hint() -> usize {
 }
 
 impl Logs {
-    /// Empty row vectors sized to what the previous run on this thread wrote.
+    /// Empty row vectors sized to what the previous run on this thread wrote,
+    /// and text buffers taken from the free list.
     pub fn sized_from_previous_run() -> Self {
         let h = RUN_BUFFER_HINTS.with(|h| h.get());
         Self {
             entries: Vec::with_capacity(h.log_rows),
             traces: Vec::with_capacity(h.trace_rows),
+            text: TextBuffers::take(),
         }
     }
 }
@@ -163,20 +174,25 @@ impl<H: HashPolicy, F: Feedback> PathState<H, F> {
         }
     }
 
-    /// Takes the run's log and trace rows, and records the run's channel,
-    /// log and trace counts as the starting capacities of the next run on
-    /// this thread.
-    pub fn take_log_rows(&mut self) -> (Vec<LogEntry>, Vec<TraceEntry>) {
+    /// Takes the run's executions, log and trace rows with their text, and
+    /// records the run's channel, log and trace counts as the starting
+    /// capacities of the next run on this thread.
+    pub fn take_run_rows(&mut self) -> RunRows {
         let hints = RunBufferHints {
             channels: self.state.channels.len().min(CHANNEL_TABLE_HINT_CAP),
             log_rows: self.logs.entries.len().min(ROW_VEC_HINT_CAP),
             trace_rows: self.logs.traces.len().min(ROW_VEC_HINT_CAP),
         };
         RUN_BUFFER_HINTS.with(|h| h.set(hints));
-        (
-            std::mem::take(&mut self.logs.entries),
-            std::mem::take(&mut self.logs.traces),
-        )
+        let mut text = std::mem::take(&mut self.logs.text);
+        let history = serialize_history(&self.history, &mut text);
+        text.record_allocated();
+        RunRows {
+            history,
+            logs: serialize_logs(std::mem::take(&mut self.logs.entries)),
+            traces: serialize_traces(std::mem::take(&mut self.logs.traces)),
+            text,
+        }
     }
 }
 

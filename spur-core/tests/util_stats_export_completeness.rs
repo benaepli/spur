@@ -1405,6 +1405,10 @@ fn history_writer(m: &mut Marks) -> HistoryWriterStats {
         busy_ns: m.int(),
         queue_full_sends: m.int(),
         blocked_ns: m.int(),
+        commands: m.int(),
+        text_buffers_allocated: m.int(),
+        text_buffers_recycled: m.int(),
+        text_buffers_dropped_oversize: m.int(),
     }
 }
 
@@ -1413,11 +1417,19 @@ fn history_writer_leaves(prefix: &str, h: &HistoryWriterStats) -> Vec<(String, V
         busy_ns,
         queue_full_sends,
         blocked_ns,
+        commands,
+        text_buffers_allocated,
+        text_buffers_recycled,
+        text_buffers_dropped_oversize,
     } = h;
     vec![
         leaf(prefix, "busy_ns", *busy_ns),
         leaf(prefix, "queue_full_sends", *queue_full_sends),
         leaf(prefix, "blocked_ns", *blocked_ns),
+        leaf(prefix, "commands", *commands),
+        leaf(prefix, "text_buffers_allocated", *text_buffers_allocated),
+        leaf(prefix, "text_buffers_recycled", *text_buffers_recycled),
+        leaf(prefix, "text_buffers_dropped_oversize", *text_buffers_dropped_oversize),
     ]
 }
 

@@ -119,6 +119,10 @@ static CHANNEL_TABLE_DENSE_INSERTS: AtomicU64 = AtomicU64::new(0);
 static HW_BUSY_NS: AtomicU64 = AtomicU64::new(0);
 static HW_QUEUE_FULL_SENDS: AtomicU64 = AtomicU64::new(0);
 static HW_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
+static HW_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static HW_TEXT_BUFFERS_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+static HW_TEXT_BUFFERS_RECYCLED: AtomicU64 = AtomicU64::new(0);
+static HW_TEXT_BUFFERS_DROPPED_OVERSIZE: AtomicU64 = AtomicU64::new(0);
 
 /// Advanced by every session reset. A per-thread counter block remembers the
 /// value it was activated under and is dropped rather than folded when the
@@ -834,6 +838,10 @@ pub fn set_enabled(on: bool) {
             &HW_BUSY_NS,
             &HW_QUEUE_FULL_SENDS,
             &HW_BLOCKED_NS,
+            &HW_COMMANDS,
+            &HW_TEXT_BUFFERS_ALLOCATED,
+            &HW_TEXT_BUFFERS_RECYCLED,
+            &HW_TEXT_BUFFERS_DROPPED_OVERSIZE,
             &TIMELINE_CONSTANT_SHORT_CIRCUITS,
             &TIMELINE_CONSTANT_INSERTS,
             &RUN_SETUP_PROGRAM_CLONES_AVOIDED,
@@ -5568,12 +5576,21 @@ impl PrintContentStats {
 /// wall time and by the writer thread count is the share of the writers in
 /// use. `queue_full_sends` counts sends from simulation threads that found the
 /// queue full, and `blocked_ns` is the time those sends waited for room; both
-/// stay 0 while the writers keep up.
+/// stay 0 while the writers keep up. `commands` counts runs the writers took
+/// from the queue. A run's four text buffers are `text_buffers_allocated`
+/// when the run gave storage to a buffer that began it without any,
+/// `text_buffers_recycled` when a writer returned a buffer's storage to the
+/// free list, and `text_buffers_dropped_oversize` when a writer freed a
+/// buffer too large to recycle.
 #[derive(Serialize, Debug)]
 pub struct HistoryWriterStats {
     pub busy_ns: u64,
     pub queue_full_sends: u64,
     pub blocked_ns: u64,
+    pub commands: u64,
+    pub text_buffers_allocated: u64,
+    pub text_buffers_recycled: u64,
+    pub text_buffers_dropped_oversize: u64,
 }
 
 impl HistoryWriterStats {
@@ -5582,7 +5599,44 @@ impl HistoryWriterStats {
             busy_ns: HW_BUSY_NS.load(Ordering::Relaxed),
             queue_full_sends: HW_QUEUE_FULL_SENDS.load(Ordering::Relaxed),
             blocked_ns: HW_BLOCKED_NS.load(Ordering::Relaxed),
+            commands: HW_COMMANDS.load(Ordering::Relaxed),
+            text_buffers_allocated: HW_TEXT_BUFFERS_ALLOCATED.load(Ordering::Relaxed),
+            text_buffers_recycled: HW_TEXT_BUFFERS_RECYCLED.load(Ordering::Relaxed),
+            text_buffers_dropped_oversize: HW_TEXT_BUFFERS_DROPPED_OVERSIZE.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// A history writer took one run from its queue.
+#[inline]
+pub fn record_history_writer_command() {
+    if !enabled() {
+        return;
+    }
+    HW_COMMANDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A run gave storage to `n` text buffers that began it without any.
+#[inline]
+pub fn record_text_buffers_allocated(n: u64) {
+    if !enabled() {
+        return;
+    }
+    HW_TEXT_BUFFERS_ALLOCATED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// A writer returned one run's text buffers: `recycled` kept their storage
+/// on the free list and `dropped_oversize` were freed for their size.
+#[inline]
+pub fn record_text_buffers_returned(recycled: u64, dropped_oversize: u64) {
+    if !enabled() {
+        return;
+    }
+    if recycled > 0 {
+        HW_TEXT_BUFFERS_RECYCLED.fetch_add(recycled, Ordering::Relaxed);
+    }
+    if dropped_oversize > 0 {
+        HW_TEXT_BUFFERS_DROPPED_OVERSIZE.fetch_add(dropped_oversize, Ordering::Relaxed);
     }
 }
 

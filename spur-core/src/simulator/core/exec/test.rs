@@ -42,8 +42,19 @@ fn json_string_array_matches_serde_vec_of_strings() {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-        assert_eq!(json_string_array(&text, &ends), expected, "items {items:?}");
+        let mut out = TextBuffer::default();
+        out.push_str("prefix");
+        json_string_array(&text, &ends, &mut out);
+        assert_eq!(out.str_from("prefix".len()), expected, "items {items:?}");
     }
+}
+
+fn trace_payload<H: HashPolicy>(
+    values: impl Iterator<Item = Result<Value<H>, RuntimeError>>,
+) -> String {
+    let mut out = TextBuffer::default();
+    write_trace_payload(values, &mut out);
+    out.str_from(0).to_string()
 }
 
 #[test]
@@ -107,17 +118,32 @@ impl TestProgramBuilder {
 
 struct TestLogger {
     entries: Vec<LogEntry>,
+    text: TextBuffer,
+    trace_text: TextBuffer,
 }
 
 impl TestLogger {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
+            text: TextBuffer::default(),
+            trace_text: TextBuffer::default(),
         }
+    }
+
+    fn content(&self, row: usize) -> &str {
+        let start = row.checked_sub(1).map_or(0, |prev| self.entries[prev].content_end);
+        &self.text.str_from(start)[..self.entries[row].content_end - start]
     }
 }
 
 impl Logger for TestLogger {
+    fn log_text(&mut self) -> &mut TextBuffer {
+        &mut self.text
+    }
+    fn trace_text(&mut self) -> &mut TextBuffer {
+        &mut self.trace_text
+    }
     fn log(&mut self, entry: LogEntry) {
         self.entries.push(entry);
     }
@@ -377,7 +403,7 @@ fn test_print_instruction() {
     );
     assert!(result.is_ok());
     assert_eq!(logger.entries.len(), 1);
-    assert_eq!(logger.entries[0].content, "123");
+    assert_eq!(logger.content(0), "123");
 }
 
 #[test]
@@ -769,7 +795,8 @@ fn observe(program: &Program, start: usize, slots: usize) -> Observed {
         logs: logger
             .entries
             .iter()
-            .map(|e| format!("{:?} {} {}", e.node, e.step, e.content))
+            .enumerate()
+            .map(|(i, e)| format!("{:?} {} {}", e.node, e.step, logger.content(i)))
             .collect(),
         state: format!("{state:?}"),
         edges: coverage.unique_edges(),

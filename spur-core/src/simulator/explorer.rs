@@ -14,9 +14,7 @@ use crate::simulator::feedback::{
     TimelineKeyGranularity, TimelineTuple,
 };
 use crate::simulator::hash_utils::compute_hash;
-use crate::simulator::history::{
-    HistoryWriter, LogBackend, create_writer, serialize_history, serialize_logs, serialize_traces,
-};
+use crate::simulator::history::{HistoryWriter, LogBackend, create_writer};
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::plan::ExecutionPlan;
 pub use crate::simulator::path::RunOutcome;
@@ -1166,12 +1164,8 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
 
     F::merge(&global_state.feedback, &path_state.feedback);
 
-    let serialized = serialize_history(&path_state.history);
-    let (log_rows, trace_rows) = path_state.take_log_rows();
-    let serialized_logs = serialize_logs(log_rows);
-    let serialized_traces = serialize_traces(trace_rows);
-    writer.write(run_id, serialized, serialized_logs, serialized_traces);
-    writer.write_run(run_row(
+    let rows = path_state.take_run_rows();
+    writer.write(rows, run_row(
         run_id,
         attribution,
         workload_seed,
@@ -1481,12 +1475,8 @@ fn run_single_plan<F: Feedback>(
     let plan_score = F::plan_score(&path_state.feedback, &snapshot, weights);
     F::merge(&global_state.feedback, &path_state.feedback);
 
-    let serialized = serialize_history(&path_state.history);
-    let (log_rows, trace_rows) = path_state.take_log_rows();
-    let serialized_logs = serialize_logs(log_rows);
-    let serialized_traces = serialize_traces(trace_rows);
-    writer.write(run_id, serialized, serialized_logs, serialized_traces);
-    writer.write_run(run_row(
+    let rows = path_state.take_run_rows();
+    writer.write(rows, run_row(
         run_id,
         attribution,
         0,

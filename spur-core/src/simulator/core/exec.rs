@@ -18,6 +18,7 @@ use rand::Rng;
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
+use crate::simulator::text_buffer::TextBuffer;
 use crate::simulator::util_stats;
 use crate::simulator::util_stats::{DeliveryBias, InterpreterTally};
 use std::cell::RefCell;
@@ -36,12 +37,13 @@ thread_local! {
     static TRACE_SCRATCH: RefCell<TraceScratch> = RefCell::new(TraceScratch::default());
 }
 
-/// Formats each evaluated parameter and returns the JSON array of the
-/// texts, byte for byte what `serde_json` writes for a `Vec<String>` of the
-/// same items. A parameter whose evaluation failed reads "<error>".
-fn trace_payload<H: HashPolicy>(
+/// Formats each evaluated parameter and appends the JSON array of the texts
+/// to `out`, byte for byte what `serde_json` writes for a `Vec<String>` of
+/// the same items. A parameter whose evaluation failed reads "<error>".
+fn write_trace_payload<H: HashPolicy>(
     values: impl Iterator<Item = Result<Value<H>, RuntimeError>>,
-) -> String {
+    out: &mut TextBuffer,
+) {
     TRACE_SCRATCH.with(|scratch| {
         let scratch = &mut *scratch.borrow_mut();
         scratch.text.clear();
@@ -55,29 +57,36 @@ fn trace_payload<H: HashPolicy>(
             }
             scratch.ends.push(scratch.text.len());
         }
-        json_string_array(&scratch.text, &scratch.ends)
+        json_string_array(&scratch.text, &scratch.ends, out)
     })
 }
 
-/// JSON array whose elements are the pieces of `text` ending at each offset
-/// in `ends`, in order. `ends` must be non-decreasing and bounded by
-/// `text.len()`, with every offset on a character boundary.
-pub(crate) fn json_string_array(text: &str, ends: &[usize]) -> String {
-    let mut out: Vec<u8> = Vec::with_capacity(text.len() + 2 + 4 * ends.len());
-    out.push(b'[');
+/// Appends the JSON array whose elements are the pieces of `text` ending at
+/// each offset in `ends`, in order. `ends` must be non-decreasing and bounded
+/// by `text.len()`, with every offset on a character boundary.
+pub(crate) fn json_string_array(text: &str, ends: &[usize], out: &mut TextBuffer) {
+    out.reserve(text.len() + 2 + 4 * ends.len());
+    out.push_str("[");
     let mut start = 0;
     for (i, &end) in ends.iter().enumerate() {
         if i > 0 {
-            out.push(b',');
+            out.push_str(",");
         }
-        // Writing into a Vec cannot fail.
-        let _ = serde_json::to_writer(&mut out, &text[start..end]);
+        out.push_json_str(&text[start..end]);
         start = end;
     }
-    out.push(b']');
-    // serde_json escapes control characters and copies other text through, so
-    // the bytes are valid UTF-8.
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    out.push_str("]");
+}
+
+/// Appends the printed text of `val` to `out` and returns where it ends. A
+/// string prints as its text between two quote characters.
+fn print_into<H: HashPolicy>(val: &Value<H>, out: &mut TextBuffer) -> usize {
+    if let ValueKind::String(s) = &val.kind {
+        util_stats::record_print_presized();
+        out.reserve(s.len() + 2);
+    }
+    let _ = val.write_to(out);
+    out.len()
 }
 
 pub fn exec_sync_on_node<H: HashPolicy, L: Logger, F: Feedback>(
@@ -383,18 +392,10 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
         }
         Label::Print(expr, next) => {
             let val = legacy_operand(local_env, node_env, expr, &program.id_to_name)?;
-            // A string prints as its text between two quote characters.
-            let mut content = match &val.kind {
-                ValueKind::String(s) => {
-                    util_stats::record_print_presized();
-                    String::with_capacity(s.len() + 2)
-                }
-                _ => String::new(),
-            };
-            let _ = val.write_to(&mut content);
+            let content_end = print_into(&val, logger.log_text());
             logger.log(LogEntry {
                 node: node_id,
-                content,
+                content_end,
                 step: state.crash_info.current_step,
             });
             Ok(Some(StepOutcome::Continue(*next)))
@@ -488,25 +489,28 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             // the pending id, from the argument values this frame's
             // parameters were built from, so it is the text formatting them
             // here would produce.
-            let payload = match (pending_id, carried) {
+            let out = logger.trace_text();
+            match (pending_id, carried) {
                 (Some(_), Some(text)) => {
                     util_stats::record_trace_enter_payload(true);
-                    text.into_string()
+                    out.push_str(&text);
                 }
                 _ => {
                     util_stats::record_trace_enter_payload(false);
-                    trace_payload(
+                    write_trace_payload(
                         param_exprs
                             .iter()
                             .map(|e| legacy_eval(local_env, node_env, e, &program.id_to_name)),
-                    )
+                        out,
+                    );
                 }
-            };
+            }
+            let payload_end = out.len();
             logger.log_trace(TraceEntry {
                 node: node_id,
                 function_name: func_name.clone(),
                 kind: TraceKind::Enter,
-                payload,
+                payload_end,
                 schedulable_count: state.total_runnable_count(),
                 step: state.crash_info.current_step,
                 trace_id: id,
@@ -518,11 +522,14 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             let trace_id =
                 legacy_eval(local_env, node_env, trace_id_expr, &program.id_to_name)?.as_int()?;
             let return_val = legacy_eval(local_env, node_env, return_val_expr, &program.id_to_name)?;
+            let out = logger.trace_text();
+            write_trace_payload(std::iter::once(Ok(return_val)), out);
+            let payload_end = out.len();
             logger.log_trace(TraceEntry {
                 node: node_id,
                 function_name: func_name.clone(),
                 kind: TraceKind::Exit,
-                payload: trace_payload(std::iter::once(Ok(return_val))),
+                payload_end,
                 schedulable_count: state.total_runnable_count(),
                 step: state.crash_info.current_step,
                 trace_id,
@@ -533,17 +540,21 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
         Label::TraceDispatch(func_name, param_exprs, next) => {
             let id = state.alloc_unique_id() as i64;
             *pending_trace_id = Some(id);
-            let payload = trace_payload(
+            let out = logger.trace_text();
+            let start = out.len();
+            write_trace_payload(
                 param_exprs
                     .iter()
                     .map(|e| legacy_eval(local_env, node_env, e, &program.id_to_name)),
+                out,
             );
-            *pending_trace_payload = Some(Box::from(payload.as_str()));
+            *pending_trace_payload = Some(Box::from(out.str_from(start)));
+            let payload_end = out.len();
             logger.log_trace(TraceEntry {
                 node: node_id,
                 function_name: func_name.clone(),
                 kind: TraceKind::Dispatch,
-                payload,
+                payload_end,
                 schedulable_count: state.total_runnable_count(),
                 step: state.crash_info.current_step,
                 trace_id: id,
@@ -1044,18 +1055,10 @@ fn run_common_op<H: HashPolicy, L: Logger, F: Feedback>(
         }
         Op::Print { value, next } => {
             let val = coperand(local_env, node_env, value, names, t)?;
-            // A string prints as its text between two quote characters.
-            let mut content = match &val.kind {
-                ValueKind::String(s) => {
-                    util_stats::record_print_presized();
-                    String::with_capacity(s.len() + 2)
-                }
-                _ => String::new(),
-            };
-            let _ = val.write_to(&mut content);
+            let content_end = print_into(&val, logger.log_text());
             logger.log(LogEntry {
                 node: node_id,
-                content,
+                content_end,
                 step: state.crash_info.current_step,
             });
             Ok(Flow::Next(*next as usize))
@@ -1295,25 +1298,28 @@ fn run_trace_enter<H: HashPolicy, L: Logger>(
     // A carried payload was formatted by the dispatch that allocated the
     // pending id, from the argument values this frame's parameters were
     // built from, so it is the text formatting them here would produce.
-    let payload = match (pending_id, carried) {
+    let out = logger.trace_text();
+    match (pending_id, carried) {
         (Some(_), Some(text)) => {
             util_stats::record_trace_enter_payload(true);
-            text.into_string()
+            out.push_str(&text);
         }
         _ => {
             util_stats::record_trace_enter_payload(false);
-            trace_payload(
+            write_trace_payload(
                 te.params
                     .iter()
                     .map(|e| cvalue(local_env, node_env, e, names, t)),
-            )
+                out,
+            );
         }
-    };
+    }
+    let payload_end = out.len();
     logger.log_trace(TraceEntry {
         node: node_id,
         function_name: te.func_name.clone(),
         kind: TraceKind::Enter,
-        payload,
+        payload_end,
         schedulable_count: state.total_runnable_count(),
         step: state.crash_info.current_step,
         trace_id: id,
@@ -1336,11 +1342,14 @@ fn run_trace_exit<H: HashPolicy, L: Logger>(
 ) -> Result<usize, RuntimeError> {
     let trace_id = cvalue(local_env, node_env, &tx.trace_id, names, t)?.as_int()?;
     let return_val = cvalue(local_env, node_env, &tx.return_value, names, t)?;
+    let out = logger.trace_text();
+    write_trace_payload(std::iter::once(Ok(return_val)), out);
+    let payload_end = out.len();
     logger.log_trace(TraceEntry {
         node: node_id,
         function_name: tx.func_name.clone(),
         kind: TraceKind::Exit,
-        payload: trace_payload(std::iter::once(Ok(return_val))),
+        payload_end,
         schedulable_count: state.total_runnable_count(),
         step: state.crash_info.current_step,
         trace_id,
@@ -1365,17 +1374,21 @@ fn run_trace_dispatch<H: HashPolicy, L: Logger>(
 ) -> usize {
     let id = state.alloc_unique_id() as i64;
     *pending_trace_id = Some(id);
-    let payload = trace_payload(
+    let out = logger.trace_text();
+    let start = out.len();
+    write_trace_payload(
         td.params
             .iter()
             .map(|e| cvalue(local_env, node_env, e, names, t)),
+        out,
     );
-    *pending_trace_payload = Some(Box::from(payload.as_str()));
+    *pending_trace_payload = Some(Box::from(out.str_from(start)));
+    let payload_end = out.len();
     logger.log_trace(TraceEntry {
         node: node_id,
         function_name: td.func_name.clone(),
         kind: TraceKind::Dispatch,
-        payload,
+        payload_end,
         schedulable_count: state.total_runnable_count(),
         step: state.crash_info.current_step,
         trace_id: id,

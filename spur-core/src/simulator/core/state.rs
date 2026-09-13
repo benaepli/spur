@@ -301,7 +301,9 @@ impl std::fmt::Display for NodeId {
 #[derive(Clone, Debug)]
 pub struct LogEntry {
     pub node: NodeId,
-    pub content: String,
+    /// End of the row's content in the logger's log text; the content starts
+    /// where the previous row's ends.
+    pub content_end: usize,
     pub step: i32,
 }
 
@@ -318,16 +320,22 @@ pub struct TraceEntry {
     /// Shared with the label that emitted the entry, so a row costs no copy.
     pub function_name: Arc<str>,
     pub kind: TraceKind,
-    /// JSON array of the parameter texts, serialized when the entry is made.
-    pub payload: String,
+    /// End of the row's payload, the JSON array of the parameter texts, in
+    /// the logger's trace text; the payload starts where the previous row's
+    /// ends.
+    pub payload_end: usize,
     pub schedulable_count: usize,
     pub step: i32,
     pub trace_id: i64,
     pub causal_operation_id: Option<i64>,
 }
 
-/// Trait for handling Print statement output during execution.
+/// Receives Print output and trace rows during execution. A row's text is
+/// appended to the matching text buffer first, and the row then records the
+/// buffer's length as its end.
 pub trait Logger {
+    fn log_text(&mut self) -> &mut crate::simulator::text_buffer::TextBuffer;
+    fn trace_text(&mut self) -> &mut crate::simulator::text_buffer::TextBuffer;
     fn log(&mut self, entry: LogEntry);
     fn log_trace(&mut self, _entry: TraceEntry) {}
 }

@@ -26,5 +26,6 @@ pub mod run_phase;
 pub mod stall_cap;
 pub mod stall_release;
 pub mod run_variant;
+pub mod text_buffer;
 pub mod timer_context;
 pub mod util_stats;

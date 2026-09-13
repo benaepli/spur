@@ -1,8 +1,10 @@
 use crate::simulator::core::{
     ChannelId, LogEntry, OpKind, Operation, TraceEntry, TraceKind, Value, ValueKind,
 };
+use crate::simulator::text_buffer::{TextBuffer, TextBuffers};
 use crate::simulator::util_stats;
-use arrow::array::{Int32Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray, UInt64Array};
+use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use crossbeam::channel::{self, Receiver, Sender};
@@ -23,29 +25,30 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-/// A pre-serialized operation ready for database / file insertion.
-/// JSON serialization is done by worker threads before sending to the writer.
+/// A pre-serialized operation ready for file insertion. Its action and
+/// payload text live in the run's text buffers; each row records where its
+/// text ends, and starts where the previous row's ends.
 pub struct PersistableOp {
     pub unique_id: i64,
     pub client_id: i64,
     pub kind: &'static str,
-    pub action: String,
-    pub payload_json: String,
+    pub action_end: usize,
+    pub payload_end: usize,
     pub step: i32,
 }
 
 pub struct PersistableLog {
     pub node_id: i64,
-    pub content: String,
+    pub content_end: usize,
     pub step: i32,
 }
 
-/// Rows keep the order of `logs`; the text moves into each row unchanged.
+/// Rows keep the order of `logs`.
 pub fn serialize_logs(logs: Vec<LogEntry>) -> Vec<PersistableLog> {
     logs.into_iter()
         .map(|l| PersistableLog {
             node_id: l.node.index as i64,
-            content: l.content,
+            content_end: l.content_end,
             step: l.step,
         })
         .collect()
@@ -56,15 +59,22 @@ pub struct PersistableTrace {
     pub step: i32,
     pub function_name: Arc<str>,
     pub trace_kind: &'static str,
-    /// JSON array of the parameter texts.
-    pub payload: String,
+    /// End of the JSON array of the parameter texts in the trace text.
+    pub payload_end: usize,
     pub schedulable_count: i64,
     pub trace_id: i64,
     pub causal_operation_id: Option<i64>,
 }
 
-/// Rows keep the order of `traces`; the name and the already serialized
-/// payload move into each row unchanged.
+/// Every row of one run and the text the rows point into.
+pub struct RunRows {
+    pub history: Vec<PersistableOp>,
+    pub logs: Vec<PersistableLog>,
+    pub traces: Vec<PersistableTrace>,
+    pub text: TextBuffers,
+}
+
+/// Rows keep the order of `traces`; the name moves into each row unchanged.
 pub fn serialize_traces(traces: Vec<TraceEntry>) -> Vec<PersistableTrace> {
     traces
         .into_iter()
@@ -77,7 +87,7 @@ pub fn serialize_traces(traces: Vec<TraceEntry>) -> Vec<PersistableTrace> {
                 TraceKind::Enter => "Enter",
                 TraceKind::Exit => "Exit",
             },
-            payload: t.payload,
+            payload_end: t.payload_end,
             schedulable_count: t.schedulable_count as i64,
             trace_id: t.trace_id,
             causal_operation_id: t.causal_operation_id,
@@ -355,26 +365,37 @@ fn payload_to_json_string<H: HashPolicy>(payload: &[Value<H>]) -> String {
     serde_json::to_string(&SeqJson(payload)).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Serializes a list of Operations into PersistableOps, in order.
-pub fn serialize_history<H: HashPolicy>(history: &[Operation<H>]) -> Vec<PersistableOp> {
+/// Serializes a list of Operations into PersistableOps, in order, appending
+/// each action and payload to `text`. A payload that fails to serialize
+/// reads "[]".
+pub fn serialize_history<H: HashPolicy>(
+    history: &[Operation<H>],
+    text: &mut TextBuffers,
+) -> Vec<PersistableOp> {
     util_stats::record_history_ops_streamed(history.len() as u64);
     history
         .iter()
-        .map(|op| PersistableOp {
-            unique_id: op.unique_id as i64,
-            client_id: op.client_id as i64,
-            kind: match op.kind {
-                OpKind::Response => "Response",
-                OpKind::Invocation => "Invocation",
-                OpKind::Crash => "Crash",
-                OpKind::Recover => "Recover",
-                OpKind::Partition => "Partition",
-                OpKind::Heal => "Heal",
-                OpKind::TimerFired => "TimerFired",
-            },
-            action: op.op_action.clone(),
-            payload_json: payload_to_json_string::<H>(&op.payload),
-            step: op.step,
+        .map(|op| {
+            text.action.push_str(&op.op_action);
+            if !text.op_payload.push_json(&SeqJson(&op.payload)) {
+                text.op_payload.push_str("[]");
+            }
+            PersistableOp {
+                unique_id: op.unique_id as i64,
+                client_id: op.client_id as i64,
+                kind: match op.kind {
+                    OpKind::Response => "Response",
+                    OpKind::Invocation => "Invocation",
+                    OpKind::Crash => "Crash",
+                    OpKind::Recover => "Recover",
+                    OpKind::Partition => "Partition",
+                    OpKind::Heal => "Heal",
+                    OpKind::TimerFired => "TimerFired",
+                },
+                action_end: text.action.len(),
+                payload_end: text.op_payload.len(),
+                step: op.step,
+            }
         })
         .collect()
 }
@@ -417,31 +438,16 @@ pub fn save_history_to_csv<H: crate::simulator::hash_utils::HashPolicy, P: AsRef
 
 /// Command sent to the background history writer thread.
 pub enum HistoryCommand {
-    Write {
-        run_id: i64,
-        history: Vec<PersistableOp>,
-        logs: Vec<PersistableLog>,
-        traces: Vec<PersistableTrace>,
-    },
-    Run(PersistableRun),
+    /// One run: its executions, log and trace rows, and its `runs` row.
+    Write { rows: RunRows, run: PersistableRun },
     Shutdown,
 }
 
 /// The abstract interface for logging simulation history.
 /// Implementations must be Send + Sync so they can be wrapped in `Arc<dyn HistoryWriter>`.
 pub trait HistoryWriter: Send + Sync {
-    /// Sends a pre-serialized history, logs, and traces write request to the background thread.
-    fn write(
-        &self,
-        run_id: i64,
-        history: Vec<PersistableOp>,
-        logs: Vec<PersistableLog>,
-        traces: Vec<PersistableTrace>,
-    );
-
-    /// Records the run's row in the `runs` table. A backend without that
-    /// table may ignore it.
-    fn write_run(&self, _run: PersistableRun) {}
+    /// Queues one run's rows and its `runs` row for the background thread.
+    fn write(&self, rows: RunRows, run: PersistableRun);
 
     /// Shuts down the background writer, waiting for all pending writes to complete.
     fn shutdown(&self);
@@ -472,76 +478,197 @@ fn logs_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Writes a batch of PersistableOps into an open ArrowWriter for the executions table.
-fn append_executions_batch(
-    writer: &mut ArrowWriter<File>,
-    run_id: i64,
-    ops: &[PersistableOp],
-) -> Result<(), Box<dyn Error>> {
-    let n = ops.len();
-    let run_ids = Int64Array::from(vec![run_id; n]);
-    let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
-    let unique_ids: Int64Array = ops.iter().map(|o| o.unique_id).collect::<Vec<_>>().into();
-    let client_ids: Int64Array = ops.iter().map(|o| o.client_id).collect::<Vec<_>>().into();
-    let kinds: StringArray = ops.iter().map(|o| o.kind).collect::<Vec<_>>().into();
-    let actions: StringArray = ops
-        .iter()
-        .map(|o| o.action.as_str())
-        .collect::<Vec<_>>()
-        .into();
-    let payloads: StringArray = ops
-        .iter()
-        .map(|o| o.payload_json.as_str())
-        .collect::<Vec<_>>()
-        .into();
-    let steps: Int32Array = ops.iter().map(|o| o.step).collect::<Vec<_>>().into();
+/// Every table's schema, built once per writer and shared by its files and
+/// batches.
+#[derive(Clone)]
+struct Schemas {
+    executions: Arc<Schema>,
+    logs: Arc<Schema>,
+    traces: Arc<Schema>,
+    runs: Arc<Schema>,
+}
 
-    let batch = RecordBatch::try_new(
-        executions_schema(),
-        vec![
-            Arc::new(run_ids),
-            Arc::new(seq_nums),
-            Arc::new(unique_ids),
-            Arc::new(client_ids),
-            Arc::new(kinds),
-            Arc::new(actions),
-            Arc::new(payloads),
-            Arc::new(steps),
-        ],
-    )?;
+impl Schemas {
+    fn new() -> Self {
+        Self {
+            executions: executions_schema(),
+            logs: logs_schema(),
+            traces: traces_schema(),
+            runs: runs_schema(),
+        }
+    }
+}
+
+/// Offset vectors for the four text columns. They stay on the writer thread
+/// and are reused from run to run.
+#[derive(Default)]
+struct OffsetScratch {
+    action: Vec<i32>,
+    op_payload: Vec<i32>,
+    log_content: Vec<i32>,
+    trace_payload: Vec<i32>,
+}
+
+/// A text column whose buffers could not be turned into an array, handed
+/// back whole.
+type Unbuilt = (TextBuffer, Vec<i32>);
+
+/// A string column whose rows are the pieces of `text` ending at each of
+/// `ends`, each starting where the previous one ends. The text bytes and the
+/// offsets move into the column without being copied. Fails, handing both
+/// buffers back, when an end decreases, lies past the text or inside a
+/// character, or does not fit an i32 offset.
+fn string_column(
+    text: TextBuffer,
+    ends: impl Iterator<Item = usize>,
+    mut offsets: Vec<i32>,
+) -> Result<StringArray, Unbuilt> {
+    offsets.clear();
+    offsets.push(0);
+    let mut previous = 0;
+    for end in ends {
+        let fits = end >= previous && text.is_char_boundary(end);
+        match i32::try_from(end) {
+            Ok(offset) if fits => offsets.push(offset),
+            _ => return Err((text, offsets)),
+        }
+        previous = end;
+    }
+    let bytes = text.into_bytes();
+    debug_assert!(std::str::from_utf8(&bytes).is_ok(), "text buffers hold UTF-8");
+    // SAFETY: the offsets start at 0 and never decrease.
+    let offsets = unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) };
+    // SAFETY: a TextBuffer holds only UTF-8, and every offset was checked to
+    // lie within it on a character boundary.
+    Ok(unsafe { StringArray::new_unchecked(offsets, Buffer::from_vec(bytes), None) })
+}
+
+/// Takes a column's text and offset storage back. Storage still referenced
+/// elsewhere cannot be taken and comes back empty.
+fn recover_column(column: StringArray) -> Unbuilt {
+    let (offsets, values, _) = column.into_parts();
+    let text = values
+        .into_vec::<u8>()
+        .map(TextBuffer::from_storage)
+        .unwrap_or_default();
+    let offsets = offsets
+        .into_inner()
+        .into_inner()
+        .into_vec::<i32>()
+        .unwrap_or_default();
+    (text, offsets)
+}
+
+fn give_back(column: Result<StringArray, Unbuilt>) -> Unbuilt {
+    match column {
+        Ok(column) => recover_column(column),
+        Err(parts) => parts,
+    }
+}
+
+/// Encodes one table's record batch. The batch, and with it every reference
+/// to the columns it was given, is gone when this returns.
+fn write_batch(
+    writer: &mut ArrowWriter<File>,
+    schema: &Arc<Schema>,
+    columns: Vec<Arc<dyn Array>>,
+) -> Result<(), Box<dyn Error>> {
+    let batch = RecordBatch::try_new(schema.clone(), columns)?;
     writer.write(&batch)?;
     Ok(())
 }
 
-/// Writes a batch of PersistableLogs into an open ArrowWriter for the logs table.
+/// Writes a batch of PersistableOps into an open ArrowWriter for the
+/// executions table, and returns the action and payload storage to `text`
+/// and `scratch` whether or not the write succeeded.
+fn append_executions_batch(
+    writer: &mut ArrowWriter<File>,
+    schema: &Arc<Schema>,
+    run_id: i64,
+    ops: &[PersistableOp],
+    text: &mut TextBuffers,
+    scratch: &mut OffsetScratch,
+) -> Result<(), Box<dyn Error>> {
+    let n = ops.len();
+    let actions = string_column(
+        std::mem::take(&mut text.action),
+        ops.iter().map(|o| o.action_end),
+        std::mem::take(&mut scratch.action),
+    );
+    let payloads = string_column(
+        std::mem::take(&mut text.op_payload),
+        ops.iter().map(|o| o.payload_end),
+        std::mem::take(&mut scratch.op_payload),
+    );
+    let result = match (&actions, &payloads) {
+        (Ok(actions), Ok(payloads)) => {
+            let run_ids = Int64Array::from(vec![run_id; n]);
+            let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
+            let unique_ids: Int64Array = ops.iter().map(|o| o.unique_id).collect::<Vec<_>>().into();
+            let client_ids: Int64Array = ops.iter().map(|o| o.client_id).collect::<Vec<_>>().into();
+            let kinds: StringArray = ops.iter().map(|o| o.kind).collect::<Vec<_>>().into();
+            let steps: Int32Array = ops.iter().map(|o| o.step).collect::<Vec<_>>().into();
+            write_batch(
+                writer,
+                schema,
+                vec![
+                    Arc::new(run_ids),
+                    Arc::new(seq_nums),
+                    Arc::new(unique_ids),
+                    Arc::new(client_ids),
+                    Arc::new(kinds),
+                    Arc::new(actions.clone()),
+                    Arc::new(payloads.clone()),
+                    Arc::new(steps),
+                ],
+            )
+        }
+        _ => Err("executions text ends do not fit the run's text".into()),
+    };
+    (text.action, scratch.action) = give_back(actions);
+    (text.op_payload, scratch.op_payload) = give_back(payloads);
+    result
+}
+
+/// Writes a batch of PersistableLogs into an open ArrowWriter for the logs
+/// table, and returns the content storage to `text` and `scratch` whether or
+/// not the write succeeded.
 fn append_logs_batch(
     writer: &mut ArrowWriter<File>,
+    schema: &Arc<Schema>,
     run_id: i64,
     logs: &[PersistableLog],
+    text: &mut TextBuffers,
+    scratch: &mut OffsetScratch,
 ) -> Result<(), Box<dyn Error>> {
     let n = logs.len();
-    let run_ids = Int64Array::from(vec![run_id; n]);
-    let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
-    let node_ids: Int64Array = logs.iter().map(|l| l.node_id).collect::<Vec<_>>().into();
-    let steps: Int32Array = logs.iter().map(|l| l.step).collect::<Vec<_>>().into();
-    let contents: StringArray = logs
-        .iter()
-        .map(|l| l.content.as_str())
-        .collect::<Vec<_>>()
-        .into();
-
-    let batch = RecordBatch::try_new(
-        logs_schema(),
-        vec![
-            Arc::new(run_ids),
-            Arc::new(seq_nums),
-            Arc::new(node_ids),
-            Arc::new(steps),
-            Arc::new(contents),
-        ],
-    )?;
-    writer.write(&batch)?;
-    Ok(())
+    let contents = string_column(
+        std::mem::take(&mut text.log_content),
+        logs.iter().map(|l| l.content_end),
+        std::mem::take(&mut scratch.log_content),
+    );
+    let result = match &contents {
+        Ok(contents) => {
+            let run_ids = Int64Array::from(vec![run_id; n]);
+            let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
+            let node_ids: Int64Array = logs.iter().map(|l| l.node_id).collect::<Vec<_>>().into();
+            let steps: Int32Array = logs.iter().map(|l| l.step).collect::<Vec<_>>().into();
+            write_batch(
+                writer,
+                schema,
+                vec![
+                    Arc::new(run_ids),
+                    Arc::new(seq_nums),
+                    Arc::new(node_ids),
+                    Arc::new(steps),
+                    Arc::new(contents.clone()),
+                ],
+            )
+        }
+        Err(_) => Err("log content ends do not fit the run's text".into()),
+    };
+    (text.log_content, scratch.log_content) = give_back(contents);
+    result
 }
 
 fn traces_schema() -> Arc<Schema> {
@@ -559,61 +686,71 @@ fn traces_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Writes a batch of PersistableTraces into an open ArrowWriter for the traces table.
+/// Writes a batch of PersistableTraces into an open ArrowWriter for the
+/// traces table, and returns the payload storage to `text` and `scratch`
+/// whether or not the write succeeded.
 fn append_traces_batch(
     writer: &mut ArrowWriter<File>,
+    schema: &Arc<Schema>,
     run_id: i64,
     traces: &[PersistableTrace],
+    text: &mut TextBuffers,
+    scratch: &mut OffsetScratch,
 ) -> Result<(), Box<dyn Error>> {
     let n = traces.len();
-    let run_ids = Int64Array::from(vec![run_id; n]);
-    let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
-    let node_ids: Int64Array = traces.iter().map(|t| t.node_id).collect::<Vec<_>>().into();
-    let steps: Int32Array = traces.iter().map(|t| t.step).collect::<Vec<_>>().into();
-    let func_names: StringArray = traces
-        .iter()
-        .map(|t| &*t.function_name)
-        .collect::<Vec<_>>()
-        .into();
-    let kinds: StringArray = traces
-        .iter()
-        .map(|t| t.trace_kind)
-        .collect::<Vec<_>>()
-        .into();
-    let payloads: StringArray = traces
-        .iter()
-        .map(|t| t.payload.as_str())
-        .collect::<Vec<_>>()
-        .into();
-    let sched_counts: Int64Array = traces
-        .iter()
-        .map(|t| t.schedulable_count)
-        .collect::<Vec<_>>()
-        .into();
-    let trace_ids: Int64Array = traces.iter().map(|t| t.trace_id).collect::<Vec<_>>().into();
-    let causal_op_ids: Int64Array = traces
-        .iter()
-        .map(|t| t.causal_operation_id)
-        .collect::<Vec<Option<i64>>>()
-        .into();
-
-    let batch = RecordBatch::try_new(
-        traces_schema(),
-        vec![
-            Arc::new(run_ids),
-            Arc::new(seq_nums),
-            Arc::new(node_ids),
-            Arc::new(steps),
-            Arc::new(func_names),
-            Arc::new(kinds),
-            Arc::new(payloads),
-            Arc::new(sched_counts),
-            Arc::new(trace_ids),
-            Arc::new(causal_op_ids),
-        ],
-    )?;
-    writer.write(&batch)?;
-    Ok(())
+    let payloads = string_column(
+        std::mem::take(&mut text.trace_payload),
+        traces.iter().map(|t| t.payload_end),
+        std::mem::take(&mut scratch.trace_payload),
+    );
+    let result = match &payloads {
+        Ok(payloads) => {
+            let run_ids = Int64Array::from(vec![run_id; n]);
+            let seq_nums: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
+            let node_ids: Int64Array = traces.iter().map(|t| t.node_id).collect::<Vec<_>>().into();
+            let steps: Int32Array = traces.iter().map(|t| t.step).collect::<Vec<_>>().into();
+            let func_names: StringArray = traces
+                .iter()
+                .map(|t| &*t.function_name)
+                .collect::<Vec<_>>()
+                .into();
+            let kinds: StringArray = traces
+                .iter()
+                .map(|t| t.trace_kind)
+                .collect::<Vec<_>>()
+                .into();
+            let sched_counts: Int64Array = traces
+                .iter()
+                .map(|t| t.schedulable_count)
+                .collect::<Vec<_>>()
+                .into();
+            let trace_ids: Int64Array = traces.iter().map(|t| t.trace_id).collect::<Vec<_>>().into();
+            let causal_op_ids: Int64Array = traces
+                .iter()
+                .map(|t| t.causal_operation_id)
+                .collect::<Vec<Option<i64>>>()
+                .into();
+            write_batch(
+                writer,
+                schema,
+                vec![
+                    Arc::new(run_ids),
+                    Arc::new(seq_nums),
+                    Arc::new(node_ids),
+                    Arc::new(steps),
+                    Arc::new(func_names),
+                    Arc::new(kinds),
+                    Arc::new(payloads.clone()),
+                    Arc::new(sched_counts),
+                    Arc::new(trace_ids),
+                    Arc::new(causal_op_ids),
+                ],
+            )
+        }
+        Err(_) => Err("trace payload ends do not fit the run's text".into()),
+    };
+    (text.trace_payload, scratch.trace_payload) = give_back(payloads);
+    result
 }
 
 fn runs_schema() -> Arc<Schema> {
@@ -642,6 +779,7 @@ fn runs_schema() -> Arc<Schema> {
 /// Writes buffered run rows into an open ArrowWriter for the runs table.
 fn append_runs_batch(
     writer: &mut ArrowWriter<File>,
+    schema: &Arc<Schema>,
     runs: &[PersistableRun],
 ) -> Result<(), Box<dyn Error>> {
     let run_ids: Int64Array = runs.iter().map(|r| r.run_id).collect::<Vec<_>>().into();
@@ -664,7 +802,7 @@ fn append_runs_batch(
     let max_inert_streak = timer_col(|r| r.max_inert_streak);
     let variants = timer_col(|r| r.variant);
     let batch = RecordBatch::try_new(
-        runs_schema(),
+        schema.clone(),
         vec![
             Arc::new(run_ids),
             Arc::new(arms),
@@ -701,10 +839,11 @@ const PARQUET_ROTATION_INTERVAL: usize = 25_000;
 
 // Runs finish on every simulation thread faster than the writers encode
 // parquet, so the queue in front of them must be bounded or it holds every
-// unwritten run's history, logs and traces in memory. In-flight runs are
-// bounded by this capacity plus one per writer thread; a full queue blocks
-// the simulation thread until a writer catches up.
-const HISTORY_QUEUE_CAPACITY: usize = 256;
+// unwritten run's history, logs and traces in memory. Each queued command is
+// one run, so in-flight runs are bounded by this capacity plus one per writer
+// thread; a full queue blocks the simulation thread until a writer catches
+// up.
+const HISTORY_QUEUE_CAPACITY: usize = 128;
 
 /// Persists run histories as parquet. `executions/`, `logs/` and `traces/`
 /// each hold a series of `batch_NNNN.parquet` files. Writer threads take
@@ -758,6 +897,7 @@ struct TableDirs {
 /// waiting to be written into it.
 struct OpenBatch {
     number: usize,
+    schemas: Schemas,
     executions: ArrowWriter<File>,
     logs: ArrowWriter<File>,
     traces: ArrowWriter<File>,
@@ -766,14 +906,15 @@ struct OpenBatch {
 }
 
 impl OpenBatch {
-    fn open(dirs: &TableDirs, number: usize) -> Result<Self, Box<dyn Error>> {
+    fn open(dirs: &TableDirs, schemas: &Schemas, number: usize) -> Result<Self, Box<dyn Error>> {
         let name = batch_filename(number);
         Ok(Self {
             number,
-            executions: open_parquet_writer(&dirs.executions.join(&name), executions_schema())?,
-            logs: open_parquet_writer(&dirs.logs.join(&name), logs_schema())?,
-            traces: open_parquet_writer(&dirs.traces.join(&name), traces_schema())?,
-            runs: open_parquet_writer(&dirs.runs.join(&name), runs_schema())?,
+            schemas: schemas.clone(),
+            executions: open_parquet_writer(&dirs.executions.join(&name), schemas.executions.clone())?,
+            logs: open_parquet_writer(&dirs.logs.join(&name), schemas.logs.clone())?,
+            traces: open_parquet_writer(&dirs.traces.join(&name), schemas.traces.clone())?,
+            runs: open_parquet_writer(&dirs.runs.join(&name), schemas.runs.clone())?,
             pending_runs: Vec::with_capacity(RUNS_FLUSH_ROWS),
         })
     }
@@ -782,7 +923,7 @@ impl OpenBatch {
         if self.pending_runs.is_empty() {
             return;
         }
-        if let Err(e) = append_runs_batch(&mut self.runs, &self.pending_runs) {
+        if let Err(e) = append_runs_batch(&mut self.runs, &self.schemas.runs, &self.pending_runs) {
             error!("failed to save runs parquet in batch {}: {}", self.number, e);
         }
         self.pending_runs.clear();
@@ -815,36 +956,70 @@ fn writer_loop(
 ) {
     let mut writes_in_batch: usize = 0;
     let mut series: usize = 0;
+    let mut offsets = OffsetScratch::default();
     while let Ok(cmd) = receiver.recv() {
         let started = util_stats::enabled().then(Instant::now);
         match cmd {
-            HistoryCommand::Write {
-                run_id,
-                history,
-                logs,
-                traces,
-            } => {
+            HistoryCommand::Write { rows, run } => {
+                util_stats::record_history_writer_command();
+                let RunRows {
+                    history,
+                    logs,
+                    traces,
+                    mut text,
+                } = rows;
+                let run_id = run.run_id;
                 if !history.is_empty()
-                    && let Err(e) = append_executions_batch(&mut batch.executions, run_id, &history)
+                    && let Err(e) = append_executions_batch(
+                        &mut batch.executions,
+                        &batch.schemas.executions,
+                        run_id,
+                        &history,
+                        &mut text,
+                        &mut offsets,
+                    )
                 {
                     error!("failed to save executions parquet for run {}: {}", run_id, e);
                 }
                 if !logs.is_empty()
-                    && let Err(e) = append_logs_batch(&mut batch.logs, run_id, &logs)
+                    && let Err(e) = append_logs_batch(
+                        &mut batch.logs,
+                        &batch.schemas.logs,
+                        run_id,
+                        &logs,
+                        &mut text,
+                        &mut offsets,
+                    )
                 {
                     error!("failed to save logs parquet for run {}: {}", run_id, e);
                 }
                 if !traces.is_empty()
-                    && let Err(e) = append_traces_batch(&mut batch.traces, run_id, &traces)
+                    && let Err(e) = append_traces_batch(
+                        &mut batch.traces,
+                        &batch.schemas.traces,
+                        run_id,
+                        &traces,
+                        &mut text,
+                        &mut offsets,
+                    )
                 {
                     error!("failed to save traces parquet for run {}: {}", run_id, e);
                 }
+                batch.pending_runs.push(run);
+                if batch.pending_runs.len() >= RUNS_FLUSH_ROWS {
+                    batch.flush_runs();
+                }
+                // Everything the run brought is released before the busy
+                // time is read, so busy time covers every free the run causes.
+                drop((history, logs, traces));
+                text.recycle();
                 writes_in_batch += 1;
                 if writes_in_batch >= rotation_interval {
+                    let schemas = batch.schemas.clone();
                     batch.finish();
                     series += 1;
                     let number = batch_number(writer_index, series, writer_count);
-                    batch = match OpenBatch::open(&dirs, number) {
+                    batch = match OpenBatch::open(&dirs, &schemas, number) {
                         Ok(b) => b,
                         Err(e) => {
                             error!("failed to open batch {}: {}", number, e);
@@ -852,12 +1027,6 @@ fn writer_loop(
                         }
                     };
                     writes_in_batch = 0;
-                }
-            }
-            HistoryCommand::Run(run) => {
-                batch.pending_runs.push(run);
-                if batch.pending_runs.len() >= RUNS_FLUSH_ROWS {
-                    batch.flush_runs();
                 }
             }
             HistoryCommand::Shutdown => break,
@@ -903,8 +1072,9 @@ impl ParquetWriter {
         let (sender, receiver) = channel::bounded::<HistoryCommand>(HISTORY_QUEUE_CAPACITY);
         let per_writer_rotation = rotation_interval.div_ceil(writer_count).max(1);
         let mut handles = Vec::with_capacity(writer_count);
+        let schemas = Schemas::new();
         for index in 0..writer_count {
-            let batch = OpenBatch::open(&dirs, batch_number(index, 0, writer_count))?;
+            let batch = OpenBatch::open(&dirs, &schemas, batch_number(index, 0, writer_count))?;
             let receiver = receiver.clone();
             let dirs = dirs.clone();
             let handle = thread::Builder::new()
@@ -941,31 +1111,14 @@ impl ParquetWriter {
 }
 
 impl HistoryWriter for ParquetWriter {
-    fn write(
-        &self,
-        run_id: i64,
-        history: Vec<PersistableOp>,
-        logs: Vec<PersistableLog>,
-        traces: Vec<PersistableTrace>,
-    ) {
-        if let Err(e) = self.send(HistoryCommand::Write {
-            run_id,
-            history,
-            logs,
-            traces,
-        }) {
+    fn write(&self, rows: RunRows, run: PersistableRun) {
+        let run_id = run.run_id;
+        if let Err(e) = self.send(HistoryCommand::Write { rows, run }) {
             log::error!(
                 "Failed to send parquet write command for run {}: {}",
                 run_id,
                 e
             );
-        }
-    }
-
-    fn write_run(&self, run: PersistableRun) {
-        let run_id = run.run_id;
-        if let Err(e) = self.send(HistoryCommand::Run(run)) {
-            log::error!("Failed to send run row for run {}: {}", run_id, e);
         }
     }
 
@@ -1021,6 +1174,295 @@ mod parquet_writer_tests {
         rows
     }
 
+    /// One run's rows: an operation per `(action, payload)` pair, a log row
+    /// per content and a trace row per payload, with the text laid out the
+    /// way a simulation thread lays it out.
+    fn run_rows(ops: &[(&str, &str)], logs: &[&str], traces: &[&str]) -> RunRows {
+        let mut text = TextBuffers::default();
+        let history = ops
+            .iter()
+            .enumerate()
+            .map(|(i, (action, payload))| {
+                text.action.push_str(action);
+                text.op_payload.push_str(payload);
+                PersistableOp {
+                    unique_id: i as i64,
+                    client_id: 7,
+                    kind: "Invocation",
+                    action_end: text.action.len(),
+                    payload_end: text.op_payload.len(),
+                    step: i as i32,
+                }
+            })
+            .collect();
+        let logs = logs
+            .iter()
+            .enumerate()
+            .map(|(i, content)| {
+                text.log_content.push_str(content);
+                PersistableLog {
+                    node_id: i as i64 % 3,
+                    content_end: text.log_content.len(),
+                    step: i as i32,
+                }
+            })
+            .collect();
+        let traces = traces
+            .iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                text.trace_payload.push_str(payload);
+                PersistableTrace {
+                    node_id: 1,
+                    step: i as i32,
+                    function_name: Arc::from("f\u{e9}"),
+                    trace_kind: "Enter",
+                    payload_end: text.trace_payload.len(),
+                    schedulable_count: i as i64,
+                    trace_id: 100 + i as i64,
+                    causal_operation_id: (i % 2 == 0).then_some(i as i64),
+                }
+            })
+            .collect();
+        RunRows { history, logs, traces, text }
+    }
+
+    fn run_record(run_id: i64, steps_used: i32) -> PersistableRun {
+        PersistableRun {
+            run_id,
+            arm: "test".to_string(),
+            arm_index: -1,
+            config_index: (run_id % 3) as i32,
+            workload_seed: run_id as u64,
+            schedule_seed: run_id as u64 + 1,
+            steps_used,
+            wall_us: 10,
+            end_reason: "plan_complete",
+            session_offset_ms: run_id,
+            timers_fired: 0,
+            timers_acted: 0,
+            timers_inflight_fired: 0,
+            timers_inflight_acted: 0,
+            timers_idle_fired: 0,
+            timers_idle_acted: 0,
+            max_inert_streak: 0,
+            variant: 0,
+        }
+    }
+
+    const MIXED_TEXT: &[&str] = &[
+        "",
+        "plain",
+        "",
+        "e\u{301}clair \u{1f600}",
+        "quote \" backslash \\ newline \n",
+        "\u{4e2d}\u{6587}",
+        "",
+    ];
+
+    #[test]
+    fn text_columns_hold_the_same_strings_and_give_their_storage_back() {
+        let empty: &[&str] = &[];
+        for items in [MIXED_TEXT, empty, &[""][..]] {
+            let mut text = TextBuffer::default();
+            let ends: Vec<usize> = items
+                .iter()
+                .map(|s| {
+                    text.push_str(s);
+                    text.len()
+                })
+                .collect();
+            let capacity = text.capacity();
+            let column = string_column(text, ends.into_iter(), Vec::with_capacity(4))
+                .unwrap_or_else(|_| panic!("valid ends for {items:?}"));
+            assert_eq!(column, StringArray::from(items.to_vec()), "items {items:?}");
+            let (text, offsets) = recover_column(column);
+            assert!(text.is_empty(), "recovered text comes back cleared");
+            assert_eq!(text.capacity(), capacity, "the text storage came back");
+            assert!(offsets.capacity() >= items.len() + 1, "the offset storage came back");
+        }
+
+        let mut text = TextBuffer::default();
+        text.push_str("abc");
+        let column = string_column(text, [1, 3].into_iter(), Vec::new())
+            .unwrap_or_else(|_| panic!("valid ends"));
+        let held = column.clone();
+        let (text, _) = recover_column(column);
+        assert_eq!(text.capacity(), 0, "storage still referenced is not taken");
+        assert_eq!(held.value(1), "bc");
+    }
+
+    #[test]
+    fn text_columns_refuse_ends_that_do_not_fit_the_text() {
+        let accent = "e\u{301}xyz";
+        let inside_accent = 2;
+        for ends in [vec![4, 3], vec![accent.len() + 1], vec![inside_accent]] {
+            let mut text = TextBuffer::default();
+            text.push_str(accent);
+            match string_column(text, ends.clone().into_iter(), Vec::new()) {
+                Ok(_) => panic!("ends {ends:?} accepted"),
+                Err((text, _)) => assert_eq!(text.str_from(0), accent, "the text is handed back whole"),
+            }
+        }
+    }
+
+    fn read_batches(path: &Path) -> (Arc<Schema>, Vec<RecordBatch>) {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+        let schema = builder.schema().clone();
+        (schema, builder.build().unwrap().map(|b| b.unwrap()).collect())
+    }
+
+    fn assert_same_rows(candidate: &Path, reference: &Path) {
+        let (schema, cand) = read_batches(candidate);
+        let (_, refr) = read_batches(reference);
+        let cand = arrow::compute::concat_batches(&schema, &cand).unwrap();
+        let refr = arrow::compute::concat_batches(&schema, &refr).unwrap();
+        assert_eq!(cand.num_rows(), refr.num_rows(), "{candidate:?} row count");
+        for i in 0..schema.fields().len() {
+            assert_eq!(
+                cand.column(i).to_data(),
+                refr.column(i).to_data(),
+                "{candidate:?} column {}",
+                schema.field(i).name()
+            );
+        }
+    }
+
+    /// Writes the run's tables the way arrays built from one string per cell
+    /// write them.
+    fn write_reference(dir: &Path, runs: &[(i64, &[(&str, &str)], &[&str], &[&str])]) {
+        let schemas = Schemas::new();
+        let mut executions = open_parquet_writer(&dir.join("executions.parquet"), schemas.executions.clone()).unwrap();
+        let mut logs = open_parquet_writer(&dir.join("logs.parquet"), schemas.logs.clone()).unwrap();
+        let mut traces = open_parquet_writer(&dir.join("traces.parquet"), schemas.traces.clone()).unwrap();
+        let mut runs_writer = open_parquet_writer(&dir.join("runs.parquet"), schemas.runs.clone()).unwrap();
+        let mut run_records = Vec::new();
+        for &(run_id, ops, contents, payloads) in runs {
+            let rows = run_rows(ops, contents, payloads);
+            let seq = |n: usize| -> Arc<dyn Array> { Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())) };
+            let run = |n: usize| -> Arc<dyn Array> { Arc::new(Int64Array::from(vec![run_id; n])) };
+            if !ops.is_empty() {
+                let n = ops.len();
+                let h = &rows.history;
+                let batch = RecordBatch::try_new(
+                    schemas.executions.clone(),
+                    vec![
+                        run(n),
+                        seq(n),
+                        Arc::new(Int64Array::from(h.iter().map(|o| o.unique_id).collect::<Vec<_>>())),
+                        Arc::new(Int64Array::from(h.iter().map(|o| o.client_id).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from(h.iter().map(|o| o.kind).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from(ops.iter().map(|o| o.0).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from(ops.iter().map(|o| o.1).collect::<Vec<_>>())),
+                        Arc::new(Int32Array::from(h.iter().map(|o| o.step).collect::<Vec<_>>())),
+                    ],
+                )
+                .unwrap();
+                executions.write(&batch).unwrap();
+            }
+            if !contents.is_empty() {
+                let n = contents.len();
+                let l = &rows.logs;
+                let batch = RecordBatch::try_new(
+                    schemas.logs.clone(),
+                    vec![
+                        run(n),
+                        seq(n),
+                        Arc::new(Int64Array::from(l.iter().map(|r| r.node_id).collect::<Vec<_>>())),
+                        Arc::new(Int32Array::from(l.iter().map(|r| r.step).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from(contents.to_vec())),
+                    ],
+                )
+                .unwrap();
+                logs.write(&batch).unwrap();
+            }
+            if !payloads.is_empty() {
+                let n = payloads.len();
+                let t = &rows.traces;
+                let batch = RecordBatch::try_new(
+                    schemas.traces.clone(),
+                    vec![
+                        run(n),
+                        seq(n),
+                        Arc::new(Int64Array::from(t.iter().map(|r| r.node_id).collect::<Vec<_>>())),
+                        Arc::new(Int32Array::from(t.iter().map(|r| r.step).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from(t.iter().map(|r| &*r.function_name).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from(t.iter().map(|r| r.trace_kind).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from(payloads.to_vec())),
+                        Arc::new(Int64Array::from(t.iter().map(|r| r.schedulable_count).collect::<Vec<_>>())),
+                        Arc::new(Int64Array::from(t.iter().map(|r| r.trace_id).collect::<Vec<_>>())),
+                        Arc::new(Int64Array::from(t.iter().map(|r| r.causal_operation_id).collect::<Vec<_>>())),
+                    ],
+                )
+                .unwrap();
+                traces.write(&batch).unwrap();
+            }
+            run_records.push(run_record(run_id, ops.len() as i32));
+        }
+        append_runs_batch(&mut runs_writer, &schemas.runs, &run_records).unwrap();
+        for w in [executions, logs, traces, runs_writer] {
+            w.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn written_rows_read_back_as_arrays_built_from_one_string_per_cell() {
+        let dir = std::env::temp_dir().join(format!("spur-history-text-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reference = dir.join("reference");
+        std::fs::create_dir_all(&reference).unwrap();
+        let ops: &[(&str, &str)] = &[
+            ("ClientInterface.Write", "[{\"type\":\"VString\",\"value\":\"k\"}]"),
+            ("", ""),
+            ("Crash \u{e9}", "[{\"type\":\"VString\",\"value\":\"\u{1f600}\"}]"),
+        ];
+        let payloads: &[&str] = &["[]", "[\"\"]", "", "[\"\u{4e2d}\\\"\"]"];
+        let runs: &[(i64, &[(&str, &str)], &[&str], &[&str])] = &[
+            (0, ops, &[], payloads),
+            (1, &ops[..1], MIXED_TEXT, &[]),
+            (2, &[], &[], &[]),
+            (3, ops, MIXED_TEXT, payloads),
+        ];
+
+        let candidate = dir.join("candidate");
+        let writer = ParquetWriter::spawn(&candidate, 1, 1_000).unwrap();
+        for &(run_id, ops, contents, payloads) in runs {
+            writer.write(run_rows(ops, contents, payloads), run_record(run_id, ops.len() as i32));
+        }
+        writer.shutdown();
+        write_reference(&reference, runs);
+
+        for table in ["executions", "logs", "traces", "runs"] {
+            assert_same_rows(
+                &candidate.join(table).join(batch_filename(1)),
+                &reference.join(format!("{table}.parquet")),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_executions_write_releases_the_text_storage_it_borrowed() {
+        let dir = std::env::temp_dir().join(format!("spur-history-release-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let schemas = Schemas::new();
+        let mut writer = open_parquet_writer(&dir.join("executions.parquet"), schemas.executions.clone()).unwrap();
+        let mut rows = run_rows(&[("a", "[]"), ("\u{e9}", "")], &[], &[]);
+        let (action_capacity, payload_capacity) = (rows.text.action.capacity(), rows.text.op_payload.capacity());
+        let mut scratch = OffsetScratch::default();
+        for _ in 0..2 {
+            rows.text.action.push_str("a\u{e9}");
+            rows.text.op_payload.push_str("[]");
+            append_executions_batch(&mut writer, &schemas.executions, 0, &rows.history, &mut rows.text, &mut scratch).unwrap();
+            assert!(rows.text.action.is_empty() && rows.text.op_payload.is_empty(), "text comes back cleared");
+            assert!(rows.text.action.capacity() >= action_capacity, "the action storage came back");
+            assert!(rows.text.op_payload.capacity() >= payload_capacity, "the payload storage came back");
+            assert!(scratch.action.capacity() >= 3 && scratch.op_payload.capacity() >= 3, "the offsets came back");
+        }
+        writer.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn rows_for(run_id: i64) -> usize {
         (run_id % 7 + 1) as usize
     }
@@ -1033,56 +1475,10 @@ mod parquet_writer_tests {
         let runs: i64 = 100;
         for run_id in 0..runs {
             let n = rows_for(run_id);
-            let history = (0..n)
-                .map(|i| PersistableOp {
-                    unique_id: i as i64,
-                    client_id: 0,
-                    kind: "Invocation",
-                    action: "Write".to_string(),
-                    payload_json: "{}".to_string(),
-                    step: i as i32,
-                })
-                .collect();
-            let logs = (0..n)
-                .map(|i| PersistableLog {
-                    node_id: 0,
-                    content: format!("line {i}"),
-                    step: i as i32,
-                })
-                .collect();
-            let traces = (0..n)
-                .map(|i| PersistableTrace {
-                    node_id: 0,
-                    step: i as i32,
-                    function_name: Arc::from("f"),
-                    trace_kind: "enter",
-                    payload: "{}".to_string(),
-                    schedulable_count: 0,
-                    trace_id: i as i64,
-                    causal_operation_id: None,
-                })
-                .collect();
-            writer.write(run_id, history, logs, traces);
-            writer.write_run(PersistableRun {
-                run_id,
-                arm: "test".to_string(),
-                arm_index: -1,
-                config_index: (run_id % 3) as i32,
-                workload_seed: run_id as u64,
-                schedule_seed: run_id as u64 + 1,
-                steps_used: n as i32,
-                wall_us: 10,
-                end_reason: "plan_complete",
-                session_offset_ms: run_id,
-                timers_fired: 0,
-                timers_acted: 0,
-                timers_inflight_fired: 0,
-                timers_inflight_acted: 0,
-                timers_idle_fired: 0,
-                timers_idle_acted: 0,
-                max_inert_streak: 0,
-                variant: 0,
-            });
+            let lines: Vec<String> = (0..n).map(|i| format!("line {i}")).collect();
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let ops: Vec<(&str, &str)> = vec![("Write", "{}"); n];
+            writer.write(run_rows(&ops, &lines, &vec!["{}"; n]), run_record(run_id, n as i32));
         }
         writer.shutdown();
 
@@ -1136,21 +1532,12 @@ mod parquet_writer_tests {
         let dir = std::env::temp_dir().join(format!("spur-history-busy-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let writer = ParquetWriter::spawn(&dir, 1, 20).unwrap();
-        let history = (0..5)
-            .map(|i| PersistableOp {
-                unique_id: i,
-                client_id: 0,
-                kind: "Invocation",
-                action: "Write".to_string(),
-                payload_json: "{}".to_string(),
-                step: i as i32,
-            })
-            .collect();
-        writer.write(0, history, Vec::new(), Vec::new());
+        writer.write(run_rows(&[("Write", "{}"); 5], &[], &[]), run_record(0, 5));
         writer.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
         let after_write = util_stats::snapshot().history_writer;
         assert!(after_write.busy_ns > before.busy_ns, "writer work was not timed");
+        assert!(after_write.commands > before.commands, "the run's command was not counted");
         assert_eq!(after_write.queue_full_sends, before.queue_full_sends, "a queue with room counted as full");
 
         // The drain waits long enough that the second send finds the queue full.
