@@ -106,6 +106,16 @@ static RUN_BUFFERS_CHANNELS_CREATED: AtomicU64 = AtomicU64::new(0);
 static RUN_BUFFERS_LOG_VEC_GROWS: AtomicU64 = AtomicU64::new(0);
 static RUN_BUFFERS_TRACE_VEC_GROWS: AtomicU64 = AtomicU64::new(0);
 static PRINT_CONTENT_PRESIZED: AtomicU64 = AtomicU64::new(0);
+static COMPILED_OPS_LABEL_EXECS: AtomicU64 = AtomicU64::new(0);
+static COMPILED_OPS_LEGACY_LABELS: AtomicU64 = AtomicU64::new(0);
+static COMPILED_EXPR_LEAF_OPERANDS_INLINE: AtomicU64 = AtomicU64::new(0);
+static COMPILED_EXPR_TREE_EVALS: AtomicU64 = AtomicU64::new(0);
+static COMPILED_EXPR_LEGACY_EVALS: AtomicU64 = AtomicU64::new(0);
+static CALL_TARGETS_INDEXED: AtomicU64 = AtomicU64::new(0);
+static CALL_TARGETS_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static CHANNEL_TABLE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+static CHANNEL_TABLE_LOOKUP_MISSES: AtomicU64 = AtomicU64::new(0);
+static CHANNEL_TABLE_DENSE_INSERTS: AtomicU64 = AtomicU64::new(0);
 static HW_BUSY_NS: AtomicU64 = AtomicU64::new(0);
 static HW_QUEUE_FULL_SENDS: AtomicU64 = AtomicU64::new(0);
 static HW_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
@@ -840,6 +850,16 @@ pub fn set_enabled(on: bool) {
             &RUN_BUFFERS_LOG_VEC_GROWS,
             &RUN_BUFFERS_TRACE_VEC_GROWS,
             &PRINT_CONTENT_PRESIZED,
+            &COMPILED_OPS_LABEL_EXECS,
+            &COMPILED_OPS_LEGACY_LABELS,
+            &COMPILED_EXPR_LEAF_OPERANDS_INLINE,
+            &COMPILED_EXPR_TREE_EVALS,
+            &COMPILED_EXPR_LEGACY_EVALS,
+            &CALL_TARGETS_INDEXED,
+            &CALL_TARGETS_FALLBACK,
+            &CHANNEL_TABLE_LOOKUPS,
+            &CHANNEL_TABLE_LOOKUP_MISSES,
+            &CHANNEL_TABLE_DENSE_INSERTS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -1879,6 +1899,11 @@ thread_local! {
     static LOG_VEC_GROWS_RUN: Cell<u64> = const { Cell::new(0) };
     static TRACE_VEC_GROWS_RUN: Cell<u64> = const { Cell::new(0) };
     static PRINT_PRESIZED_RUN: Cell<u64> = const { Cell::new(0) };
+    /// Interpreter and channel table counts of the run executing on this
+    /// thread, added once per executed segment and drained with the cells
+    /// above.
+    static INTERPRETER_RUN: Cell<InterpreterTally> = const { Cell::new(InterpreterTally::new()) };
+    static CHANNEL_TABLE_RUN: Cell<[u64; 3]> = const { Cell::new([0; 3]) };
     /// Counters written at every scheduling step, delivery or timer firing
     /// of the run executing on this thread, folded into the session totals
     /// once the run ends. Each counter is its own cell so a write touches
@@ -5450,6 +5475,80 @@ impl RunBufferStats {
     }
 }
 
+/// Labels run by the decoded operation loop, and labels run one by one from
+/// the graph because a program carried no decoded form.
+#[derive(Serialize, Debug)]
+pub struct CompiledOpsStats {
+    pub label_execs: u64,
+    pub legacy_labels: u64,
+}
+
+impl CompiledOpsStats {
+    fn read() -> Self {
+        Self {
+            label_execs: COMPILED_OPS_LABEL_EXECS.load(Ordering::Relaxed),
+            legacy_labels: COMPILED_OPS_LEGACY_LABELS.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Decoded expression evaluation. `leaf_operands_inline` counts slot and
+/// literal positions read without entering the tree evaluator,
+/// `tree_evals` counts entries into it, and `legacy_evals` counts
+/// expressions a label executed from the graph evaluated.
+#[derive(Serialize, Debug)]
+pub struct CompiledExprStats {
+    pub leaf_operands_inline: u64,
+    pub tree_evals: u64,
+    pub legacy_evals: u64,
+}
+
+impl CompiledExprStats {
+    fn read() -> Self {
+        Self {
+            leaf_operands_inline: COMPILED_EXPR_LEAF_OPERANDS_INLINE.load(Ordering::Relaxed),
+            tree_evals: COMPILED_EXPR_TREE_EVALS.load(Ordering::Relaxed),
+            legacy_evals: COMPILED_EXPR_LEGACY_EVALS.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Call labels whose callee came from the per-vertex table, and those that
+/// resolved it by name.
+#[derive(Serialize, Debug)]
+pub struct CallTargetStats {
+    pub indexed: u64,
+    pub fallback: u64,
+}
+
+impl CallTargetStats {
+    fn read() -> Self {
+        Self {
+            indexed: CALL_TARGETS_INDEXED.load(Ordering::Relaxed),
+            fallback: CALL_TARGETS_FALLBACK.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Channel table mutable lookups, the ones that found no channel, and
+/// channels appended, over ended runs.
+#[derive(Serialize, Debug)]
+pub struct ChannelTableStats {
+    pub lookups: u64,
+    pub lookup_misses: u64,
+    pub dense_inserts: u64,
+}
+
+impl ChannelTableStats {
+    fn read() -> Self {
+        Self {
+            lookups: CHANNEL_TABLE_LOOKUPS.load(Ordering::Relaxed),
+            lookup_misses: CHANNEL_TABLE_LOOKUP_MISSES.load(Ordering::Relaxed),
+            dense_inserts: CHANNEL_TABLE_DENSE_INSERTS.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Print lines whose text buffer was allocated at its final size.
 #[derive(Serialize, Debug)]
 pub struct PrintContentStats {
@@ -5728,6 +5827,97 @@ pub fn record_print_presized() {
     tick(&PRINT_PRESIZED_RUN);
 }
 
+/// Interpreter counts of one executed segment, kept in a local while the
+/// segment runs and added to the thread's run cell once when it returns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InterpreterTally {
+    pub label_execs: u64,
+    pub legacy_labels: u64,
+    pub leaf_operands_inline: u64,
+    pub tree_evals: u64,
+    pub legacy_evals: u64,
+    pub call_targets_indexed: u64,
+    pub call_targets_fallback: u64,
+}
+
+impl InterpreterTally {
+    pub const fn new() -> Self {
+        Self {
+            label_execs: 0,
+            legacy_labels: 0,
+            leaf_operands_inline: 0,
+            tree_evals: 0,
+            legacy_evals: 0,
+            call_targets_indexed: 0,
+            call_targets_fallback: 0,
+        }
+    }
+
+    fn add(self, o: Self) -> Self {
+        Self {
+            label_execs: self.label_execs + o.label_execs,
+            legacy_labels: self.legacy_labels + o.legacy_labels,
+            leaf_operands_inline: self.leaf_operands_inline + o.leaf_operands_inline,
+            tree_evals: self.tree_evals + o.tree_evals,
+            legacy_evals: self.legacy_evals + o.legacy_evals,
+            call_targets_indexed: self.call_targets_indexed + o.call_targets_indexed,
+            call_targets_fallback: self.call_targets_fallback + o.call_targets_fallback,
+        }
+    }
+
+    /// Adds this segment's counts to the running thread's run cell.
+    #[inline]
+    pub fn flush(self) {
+        INTERPRETER_RUN.with(|c| c.set(c.get().add(self)));
+    }
+}
+
+/// The running thread's interpreter counts not yet drained into the session
+/// totals.
+pub fn pending_interpreter_tally() -> InterpreterTally {
+    INTERPRETER_RUN.with(|c| c.get())
+}
+
+/// The running thread's evaluator events not yet drained: variable operands
+/// read in place that were handles, those that were scalars, and leaf values
+/// hashed with a deferred signature.
+#[cfg(test)]
+pub(crate) fn pending_evaluator_events() -> [u64; 3] {
+    [
+        HANDLES_NOT_CLONED_RUN.with(|c| c.get()),
+        SCALARS_NOT_CLONED_RUN.with(|c| c.get()),
+        LEAF_HASHES_DEFERRED_RUN.with(|c| c.get()),
+    ]
+}
+
+/// A label ran from the graph because its program carried no decoded form.
+pub fn record_legacy_label() {
+    INTERPRETER_RUN.with(|c| {
+        let mut t = c.get();
+        t.legacy_labels += 1;
+        c.set(t);
+    });
+}
+
+/// A label run from the graph evaluated one expression.
+pub fn record_legacy_eval() {
+    INTERPRETER_RUN.with(|c| {
+        let mut t = c.get();
+        t.legacy_evals += 1;
+        c.set(t);
+    });
+}
+
+/// A run ended after `lookups` mutable channel lookups, `misses` of them
+/// finding no channel, and `inserts` channels appended.
+#[inline]
+pub fn record_channel_table(lookups: u64, misses: u64, inserts: u64) {
+    CHANNEL_TABLE_RUN.with(|c| {
+        let [l, m, i] = c.get();
+        c.set([l + lookups, m + misses, i + inserts]);
+    });
+}
+
 /// A write to a local call frame found it shared, so the write copied it.
 #[inline]
 pub fn record_entry_frame_copy() {
@@ -5757,8 +5947,26 @@ pub fn flush_frame_stats() {
         (&PRINT_PRESIZED_RUN, &PRINT_CONTENT_PRESIZED),
     ]
     .map(|(cell, total)| (cell.with(|c| c.replace(0)), total));
+    let interp = INTERPRETER_RUN.with(|c| c.replace(InterpreterTally::new()));
+    let [lookups, misses, inserts] = CHANNEL_TABLE_RUN.with(|c| c.replace([0; 3]));
     if !enabled() {
         return;
+    }
+    for (v, total) in [
+        (interp.label_execs, &COMPILED_OPS_LABEL_EXECS),
+        (interp.legacy_labels, &COMPILED_OPS_LEGACY_LABELS),
+        (interp.leaf_operands_inline, &COMPILED_EXPR_LEAF_OPERANDS_INLINE),
+        (interp.tree_evals, &COMPILED_EXPR_TREE_EVALS),
+        (interp.legacy_evals, &COMPILED_EXPR_LEGACY_EVALS),
+        (interp.call_targets_indexed, &CALL_TARGETS_INDEXED),
+        (interp.call_targets_fallback, &CALL_TARGETS_FALLBACK),
+        (lookups, &CHANNEL_TABLE_LOOKUPS),
+        (misses, &CHANNEL_TABLE_LOOKUP_MISSES),
+        (inserts, &CHANNEL_TABLE_DENSE_INSERTS),
+    ] {
+        if v != 0 {
+            total.fetch_add(v, Ordering::Relaxed);
+        }
     }
     for (v, total) in drained {
         if v != 0 {
@@ -6840,6 +7048,10 @@ pub struct UtilizationSnapshot {
     pub eval_borrow: EvalBorrowStats,
     pub run_buffers: RunBufferStats,
     pub print_content: PrintContentStats,
+    pub compiled_ops: CompiledOpsStats,
+    pub compiled_expr: CompiledExprStats,
+    pub call_targets: CallTargetStats,
+    pub channel_table: ChannelTableStats,
     pub stats_local: StatsLocalStats,
     pub fresh_first: FreshFirstStats,
     pub pair_order: PairOrderStats,
@@ -7063,6 +7275,10 @@ pub fn snapshot() -> UtilizationSnapshot {
         eval_borrow: EvalBorrowStats::read(),
         run_buffers: RunBufferStats::read(),
         print_content: PrintContentStats::read(),
+        compiled_ops: CompiledOpsStats::read(),
+        compiled_expr: CompiledExprStats::read(),
+        call_targets: CallTargetStats::read(),
+        channel_table: ChannelTableStats::read(),
         stats_local: StatsLocalStats::read(),
         fresh_first: FreshFirstStats::read(),
         pair_order: PairOrderStats::read(),

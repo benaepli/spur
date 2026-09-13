@@ -527,6 +527,8 @@ fn record_termination<H: HashPolicy>(
     });
     util_stats::record_ghost_release_run(state.ghost_release.cell, steps_used);
     util_stats::record_channels_created(state.channels.len() as u64);
+    let (lookups, misses) = state.channels.lookup_counts();
+    util_stats::record_channel_table(lookups, misses, state.channels.len() as u64);
     util_stats::flush_frame_stats();
 }
 

@@ -2,6 +2,7 @@ pub mod error;
 pub mod values;
 pub mod state;
 pub mod eval;
+pub mod compiled_eval;
 pub mod exec;
 pub mod scheduler;
 pub mod partition;

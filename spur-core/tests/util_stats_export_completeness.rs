@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    EvalBorrowStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CallTargetStats, ChannelTableStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1316,6 +1316,81 @@ fn run_buffers_leaves(prefix: &str, r: &RunBufferStats) -> Vec<(String, Value)> 
     ]
 }
 
+fn compiled_ops(m: &mut Marks) -> CompiledOpsStats {
+    CompiledOpsStats {
+        label_execs: m.int(),
+        legacy_labels: m.int(),
+    }
+}
+
+fn compiled_ops_leaves(prefix: &str, c: &CompiledOpsStats) -> Vec<(String, Value)> {
+    let CompiledOpsStats {
+        label_execs,
+        legacy_labels,
+    } = c;
+    vec![
+        leaf(prefix, "label_execs", *label_execs),
+        leaf(prefix, "legacy_labels", *legacy_labels),
+    ]
+}
+
+fn compiled_expr(m: &mut Marks) -> CompiledExprStats {
+    CompiledExprStats {
+        leaf_operands_inline: m.int(),
+        tree_evals: m.int(),
+        legacy_evals: m.int(),
+    }
+}
+
+fn compiled_expr_leaves(prefix: &str, c: &CompiledExprStats) -> Vec<(String, Value)> {
+    let CompiledExprStats {
+        leaf_operands_inline,
+        tree_evals,
+        legacy_evals,
+    } = c;
+    vec![
+        leaf(prefix, "leaf_operands_inline", *leaf_operands_inline),
+        leaf(prefix, "tree_evals", *tree_evals),
+        leaf(prefix, "legacy_evals", *legacy_evals),
+    ]
+}
+
+fn call_targets(m: &mut Marks) -> CallTargetStats {
+    CallTargetStats {
+        indexed: m.int(),
+        fallback: m.int(),
+    }
+}
+
+fn call_targets_leaves(prefix: &str, c: &CallTargetStats) -> Vec<(String, Value)> {
+    let CallTargetStats { indexed, fallback } = c;
+    vec![
+        leaf(prefix, "indexed", *indexed),
+        leaf(prefix, "fallback", *fallback),
+    ]
+}
+
+fn channel_table(m: &mut Marks) -> ChannelTableStats {
+    ChannelTableStats {
+        lookups: m.int(),
+        lookup_misses: m.int(),
+        dense_inserts: m.int(),
+    }
+}
+
+fn channel_table_leaves(prefix: &str, c: &ChannelTableStats) -> Vec<(String, Value)> {
+    let ChannelTableStats {
+        lookups,
+        lookup_misses,
+        dense_inserts,
+    } = c;
+    vec![
+        leaf(prefix, "lookups", *lookups),
+        leaf(prefix, "lookup_misses", *lookup_misses),
+        leaf(prefix, "dense_inserts", *dense_inserts),
+    ]
+}
+
 fn print_content(m: &mut Marks) -> PrintContentStats {
     PrintContentStats { presized: m.int() }
 }
@@ -2110,6 +2185,10 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         eval_borrow: _,
         run_buffers: _,
         print_content: _,
+        compiled_ops: _,
+        compiled_expr: _,
+        call_targets: _,
+        channel_table: _,
         stats_local: _,
         fresh_first: _,
         pair_order: _,
@@ -2162,6 +2241,10 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "eval_borrow",
         "run_buffers",
         "print_content",
+        "compiled_ops",
+        "compiled_expr",
+        "call_targets",
+        "channel_table",
         "stats_local",
         "fresh_first",
         "pair_order",
@@ -2248,6 +2331,10 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.eval_borrow = eval_borrow(&mut m);
     s.run_buffers = run_buffers(&mut m);
     s.print_content = print_content(&mut m);
+    s.compiled_ops = compiled_ops(&mut m);
+    s.compiled_expr = compiled_expr(&mut m);
+    s.call_targets = call_targets(&mut m);
+    s.channel_table = channel_table(&mut m);
     s.stats_local = stats_local(&mut m);
     s.fresh_first = fresh_first(&mut m);
     s.pair_order = pair_order(&mut m);
@@ -2280,6 +2367,10 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(eval_borrow_leaves("eval_borrow", &s.eval_borrow));
     expected.extend(run_buffers_leaves("run_buffers", &s.run_buffers));
     expected.extend(print_content_leaves("print_content", &s.print_content));
+    expected.extend(compiled_ops_leaves("compiled_ops", &s.compiled_ops));
+    expected.extend(compiled_expr_leaves("compiled_expr", &s.compiled_expr));
+    expected.extend(call_targets_leaves("call_targets", &s.call_targets));
+    expected.extend(channel_table_leaves("channel_table", &s.channel_table));
     expected.extend(stats_local_leaves("stats_local", &s.stats_local));
     expected.extend(fresh_first_leaves("fresh_first", &s.fresh_first));
     expected.extend(pair_order_leaves("pair_order", &s.pair_order));
@@ -2337,6 +2428,10 @@ fn every_counter_field_reaches_the_written_json() {
         "eval_borrow",
         "run_buffers",
         "print_content",
+        "compiled_ops",
+        "compiled_expr",
+        "call_targets",
+        "channel_table",
         "stats_local",
         "fresh_first",
         "pair_order",

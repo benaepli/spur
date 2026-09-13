@@ -224,9 +224,19 @@ pub struct Program {
     /// Maps each structurally distinct Type to a unique TypeId.
     #[serde(skip)]
     pub type_ids: TypeIdMap,
+
+    /// The graph decoded for execution. Built from every field above, so it
+    /// must be rebuilt by `decode` after any of them changes.
+    #[serde(skip)]
+    pub compiled: super::compiled::CompiledProgram,
 }
 
 impl Program {
+    /// Builds the execution form of the graph from the current labels.
+    pub fn decode(&mut self) {
+        self.compiled = super::compiled::CompiledProgram::build(self);
+    }
+
     /// Look up a function by its qualified name (e.g., "Node.Init").
     /// Returns the FunctionInfo if found, None otherwise.
     pub fn get_func_by_name(&self, name: &str) -> Option<&FunctionInfo> {

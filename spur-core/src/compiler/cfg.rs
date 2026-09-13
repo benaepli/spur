@@ -1,4 +1,6 @@
+pub mod compiled;
 mod ir;
+pub use compiled::{CExpr, CompiledProgram, Op, Opnd};
 pub use ir::*;
 
 use crate::analysis::resolver::{BuiltinFn, NameId};
@@ -259,7 +261,7 @@ impl Compiler {
             }
         }
 
-        Program {
+        let mut program = Program {
             cfg: Cfg { graph: self.cfg },
             rpc: self.rpc_map,
             func_name_to_id: self.func_name_to_id,
@@ -269,7 +271,10 @@ impl Compiler {
             max_node_slots: self.max_node_slots,
             roles: self.roles,
             type_ids: self.type_ids,
-        }
+            compiled: CompiledProgram::default(),
+        };
+        program.decode();
+        program
     }
 
     fn compile_init_func(

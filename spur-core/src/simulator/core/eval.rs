@@ -199,7 +199,7 @@ pub fn build_frame<H: HashPolicy>(func: &FunctionInfo, args: &[Value<H>]) -> Env
     builder.finish(func)
 }
 
-fn update_collection<H: HashPolicy>(
+pub(crate) fn update_collection<H: HashPolicy>(
     col: Value<H>,
     key: Operand<'_, H>,
     val: Value<H>,

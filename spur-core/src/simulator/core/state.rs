@@ -17,16 +17,92 @@ use crate::simulator::util_stats::DeliveryBias;
 use ecow::EcoVec;
 use imbl::{HashMap as ImHashMap, OrdSet, Vector};
 use rand_distr::{Beta, Distribution};
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// Channel storage. The hasher carries no per-process seed, so a session at
-/// one seed replays the same schedule; the only place the map is iterated
-/// combines entries with XOR, so iteration order is not observable either way.
-pub type ChannelMap<H> = HashMap<ChannelId, ChannelState<H>, BuildHasherDefault<FxHasher>>;
+/// Channel storage indexed by channel id. Ids are allocated from 0 within a
+/// run, one per insert, and nothing is removed, so an id is its channel's
+/// position. A lookup whose position holds a channel of another node misses.
+/// The only place the table is iterated combines entries with XOR, so
+/// iteration order is not observable.
+#[derive(Debug, Clone)]
+pub struct ChannelTable<H: HashPolicy> {
+    ids: Vec<ChannelId>,
+    states: Vec<ChannelState<H>>,
+    lookups: u64,
+    lookup_misses: u64,
+}
+
+impl<H: HashPolicy> ChannelTable<H> {
+    /// An empty table with room for exactly `capacity` channels.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ids: Vec::with_capacity(capacity),
+            states: Vec::with_capacity(capacity),
+            lookups: 0,
+            lookup_misses: 0,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.states.capacity()
+    }
+
+    pub fn get(&self, id: &ChannelId) -> Option<&ChannelState<H>> {
+        match self.ids.get(id.id) {
+            Some(stored) if stored == id => Some(&self.states[id.id]),
+            _ => None,
+        }
+    }
+
+    /// Counted: every call is a lookup, and a call that finds nothing is a
+    /// miss.
+    #[inline]
+    pub fn get_mut(&mut self, id: &ChannelId) -> Option<&mut ChannelState<H>> {
+        self.lookups += 1;
+        match self.ids.get(id.id) {
+            Some(stored) if stored == id => Some(&mut self.states[id.id]),
+            _ => {
+                self.lookup_misses += 1;
+                None
+            }
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ChannelId, &ChannelState<H>)> {
+        self.ids.iter().zip(self.states.iter())
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &ChannelId> {
+        self.ids.iter()
+    }
+
+    /// Appends an empty channel. `id.id` must equal the current length.
+    #[inline]
+    pub fn insert_new(&mut self, id: ChannelId) {
+        assert_eq!(id.id, self.states.len(), "channel ids are allocated densely");
+        self.ids.push(id);
+        self.states.push(ChannelState::new());
+    }
+
+    /// Mutable lookups and misses so far.
+    pub fn lookup_counts(&self) -> (u64, u64) {
+        (self.lookups, self.lookup_misses)
+    }
+}
 
 /// Defines the priority band for a category of runnable.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -600,7 +676,7 @@ pub struct State<H: HashPolicy> {
     pub purgatory: Vec<(i32, Runnable<H>)>,
     /// Owned outright like `nodes` and the run queues, so a channel is updated
     /// through the map rather than copied out and put back.
-    pub channels: ChannelMap<H>,
+    pub channels: ChannelTable<H>,
     pub crash_info: CrashInfo<H>,
     pub partition_info: PartitionInfo<H>,
     /// Per-node durable storage that survives crashes. Keyed by node index.
@@ -848,7 +924,7 @@ impl<H: HashPolicy> State<H> {
             network_queue: Vec::new(),
             timer_queue: Vec::new(),
             purgatory: Vec::new(),
-            channels: ChannelMap::with_capacity_and_hasher(channel_capacity, Default::default()),
+            channels: ChannelTable::with_capacity(channel_capacity),
             crash_info: CrashInfo {
                 currently_crashed: OrdSet::new(),
                 queued_messages: Vector::new(),
@@ -1025,7 +1101,7 @@ impl<H: HashPolicy> State<H> {
         if self.channels.len() == self.channels.capacity() {
             crate::simulator::util_stats::record_channel_table_grow();
         }
-        self.channels.insert(id, ChannelState::new());
+        self.channels.insert_new(id);
     }
 
     pub fn alloc_channel_id(&mut self) -> usize {
