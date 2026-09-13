@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FrameStats, StatsLocalStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    FrameStats, HistoryWriterStats, StatsLocalStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1255,6 +1255,27 @@ fn frame_leaves(prefix: &str, f: &FrameStats) -> Vec<(String, Value)> {
     ]
 }
 
+fn history_writer(m: &mut Marks) -> HistoryWriterStats {
+    HistoryWriterStats {
+        busy_ns: m.int(),
+        queue_full_sends: m.int(),
+        blocked_ns: m.int(),
+    }
+}
+
+fn history_writer_leaves(prefix: &str, h: &HistoryWriterStats) -> Vec<(String, Value)> {
+    let HistoryWriterStats {
+        busy_ns,
+        queue_full_sends,
+        blocked_ns,
+    } = h;
+    vec![
+        leaf(prefix, "busy_ns", *busy_ns),
+        leaf(prefix, "queue_full_sends", *queue_full_sends),
+        leaf(prefix, "blocked_ns", *blocked_ns),
+    ]
+}
+
 fn stats_local(m: &mut Marks) -> StatsLocalStats {
     StatsLocalStats {
         folds: m.int(),
@@ -1964,6 +1985,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         timer_context: _,
         timeline_keys: _,
         steer_terms: _,
+        history_writer: _,
     } = s;
     vec![
         "rng_streams",
@@ -2007,6 +2029,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "timer_context",
         "timeline_keys",
         "steer_terms",
+        "history_writer",
     ]
 }
 
@@ -2083,6 +2106,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.replay = replay(&mut m);
     s.timer_context = timer_context(&mut m);
     s.plan_deps = plan_deps(&mut m);
+    s.history_writer = history_writer(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
     expected.extend(plan_deps_leaves("plan_deps", &s.plan_deps));
@@ -2105,6 +2129,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(arm_selector_axis_leaves("arm_selector_axis", &s.arm_selector_axis));
     expected.extend(replay_leaves("replay", &s.replay));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
+    expected.extend(history_writer_leaves("history_writer", &s.history_writer));
     (s, expected)
 }
 
@@ -2153,6 +2178,7 @@ fn every_counter_field_reaches_the_written_json() {
         "arm_selector_axis",
         "replay",
         "timer_context",
+        "history_writer",
     ] {
         let mut actual = BTreeMap::new();
         leaves(&parsed[block], block, &mut actual);

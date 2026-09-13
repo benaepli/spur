@@ -96,6 +96,9 @@ static GS_FIRED_RUNS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
 static FRAME_SLOTS_BUILT: AtomicU64 = AtomicU64::new(0);
 static FRAME_ENTRY_COPIES: AtomicU64 = AtomicU64::new(0);
+static HW_BUSY_NS: AtomicU64 = AtomicU64::new(0);
+static HW_QUEUE_FULL_SENDS: AtomicU64 = AtomicU64::new(0);
+static HW_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Advanced by every session reset. A per-thread counter block remembers the
 /// value it was activated under and is dropped rather than folded when the
@@ -802,6 +805,9 @@ pub fn set_enabled(on: bool) {
             &RWP_FLIPPED,
             &STATS_LOCAL_FOLDS,
             &STATS_LOCAL_FOLDED_INCREMENTS,
+            &HW_BUSY_NS,
+            &HW_QUEUE_FULL_SENDS,
+            &HW_BLOCKED_NS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -5339,6 +5345,49 @@ impl FrameStats {
     }
 }
 
+/// The history writer's threads and the queue in front of them. `busy_ns` is
+/// time writer threads spent handling queued runs, so `busy_ns` divided by
+/// wall time and by the writer thread count is the share of the writers in
+/// use. `queue_full_sends` counts sends from simulation threads that found the
+/// queue full, and `blocked_ns` is the time those sends waited for room; both
+/// stay 0 while the writers keep up.
+#[derive(Serialize, Debug)]
+pub struct HistoryWriterStats {
+    pub busy_ns: u64,
+    pub queue_full_sends: u64,
+    pub blocked_ns: u64,
+}
+
+impl HistoryWriterStats {
+    fn read() -> Self {
+        Self {
+            busy_ns: HW_BUSY_NS.load(Ordering::Relaxed),
+            queue_full_sends: HW_QUEUE_FULL_SENDS.load(Ordering::Relaxed),
+            blocked_ns: HW_BLOCKED_NS.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A history writer thread spent `busy_ns` handling one queued command.
+#[inline]
+pub fn record_history_writer_busy(busy_ns: u64) {
+    if !enabled() {
+        return;
+    }
+    HW_BUSY_NS.fetch_add(busy_ns, Ordering::Relaxed);
+}
+
+/// A send to the history writer found its queue full and waited `blocked_ns`
+/// for room.
+#[inline]
+pub fn record_history_writer_blocked(blocked_ns: u64) {
+    if !enabled() {
+        return;
+    }
+    HW_QUEUE_FULL_SENDS.fetch_add(1, Ordering::Relaxed);
+    HW_BLOCKED_NS.fetch_add(blocked_ns, Ordering::Relaxed);
+}
+
 /// Counter blocks folded into the session totals at run end, and the writes
 /// they carried.
 #[derive(Serialize, Debug)]
@@ -6467,6 +6516,7 @@ pub struct UtilizationSnapshot {
     pub timer_context: TimerContextStats,
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
+    pub history_writer: HistoryWriterStats,
 }
 
 /// The snapshot as JSON, for readers that difference or accumulate it.
@@ -6681,6 +6731,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         timer_context: TimerContextStats::read(),
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),
+        history_writer: HistoryWriterStats::read(),
     }
 }
 

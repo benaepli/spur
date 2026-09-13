@@ -1,6 +1,7 @@
 use crate::simulator::core::{
     ChannelId, LogEntry, OpKind, Operation, TraceEntry, TraceKind, Value, ValueKind,
 };
+use crate::simulator::util_stats;
 use arrow::array::{Int32Array, Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -16,6 +17,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 /// A pre-serialized operation ready for database / file insertion.
 /// JSON serialization is done by worker threads before sending to the writer.
@@ -667,6 +669,7 @@ fn writer_loop(
     let mut writes_in_batch: usize = 0;
     let mut series: usize = 0;
     while let Ok(cmd) = receiver.recv() {
+        let started = util_stats::enabled().then(Instant::now);
         match cmd {
             HistoryCommand::Write {
                 run_id,
@@ -712,8 +715,17 @@ fn writer_loop(
             }
             HistoryCommand::Shutdown => break,
         }
+        record_writer_busy(started);
     }
+    let started = util_stats::enabled().then(Instant::now);
     batch.finish();
+    record_writer_busy(started);
+}
+
+fn record_writer_busy(started: Option<Instant>) {
+    if let Some(started) = started {
+        util_stats::record_history_writer_busy(started.elapsed().as_nanos() as u64);
+    }
 }
 
 impl ParquetWriter {
@@ -763,6 +775,24 @@ impl ParquetWriter {
     }
 }
 
+impl ParquetWriter {
+    /// Queues a command, waiting for room when the queue is full. Only a send
+    /// that finds the queue full reads the clock, so simulation threads pay
+    /// nothing extra while the writers keep up.
+    fn send(&self, cmd: HistoryCommand) -> Result<(), channel::SendError<HistoryCommand>> {
+        match self.sender.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(channel::TrySendError::Full(cmd)) => {
+                let started = Instant::now();
+                let sent = self.sender.send(cmd);
+                util_stats::record_history_writer_blocked(started.elapsed().as_nanos() as u64);
+                sent
+            }
+            Err(channel::TrySendError::Disconnected(cmd)) => Err(channel::SendError(cmd)),
+        }
+    }
+}
+
 impl HistoryWriter for ParquetWriter {
     fn write(
         &self,
@@ -771,7 +801,7 @@ impl HistoryWriter for ParquetWriter {
         logs: Vec<PersistableLog>,
         traces: Vec<PersistableTrace>,
     ) {
-        if let Err(e) = self.sender.send(HistoryCommand::Write {
+        if let Err(e) = self.send(HistoryCommand::Write {
             run_id,
             history,
             logs,
@@ -787,7 +817,7 @@ impl HistoryWriter for ParquetWriter {
 
     fn write_run(&self, run: PersistableRun) {
         let run_id = run.run_id;
-        if let Err(e) = self.sender.send(HistoryCommand::Run(run)) {
+        if let Err(e) = self.send(HistoryCommand::Run(run)) {
             log::error!("Failed to send run row for run {}: {}", run_id, e);
         }
     }
@@ -948,6 +978,55 @@ mod parquet_writer_tests {
             assert!(files > 3, "{table}: rotation produced only {files} files");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_busy_time_and_full_queue_waits_are_counted() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let before = util_stats::snapshot().history_writer;
+
+        let dir = std::env::temp_dir().join(format!("spur-history-busy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let writer = ParquetWriter::spawn(&dir, 1, 20).unwrap();
+        let history = (0..5)
+            .map(|i| PersistableOp {
+                unique_id: i,
+                client_id: 0,
+                kind: "Invocation",
+                action: "Write".to_string(),
+                payload_json: "{}".to_string(),
+                step: i as i32,
+            })
+            .collect();
+        writer.write(0, history, Vec::new(), Vec::new());
+        writer.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+        let after_write = util_stats::snapshot().history_writer;
+        assert!(after_write.busy_ns > before.busy_ns, "writer work was not timed");
+        assert_eq!(after_write.queue_full_sends, before.queue_full_sends, "a queue with room counted as full");
+
+        // The drain waits long enough that the second send finds the queue full.
+        let (sender, receiver) = channel::bounded::<HistoryCommand>(1);
+        let full = ParquetWriter { sender, handles: Mutex::new(Vec::new()), writer_count: 0 };
+        full.send(HistoryCommand::Shutdown).unwrap();
+        let drain = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(100));
+            while receiver.recv().is_ok() {}
+        });
+        full.send(HistoryCommand::Shutdown).unwrap();
+        drop(full);
+        drain.join().unwrap();
+        let after_full = util_stats::snapshot().history_writer;
+        assert_eq!(after_full.queue_full_sends, after_write.queue_full_sends + 1);
+        assert!(after_full.blocked_ns > after_write.blocked_ns, "the wait for room was not timed");
+
+        util_stats::set_enabled(false);
+        util_stats::record_history_writer_blocked(1);
+        util_stats::record_history_writer_busy(1);
+        let disabled = util_stats::snapshot().history_writer;
+        assert_eq!(disabled.queue_full_sends, after_full.queue_full_sends, "a disabled session counted");
+        assert_eq!(disabled.busy_ns, after_full.busy_ns, "a disabled session counted");
     }
 }
 
