@@ -795,7 +795,11 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: F
         .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
 
     let role_node_counts = vec![(server_role, num_servers)];
-    let mut state = State::<H>::new(&role_node_counts, program.max_node_slots as usize);
+    let mut state = State::<H>::with_channel_capacity(
+        &role_node_counts,
+        program.max_node_slots as usize,
+        crate::simulator::path::channel_table_hint(),
+    );
 
     if let Some(init_fn) = program.get_func_by_name("Node.BASE_NODE_INIT") {
         for i in 0..num_servers {
@@ -1163,8 +1167,9 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     F::merge(&global_state.feedback, &path_state.feedback);
 
     let serialized = serialize_history(&path_state.history);
-    let serialized_logs = serialize_logs(std::mem::take(&mut path_state.logs.entries));
-    let serialized_traces = serialize_traces(std::mem::take(&mut path_state.logs.traces));
+    let (log_rows, trace_rows) = path_state.take_log_rows();
+    let serialized_logs = serialize_logs(log_rows);
+    let serialized_traces = serialize_traces(trace_rows);
     writer.write(run_id, serialized, serialized_logs, serialized_traces);
     writer.write_run(run_row(
         run_id,
@@ -1477,8 +1482,9 @@ fn run_single_plan<F: Feedback>(
     F::merge(&global_state.feedback, &path_state.feedback);
 
     let serialized = serialize_history(&path_state.history);
-    let serialized_logs = serialize_logs(std::mem::take(&mut path_state.logs.entries));
-    let serialized_traces = serialize_traces(std::mem::take(&mut path_state.logs.traces));
+    let (log_rows, trace_rows) = path_state.take_log_rows();
+    let serialized_logs = serialize_logs(log_rows);
+    let serialized_traces = serialize_traces(trace_rows);
     writer.write(run_id, serialized, serialized_logs, serialized_traces);
     writer.write_run(run_row(
         run_id,

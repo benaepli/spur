@@ -815,6 +815,17 @@ impl<H: HashPolicy> State<H> {
     /// Create a new state. `role_node_counts` is a list of (role NameId, count) pairs.
     /// Nodes are laid out sequentially: all nodes of the first role, then all of the second, etc.
     pub fn new(role_node_counts: &[(NameId, usize)], node_slot_count: usize) -> Self {
+        Self::with_channel_capacity(role_node_counts, node_slot_count, 0)
+    }
+
+    /// Create a new state whose channel table has room for
+    /// `channel_capacity` channels before it grows. Capacity changes no
+    /// content and no lookup.
+    pub fn with_channel_capacity(
+        role_node_counts: &[(NameId, usize)],
+        node_slot_count: usize,
+        channel_capacity: usize,
+    ) -> Self {
         let mut nodes = Vec::new();
         let mut global_index = 0usize;
         for &(role, count) in role_node_counts {
@@ -837,7 +848,7 @@ impl<H: HashPolicy> State<H> {
             network_queue: Vec::new(),
             timer_queue: Vec::new(),
             purgatory: Vec::new(),
-            channels: ChannelMap::default(),
+            channels: ChannelMap::with_capacity_and_hasher(channel_capacity, Default::default()),
             crash_info: CrashInfo {
                 currently_crashed: OrdSet::new(),
                 queued_messages: Vector::new(),
@@ -1004,6 +1015,17 @@ impl<H: HashPolicy> State<H> {
     /// across clones and reallocates only when copy-on-write fires.
     pub fn node_state_token(&self, node: NodeId) -> u64 {
         self.nodes[node.index].writes
+    }
+
+    /// Adds an empty channel under a freshly allocated id. Ids are never
+    /// reused and nothing is removed from the table, so every insert adds an
+    /// entry and the table grows exactly when it is full.
+    #[inline]
+    pub fn insert_channel(&mut self, id: ChannelId) {
+        if self.channels.len() == self.channels.capacity() {
+            crate::simulator::util_stats::record_channel_table_grow();
+        }
+        self.channels.insert(id, ChannelState::new());
     }
 
     pub fn alloc_channel_id(&mut self) -> usize {

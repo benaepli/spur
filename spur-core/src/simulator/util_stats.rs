@@ -96,6 +96,16 @@ static GS_FIRED_RUNS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
 static FRAME_SLOTS_BUILT: AtomicU64 = AtomicU64::new(0);
 static FRAME_ENTRY_COPIES: AtomicU64 = AtomicU64::new(0);
+static FRAME_DEFAULT_SLOTS_FILLED: AtomicU64 = AtomicU64::new(0);
+static FRAME_PARAMS_FILLED: AtomicU64 = AtomicU64::new(0);
+static VALUE_SIG_LEAF_HASHES_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static EVAL_BORROW_HANDLES_NOT_CLONED: AtomicU64 = AtomicU64::new(0);
+static EVAL_BORROW_SCALARS_NOT_CLONED: AtomicU64 = AtomicU64::new(0);
+static RUN_BUFFERS_CHANNEL_TABLE_GROWS: AtomicU64 = AtomicU64::new(0);
+static RUN_BUFFERS_CHANNELS_CREATED: AtomicU64 = AtomicU64::new(0);
+static RUN_BUFFERS_LOG_VEC_GROWS: AtomicU64 = AtomicU64::new(0);
+static RUN_BUFFERS_TRACE_VEC_GROWS: AtomicU64 = AtomicU64::new(0);
+static PRINT_CONTENT_PRESIZED: AtomicU64 = AtomicU64::new(0);
 static HW_BUSY_NS: AtomicU64 = AtomicU64::new(0);
 static HW_QUEUE_FULL_SENDS: AtomicU64 = AtomicU64::new(0);
 static HW_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
@@ -820,6 +830,16 @@ pub fn set_enabled(on: bool) {
             &TRACE_FORMAT_ENTER_REUSED,
             &TRACE_FORMAT_ENTER_FORMATTED,
             &HISTORY_FORMAT_OPS_STREAMED,
+            &FRAME_DEFAULT_SLOTS_FILLED,
+            &FRAME_PARAMS_FILLED,
+            &VALUE_SIG_LEAF_HASHES_DEFERRED,
+            &EVAL_BORROW_HANDLES_NOT_CLONED,
+            &EVAL_BORROW_SCALARS_NOT_CLONED,
+            &RUN_BUFFERS_CHANNEL_TABLE_GROWS,
+            &RUN_BUFFERS_CHANNELS_CREATED,
+            &RUN_BUFFERS_LOG_VEC_GROWS,
+            &RUN_BUFFERS_TRACE_VEC_GROWS,
+            &PRINT_CONTENT_PRESIZED,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -1849,6 +1869,16 @@ thread_local! {
     /// session totals once the run ends. A thread runs one run at a time, so
     /// no atomic is taken on the interpreter's path.
     static FRAME_RUN: std::cell::Cell<FrameTally> = const { std::cell::Cell::new(FrameTally::new()) };
+    /// Interpreter counts written without a stats switch check, one cell
+    /// each, drained into the session totals where the frame counts fold.
+    static LEAF_HASHES_DEFERRED_RUN: Cell<u64> = const { Cell::new(0) };
+    static HANDLES_NOT_CLONED_RUN: Cell<u64> = const { Cell::new(0) };
+    static SCALARS_NOT_CLONED_RUN: Cell<u64> = const { Cell::new(0) };
+    static CHANNEL_TABLE_GROWS_RUN: Cell<u64> = const { Cell::new(0) };
+    static CHANNELS_CREATED_RUN: Cell<u64> = const { Cell::new(0) };
+    static LOG_VEC_GROWS_RUN: Cell<u64> = const { Cell::new(0) };
+    static TRACE_VEC_GROWS_RUN: Cell<u64> = const { Cell::new(0) };
+    static PRINT_PRESIZED_RUN: Cell<u64> = const { Cell::new(0) };
     /// Counters written at every scheduling step, delivery or timer firing
     /// of the run executing on this thread, folded into the session totals
     /// once the run ends. Each counter is its own cell so a write touches
@@ -5340,11 +5370,16 @@ impl VictimSwapStats {
 /// Local call frames built by the interpreter. `calls` counts the frames,
 /// `slots_built` sums their slot counts, and `entry_frame_copies` counts the
 /// writes to a local frame that found it shared and therefore copied it.
+/// `params_filled` counts slots holding a value the caller supplied and
+/// `default_slots_filled` the slots given their declared starting value, so
+/// the two sum to `slots_built`.
 #[derive(Serialize, Debug)]
 pub struct FrameStats {
     pub calls: u64,
     pub slots_built: u64,
     pub entry_frame_copies: u64,
+    pub default_slots_filled: u64,
+    pub params_filled: u64,
 }
 
 impl FrameStats {
@@ -5353,6 +5388,78 @@ impl FrameStats {
             calls: FRAME_CALLS.load(Ordering::Relaxed),
             slots_built: FRAME_SLOTS_BUILT.load(Ordering::Relaxed),
             entry_frame_copies: FRAME_ENTRY_COPIES.load(Ordering::Relaxed),
+            default_slots_filled: FRAME_DEFAULT_SLOTS_FILLED.load(Ordering::Relaxed),
+            params_filled: FRAME_PARAMS_FILLED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Map-key hashes of leaf values whose signature was computed at hash time
+/// rather than when the value was built.
+#[derive(Serialize, Debug)]
+pub struct ValueSigStats {
+    pub leaf_hashes_deferred: u64,
+}
+
+impl ValueSigStats {
+    fn read() -> Self {
+        Self {
+            leaf_hashes_deferred: VALUE_SIG_LEAF_HASHES_DEFERRED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Variable operands the evaluator read in place instead of copying.
+/// `handles_not_cloned` counts lists, maps, strings, options, tuples and
+/// variants, whose copy touches a reference count or string bytes;
+/// `scalars_not_cloned` counts the remaining kinds.
+#[derive(Serialize, Debug)]
+pub struct EvalBorrowStats {
+    pub handles_not_cloned: u64,
+    pub scalars_not_cloned: u64,
+}
+
+impl EvalBorrowStats {
+    fn read() -> Self {
+        Self {
+            handles_not_cloned: EVAL_BORROW_HANDLES_NOT_CLONED.load(Ordering::Relaxed),
+            scalars_not_cloned: EVAL_BORROW_SCALARS_NOT_CLONED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Per-run buffers: inserts into the channel table that had to grow it,
+/// channels in the table when a run ended, and pushes that grew the log and
+/// trace row vectors.
+#[derive(Serialize, Debug)]
+pub struct RunBufferStats {
+    pub channel_table_grows: u64,
+    pub channels_created: u64,
+    pub log_vec_grows: u64,
+    pub trace_vec_grows: u64,
+}
+
+impl RunBufferStats {
+    fn read() -> Self {
+        Self {
+            channel_table_grows: RUN_BUFFERS_CHANNEL_TABLE_GROWS.load(Ordering::Relaxed),
+            channels_created: RUN_BUFFERS_CHANNELS_CREATED.load(Ordering::Relaxed),
+            log_vec_grows: RUN_BUFFERS_LOG_VEC_GROWS.load(Ordering::Relaxed),
+            trace_vec_grows: RUN_BUFFERS_TRACE_VEC_GROWS.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Print lines whose text buffer was allocated at its final size.
+#[derive(Serialize, Debug)]
+pub struct PrintContentStats {
+    pub presized: u64,
+}
+
+impl PrintContentStats {
+    fn read() -> Self {
+        Self {
+            presized: PRINT_CONTENT_PRESIZED.load(Ordering::Relaxed),
         }
     }
 }
@@ -5538,6 +5645,7 @@ struct FrameTally {
     calls: u64,
     slots_built: u64,
     entry_frame_copies: u64,
+    params_filled: u64,
 }
 
 impl FrameTally {
@@ -5546,13 +5654,16 @@ impl FrameTally {
             calls: 0,
             slots_built: 0,
             entry_frame_copies: 0,
+            params_filled: 0,
         }
     }
 }
 
-/// One local call frame of `slots` slots was built.
+/// One local call frame of `slots` slots was built, `params` of them holding
+/// caller-supplied values and the rest their declared starting value.
+/// `params` must not exceed `slots`.
 #[inline]
-pub fn record_frame_build(slots: u64) {
+pub fn record_frame_build(slots: u64, params: u64) {
     if !enabled() {
         return;
     }
@@ -5560,8 +5671,61 @@ pub fn record_frame_build(slots: u64) {
         let mut t = f.get();
         t.calls += 1;
         t.slots_built += slots;
+        t.params_filled += params;
         f.set(t);
     });
+}
+
+#[inline]
+fn tick(cell: &'static std::thread::LocalKey<Cell<u64>>) {
+    cell.with(|c| c.set(c.get() + 1));
+}
+
+/// A leaf value was hashed with its signature computed from its kind.
+#[inline]
+pub fn record_leaf_hash_deferred() {
+    tick(&LEAF_HASHES_DEFERRED_RUN);
+}
+
+/// The evaluator read a variable operand in place. `handle` is true when the
+/// value's copy would have touched a reference count or string bytes.
+#[inline]
+pub fn record_operand_borrowed(handle: bool) {
+    if handle {
+        tick(&HANDLES_NOT_CLONED_RUN);
+    } else {
+        tick(&SCALARS_NOT_CLONED_RUN);
+    }
+}
+
+/// An insert found the channel table full, so the table grew.
+#[inline]
+pub fn record_channel_table_grow() {
+    tick(&CHANNEL_TABLE_GROWS_RUN);
+}
+
+/// A run ended holding `n` channels in its table.
+#[inline]
+pub fn record_channels_created(n: u64) {
+    CHANNELS_CREATED_RUN.with(|c| c.set(c.get() + n));
+}
+
+/// A push found the log row vector full, so the vector grew.
+#[inline]
+pub fn record_log_vec_grow() {
+    tick(&LOG_VEC_GROWS_RUN);
+}
+
+/// A push found the trace row vector full, so the vector grew.
+#[inline]
+pub fn record_trace_vec_grow() {
+    tick(&TRACE_VEC_GROWS_RUN);
+}
+
+/// A print line's text buffer was allocated at its final size.
+#[inline]
+pub fn record_print_presized() {
+    tick(&PRINT_PRESIZED_RUN);
 }
 
 /// A write to a local call frame found it shared, so the write copied it.
@@ -5580,13 +5744,33 @@ pub fn record_entry_frame_copy() {
 /// Fold the running thread's frame counts into the session totals. Called
 /// where a run ends, so the totals are exact once every run has ended.
 pub fn flush_frame_stats() {
+    // These cells are written without a switch check, so they are drained
+    // even when stats are off and a later session never inherits them.
+    let drained = [
+        (&LEAF_HASHES_DEFERRED_RUN, &VALUE_SIG_LEAF_HASHES_DEFERRED),
+        (&HANDLES_NOT_CLONED_RUN, &EVAL_BORROW_HANDLES_NOT_CLONED),
+        (&SCALARS_NOT_CLONED_RUN, &EVAL_BORROW_SCALARS_NOT_CLONED),
+        (&CHANNEL_TABLE_GROWS_RUN, &RUN_BUFFERS_CHANNEL_TABLE_GROWS),
+        (&CHANNELS_CREATED_RUN, &RUN_BUFFERS_CHANNELS_CREATED),
+        (&LOG_VEC_GROWS_RUN, &RUN_BUFFERS_LOG_VEC_GROWS),
+        (&TRACE_VEC_GROWS_RUN, &RUN_BUFFERS_TRACE_VEC_GROWS),
+        (&PRINT_PRESIZED_RUN, &PRINT_CONTENT_PRESIZED),
+    ]
+    .map(|(cell, total)| (cell.with(|c| c.replace(0)), total));
     if !enabled() {
         return;
+    }
+    for (v, total) in drained {
+        if v != 0 {
+            total.fetch_add(v, Ordering::Relaxed);
+        }
     }
     let t = FRAME_RUN.with(|f| f.replace(FrameTally::new()));
     if t.calls != 0 {
         FRAME_CALLS.fetch_add(t.calls, Ordering::Relaxed);
         FRAME_SLOTS_BUILT.fetch_add(t.slots_built, Ordering::Relaxed);
+        FRAME_PARAMS_FILLED.fetch_add(t.params_filled, Ordering::Relaxed);
+        FRAME_DEFAULT_SLOTS_FILLED.fetch_add(t.slots_built - t.params_filled, Ordering::Relaxed);
     }
     if t.entry_frame_copies != 0 {
         FRAME_ENTRY_COPIES.fetch_add(t.entry_frame_copies, Ordering::Relaxed);
@@ -6652,6 +6836,10 @@ pub struct UtilizationSnapshot {
     pub victim_swap: VictimSwapStats,
     pub ghost_signal: GhostSignalStats,
     pub frame: FrameStats,
+    pub value_sig: ValueSigStats,
+    pub eval_borrow: EvalBorrowStats,
+    pub run_buffers: RunBufferStats,
+    pub print_content: PrintContentStats,
     pub stats_local: StatsLocalStats,
     pub fresh_first: FreshFirstStats,
     pub pair_order: PairOrderStats,
@@ -6871,6 +7059,10 @@ pub fn snapshot() -> UtilizationSnapshot {
         victim_swap: VictimSwapStats::read(),
         ghost_signal: GhostSignalStats::read(),
         frame: FrameStats::read(),
+        value_sig: ValueSigStats::read(),
+        eval_borrow: EvalBorrowStats::read(),
+        run_buffers: RunBufferStats::read(),
+        print_content: PrintContentStats::read(),
         stats_local: StatsLocalStats::read(),
         fresh_first: FreshFirstStats::read(),
         pair_order: PairOrderStats::read(),

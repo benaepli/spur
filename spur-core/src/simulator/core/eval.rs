@@ -20,6 +20,60 @@ pub fn load<H: HashPolicy>(slot: VarSlot, local_env: &Env<H>, node_env: &Env<H>)
     }
 }
 
+/// A value the evaluator only reads: a variable's slot in place, or the value
+/// any other expression produced.
+pub enum Operand<'a, H: HashPolicy> {
+    Borrowed(&'a Value<H>),
+    Owned(Value<H>),
+}
+
+impl<H: HashPolicy> std::ops::Deref for Operand<'_, H> {
+    type Target = Value<H>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Value<H> {
+        match self {
+            Operand::Borrowed(v) => v,
+            Operand::Owned(v) => v,
+        }
+    }
+}
+
+impl<H: HashPolicy> Operand<'_, H> {
+    #[inline]
+    pub fn into_owned(self) -> Value<H> {
+        match self {
+            Operand::Borrowed(v) => v.clone(),
+            Operand::Owned(v) => v,
+        }
+    }
+}
+
+/// Evaluates an expression whose value is only read. A variable is returned
+/// in place, so its slot value is neither copied nor dropped. The result
+/// borrows the environments, so no slot can be written while it is alive.
+#[inline]
+pub fn eval_operand<'a, H: HashPolicy>(
+    local_env: &'a Env<H>,
+    node_env: &'a Env<H>,
+    expr: &Expr,
+    role_names: &HashMap<NameId, String>,
+) -> Result<Operand<'a, H>, RuntimeError> {
+    match expr {
+        Expr::Var(slot) => {
+            let v = match *slot {
+                VarSlot::Local(idx, _) => local_env.get(idx),
+                VarSlot::Node(idx, _) => node_env.get(idx),
+            };
+            util_stats::record_operand_borrowed(
+                v.kind.is_composite() || matches!(v.kind, ValueKind::String(_)),
+            );
+            Ok(Operand::Borrowed(v))
+        }
+        _ => eval(local_env, node_env, expr, role_names).map(Operand::Owned),
+    }
+}
+
 #[inline(always)]
 pub fn store_slot<H: HashPolicy>(
     slot: VarSlot,
@@ -81,24 +135,47 @@ impl<H: HashPolicy> FrameBuilder<H> {
         self.slots.push(value);
     }
 
+    /// Fills every slot from the current length up to the slot count: Unit
+    /// for parameters the caller did not push, then the declared defaults in
+    /// order, then Unit. Each slot value is constructed where it is written.
     pub fn finish(mut self, func: &FunctionInfo) -> Env<H> {
         let total = func.local_slot_count as usize;
-        while self.slots.len() < (func.param_count as usize).min(total) {
-            self.push(Value::<H>::unit());
-        }
-        for default in &func.local_defaults {
-            if self.slots.len() >= total {
-                break;
-            }
-            self.push(match default {
-                SlotDefault::Unit => Value::<H>::unit(),
-                SlotDefault::Nil => Value::<H>::option_none(),
+        let start = self.slots.len();
+        let defaults_start = start.max((func.param_count as usize).min(total));
+        let defaults_end = defaults_start
+            + func
+                .local_defaults
+                .len()
+                .min(total.saturating_sub(defaults_start));
+        if start < total {
+            let (unit_sig, nil_sig) = if H::EAGER {
+                (Value::<H>::unit().sig, Value::<H>::option_none().sig)
+            } else {
+                (0, 0)
+            };
+            let mut sig = self.sig;
+            let defaults = &func.local_defaults;
+            let fill = (start..total).map(|i| {
+                let value = if i < defaults_start || i >= defaults_end {
+                    Value::<H>::with_sig(ValueKind::Unit, unit_sig)
+                } else {
+                    match defaults[i - defaults_start] {
+                        SlotDefault::Unit => Value::<H>::with_sig(ValueKind::Unit, unit_sig),
+                        SlotDefault::Nil => {
+                            Value::<H>::with_sig(ValueKind::Option(None), nil_sig)
+                        }
+                    }
+                };
+                if H::EAGER {
+                    sig ^= H::mix(value.sig, i as u32);
+                }
+                value
             });
+            // SAFETY: a mapped range reports its exact length.
+            unsafe { self.slots.extend_from_trusted(fill) };
+            self.sig = sig;
         }
-        while self.slots.len() < total {
-            self.push(Value::<H>::unit());
-        }
-        util_stats::record_frame_build(total as u64);
+        util_stats::record_frame_build(total as u64, start.min(total) as u64);
         Env::from_slots(self.slots, self.sig)
     }
 }
@@ -106,16 +183,25 @@ impl<H: HashPolicy> FrameBuilder<H> {
 /// The local call frame for `func` with `args` in its parameter slots.
 pub fn build_frame<H: HashPolicy>(func: &FunctionInfo, args: &[Value<H>]) -> Env<H> {
     let mut builder = FrameBuilder::<H>::new(func);
-    let params = (func.param_count as usize).min(func.local_slot_count as usize);
-    for arg in args.iter().take(params) {
-        builder.push(arg.clone());
-    }
+    let params = (func.param_count as usize)
+        .min(func.local_slot_count as usize)
+        .min(args.len());
+    let mut sig = builder.sig;
+    let copied = args[..params].iter().enumerate().map(|(i, arg)| {
+        if H::EAGER {
+            sig ^= H::mix(arg.sig, i as u32);
+        }
+        arg.clone()
+    });
+    // SAFETY: an enumerated slice iterator reports its exact length.
+    unsafe { builder.slots.extend_from_trusted(copied) };
+    builder.sig = sig;
     builder.finish(func)
 }
 
 fn update_collection<H: HashPolicy>(
     col: Value<H>,
-    key: Value<H>,
+    key: Operand<'_, H>,
     val: Value<H>,
 ) -> Result<Value<H>, RuntimeError> {
     use ValueKind::*;
@@ -151,7 +237,7 @@ fn update_collection<H: HashPolicy>(
                 0
             };
 
-            let new_map = m.update(key, val);
+            let new_map = m.update(key.into_owned(), val);
 
             Ok(Value::<H>::with_sig(ValueKind::Map(new_map), new_sig))
         }
@@ -186,8 +272,8 @@ pub fn eval<H: HashPolicy>(
         Expr::Nil => Ok(Value::<H>::option_none()),
         Expr::Var(s) => Ok(load(*s, local_env, node_env)),
         Expr::Plus(e1, e2) => {
-            let v1 = eval(local_env, node_env, e1, role_names)?;
-            let v2 = eval(local_env, node_env, e2, role_names)?;
+            let v1 = eval_operand(local_env, node_env, e1, role_names)?;
+            let v2 = eval_operand(local_env, node_env, e2, role_names)?;
 
             match (&v1.kind, &v2.kind) {
                 (ValueKind::Int(i1), ValueKind::Int(i2)) => Ok(Value::<H>::int(i1 + i2)),
@@ -204,38 +290,39 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::Minus(e1, e2) => Ok(Value::<H>::int(
-            eval(local_env, node_env, e1, role_names)?.as_int()?
-                - eval(local_env, node_env, e2, role_names)?.as_int()?,
+            eval_operand(local_env, node_env, e1, role_names)?.as_int()?
+                - eval_operand(local_env, node_env, e2, role_names)?.as_int()?,
         )),
         Expr::Times(e1, e2) => Ok(Value::<H>::int(
-            eval(local_env, node_env, e1, role_names)?.as_int()?
-                * eval(local_env, node_env, e2, role_names)?.as_int()?,
+            eval_operand(local_env, node_env, e1, role_names)?.as_int()?
+                * eval_operand(local_env, node_env, e2, role_names)?.as_int()?,
         )),
         Expr::Div(e1, e2) => Ok(Value::<H>::int(
-            eval(local_env, node_env, e1, role_names)?.as_int()?
-                / eval(local_env, node_env, e2, role_names)?.as_int()?,
+            eval_operand(local_env, node_env, e1, role_names)?.as_int()?
+                / eval_operand(local_env, node_env, e2, role_names)?.as_int()?,
         )),
         Expr::Mod(e1, e2) => Ok(Value::<H>::int(
-            eval(local_env, node_env, e1, role_names)?.as_int()?
-                % eval(local_env, node_env, e2, role_names)?.as_int()?,
+            eval_operand(local_env, node_env, e1, role_names)?.as_int()?
+                % eval_operand(local_env, node_env, e2, role_names)?.as_int()?,
         )),
         Expr::LessThan(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1, role_names)? < eval(local_env, node_env, e2, role_names)?,
+            *eval_operand(local_env, node_env, e1, role_names)?
+                < *eval_operand(local_env, node_env, e2, role_names)?,
         )),
         Expr::EqualsEquals(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1, role_names)?
-                == eval(local_env, node_env, e2, role_names)?,
+            *eval_operand(local_env, node_env, e1, role_names)?
+                == *eval_operand(local_env, node_env, e2, role_names)?,
         )),
         Expr::Not(e) => Ok(Value::<H>::bool(
-            !eval(local_env, node_env, e, role_names)?.as_bool()?,
+            !eval_operand(local_env, node_env, e, role_names)?.as_bool()?,
         )),
         Expr::And(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1, role_names)?.as_bool()?
-                && eval(local_env, node_env, e2, role_names)?.as_bool()?,
+            eval_operand(local_env, node_env, e1, role_names)?.as_bool()?
+                && eval_operand(local_env, node_env, e2, role_names)?.as_bool()?,
         )),
         Expr::Or(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1, role_names)?.as_bool()?
-                || eval(local_env, node_env, e2, role_names)?.as_bool()?,
+            eval_operand(local_env, node_env, e1, role_names)?.as_bool()?
+                || eval_operand(local_env, node_env, e2, role_names)?.as_bool()?,
         )),
         Expr::Some(e) => Ok(Value::<H>::option_some(eval(
             local_env, node_env, e, role_names,
@@ -265,14 +352,15 @@ pub fn eval<H: HashPolicy>(
             Ok(Value::<H>::map(m))
         }
         Expr::Find(col, key) => {
-            let col_val = eval(local_env, node_env, col, role_names)?;
+            let col_val = eval_operand(local_env, node_env, col, role_names)?;
             match &col_val.kind {
                 ValueKind::Map(m) => {
-                    let k = eval(local_env, node_env, key, role_names)?;
-                    m.get(&k).cloned().ok_or(RuntimeError::KeyNotFound)
+                    let k = eval_operand(local_env, node_env, key, role_names)?;
+                    m.get(&*k).cloned().ok_or(RuntimeError::KeyNotFound)
                 }
                 ValueKind::List(l) => {
-                    let idx = eval(local_env, node_env, key, role_names)?.as_int()? as usize;
+                    let idx =
+                        eval_operand(local_env, node_env, key, role_names)?.as_int()? as usize;
                     l.get(idx).cloned().ok_or(RuntimeError::IndexOutOfBounds {
                         index: idx,
                         len: l.len(),
@@ -285,7 +373,7 @@ pub fn eval<H: HashPolicy>(
         }
         Expr::ListPrepend(head, tail) => {
             let h = eval(local_env, node_env, head, role_names)?;
-            let tail_val = eval(local_env, node_env, tail, role_names)?;
+            let tail_val = eval_operand(local_env, node_env, tail, role_names)?;
             let t = tail_val.as_list()?;
             let mut new_list = ValueSeq::<H>::with_capacity(t.len() + 1);
             new_list.push(h);
@@ -293,16 +381,16 @@ pub fn eval<H: HashPolicy>(
             Ok(Value::<H>::list(new_list))
         }
         Expr::ListAppend(list, item) => {
-            let list_val = eval(local_env, node_env, list, role_names)?;
+            let list_val = eval_operand(local_env, node_env, list, role_names)?;
             let mut l = list_val.as_list()?.clone();
             let i = eval(local_env, node_env, item, role_names)?;
             l.push(i);
             Ok(Value::<H>::list(l))
         }
         Expr::ListSubsequence(list, start, end) => {
-            let l = eval(local_env, node_env, list, role_names)?;
-            let s = eval(local_env, node_env, start, role_names)?.as_int()? as usize;
-            let e = eval(local_env, node_env, end, role_names)?.as_int()? as usize;
+            let l = eval_operand(local_env, node_env, list, role_names)?;
+            let s = eval_operand(local_env, node_env, start, role_names)?.as_int()? as usize;
+            let e = eval_operand(local_env, node_env, end, role_names)?.as_int()? as usize;
             let vec = l.as_list()?;
             if s > vec.len() || e > vec.len() || s > e {
                 return Err(RuntimeError::SubsequenceOutOfBounds {
@@ -314,30 +402,29 @@ pub fn eval<H: HashPolicy>(
             Ok(Value::<H>::list(ValueSeq::<H>::from(&vec[s..e])))
         }
         Expr::LessThanEquals(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1, role_names)?
-                <= eval(local_env, node_env, e2, role_names)?,
+            *eval_operand(local_env, node_env, e1, role_names)?
+                <= *eval_operand(local_env, node_env, e2, role_names)?,
         )),
         Expr::GreaterThan(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1, role_names)? > eval(local_env, node_env, e2, role_names)?,
+            *eval_operand(local_env, node_env, e1, role_names)?
+                > *eval_operand(local_env, node_env, e2, role_names)?,
         )),
         Expr::GreaterThanEquals(e1, e2) => Ok(Value::<H>::bool(
-            eval(local_env, node_env, e1, role_names)?
-                >= eval(local_env, node_env, e2, role_names)?,
+            *eval_operand(local_env, node_env, e1, role_names)?
+                >= *eval_operand(local_env, node_env, e2, role_names)?,
         )),
         Expr::KeyExists(key, map) => {
-            let k = eval(local_env, node_env, key, role_names)?;
-            let m = eval(local_env, node_env, map, role_names)?;
-            Ok(Value::<H>::bool(m.as_map()?.contains_key(&k)))
+            let k = eval_operand(local_env, node_env, key, role_names)?;
+            let m = eval_operand(local_env, node_env, map, role_names)?;
+            Ok(Value::<H>::bool(m.as_map()?.contains_key(&*k)))
         }
         Expr::MapErase(key, map) => {
-            let k = eval(local_env, node_env, key, role_names)?;
-            let m = eval(local_env, node_env, map, role_names)?
-                .as_map()?
-                .clone();
-            Ok(Value::<H>::map(m.without(&k)))
+            let k = eval_operand(local_env, node_env, key, role_names)?;
+            let m = eval_operand(local_env, node_env, map, role_names)?;
+            Ok(Value::<H>::map(m.as_map()?.without(&*k)))
         }
         Expr::ListLen(list) => {
-            let list_val = eval(local_env, node_env, list, role_names)?;
+            let list_val = eval_operand(local_env, node_env, list, role_names)?;
             match &list_val.kind {
                 ValueKind::List(l) => Ok(Value::<H>::int(l.len() as i64)),
                 ValueKind::Map(m) => Ok(Value::<H>::int(m.len() as i64)),
@@ -347,7 +434,7 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::ListAccess(list, idx) => {
-            let l = eval(local_env, node_env, list, role_names)?;
+            let l = eval_operand(local_env, node_env, list, role_names)?;
             let vec = l.as_list()?;
             let i = *idx;
             if i >= vec.len() {
@@ -359,12 +446,12 @@ pub fn eval<H: HashPolicy>(
             Ok(vec[i].clone())
         }
         Expr::Min(e1, e2) => {
-            let v1 = eval(local_env, node_env, e1, role_names)?.as_int()?;
-            let v2 = eval(local_env, node_env, e2, role_names)?.as_int()?;
+            let v1 = eval_operand(local_env, node_env, e1, role_names)?.as_int()?;
+            let v2 = eval_operand(local_env, node_env, e2, role_names)?.as_int()?;
             Ok(Value::<H>::int(v1.min(v2)))
         }
         Expr::TupleAccess(tuple, idx) => {
-            let t = eval(local_env, node_env, tuple, role_names)?;
+            let t = eval_operand(local_env, node_env, tuple, role_names)?;
             if let ValueKind::Tuple(vec) = &t.kind {
                 if *idx >= vec.len() {
                     return Err(RuntimeError::IndexOutOfBounds {
@@ -381,9 +468,9 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::Unwrap(e) => {
-            let val = eval(local_env, node_env, e, role_names)?;
+            let val = eval_operand(local_env, node_env, e, role_names)?;
             match &val.kind {
-                ValueKind::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v.clone())),
+                ValueKind::Option(Some(v)) => Ok((**v).clone()),
                 ValueKind::Option(None) => Err(RuntimeError::UnwrapNone),
                 _ => Err(RuntimeError::TypeError {
                     expected: "option",
@@ -392,9 +479,9 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::Coalesce(opt, default) => {
-            let val = eval(local_env, node_env, opt, role_names)?;
+            let val = eval_operand(local_env, node_env, opt, role_names)?;
             match &val.kind {
-                ValueKind::Option(Some(v)) => Ok(Arc::unwrap_or_clone(v.clone())),
+                ValueKind::Option(Some(v)) => Ok((**v).clone()),
                 ValueKind::Option(None) => eval(local_env, node_env, default, role_names),
                 _ => Err(RuntimeError::CoalesceNonOption {
                     got: val.type_name(),
@@ -402,16 +489,16 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::IntToString(e) => {
-            let n = eval(local_env, node_env, e, role_names)?.as_int()?;
+            let n = eval_operand(local_env, node_env, e, role_names)?.as_int()?;
             Ok(Value::<H>::string(EcoString::from(Decimal::of_i64(n).as_str())))
         }
         Expr::BoolToString(e) => Ok(Value::<H>::string(EcoString::from(
-            eval(local_env, node_env, e, role_names)?
+            eval_operand(local_env, node_env, e, role_names)?
                 .as_bool()?
                 .to_string(),
         ))),
         Expr::NodeToString(e) => {
-            let node_id = eval(local_env, node_env, e, role_names)?.as_node()?;
+            let node_id = eval_operand(local_env, node_env, e, role_names)?.as_node()?;
             let role_name = role_names
                 .get(&node_id.role)
                 .map(|s| s.as_str())
@@ -423,7 +510,7 @@ pub fn eval<H: HashPolicy>(
         }
         Expr::Store(col, key, val) => update_collection(
             eval(local_env, node_env, col, role_names)?,
-            eval(local_env, node_env, key, role_names)?,
+            eval_operand(local_env, node_env, key, role_names)?,
             eval(local_env, node_env, val, role_names)?,
         ),
         Expr::Variant(enum_id, name, payload) => {
@@ -435,7 +522,7 @@ pub fn eval<H: HashPolicy>(
             Ok(Value::<H>::variant(*enum_id, name.clone(), payload_val))
         }
         Expr::IsVariant(expr, name) => {
-            let val = eval(local_env, node_env, expr, role_names)?;
+            let val = eval_operand(local_env, node_env, expr, role_names)?;
             match &val.kind {
                 ValueKind::Variant(_, variant_name, _) => {
                     Ok(Value::<H>::bool(variant_name == name))
@@ -444,7 +531,7 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::VariantPayload(expr) => {
-            let val = eval(local_env, node_env, expr, role_names)?;
+            let val = eval_operand(local_env, node_env, expr, role_names)?;
             match &val.kind {
                 ValueKind::Variant(_, _, Some(payload)) => Ok((**payload).clone()),
                 ValueKind::Variant(_, _, None) => Err(RuntimeError::VariantHasNoPayload),
@@ -455,15 +542,15 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::SafeFind(col, key) => {
-            let col_val = eval(local_env, node_env, col, role_names)?;
+            let col_val = eval_operand(local_env, node_env, col, role_names)?;
             match &col_val.kind {
                 ValueKind::Option(None) => Ok(Value::<H>::option_none()),
                 ValueKind::Option(Some(inner)) => {
-                    let inner_val = Arc::unwrap_or_clone(inner.clone());
-                    let key_val = eval(local_env, node_env, key, role_names)?;
+                    let inner_val: &Value<H> = inner;
+                    let key_val = eval_operand(local_env, node_env, key, role_names)?;
                     match &inner_val.kind {
                         ValueKind::Map(m) => {
-                            let result = m.get(&key_val).cloned().ok_or(RuntimeError::KeyNotFound)?;
+                            let result = m.get(&*key_val).cloned().ok_or(RuntimeError::KeyNotFound)?;
                             Ok(Value::<H>::option_some(result))
                         }
                         ValueKind::List(l) => {
@@ -486,11 +573,11 @@ pub fn eval<H: HashPolicy>(
             }
         }
         Expr::SafeTupleAccess(tuple, idx) => {
-            let t = eval(local_env, node_env, tuple, role_names)?;
+            let t = eval_operand(local_env, node_env, tuple, role_names)?;
             match &t.kind {
                 ValueKind::Option(None) => Ok(Value::<H>::option_none()),
                 ValueKind::Option(Some(inner)) => {
-                    let inner_val = Arc::unwrap_or_clone(inner.clone());
+                    let inner_val: &Value<H> = inner;
                     if let ValueKind::Tuple(vec) = &inner_val.kind {
                         if *idx >= vec.len() {
                             return Err(RuntimeError::IndexOutOfBounds {

@@ -1,6 +1,7 @@
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::state::NodeId;
 use crate::simulator::hash_utils::{HashPolicy, mix};
+use crate::simulator::util_stats;
 use ecow::{EcoString, EcoVec};
 use std::cmp::Ordering;
 use rustc_hash::FxHasher;
@@ -71,13 +72,12 @@ pub fn hash_map_entry(k_sig: u64, v_sig: u64) -> u64 {
 }
 
 impl<H: HashPolicy> Value<H> {
-    /// Create a new Value with computed signature.
+    /// Create a new Value. Under an eager policy the signature is computed
+    /// here; otherwise it is stored as 0 and `Hash` derives the leaf
+    /// signature from the kind when the value is hashed.
+    #[inline]
     pub fn new(kind: ValueKind<H>) -> Self {
-        let sig = if H::EAGER {
-            Self::compute_sig(&kind)
-        } else {
-            Self::compute_sig_leaf_only(&kind)
-        };
+        let sig = if H::EAGER { Self::compute_sig(&kind) } else { 0 };
         Self {
             kind,
             sig,
@@ -88,6 +88,7 @@ impl<H: HashPolicy> Value<H> {
     /// Signature for leaf variants only; composites get sig = 0.
     /// Used under `NoHashing` so map-keyable leaves (Int/Bool/Node/String/Channel)
     /// still discriminate for `imbl::HashMap` bucketing, while composites skip work.
+    #[inline]
     fn compute_sig_leaf_only(kind: &ValueKind<H>) -> u64 {
         match kind {
             ValueKind::Int(_)
@@ -364,8 +365,35 @@ impl<H: HashPolicy> Ord for Value<H> {
 }
 
 impl<H: HashPolicy> Hash for Value<H> {
+    /// Under a lazy policy the hashed signature must equal the one an eager
+    /// leaf-only construction would have stored, because map layout and
+    /// iteration order follow these bits.
+    #[inline]
     fn hash<Ha: Hasher>(&self, state: &mut Ha) {
-        self.sig.hash(state);
+        if H::EAGER {
+            self.sig.hash(state);
+        } else {
+            let sig = Self::compute_sig_leaf_only(&self.kind);
+            if !self.kind.is_composite() {
+                util_stats::record_leaf_hash_deferred();
+            }
+            sig.hash(state);
+        }
+    }
+}
+
+impl<H: HashPolicy> ValueKind<H> {
+    /// Whether the kind holds other values, so a leaf-only signature is 0.
+    #[inline]
+    pub fn is_composite(&self) -> bool {
+        matches!(
+            self,
+            ValueKind::Option(_)
+                | ValueKind::Tuple(_)
+                | ValueKind::List(_)
+                | ValueKind::Map(_)
+                | ValueKind::Variant(_, _, _)
+        )
     }
 }
 
@@ -1038,6 +1066,129 @@ mod tests {
                  prop_assert_ne!(calculate_hash(&env1), calculate_hash(&env2));
                  prop_assert_ne!(env1.sig, env2.sig);
              }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lazy_signature_tests {
+    use super::*;
+    use crate::analysis::resolver::NameId;
+    use crate::simulator::hash_utils::{NoHashing, WithHashing};
+
+    fn fx_hash<T: Hash + ?Sized>(t: &T) -> u64 {
+        let mut h = FxHasher::default();
+        t.hash(&mut h);
+        h.finish()
+    }
+
+    /// One value of every kind, strings on both sides of the inline length,
+    /// and composites nested inside each other.
+    fn value_set<H: HashPolicy>() -> Vec<Value<H>> {
+        let node = |role: usize, index: usize| NodeId {
+            role: NameId(role),
+            index,
+        };
+        let s = |t: &str| Value::<H>::string(EcoString::from(t));
+        let mut inner = ValueMap::<H>::default();
+        inner.insert(s("k"), Value::<H>::int(1));
+        inner.insert(Value::<H>::int(2), s("a string longer than fifteen bytes"));
+        let mut outer = ValueMap::<H>::default();
+        outer.insert(s("nested"), Value::<H>::map(inner.clone()));
+        outer.insert(Value::<H>::node(node(0, 1)), Value::<H>::list(EcoVec::new()));
+        vec![
+            Value::<H>::int(0),
+            Value::<H>::int(-7),
+            Value::<H>::int(i64::MAX),
+            Value::<H>::bool(true),
+            Value::<H>::bool(false),
+            Value::<H>::unit(),
+            s(""),
+            s("short"),
+            s("exactly15bytes!"),
+            s("sixteen bytes!!!"),
+            s("a string well past the inline limit of the small string"),
+            Value::<H>::node(node(0, 0)),
+            Value::<H>::node(node(1, 5)),
+            Value::<H>::channel(ChannelId {
+                node: node(0, 2),
+                id: 9,
+            }),
+            Value::<H>::channel(ChannelId {
+                node: node(1, 0),
+                id: 0,
+            }),
+            Value::<H>::fifo_link(LinkId(3), node(0, 1)),
+            Value::<H>::fifo_link(LinkId(0), node(1, 2)),
+            Value::<H>::option_none(),
+            Value::<H>::option_some(Value::<H>::int(4)),
+            Value::<H>::option_some(s("a string longer than fifteen bytes")),
+            Value::<H>::variant(0, EcoString::from("Empty"), None),
+            Value::<H>::variant(1, EcoString::from("Prepare"), Some(Arc::new(Value::<H>::int(3)))),
+            Value::<H>::tuple(EcoVec::from([Value::<H>::int(1), s("t")])),
+            Value::<H>::list(EcoVec::from([Value::<H>::unit(), Value::<H>::map(inner.clone())])),
+            Value::<H>::map(inner),
+            Value::<H>::map(outer),
+        ]
+    }
+
+    #[test]
+    fn hash_matches_the_signature_stored_at_construction() {
+        let lazy = value_set::<NoHashing>();
+        let eager = value_set::<WithHashing>();
+        assert_eq!(lazy.len(), eager.len());
+        for (l, e) in lazy.iter().zip(&eager) {
+            // A leaf-only signature stored at construction was the leaf's
+            // full signature, which does not depend on any other value.
+            let stored = if l.kind.is_composite() { 0 } else { e.sig };
+            assert_eq!(stored, Value::<NoHashing>::compute_sig_leaf_only(&l.kind), "{l:?}");
+            assert_eq!(fx_hash(l), fx_hash(&stored), "{l:?}");
+            assert_eq!(l.sig, 0, "{l:?}");
+            assert_eq!(e.sig, Value::<WithHashing>::compute_sig(&e.kind), "{e:?}");
+            assert_eq!(fx_hash(e), fx_hash(&e.sig), "{e:?}");
+        }
+    }
+
+    /// A map key hashed with the signature the value stored at construction.
+    #[derive(Clone, PartialEq, Eq)]
+    struct StoredSigKey(Value<NoHashing>, u64);
+
+    impl Hash for StoredSigKey {
+        fn hash<Ha: Hasher>(&self, state: &mut Ha) {
+            self.1.hash(state);
+        }
+    }
+
+    #[test]
+    fn map_iteration_order_matches_hashing_the_stored_signature() {
+        let keys = value_set::<NoHashing>();
+        let mut current = ValueMap::<NoHashing>::default();
+        let mut reference: imbl::GenericHashMap<
+            StoredSigKey,
+            usize,
+            BuildHasherDefault<FxHasher>,
+            imbl::shared_ptr::DefaultSharedPtr,
+        > = imbl::GenericHashMap::default();
+        for round in 0..3usize {
+            for (i, k) in keys.iter().enumerate() {
+                let stored = Value::<NoHashing>::compute_sig_leaf_only(&k.kind);
+                if (i + round) % 4 == 3 {
+                    current.remove(k);
+                    reference.remove(&StoredSigKey(k.clone(), stored));
+                } else {
+                    current.insert(k.clone(), Value::<NoHashing>::int((i * 10 + round) as i64));
+                    reference.insert(StoredSigKey(k.clone(), stored), i * 10 + round);
+                }
+            }
+            let a: Vec<(Value<NoHashing>, i64)> = current
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_int().unwrap()))
+                .collect();
+            let b: Vec<(Value<NoHashing>, i64)> = reference
+                .iter()
+                .map(|(k, v)| (k.0.clone(), *v as i64))
+                .collect();
+            assert_eq!(a, b, "round {round}");
         }
     }
 }

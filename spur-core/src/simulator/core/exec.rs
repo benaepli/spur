@@ -1,8 +1,10 @@
 use crate::compiler::cfg::{Instr, Label, Program, VarSlot};
 use crate::simulator::core::error::RuntimeError;
-use crate::simulator::core::eval::{FrameBuilder, build_frame, eval, set_local, store};
+use crate::simulator::core::eval::{
+    FrameBuilder, build_frame, eval, eval_operand, set_local, store,
+};
 use crate::simulator::core::state::{
-    ChannelState, ClientOpResult, Continuation, LogEntry, Logger, NodeId, PurgatoryConfig, Record,
+    ClientOpResult, Continuation, LogEntry, Logger, NodeId, PurgatoryConfig, Record,
     Runnable, RunnableCategory, SchedulePolicy, State, Timer, TraceEntry, TraceKind,
 };
 use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind, ValueSeq};
@@ -207,8 +209,9 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                 Ok(Some(StepOutcome::Continue(*next)))
             }
             Instr::Async(lhs, node_expr, func_name, args) => {
-                let target_val = eval(local_env, node_env, node_expr, &program.id_to_name)?;
-                let (target_node, link_id) = target_val.as_rpc_target()?;
+                let (target_node, link_id) =
+                    eval_operand(local_env, node_env, node_expr, &program.id_to_name)?
+                        .as_rpc_target()?;
                 let mut arg_vals: EcoVec<Value<H>> = EcoVec::with_capacity(args.len());
                 for a in args {
                     arg_vals.push(eval(local_env, node_env, a, &program.id_to_name)?);
@@ -219,7 +222,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     id: state.alloc_channel_id(),
                 };
 
-                state.channels.insert(chan_id, ChannelState::new());
+                state.insert_channel(chan_id);
                 store(lhs, Value::channel(chan_id), local_env, node_env)?;
 
                 let func_name_id = program
@@ -279,12 +282,13 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                 node: node_id,
                 id: state.alloc_channel_id(),
             };
-            state.channels.insert(cid, ChannelState::new());
+            state.insert_channel(cid);
             store(lhs, Value::channel(cid), local_env, node_env)?;
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::MakeFifoLink(lhs, peer_expr, next) => {
-            let peer = eval(local_env, node_env, peer_expr, &program.id_to_name)?.as_node()?;
+            let peer =
+                eval_operand(local_env, node_env, peer_expr, &program.id_to_name)?.as_node()?;
             let link_id = state.alloc_link_id();
             state.link_meta.insert(link_id, (node_id, peer));
             state.link_send_seq.insert(link_id, 0);
@@ -297,7 +301,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                 node: node_id,
                 id: state.alloc_channel_id(),
             };
-            state.channels.insert(cid, ChannelState::new());
+            state.insert_channel(cid);
             store(lhs, Value::channel(cid), local_env, node_env)?;
 
             // Create a timer that will fire when scheduled
@@ -317,7 +321,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             Ok(Some(StepOutcome::Continue(*next)))
         }
         Label::Cond(cond, bthen, belse) => {
-            if eval(local_env, node_env, cond, &program.id_to_name)?.as_bool()? {
+            if eval_operand(local_env, node_env, cond, &program.id_to_name)?.as_bool()? {
                 Ok(Some(StepOutcome::Continue(*bthen)))
             } else {
                 Ok(Some(StepOutcome::Continue(*belse)))
@@ -328,8 +332,15 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             Ok(Some(StepOutcome::Return(val)))
         }
         Label::Print(expr, next) => {
-            let val = eval(local_env, node_env, expr, &program.id_to_name)?;
-            let mut content = String::new();
+            let val = eval_operand(local_env, node_env, expr, &program.id_to_name)?;
+            // A string prints as its text between two quote characters.
+            let mut content = match &val.kind {
+                ValueKind::String(s) => {
+                    util_stats::record_print_presized();
+                    String::with_capacity(s.len() + 2)
+                }
+                _ => String::new(),
+            };
             let _ = val.write_to(&mut content);
             logger.log(LogEntry {
                 node: node_id,
@@ -632,8 +643,8 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
 
         match label {
             Label::Send(chan_expr, val_expr, next) => {
-                let cid =
-                    eval(&local_env, &node_env, chan_expr, &program.id_to_name)?.as_channel()?;
+                let cid = eval_operand(&local_env, &node_env, chan_expr, &program.id_to_name)?
+                    .as_channel()?;
                 let val = eval(&local_env, &node_env, val_expr, &program.id_to_name)?;
                 if cid.node != record.node {
                     let cs = Runnable::ChannelSend {
@@ -674,8 +685,8 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                 }
             }
             Label::Recv(lhs, chan_expr, next) => {
-                let cid =
-                    eval(&local_env, &node_env, chan_expr, &program.id_to_name)?.as_channel()?;
+                let cid = eval_operand(&local_env, &node_env, chan_expr, &program.id_to_name)?
+                    .as_channel()?;
                 if cid.node != record.node {
                     return Err(RuntimeError::RemoteChannelRead);
                 }
@@ -707,7 +718,7 @@ pub fn exec<H: HashPolicy, L: Logger, F: Feedback>(
                 return Ok(None); // Yield
             }
             Label::SpinAwait(expr, next) => {
-                if eval(&local_env, &node_env, expr, &program.id_to_name)?.as_bool()? {
+                if eval_operand(&local_env, &node_env, expr, &program.id_to_name)?.as_bool()? {
                     record.pc = *next;
                 } else {
                     let node_id = record.node;

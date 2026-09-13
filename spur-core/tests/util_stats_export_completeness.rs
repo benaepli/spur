@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    FrameStats, HistoryFormatStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    EvalBorrowStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1239,6 +1239,8 @@ fn frame(m: &mut Marks) -> FrameStats {
         calls: m.int(),
         slots_built: m.int(),
         entry_frame_copies: m.int(),
+        default_slots_filled: m.int(),
+        params_filled: m.int(),
     }
 }
 
@@ -1247,12 +1249,80 @@ fn frame_leaves(prefix: &str, f: &FrameStats) -> Vec<(String, Value)> {
         calls,
         slots_built,
         entry_frame_copies,
+        default_slots_filled,
+        params_filled,
     } = f;
     vec![
         leaf(prefix, "calls", *calls),
         leaf(prefix, "slots_built", *slots_built),
         leaf(prefix, "entry_frame_copies", *entry_frame_copies),
+        leaf(prefix, "default_slots_filled", *default_slots_filled),
+        leaf(prefix, "params_filled", *params_filled),
     ]
+}
+
+fn value_sig(m: &mut Marks) -> ValueSigStats {
+    ValueSigStats {
+        leaf_hashes_deferred: m.int(),
+    }
+}
+
+fn value_sig_leaves(prefix: &str, v: &ValueSigStats) -> Vec<(String, Value)> {
+    let ValueSigStats {
+        leaf_hashes_deferred,
+    } = v;
+    vec![leaf(prefix, "leaf_hashes_deferred", *leaf_hashes_deferred)]
+}
+
+fn eval_borrow(m: &mut Marks) -> EvalBorrowStats {
+    EvalBorrowStats {
+        handles_not_cloned: m.int(),
+        scalars_not_cloned: m.int(),
+    }
+}
+
+fn eval_borrow_leaves(prefix: &str, e: &EvalBorrowStats) -> Vec<(String, Value)> {
+    let EvalBorrowStats {
+        handles_not_cloned,
+        scalars_not_cloned,
+    } = e;
+    vec![
+        leaf(prefix, "handles_not_cloned", *handles_not_cloned),
+        leaf(prefix, "scalars_not_cloned", *scalars_not_cloned),
+    ]
+}
+
+fn run_buffers(m: &mut Marks) -> RunBufferStats {
+    RunBufferStats {
+        channel_table_grows: m.int(),
+        channels_created: m.int(),
+        log_vec_grows: m.int(),
+        trace_vec_grows: m.int(),
+    }
+}
+
+fn run_buffers_leaves(prefix: &str, r: &RunBufferStats) -> Vec<(String, Value)> {
+    let RunBufferStats {
+        channel_table_grows,
+        channels_created,
+        log_vec_grows,
+        trace_vec_grows,
+    } = r;
+    vec![
+        leaf(prefix, "channel_table_grows", *channel_table_grows),
+        leaf(prefix, "channels_created", *channels_created),
+        leaf(prefix, "log_vec_grows", *log_vec_grows),
+        leaf(prefix, "trace_vec_grows", *trace_vec_grows),
+    ]
+}
+
+fn print_content(m: &mut Marks) -> PrintContentStats {
+    PrintContentStats { presized: m.int() }
+}
+
+fn print_content_leaves(prefix: &str, p: &PrintContentStats) -> Vec<(String, Value)> {
+    let PrintContentStats { presized } = p;
+    vec![leaf(prefix, "presized", *presized)]
 }
 
 fn history_writer(m: &mut Marks) -> HistoryWriterStats {
@@ -2036,6 +2106,10 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         victim_swap: _,
         ghost_signal: _,
         frame: _,
+        value_sig: _,
+        eval_borrow: _,
+        run_buffers: _,
+        print_content: _,
         stats_local: _,
         fresh_first: _,
         pair_order: _,
@@ -2084,6 +2158,10 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "victim_swap",
         "ghost_signal",
         "frame",
+        "value_sig",
+        "eval_borrow",
+        "run_buffers",
+        "print_content",
         "stats_local",
         "fresh_first",
         "pair_order",
@@ -2166,6 +2244,10 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.victim_swap = victim_swap(&mut m);
     s.ghost_signal = ghost_signal(&mut m);
     s.frame = frame(&mut m);
+    s.value_sig = value_sig(&mut m);
+    s.eval_borrow = eval_borrow(&mut m);
+    s.run_buffers = run_buffers(&mut m);
+    s.print_content = print_content(&mut m);
     s.stats_local = stats_local(&mut m);
     s.fresh_first = fresh_first(&mut m);
     s.pair_order = pair_order(&mut m);
@@ -2194,6 +2276,10 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
     expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
     expected.extend(frame_leaves("frame", &s.frame));
+    expected.extend(value_sig_leaves("value_sig", &s.value_sig));
+    expected.extend(eval_borrow_leaves("eval_borrow", &s.eval_borrow));
+    expected.extend(run_buffers_leaves("run_buffers", &s.run_buffers));
+    expected.extend(print_content_leaves("print_content", &s.print_content));
     expected.extend(stats_local_leaves("stats_local", &s.stats_local));
     expected.extend(fresh_first_leaves("fresh_first", &s.fresh_first));
     expected.extend(pair_order_leaves("pair_order", &s.pair_order));
@@ -2247,6 +2333,10 @@ fn every_counter_field_reaches_the_written_json() {
         "victim_swap",
         "ghost_signal",
         "frame",
+        "value_sig",
+        "eval_borrow",
+        "run_buffers",
+        "print_content",
         "stats_local",
         "fresh_first",
         "pair_order",

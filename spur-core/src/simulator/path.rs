@@ -55,10 +55,53 @@ pub struct Logs {
 
 impl Logger for Logs {
     fn log(&mut self, entry: LogEntry) {
+        if self.entries.len() == self.entries.capacity() {
+            util_stats::record_log_vec_grow();
+        }
         self.entries.push(entry);
     }
     fn log_trace(&mut self, entry: TraceEntry) {
+        if self.traces.len() == self.traces.capacity() {
+            util_stats::record_trace_vec_grow();
+        }
         self.traces.push(entry);
+    }
+}
+
+/// Largest channel table a run starts with, so one long run cannot hand a
+/// large sparse table to the next.
+const CHANNEL_TABLE_HINT_CAP: usize = 4_096;
+/// Largest log or trace row vector a run starts with.
+const ROW_VEC_HINT_CAP: usize = 8_192;
+
+/// The sizes the previous run on this thread ended with. Only capacities are
+/// taken from them, so no run can observe another through these.
+#[derive(Clone, Copy)]
+struct RunBufferHints {
+    channels: usize,
+    log_rows: usize,
+    trace_rows: usize,
+}
+
+thread_local! {
+    static RUN_BUFFER_HINTS: std::cell::Cell<RunBufferHints> = const {
+        std::cell::Cell::new(RunBufferHints { channels: 0, log_rows: 0, trace_rows: 0 })
+    };
+}
+
+/// The channel table capacity a run starting on this thread begins with.
+pub fn channel_table_hint() -> usize {
+    RUN_BUFFER_HINTS.with(|h| h.get().channels)
+}
+
+impl Logs {
+    /// Empty row vectors sized to what the previous run on this thread wrote.
+    pub fn sized_from_previous_run() -> Self {
+        let h = RUN_BUFFER_HINTS.with(|h| h.get());
+        Self {
+            entries: Vec::with_capacity(h.log_rows),
+            traces: Vec::with_capacity(h.trace_rows),
+        }
     }
 }
 
@@ -114,10 +157,26 @@ impl<H: HashPolicy, F: Feedback> PathState<H, F> {
         Self {
             state: State::<H>::new(role_node_counts, node_slot_count),
             feedback: F::Local::default(),
-            logs: Logs::default(),
+            logs: Logs::sized_from_previous_run(),
             history: Vec::new(),
             client_pool: ClientPool::new(client_role, node_slot_count),
         }
+    }
+
+    /// Takes the run's log and trace rows, and records the run's channel,
+    /// log and trace counts as the starting capacities of the next run on
+    /// this thread.
+    pub fn take_log_rows(&mut self) -> (Vec<LogEntry>, Vec<TraceEntry>) {
+        let hints = RunBufferHints {
+            channels: self.state.channels.len().min(CHANNEL_TABLE_HINT_CAP),
+            log_rows: self.logs.entries.len().min(ROW_VEC_HINT_CAP),
+            trace_rows: self.logs.traces.len().min(ROW_VEC_HINT_CAP),
+        };
+        RUN_BUFFER_HINTS.with(|h| h.set(hints));
+        (
+            std::mem::take(&mut self.logs.entries),
+            std::mem::take(&mut self.logs.traces),
+        )
     }
 }
 
@@ -467,6 +526,7 @@ fn record_termination<H: HashPolicy>(
         recovered_nodes,
     });
     util_stats::record_ghost_release_run(state.ghost_release.cell, steps_used);
+    util_stats::record_channels_created(state.channels.len() as u64);
     util_stats::flush_frame_stats();
 }
 
