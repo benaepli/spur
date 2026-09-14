@@ -57,7 +57,7 @@ pub fn serialize_logs(logs: Vec<LogEntry>) -> Vec<PersistableLog> {
 pub struct PersistableTrace {
     pub node_id: i64,
     pub step: i32,
-    pub function_name: Arc<str>,
+    pub function_name: &'static str,
     pub trace_kind: &'static str,
     /// End of the JSON array of the parameter texts in the trace text.
     pub payload_end: usize,
@@ -1277,7 +1277,7 @@ mod parquet_writer_tests {
                 PersistableTrace {
                     node_id: 1,
                     step: i as i32,
-                    function_name: Arc::from("f\u{e9}"),
+                    function_name: "f\u{e9}",
                     trace_kind: "Enter",
                     payload_end: text.trace_payload.len(),
                     schedulable_count: i as i64,

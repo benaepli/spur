@@ -317,8 +317,8 @@ pub enum TraceKind {
 #[derive(Clone, Debug)]
 pub struct TraceEntry {
     pub node: NodeId,
-    /// Shared with the label that emitted the entry, so a row costs no copy.
-    pub function_name: Arc<str>,
+    /// The process-wide copy of the name, so a row copies only a pointer.
+    pub function_name: &'static str,
     pub kind: TraceKind,
     /// End of the row's payload, the JSON array of the parameter texts, in
     /// the logger's trace text; the payload starts where the previous row's

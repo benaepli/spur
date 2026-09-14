@@ -509,7 +509,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             let payload_end = out.len();
             logger.log_trace(TraceEntry {
                 node: node_id,
-                function_name: func_name.clone(),
+                function_name: *func_name,
                 kind: TraceKind::Enter,
                 payload_end,
                 schedulable_count: state.total_runnable_count(),
@@ -528,7 +528,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             let payload_end = out.len();
             logger.log_trace(TraceEntry {
                 node: node_id,
-                function_name: func_name.clone(),
+                function_name: *func_name,
                 kind: TraceKind::Exit,
                 payload_end,
                 schedulable_count: state.total_runnable_count(),
@@ -553,7 +553,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             let payload_end = out.len();
             logger.log_trace(TraceEntry {
                 node: node_id,
-                function_name: func_name.clone(),
+                function_name: *func_name,
                 kind: TraceKind::Dispatch,
                 payload_end,
                 schedulable_count: state.total_runnable_count(),
@@ -1319,7 +1319,7 @@ fn run_trace_enter<H: HashPolicy, L: Logger>(
     let payload_end = out.len();
     logger.log_trace(TraceEntry {
         node: node_id,
-        function_name: te.func_name.clone(),
+        function_name: te.func_name,
         kind: TraceKind::Enter,
         payload_end,
         schedulable_count: state.total_runnable_count(),
@@ -1349,7 +1349,7 @@ fn run_trace_exit<H: HashPolicy, L: Logger>(
     let payload_end = out.len();
     logger.log_trace(TraceEntry {
         node: node_id,
-        function_name: tx.func_name.clone(),
+        function_name: tx.func_name,
         kind: TraceKind::Exit,
         payload_end,
         schedulable_count: state.total_runnable_count(),
@@ -1388,7 +1388,7 @@ fn run_trace_dispatch<H: HashPolicy, L: Logger>(
     let payload_end = out.len();
     logger.log_trace(TraceEntry {
         node: node_id,
-        function_name: td.func_name.clone(),
+        function_name: td.func_name,
         kind: TraceKind::Dispatch,
         payload_end,
         schedulable_count: state.total_runnable_count(),

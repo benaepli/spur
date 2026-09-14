@@ -9,7 +9,6 @@ use crate::analysis::resolver::NameId;
 use crate::analysis::type_id::TypeId;
 use crate::simulator::{StructShape, struct_shape};
 use ecow::EcoString;
-use std::sync::Arc;
 
 /// A child expression position. Slots and literals are read in place by the
 /// parent; only `Tree` enters the tree evaluator.
@@ -120,14 +119,14 @@ pub struct ForLoopInOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceDispatchOp {
-    pub func_name: Arc<str>,
+    pub func_name: &'static str,
     pub params: Vec<Opnd>,
     pub next: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceEnterOp {
-    pub func_name: Arc<str>,
+    pub func_name: &'static str,
     pub params: Vec<Opnd>,
     pub dest: Dest,
     pub next: u32,
@@ -135,7 +134,7 @@ pub struct TraceEnterOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceExitOp {
-    pub func_name: Arc<str>,
+    pub func_name: &'static str,
     pub trace_id: Opnd,
     pub return_value: Opnd,
     pub next: u32,
@@ -386,14 +385,14 @@ impl Builder<'_> {
             Label::Break(target) | Label::Continue(target) => Op::Goto(vertex(*target)),
             Label::TraceDispatch(func_name, params, next) => {
                 Op::TraceDispatch(Box::new(TraceDispatchOp {
-                    func_name: func_name.clone(),
+                    func_name: *func_name,
                     params: params.iter().map(opnd).collect(),
                     next: vertex(*next),
                 }))
             }
             Label::TraceEnter(func_name, params, lhs, next) => {
                 Op::TraceEnter(Box::new(TraceEnterOp {
-                    func_name: func_name.clone(),
+                    func_name: *func_name,
                     params: params.iter().map(opnd).collect(),
                     dest: dest(lhs),
                     next: vertex(*next),
@@ -401,7 +400,7 @@ impl Builder<'_> {
             }
             Label::TraceExit(func_name, trace_id, return_value, next) => {
                 Op::TraceExit(Box::new(TraceExitOp {
-                    func_name: func_name.clone(),
+                    func_name: *func_name,
                     trace_id: opnd(trace_id),
                     return_value: opnd(return_value),
                     next: vertex(*next),

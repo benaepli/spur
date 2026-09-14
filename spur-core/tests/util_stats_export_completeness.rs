@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, ValueStructStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TextBufferStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDeliverStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, PlanReadyStats, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, ProgramTextStats, RunBufferStats, ValueSigStats, ValueStructStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TextBufferStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDeliverStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, PlanReadyStats, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1670,6 +1670,17 @@ fn history_format_leaves(prefix: &str, h: &HistoryFormatStats) -> Vec<(String, V
     vec![leaf(prefix, "ops_streamed", *ops_streamed)]
 }
 
+fn program_text(m: &mut Marks) -> ProgramTextStats {
+    ProgramTextStats {
+        names_interned: m.int(),
+    }
+}
+
+fn program_text_leaves(prefix: &str, p: &ProgramTextStats) -> Vec<(String, Value)> {
+    let ProgramTextStats { names_interned } = p;
+    vec![leaf(prefix, "names_interned", *names_interned)]
+}
+
 fn plan_ready(m: &mut Marks) -> PlanReadyStats {
     PlanReadyStats {
         scans: m.int(),
@@ -2433,6 +2444,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         run_setup: _,
         trace_format: _,
         history_format: _,
+        program_text: _,
         plan_ready: _,
         plan_deliver: _,
         text_buffer: _,
@@ -2496,6 +2508,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "run_setup",
         "trace_format",
         "history_format",
+        "program_text",
         "plan_ready",
         "plan_deliver",
         "text_buffer",
@@ -2592,6 +2605,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.run_setup = run_setup(&mut m);
     s.trace_format = trace_format(&mut m);
     s.history_format = history_format(&mut m);
+    s.program_text = program_text(&mut m);
     s.plan_ready = plan_ready(&mut m);
     s.plan_deliver = plan_deliver(&mut m);
     s.text_buffer = text_buffer(&mut m);
@@ -2634,6 +2648,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(run_setup_leaves("run_setup", &s.run_setup));
     expected.extend(trace_format_leaves("trace_format", &s.trace_format));
     expected.extend(history_format_leaves("history_format", &s.history_format));
+    expected.extend(program_text_leaves("program_text", &s.program_text));
     expected.extend(plan_ready_leaves("plan_ready", &s.plan_ready));
     expected.extend(plan_deliver_leaves("plan_deliver", &s.plan_deliver));
     expected.extend(text_buffer_leaves("text_buffer", &s.text_buffer));
@@ -2702,6 +2717,7 @@ fn every_counter_field_reaches_the_written_json() {
         "run_setup",
         "trace_format",
         "history_format",
+        "program_text",
         "plan_ready",
         "plan_deliver",
         "text_buffer",

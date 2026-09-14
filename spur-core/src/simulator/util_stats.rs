@@ -160,6 +160,10 @@ static HW_STR_STATS_COMPARED: AtomicU64 = AtomicU64::new(0);
 static HW_STR_STATS_CELLS: AtomicU64 = AtomicU64::new(0);
 static HW_GATHER_CALLS: AtomicU64 = AtomicU64::new(0);
 static HW_GATHER_COPIES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Counts for the life of the process: session resets leave it alone,
+/// because names are interned when a program is compiled, before a session
+/// switches stats on.
+static PROGRAM_TEXT_NAMES_INTERNED: AtomicU64 = AtomicU64::new(0);
 
 /// Advanced by every session reset. A per-thread counter block remembers the
 /// value it was activated under and is dropped rather than folded when the
@@ -5960,6 +5964,28 @@ impl HistoryWriterStats {
     }
 }
 
+/// Text the compiled program shares with every run. `names_interned` is the
+/// number of distinct traced function names this process has leaked one
+/// copy of.
+#[derive(Serialize, Debug)]
+pub struct ProgramTextStats {
+    pub names_interned: u64,
+}
+
+impl ProgramTextStats {
+    fn read() -> Self {
+        Self {
+            names_interned: PROGRAM_TEXT_NAMES_INTERNED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A traced function name was seen for the first time in this process and
+/// one copy of it was leaked.
+pub fn record_trace_name_interned() {
+    PROGRAM_TEXT_NAMES_INTERNED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// A history writer's page statistics and batch gathers since its previous
 /// reading.
 #[inline]
@@ -7709,6 +7735,7 @@ pub struct UtilizationSnapshot {
     pub run_setup: RunSetupStats,
     pub trace_format: TraceFormatStats,
     pub history_format: HistoryFormatStats,
+    pub program_text: ProgramTextStats,
 }
 
 /// The snapshot as JSON, for readers that difference or accumulate it.
@@ -7943,6 +7970,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         run_setup: RunSetupStats::read(),
         trace_format: TraceFormatStats::read(),
         history_format: HistoryFormatStats::read(),
+        program_text: ProgramTextStats::read(),
     }
 }
 
