@@ -2,7 +2,7 @@ use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{Expr, FunctionInfo, Lhs, SlotDefault, VarSlot};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::values::{
-    Decimal, Env, Value, ValueKind, ValueMap, ValueSeq, hash_map_entry,
+    Decimal, Env, Value, ValueKind, ValueMap, ValueSeq, hash_map_entry, struct_get, struct_to_map,
 };
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::util_stats;
@@ -206,6 +206,24 @@ pub(crate) fn update_collection<H: HashPolicy>(
 ) -> Result<Value<H>, RuntimeError> {
     use ValueKind::*;
     match col.kind {
+        Struct(shape, mut fields) => {
+            let known = match &key.kind {
+                String(name) => shape.position(name),
+                _ => None,
+            };
+            let Some(i) = known else {
+                let map = struct_to_map(shape, &fields);
+                return update_collection(Value::<H>::with_sig(Map(map), col.sig), key, val);
+            };
+            let new_sig = if H::EAGER {
+                col.sig ^ hash_map_entry(key.sig, fields[i].sig) ^ hash_map_entry(key.sig, val.sig)
+            } else {
+                util_stats::record_struct_other_lookups(1);
+                0
+            };
+            fields.make_mut()[i] = val;
+            Ok(Value::<H>::with_sig(Struct(shape, fields), new_sig))
+        }
         Map(m) => {
             let new_sig = if H::EAGER {
                 let mut s = col.sig;
@@ -358,6 +376,12 @@ pub fn eval<H: HashPolicy>(
                     let k = eval_operand(local_env, node_env, key, role_names)?;
                     m.get(&*k).cloned().ok_or(RuntimeError::KeyNotFound)
                 }
+                ValueKind::Struct(shape, fields) => {
+                    let k = eval_operand(local_env, node_env, key, role_names)?;
+                    struct_get(shape, fields, &k, true)
+                        .cloned()
+                        .ok_or(RuntimeError::KeyNotFound)
+                }
                 ValueKind::List(l) => {
                     let idx =
                         eval_operand(local_env, node_env, key, role_names)?.as_int()? as usize;
@@ -416,11 +440,17 @@ pub fn eval<H: HashPolicy>(
         Expr::KeyExists(key, map) => {
             let k = eval_operand(local_env, node_env, key, role_names)?;
             let m = eval_operand(local_env, node_env, map, role_names)?;
+            if let ValueKind::Struct(shape, fields) = &m.kind {
+                return Ok(Value::<H>::bool(struct_get(shape, fields, &k, false).is_some()));
+            }
             Ok(Value::<H>::bool(m.as_map()?.contains_key(&*k)))
         }
         Expr::MapErase(key, map) => {
             let k = eval_operand(local_env, node_env, key, role_names)?;
             let m = eval_operand(local_env, node_env, map, role_names)?;
+            if let ValueKind::Struct(shape, fields) = &m.kind {
+                return Ok(Value::<H>::map(struct_to_map(shape, fields).without(&*k)));
+            }
             Ok(Value::<H>::map(m.as_map()?.without(&*k)))
         }
         Expr::ListLen(list) => {
@@ -428,6 +458,7 @@ pub fn eval<H: HashPolicy>(
             match &list_val.kind {
                 ValueKind::List(l) => Ok(Value::<H>::int(l.len() as i64)),
                 ValueKind::Map(m) => Ok(Value::<H>::int(m.len() as i64)),
+                ValueKind::Struct(shape, _) => Ok(Value::<H>::int(shape.len() as i64)),
                 _ => Err(RuntimeError::NotACollection {
                     got: list_val.type_name(),
                 }),
@@ -551,6 +582,12 @@ pub fn eval<H: HashPolicy>(
                     match &inner_val.kind {
                         ValueKind::Map(m) => {
                             let result = m.get(&*key_val).cloned().ok_or(RuntimeError::KeyNotFound)?;
+                            Ok(Value::<H>::option_some(result))
+                        }
+                        ValueKind::Struct(shape, fields) => {
+                            let result = struct_get(shape, fields, &key_val, false)
+                                .cloned()
+                                .ok_or(RuntimeError::KeyNotFound)?;
                             Ok(Value::<H>::option_some(result))
                         }
                         ValueKind::List(l) => {

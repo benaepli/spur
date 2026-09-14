@@ -99,6 +99,12 @@ static FRAME_ENTRY_COPIES: AtomicU64 = AtomicU64::new(0);
 static FRAME_DEFAULT_SLOTS_FILLED: AtomicU64 = AtomicU64::new(0);
 static FRAME_PARAMS_FILLED: AtomicU64 = AtomicU64::new(0);
 static VALUE_SIG_LEAF_HASHES_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static VALUE_STRUCT_LITERALS: AtomicU64 = AtomicU64::new(0);
+static VALUE_STRUCT_LITERAL_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static VALUE_STRUCT_FIELD_READS: AtomicU64 = AtomicU64::new(0);
+static VALUE_STRUCT_OTHER_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+static VALUE_STRUCT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static VALUE_STRUCT_FALLBACK_KEY_HASHES: AtomicU64 = AtomicU64::new(0);
 static EVAL_BORROW_HANDLES_NOT_CLONED: AtomicU64 = AtomicU64::new(0);
 static EVAL_BORROW_SCALARS_NOT_CLONED: AtomicU64 = AtomicU64::new(0);
 static RUN_BUFFERS_CHANNEL_TABLE_GROWS: AtomicU64 = AtomicU64::new(0);
@@ -874,6 +880,12 @@ pub fn set_enabled(on: bool) {
             &FRAME_DEFAULT_SLOTS_FILLED,
             &FRAME_PARAMS_FILLED,
             &VALUE_SIG_LEAF_HASHES_DEFERRED,
+            &VALUE_STRUCT_LITERALS,
+            &VALUE_STRUCT_LITERAL_ENTRIES,
+            &VALUE_STRUCT_FIELD_READS,
+            &VALUE_STRUCT_OTHER_LOOKUPS,
+            &VALUE_STRUCT_FALLBACKS,
+            &VALUE_STRUCT_FALLBACK_KEY_HASHES,
             &EVAL_BORROW_HANDLES_NOT_CLONED,
             &EVAL_BORROW_SCALARS_NOT_CLONED,
             &RUN_BUFFERS_CHANNEL_TABLE_GROWS,
@@ -1958,6 +1970,12 @@ thread_local! {
     /// Interpreter counts written without a stats switch check, one cell
     /// each, drained into the session totals where the frame counts fold.
     static LEAF_HASHES_DEFERRED_RUN: Cell<u64> = const { Cell::new(0) };
+    static STRUCT_LITERALS_RUN: Cell<u64> = const { Cell::new(0) };
+    static STRUCT_LITERAL_ENTRIES_RUN: Cell<u64> = const { Cell::new(0) };
+    static STRUCT_FIELD_READS_RUN: Cell<u64> = const { Cell::new(0) };
+    static STRUCT_OTHER_LOOKUPS_RUN: Cell<u64> = const { Cell::new(0) };
+    static STRUCT_FALLBACKS_RUN: Cell<u64> = const { Cell::new(0) };
+    static STRUCT_FALLBACK_KEY_HASHES_RUN: Cell<u64> = const { Cell::new(0) };
     static HANDLES_NOT_CLONED_RUN: Cell<u64> = const { Cell::new(0) };
     static SCALARS_NOT_CLONED_RUN: Cell<u64> = const { Cell::new(0) };
     static CHANNEL_TABLE_GROWS_RUN: Cell<u64> = const { Cell::new(0) };
@@ -5573,6 +5591,44 @@ impl ValueSigStats {
     }
 }
 
+/// Map literals with distinct string keys stored as field slices.
+/// `key_hashes_avoided` is the sum of `literal_entries`, `field_reads` and
+/// `other_lookups`: the deferred leaf hashes the map form of those values
+/// would have recorded and the struct form did not. `fallback_key_hashes` are
+/// the deferred leaf hashes spent turning `fallbacks` structs back into maps.
+/// The hash leaves count under the deferred signature policy only.
+/// `shapes_kept_as_maps` counts distinct key sets of such literals that had
+/// to stay maps.
+#[derive(Serialize, Debug)]
+pub struct ValueStructStats {
+    pub literals: u64,
+    pub key_hashes_avoided: u64,
+    pub literal_entries: u64,
+    pub field_reads: u64,
+    pub other_lookups: u64,
+    pub fallbacks: u64,
+    pub fallback_key_hashes: u64,
+    pub shapes_kept_as_maps: u64,
+}
+
+impl ValueStructStats {
+    fn read() -> Self {
+        let literal_entries = VALUE_STRUCT_LITERAL_ENTRIES.load(Ordering::Relaxed);
+        let field_reads = VALUE_STRUCT_FIELD_READS.load(Ordering::Relaxed);
+        let other_lookups = VALUE_STRUCT_OTHER_LOOKUPS.load(Ordering::Relaxed);
+        Self {
+            literals: VALUE_STRUCT_LITERALS.load(Ordering::Relaxed),
+            key_hashes_avoided: literal_entries + field_reads + other_lookups,
+            literal_entries,
+            field_reads,
+            other_lookups,
+            fallbacks: VALUE_STRUCT_FALLBACKS.load(Ordering::Relaxed),
+            fallback_key_hashes: VALUE_STRUCT_FALLBACK_KEY_HASHES.load(Ordering::Relaxed),
+            shapes_kept_as_maps: crate::simulator::core::values::struct_shapes_kept_as_maps(),
+        }
+    }
+}
+
 /// Variable operands the evaluator read in place instead of copying.
 /// `handles_not_cloned` counts lists, maps, strings, options, tuples and
 /// variants, whose copy touches a reference count or string bytes;
@@ -6005,6 +6061,48 @@ pub fn record_leaf_hash_deferred() {
     tick(&LEAF_HASHES_DEFERRED_RUN);
 }
 
+#[inline]
+fn add_to_cell(cell: &'static std::thread::LocalKey<Cell<u64>>, n: u64) {
+    cell.with(|c| c.set(c.get() + n));
+}
+
+/// A map literal was built as a struct. `key_hashes` is the number of key
+/// hashes its map form would have recorded as deferred leaf hashes.
+#[inline]
+pub fn record_struct_literal(key_hashes: u64) {
+    tick(&STRUCT_LITERALS_RUN);
+    add_to_cell(&STRUCT_LITERAL_ENTRIES_RUN, key_hashes);
+}
+
+/// A map literal built as a struct failed while its fields were evaluated,
+/// after the map form would have recorded `key_hashes` deferred leaf hashes.
+#[inline]
+pub fn record_struct_literal_failed(key_hashes: u64) {
+    add_to_cell(&STRUCT_LITERAL_ENTRIES_RUN, key_hashes);
+}
+
+/// A string key was read from a struct where its map form would have
+/// recorded one deferred leaf hash.
+#[inline]
+pub fn record_struct_field_read() {
+    tick(&STRUCT_FIELD_READS_RUN);
+}
+
+/// A struct operation other than a literal or a field read skipped
+/// `key_hashes` deferred leaf hashes its map form would have recorded.
+#[inline]
+pub fn record_struct_other_lookups(key_hashes: u64) {
+    add_to_cell(&STRUCT_OTHER_LOOKUPS_RUN, key_hashes);
+}
+
+/// A struct was turned into the map it stands for, recording `key_hashes`
+/// deferred leaf hashes its source value never paid.
+#[inline]
+pub fn record_struct_fallback(key_hashes: u64) {
+    tick(&STRUCT_FALLBACKS_RUN);
+    add_to_cell(&STRUCT_FALLBACK_KEY_HASHES_RUN, key_hashes);
+}
+
 /// The evaluator read a variable operand in place. `handle` is true when the
 /// value's copy would have touched a reference count or string bytes.
 #[inline]
@@ -6102,10 +6200,24 @@ pub fn pending_interpreter_tally() -> InterpreterTally {
 /// hashed with a deferred signature.
 #[cfg(test)]
 pub(crate) fn pending_evaluator_events() -> [u64; 3] {
+    // The third event is the deferred leaf hashes the evaluation would have
+    // recorded had every struct been its map: hashes a struct skipped are
+    // added back and hashes spent turning a struct into a map are taken out.
+    let skipped = [
+        &STRUCT_LITERAL_ENTRIES_RUN,
+        &STRUCT_FIELD_READS_RUN,
+        &STRUCT_OTHER_LOOKUPS_RUN,
+    ]
+    .map(|cell| cell.with(|c| c.get()))
+    .iter()
+    .fold(0u64, |a, b| a.wrapping_add(*b));
     [
         HANDLES_NOT_CLONED_RUN.with(|c| c.get()),
         SCALARS_NOT_CLONED_RUN.with(|c| c.get()),
-        LEAF_HASHES_DEFERRED_RUN.with(|c| c.get()),
+        LEAF_HASHES_DEFERRED_RUN
+            .with(|c| c.get())
+            .wrapping_add(skipped)
+            .wrapping_sub(STRUCT_FALLBACK_KEY_HASHES_RUN.with(|c| c.get())),
     ]
 }
 
@@ -6157,6 +6269,12 @@ pub fn flush_frame_stats() {
     // even when stats are off and a later session never inherits them.
     let drained = [
         (&LEAF_HASHES_DEFERRED_RUN, &VALUE_SIG_LEAF_HASHES_DEFERRED),
+        (&STRUCT_LITERALS_RUN, &VALUE_STRUCT_LITERALS),
+        (&STRUCT_LITERAL_ENTRIES_RUN, &VALUE_STRUCT_LITERAL_ENTRIES),
+        (&STRUCT_FIELD_READS_RUN, &VALUE_STRUCT_FIELD_READS),
+        (&STRUCT_OTHER_LOOKUPS_RUN, &VALUE_STRUCT_OTHER_LOOKUPS),
+        (&STRUCT_FALLBACKS_RUN, &VALUE_STRUCT_FALLBACKS),
+        (&STRUCT_FALLBACK_KEY_HASHES_RUN, &VALUE_STRUCT_FALLBACK_KEY_HASHES),
         (&HANDLES_NOT_CLONED_RUN, &EVAL_BORROW_HANDLES_NOT_CLONED),
         (&SCALARS_NOT_CLONED_RUN, &EVAL_BORROW_SCALARS_NOT_CLONED),
         (&CHANNEL_TABLE_GROWS_RUN, &RUN_BUFFERS_CHANNEL_TABLE_GROWS),
@@ -7331,6 +7449,7 @@ pub struct UtilizationSnapshot {
     pub frame: FrameStats,
     pub frame_layout: FrameLayoutStats,
     pub value_sig: ValueSigStats,
+    pub value_struct: ValueStructStats,
     pub eval_borrow: EvalBorrowStats,
     pub run_buffers: RunBufferStats,
     pub print_content: PrintContentStats,
@@ -7561,6 +7680,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         frame: FrameStats::read(),
         frame_layout: FrameLayoutStats::read(),
         value_sig: ValueSigStats::read(),
+        value_struct: ValueStructStats::read(),
         eval_borrow: EvalBorrowStats::read(),
         run_buffers: RunBufferStats::read(),
         print_content: PrintContentStats::read(),

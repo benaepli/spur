@@ -1,6 +1,7 @@
 pub mod arm_selector;
 pub mod config_override;
 mod core;
+pub(crate) use self::core::values::{StructShape, struct_shape};
 pub mod client_anchor;
 pub mod crash_phase;
 mod coverage;

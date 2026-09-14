@@ -443,6 +443,7 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
                     current
                 }
             };
+            let col_val = col_val.into_map_form();
 
             match col_val.kind {
                 ValueKind::List(l) => {
@@ -1239,6 +1240,7 @@ fn run_for_loop_in<H: HashPolicy>(
             current
         }
     };
+    let col_val = col_val.into_map_form();
 
     match col_val.kind {
         ValueKind::List(l) => {

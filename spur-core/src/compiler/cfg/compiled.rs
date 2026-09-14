@@ -7,6 +7,7 @@
 use super::ir::{Expr, FunctionInfo, Instr, Label, Lhs, Program, VarSlot, Vertex};
 use crate::analysis::resolver::NameId;
 use crate::analysis::type_id::TypeId;
+use crate::simulator::{StructShape, struct_shape};
 use ecow::EcoString;
 use std::sync::Arc;
 
@@ -39,6 +40,9 @@ pub enum CExpr {
     /// `Not(EqualsEquals(a, b))`.
     NotEquals(Opnd, Opnd),
     Map(Vec<(Opnd, Opnd)>),
+    /// `Map` whose keys are the distinct string literals of a struct shape:
+    /// each value with the field position it fills, in source order.
+    StructLit(&'static StructShape, Vec<(usize, Opnd)>),
     List(Vec<Opnd>),
     ListPrepend(Opnd, Opnd),
     ListAppend(Opnd, Opnd),
@@ -425,6 +429,24 @@ fn o(expr: &Expr) -> Opnd {
     opnd(expr)
 }
 
+/// A map literal whose keys are all string literals and form a struct shape.
+fn struct_literal(kv: &[(Expr, Expr)]) -> Option<CExpr> {
+    let names = kv
+        .iter()
+        .map(|(k, _)| match k {
+            Expr::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<EcoString>>>()?;
+    let shape = struct_shape(&names)?;
+    let fields = kv
+        .iter()
+        .zip(&names)
+        .map(|((_, v), name)| (shape.position(name).expect("a shape holds its own keys"), o(v)))
+        .collect();
+    Some(CExpr::StructLit(shape, fields))
+}
+
 /// Decodes an expression that is not a slot or a literal.
 fn tree(expr: &Expr) -> CExpr {
     match expr {
@@ -442,7 +464,8 @@ fn tree(expr: &Expr) -> CExpr {
         Expr::And(a, b) => CExpr::And(o(a), o(b)),
         Expr::Or(a, b) => CExpr::Or(o(a), o(b)),
         Expr::EqualsEquals(a, b) => CExpr::EqualsEquals(o(a), o(b)),
-        Expr::Map(kv) => CExpr::Map(kv.iter().map(|(k, v)| (o(k), o(v))).collect()),
+        Expr::Map(kv) => struct_literal(kv)
+            .unwrap_or_else(|| CExpr::Map(kv.iter().map(|(k, v)| (o(k), o(v))).collect())),
         Expr::List(es) => CExpr::List(es.iter().map(o).collect()),
         Expr::ListPrepend(a, b) => CExpr::ListPrepend(o(a), o(b)),
         Expr::ListAppend(a, b) => CExpr::ListAppend(o(a), o(b)),

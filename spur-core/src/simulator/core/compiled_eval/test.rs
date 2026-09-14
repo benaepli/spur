@@ -392,6 +392,90 @@ fn not_equals_and_string_field_reads_decode_to_their_fused_forms() {
     assert!(matches!(field, Opnd::Tree(ref t) if matches!(**t, CExpr::FieldGet(Opnd::Node(1), _))));
 }
 
+fn events_between(a: [u64; 3], b: [u64; 3]) -> Vec<u64> {
+    (0..3).map(|i| b[i].wrapping_sub(a[i])).collect()
+}
+
+fn vr_literal(set: &[&str]) -> Expr {
+    Expr::Map(
+        set.iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let v = if i % 2 == 0 { local(i as u32) } else { Expr::Int(i as i64) };
+                (s(k), v)
+            })
+            .collect(),
+    )
+}
+
+fn is_struct_literal(e: &Expr) -> bool {
+    matches!(opnd(e), Opnd::Tree(ref t) if matches!(**t, CExpr::StructLit(_, _)))
+}
+
+fn struct_literals_evaluate_like_eval<H: HashPolicy>() {
+    use crate::simulator::core::values::struct_tests::VR_KEY_SETS;
+    let l = local_env::<H>();
+    let n = node_env::<H>();
+    let roles = HashMap::new();
+    for set in VR_KEY_SETS {
+        let lit = vr_literal(set);
+        let read = Expr::Find(b(&lit), b(&s(set[set.len() - 1])));
+        let missing = Expr::Find(b(&lit), b(&s("missing")));
+        for e in [lit, read, missing] {
+            let decoded = opnd(&e);
+            let before = util_stats::pending_evaluator_events();
+            let legacy = eval(&l, &n, &e, &roles);
+            let mid = util_stats::pending_evaluator_events();
+            let mut t = InterpreterTally::new();
+            let compiled = cvalue(&l, &n, &decoded, &roles, &mut t);
+            let after = util_stats::pending_evaluator_events();
+            assert_eq!(outcome(&legacy), outcome(&compiled), "{e:?}");
+            if let (Ok(a), Ok(c)) = (&legacy, &compiled) {
+                assert!(a == c && a.sig == c.sig, "{e:?}");
+            }
+            assert_eq!(events_between(before, mid), events_between(mid, after), "{e:?}");
+        }
+    }
+}
+
+#[test]
+fn struct_shaped_map_literals_decode_to_struct_literals() {
+    use crate::simulator::core::values::struct_shape;
+    use crate::simulator::core::values::struct_tests::VR_KEY_SETS;
+    for set in VR_KEY_SETS {
+        assert!(is_struct_literal(&vr_literal(set)), "{set:?}");
+    }
+
+    let names: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+    let (i, j) = (1..names.len())
+        .find_map(|j| {
+            (0..j)
+                .find(|&i| struct_shape(&[names[i].as_str().into(), names[j].as_str().into()]).is_none())
+                .map(|i| (i, j))
+        })
+        .expect("two of 64 names share one of 32 home slots");
+    let (first, second) = (names[i].as_str(), names[j].as_str());
+    let order = |x: &str, y: &str| {
+        let mut m = ValueMap::<NoHashing>::new();
+        m.insert(Value::string(x.into()), Value::unit());
+        m.insert(Value::string(y.into()), Value::unit());
+        m.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>()
+    };
+    assert_ne!(order(first, second), order(second, first), "the key set is order sensitive");
+    let shared_slot = vr_literal(&[first, second]);
+    assert!(matches!(opnd(&shared_slot), Opnd::Tree(ref t) if matches!(**t, CExpr::Map(_))));
+
+    assert!(!is_struct_literal(&vr_literal(&["x", "x"])));
+    let sixteen: Vec<String> = (0..16).map(|i| format!("wide_{i}")).collect();
+    let sixteen: Vec<&str> = sixteen.iter().map(|k| k.as_str()).collect();
+    assert!(!is_struct_literal(&vr_literal(&sixteen)));
+    assert!(!is_struct_literal(&Expr::Map(vec![])));
+    assert!(!is_struct_literal(&Expr::Map(vec![(Expr::Int(1), Expr::Int(2))])));
+
+    struct_literals_evaluate_like_eval::<WithHashing>();
+    struct_literals_evaluate_like_eval::<NoHashing>();
+}
+
 #[test]
 fn slot_and_literal_operands_are_read_without_entering_the_tree_evaluator() {
     let l = local_env::<NoHashing>();

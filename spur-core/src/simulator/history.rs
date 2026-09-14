@@ -13,7 +13,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use crate::simulator::core::state::NodeId;
-use crate::simulator::core::values::ValueMap;
+use crate::simulator::core::values::{StructShape, ValueMap};
 use crate::simulator::hash_utils::HashPolicy;
 use serde::ser::{Serialize, SerializeMap, Serializer};
 #[cfg(test)]
@@ -169,6 +169,18 @@ fn json_of_value<H: crate::simulator::hash_utils::HashPolicy>(v: &Value<H>) -> J
             "value": json_pairs
             })
         }
+        ValueKind::Struct(shape, fields) => {
+            let json_pairs: Vec<JsonValue> = shape
+                .names()
+                .iter()
+                .zip(fields.iter())
+                .map(|(name, v)| json!([json_of_value(&Value::<H>::string(name.clone())), json_of_value(v)]))
+                .collect();
+            json!({
+            "type": "VMap",
+            "value": json_pairs
+            })
+        }
         ValueKind::Option(opt) => {
             let value_json = match opt {
                 Some(inner) => json_of_value(inner),
@@ -263,6 +275,33 @@ impl<H: HashPolicy> Serialize for MapJson<'_, H> {
     }
 }
 
+/// A struct written as the entry pairs of the map it stands for.
+struct StructJson<'a, H: HashPolicy>(&'a StructShape, &'a [Value<H>]);
+
+/// A string key written as `ValueJson` writes a string value.
+struct StringKeyJson<'a>(&'a str);
+
+impl Serialize for StringKeyJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut m = serializer.serialize_map(Some(2))?;
+        m.serialize_entry("type", "VString")?;
+        m.serialize_entry("value", self.0)?;
+        m.end()
+    }
+}
+
+impl<H: HashPolicy> Serialize for StructJson<'_, H> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(
+            self.0
+                .names()
+                .iter()
+                .zip(self.1.iter())
+                .map(|(name, v)| (StringKeyJson(name.as_str()), ValueJson(v))),
+        )
+    }
+}
+
 impl Serialize for ChannelJson {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut m = serializer.serialize_map(Some(2))?;
@@ -328,6 +367,10 @@ impl<H: HashPolicy> Serialize for ValueJson<'_, H> {
             ValueKind::Map(map) => {
                 m.serialize_entry("type", "VMap")?;
                 m.serialize_entry("value", &MapJson(map))?;
+            }
+            ValueKind::Struct(shape, fields) => {
+                m.serialize_entry("type", "VMap")?;
+                m.serialize_entry("value", &StructJson(shape, fields.as_slice()))?;
             }
             ValueKind::Option(opt) => {
                 m.serialize_entry("type", "VOption")?;
@@ -1683,5 +1726,34 @@ mod payload_json_tests {
     fn streamed_payload_is_byte_identical_to_the_json_tree_text() {
         check::<NoHashing>();
         check::<WithHashing>();
+    }
+
+    fn check_structs<H: HashPolicy>() {
+        use crate::simulator::core::values::struct_tests::{
+            VR_KEY_SETS, generated_key_sets, struct_and_map,
+        };
+        let mut sets: Vec<Vec<String>> = VR_KEY_SETS
+            .iter()
+            .map(|set| set.iter().map(|k| k.to_string()).collect())
+            .collect();
+        sets.extend(generated_key_sets());
+        for seed in 0..4 {
+            let mut structs = Vec::new();
+            let mut maps = Vec::new();
+            for set in &sets {
+                let (s, m) = struct_and_map::<H, _>(set, seed);
+                assert_eq!(json_of_value(&s), json_of_value(&m));
+                assert_eq!(payload_to_json_string(std::slice::from_ref(&s)), tree_text(std::slice::from_ref(&m)));
+                structs.push(s);
+                maps.push(m);
+            }
+            assert_eq!(payload_to_json_string(&structs), tree_text(&maps));
+        }
+    }
+
+    #[test]
+    fn struct_payloads_are_byte_identical_to_their_maps() {
+        check_structs::<NoHashing>();
+        check_structs::<WithHashing>();
     }
 }

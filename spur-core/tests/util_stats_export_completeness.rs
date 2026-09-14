@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, ValueStructStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1313,6 +1313,42 @@ fn value_sig_leaves(prefix: &str, v: &ValueSigStats) -> Vec<(String, Value)> {
     vec![leaf(prefix, "leaf_hashes_deferred", *leaf_hashes_deferred)]
 }
 
+fn value_struct(m: &mut Marks) -> ValueStructStats {
+    ValueStructStats {
+        literals: m.int(),
+        key_hashes_avoided: m.int(),
+        literal_entries: m.int(),
+        field_reads: m.int(),
+        other_lookups: m.int(),
+        fallbacks: m.int(),
+        fallback_key_hashes: m.int(),
+        shapes_kept_as_maps: m.int(),
+    }
+}
+
+fn value_struct_leaves(prefix: &str, v: &ValueStructStats) -> Vec<(String, Value)> {
+    let ValueStructStats {
+        literals,
+        key_hashes_avoided,
+        literal_entries,
+        field_reads,
+        other_lookups,
+        fallbacks,
+        fallback_key_hashes,
+        shapes_kept_as_maps,
+    } = v;
+    vec![
+        leaf(prefix, "literals", *literals),
+        leaf(prefix, "key_hashes_avoided", *key_hashes_avoided),
+        leaf(prefix, "literal_entries", *literal_entries),
+        leaf(prefix, "field_reads", *field_reads),
+        leaf(prefix, "other_lookups", *other_lookups),
+        leaf(prefix, "fallbacks", *fallbacks),
+        leaf(prefix, "fallback_key_hashes", *fallback_key_hashes),
+        leaf(prefix, "shapes_kept_as_maps", *shapes_kept_as_maps),
+    ]
+}
+
 fn eval_borrow(m: &mut Marks) -> EvalBorrowStats {
     EvalBorrowStats {
         handles_not_cloned: m.int(),
@@ -2292,6 +2328,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         frame: _,
         frame_layout: _,
         value_sig: _,
+        value_struct: _,
         eval_borrow: _,
         run_buffers: _,
         print_content: _,
@@ -2351,6 +2388,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "frame",
         "frame_layout",
         "value_sig",
+        "value_struct",
         "eval_borrow",
         "run_buffers",
         "print_content",
@@ -2444,6 +2482,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.frame = frame(&mut m);
     s.frame_layout = frame_layout(&mut m);
     s.value_sig = value_sig(&mut m);
+    s.value_struct = value_struct(&mut m);
     s.eval_borrow = eval_borrow(&mut m);
     s.run_buffers = run_buffers(&mut m);
     s.print_content = print_content(&mut m);
@@ -2483,6 +2522,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(frame_leaves("frame", &s.frame));
     expected.extend(frame_layout_leaves("frame_layout", &s.frame_layout));
     expected.extend(value_sig_leaves("value_sig", &s.value_sig));
+    expected.extend(value_struct_leaves("value_struct", &s.value_struct));
     expected.extend(eval_borrow_leaves("eval_borrow", &s.eval_borrow));
     expected.extend(run_buffers_leaves("run_buffers", &s.run_buffers));
     expected.extend(print_content_leaves("print_content", &s.print_content));
@@ -2547,6 +2587,7 @@ fn every_counter_field_reaches_the_written_json() {
         "frame",
         "frame_layout",
         "value_sig",
+        "value_struct",
         "eval_borrow",
         "run_buffers",
         "print_content",

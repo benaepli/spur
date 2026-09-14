@@ -7,7 +7,9 @@ use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{CExpr, Opnd};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{Operand, update_collection};
-use crate::simulator::core::values::{Decimal, Env, Value, ValueKind, ValueMap, ValueSeq};
+use crate::simulator::core::values::{
+    Decimal, Env, Value, ValueKind, ValueMap, ValueSeq, struct_get, struct_to_map,
+};
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::util_stats::{self, InterpreterTally};
 use ecow::EcoString;
@@ -208,12 +210,36 @@ pub fn ceval<H: HashPolicy>(
             }
             Ok(Value::<H>::map(m))
         }
+        CExpr::StructLit(shape, fields) => {
+            let mut vals = ValueSeq::<H>::from_elem(Value::<H>::unit(), fields.len());
+            let slots = vals.make_mut();
+            for (done, (pos, v)) in fields.iter().enumerate() {
+                t.leaf_operands_inline += 1;
+                match cvalue(l, n, v, r, t) {
+                    Ok(val) => slots[*pos] = val,
+                    Err(e) => {
+                        if !H::EAGER {
+                            util_stats::record_struct_literal_failed(done as u64);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            util_stats::record_struct_literal(if H::EAGER { 0 } else { fields.len() as u64 });
+            Ok(Value::<H>::struct_of(shape, vals))
+        }
         CExpr::Find(col, key) => {
             let col_val = coperand(l, n, col, r, t)?;
             match &col_val.kind {
                 ValueKind::Map(m) => {
                     let k = coperand(l, n, key, r, t)?;
                     m.get(&*k).cloned().ok_or(RuntimeError::KeyNotFound)
+                }
+                ValueKind::Struct(shape, fields) => {
+                    let k = coperand(l, n, key, r, t)?;
+                    struct_get(shape, fields, &k, true)
+                        .cloned()
+                        .ok_or(RuntimeError::KeyNotFound)
                 }
                 ValueKind::List(list) => {
                     let idx = coperand(l, n, key, r, t)?.as_int()? as usize;
@@ -234,6 +260,16 @@ pub fn ceval<H: HashPolicy>(
                     t.leaf_operands_inline += 1;
                     let k = Value::<H>::string(name.clone());
                     m.get(&k).cloned().ok_or(RuntimeError::KeyNotFound)
+                }
+                ValueKind::Struct(shape, fields) => {
+                    t.leaf_operands_inline += 1;
+                    if !H::EAGER {
+                        util_stats::record_struct_field_read();
+                    }
+                    shape
+                        .position(name)
+                        .map(|i| fields[i].clone())
+                        .ok_or(RuntimeError::KeyNotFound)
                 }
                 ValueKind::List(list) => {
                     t.leaf_operands_inline += 1;
@@ -281,11 +317,17 @@ pub fn ceval<H: HashPolicy>(
         CExpr::KeyExists(key, map) => {
             let k = coperand(l, n, key, r, t)?;
             let m = coperand(l, n, map, r, t)?;
+            if let ValueKind::Struct(shape, fields) = &m.kind {
+                return Ok(Value::<H>::bool(struct_get(shape, fields, &k, false).is_some()));
+            }
             Ok(Value::<H>::bool(m.as_map()?.contains_key(&*k)))
         }
         CExpr::MapErase(key, map) => {
             let k = coperand(l, n, key, r, t)?;
             let m = coperand(l, n, map, r, t)?;
+            if let ValueKind::Struct(shape, fields) = &m.kind {
+                return Ok(Value::<H>::map(struct_to_map(shape, fields).without(&*k)));
+            }
             Ok(Value::<H>::map(m.as_map()?.without(&*k)))
         }
         CExpr::ListLen(list) => {
@@ -293,6 +335,7 @@ pub fn ceval<H: HashPolicy>(
             match &list_val.kind {
                 ValueKind::List(v) => Ok(Value::<H>::int(v.len() as i64)),
                 ValueKind::Map(m) => Ok(Value::<H>::int(m.len() as i64)),
+                ValueKind::Struct(shape, _) => Ok(Value::<H>::int(shape.len() as i64)),
                 _ => Err(RuntimeError::NotACollection {
                     got: list_val.type_name(),
                 }),
@@ -414,6 +457,12 @@ pub fn ceval<H: HashPolicy>(
                         ValueKind::Map(m) => {
                             let result =
                                 m.get(&*key_val).cloned().ok_or(RuntimeError::KeyNotFound)?;
+                            Ok(Value::<H>::option_some(result))
+                        }
+                        ValueKind::Struct(shape, fields) => {
+                            let result = struct_get(shape, fields, &key_val, false)
+                                .cloned()
+                                .ok_or(RuntimeError::KeyNotFound)?;
                             Ok(Value::<H>::option_some(result))
                         }
                         ValueKind::List(list) => {

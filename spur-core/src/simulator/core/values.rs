@@ -36,12 +36,204 @@ pub type ValueMap<H> =
 /// order the spec wrote, so nothing a spec observes depends on the layout.
 pub type ValueSeq<H> = EcoVec<Value<H>>;
 
+/// Width of the root node of a `ValueMap`: a key's home slot there is its
+/// key hash masked to this many buckets.
+const MAP_ROOT_WIDTH: u32 = 32;
+
+/// Most keys a struct shape may have. A root node holding fewer than half
+/// its width keeps every entry at the slot it was inserted into.
+const STRUCT_MAX_FIELDS: usize = 15;
+
+/// The key set of a map literal whose keys are distinct string literals,
+/// stored as a slice of field values instead of a hash map.
+///
+/// Every name's home slot in the root node of a `ValueMap` differs from every
+/// other name's, so a map holding exactly these keys keeps each entry at its
+/// home slot whatever order the keys were inserted in. Such a map iterates in
+/// ascending home slot, the order `names` and a struct's fields are kept in,
+/// and a map rebuilt from the fields is node for node the map the literal
+/// would have built, including under later inserts and removals.
+#[derive(Debug, PartialEq)]
+pub struct StructShape {
+    names: Box<[EcoString]>,
+    /// Signature of each name as a string value; equal under both policies.
+    key_sigs: Box<[u64]>,
+    /// Field positions in ascending name order.
+    sorted: Box<[usize]>,
+    /// The map signature term for this many entries.
+    sig_prefix: u64,
+}
+
+impl StructShape {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn names(&self) -> &[EcoString] {
+        &self.names
+    }
+
+    /// Position of the field called `name`.
+    #[inline]
+    pub fn position(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n.as_str() == name)
+    }
+}
+
+struct ShapeTables {
+    shapes: Vec<&'static StructShape>,
+    /// Sorted key lists of literals that could not be stored as structs.
+    kept_as_maps: Vec<Vec<EcoString>>,
+}
+
+static SHAPE_TABLES: std::sync::Mutex<ShapeTables> = std::sync::Mutex::new(ShapeTables {
+    shapes: Vec::new(),
+    kept_as_maps: Vec::new(),
+});
+
+/// The shape of a map literal with these keys, in source order, or `None`
+/// when the literal must stay a map: no keys, more than `STRUCT_MAX_FIELDS`,
+/// a repeated key, or two keys sharing a home slot. Shapes are interned once
+/// per process by key set, so equal key sets share one shape.
+pub fn struct_shape(names: &[EcoString]) -> Option<&'static StructShape> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut sorted_names: Vec<EcoString> = names.to_vec();
+    sorted_names.sort();
+    let mut tables = SHAPE_TABLES.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(shape) = tables.shapes.iter().find(|s| {
+        s.len() == sorted_names.len()
+            && s.sorted.iter().zip(&sorted_names).all(|(&i, n)| s.names[i] == *n)
+    }) {
+        return Some(shape);
+    }
+    let distinct = sorted_names.windows(2).all(|w| w[0] != w[1]);
+    let mut slotted: Vec<(u32, EcoString, u64)> = sorted_names
+        .iter()
+        .map(|n| {
+            let sig = Value::<crate::simulator::hash_utils::NoHashing>::compute_sig(&ValueKind::String(n.clone()));
+            let mut h = FxHasher::default();
+            sig.hash(&mut h);
+            ((h.finish() as u32) & (MAP_ROOT_WIDTH - 1), n.clone(), sig)
+        })
+        .collect();
+    slotted.sort_by_key(|(slot, _, _)| *slot);
+    let slots_distinct = slotted.windows(2).all(|w| w[0].0 != w[1].0);
+    if !distinct || !slots_distinct || names.len() > STRUCT_MAX_FIELDS {
+        if !tables.kept_as_maps.contains(&sorted_names) {
+            tables.kept_as_maps.push(sorted_names);
+        }
+        return None;
+    }
+    let names: Box<[EcoString]> = slotted.iter().map(|(_, n, _)| n.clone()).collect();
+    let mut sorted: Vec<usize> = (0..names.len()).collect();
+    sorted.sort_by(|&a, &b| names[a].cmp(&names[b]));
+    let mut h = FxHasher::default();
+    9u8.hash(&mut h);
+    names.len().hash(&mut h);
+    let shape: &'static StructShape = Box::leak(Box::new(StructShape {
+        key_sigs: slotted.iter().map(|(_, _, sig)| *sig).collect(),
+        names,
+        sorted: sorted.into_boxed_slice(),
+        sig_prefix: h.finish(),
+    }));
+    tables.shapes.push(shape);
+    Some(shape)
+}
+
+/// Distinct key sets of map literals with string literal keys that stay maps.
+pub fn struct_shapes_kept_as_maps() -> u64 {
+    SHAPE_TABLES
+        .lock()
+        .map(|t| t.kept_as_maps.len() as u64)
+        .unwrap_or_else(|p| p.into_inner().kept_as_maps.len() as u64)
+}
+
+/// Key hashes that inserting `count` distinct keys into an empty
+/// `std::collections::HashSet` performs, counting the rehash of every entry
+/// when the table grows. The map equality of `ValueMap` fills such a set.
+fn set_insert_key_hashes(count: usize) -> u64 {
+    static TABLE: std::sync::OnceLock<[u64; STRUCT_MAX_FIELDS + 1]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        struct Probe<'a>(usize, &'a std::cell::Cell<u64>);
+        impl PartialEq for Probe<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+        impl Eq for Probe<'_> {}
+        impl Hash for Probe<'_> {
+            fn hash<Ha: Hasher>(&self, state: &mut Ha) {
+                self.1.set(self.1.get() + 1);
+                self.0.hash(state);
+            }
+        }
+        let calls = std::cell::Cell::new(0u64);
+        let mut set = std::collections::HashSet::new();
+        let mut table = [0u64; STRUCT_MAX_FIELDS + 1];
+        for (i, entry) in table.iter_mut().enumerate().skip(1) {
+            set.insert(Probe(i, &calls));
+            *entry = calls.get();
+        }
+        table
+    });
+    table[count]
+}
+
+/// The map a struct stands for, built by inserting its fields in order.
+/// Each insert hashes a string key, which the counters record as a fallback.
+pub fn struct_to_map<H: HashPolicy>(shape: &StructShape, fields: &ValueSeq<H>) -> ValueMap<H> {
+    util_stats::record_struct_fallback(if H::EAGER { 0 } else { shape.len() as u64 });
+    let mut m = ValueMap::<H>::new();
+    for (name, v) in shape.names.iter().zip(fields.iter()) {
+        m.insert(Value::<H>::string(name.clone()), v.clone());
+    }
+    m
+}
+
+/// The field a struct holds under `key`, as looking `key` up in the map it
+/// stands for finds it. A leaf key would have been hashed there; that hash
+/// is recorded as a field read when `field_read` is set and the key is a
+/// string, and as another lookup otherwise.
+#[inline]
+pub fn struct_get<'a, H: HashPolicy>(
+    shape: &StructShape,
+    fields: &'a ValueSeq<H>,
+    key: &Value<H>,
+    field_read: bool,
+) -> Option<&'a Value<H>> {
+    match &key.kind {
+        ValueKind::String(name) => {
+            if !H::EAGER {
+                if field_read {
+                    util_stats::record_struct_field_read();
+                } else {
+                    util_stats::record_struct_other_lookups(1);
+                }
+            }
+            shape.position(name).map(|i| &fields[i])
+        }
+        kind => {
+            if !H::EAGER && !kind.is_composite() {
+                util_stats::record_struct_other_lookups(1);
+            }
+            None
+        }
+    }
+}
+
 /// The inner representation of a value, without cached signature.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum ValueKind<H: HashPolicy> {
     Int(i64),
     Bool(bool),
     Map(ValueMap<H>),
+    /// A map whose key set is `StructShape`: the value of each key, in the
+    /// shape's field order. Every observation of it - equality, ordering,
+    /// signature, hash, text, JSON and debug output - is that of the map.
+    Struct(&'static StructShape, ValueSeq<H>),
     List(ValueSeq<H>),
     Option(Option<Arc<Value<H>>>),
     Channel(ChannelId),
@@ -54,6 +246,47 @@ pub enum ValueKind<H: HashPolicy> {
     Unit,
     Tuple(ValueSeq<H>),
     Variant(u32, EcoString, Option<Arc<Value<H>>>), // (enum_id, variant_name, payload)
+}
+
+/// The entries of a struct, printed the way the map it stands for prints.
+struct StructEntries<'a, H: HashPolicy>(&'a StructShape, &'a ValueSeq<H>);
+
+impl<H: HashPolicy> std::fmt::Debug for StructEntries<'_, H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_map();
+        for (name, v) in self.0.names.iter().zip(self.1.iter()) {
+            d.entry(&Value::<H>::string(name.clone()), v);
+        }
+        d.finish()
+    }
+}
+
+/// Prints what a derived `Debug` prints, except that a struct prints as the
+/// `Map` it stands for.
+impl<H: HashPolicy> std::fmt::Debug for ValueKind<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use ValueKind::*;
+        match self {
+            Int(i) => f.debug_tuple("Int").field(i).finish(),
+            Bool(b) => f.debug_tuple("Bool").field(b).finish(),
+            Map(m) => f.debug_tuple("Map").field(m).finish(),
+            Struct(shape, fields) => f.debug_tuple("Map").field(&StructEntries(shape, fields)).finish(),
+            List(l) => f.debug_tuple("List").field(l).finish(),
+            Option(o) => f.debug_tuple("Option").field(o).finish(),
+            Channel(c) => f.debug_tuple("Channel").field(c).finish(),
+            Node(n) => f.debug_tuple("Node").field(n).finish(),
+            FifoLink(link_id, peer) => f.debug_tuple("FifoLink").field(link_id).field(peer).finish(),
+            String(s) => f.debug_tuple("String").field(s).finish(),
+            Unit => f.write_str("Unit"),
+            Tuple(t) => f.debug_tuple("Tuple").field(t).finish(),
+            Variant(enum_id, name, payload) => f
+                .debug_tuple("Variant")
+                .field(enum_id)
+                .field(name)
+                .field(payload)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +335,7 @@ impl<H: HashPolicy> Value<H> {
             | ValueKind::Tuple(_)
             | ValueKind::List(_)
             | ValueKind::Map(_)
+            | ValueKind::Struct(_, _)
             | ValueKind::Variant(_, _, _) => 0,
         }
     }
@@ -181,6 +415,13 @@ impl<H: HashPolicy> Value<H> {
                 for (k, v) in m.iter() {
                     // Use hash_map_entry for consistent entry hashing
                     sig ^= hash_map_entry(k.sig, v.sig);
+                }
+                sig
+            }
+            ValueKind::Struct(shape, fields) => {
+                let mut sig = shape.sig_prefix;
+                for (k, v) in shape.key_sigs.iter().zip(fields.iter()) {
+                    sig ^= hash_map_entry(*k, v.sig);
                 }
                 sig
             }
@@ -272,6 +513,26 @@ impl<H: HashPolicy> Value<H> {
         Self::new(ValueKind::Variant(enum_id, name, payload))
     }
 
+    /// A struct of `shape`; `fields` must hold one value per field, in the
+    /// shape's field order.
+    #[inline]
+    pub fn struct_of(shape: &'static StructShape, fields: ValueSeq<H>) -> Self {
+        debug_assert_eq!(shape.len(), fields.len());
+        Self::new(ValueKind::Struct(shape, fields))
+    }
+
+    /// The value with a struct turned into the map it stands for; any other
+    /// value is returned unchanged.
+    #[inline]
+    pub fn into_map_form(self) -> Self {
+        match self.kind {
+            ValueKind::Struct(shape, fields) => {
+                Self::with_sig(ValueKind::Map(struct_to_map(shape, &fields)), self.sig)
+            }
+            kind => Self::with_sig(kind, self.sig),
+        }
+    }
+
     /// Create a Value with a pre-computed signature (for incremental updates)
     #[inline]
     pub fn with_sig(kind: ValueKind<H>, sig: u64) -> Self {
@@ -296,6 +557,12 @@ impl<H: HashPolicy> PartialEq for Value<H> {
             (Tuple(a), Tuple(b)) => a == b,
             (List(a), List(b)) => a == b,
             (Map(a), Map(b)) => a == b,
+            (Struct(sa, fa), Struct(sb, fb)) if std::ptr::eq(*sa, *sb) => struct_fields_eq(fa, fb),
+            (Struct(sa, fa), Map(b)) => sa.len() == b.len() && struct_to_map(sa, fa) == *b,
+            (Map(a), Struct(sb, fb)) => a.len() == sb.len() && *a == struct_to_map(sb, fb),
+            (Struct(sa, fa), Struct(sb, fb)) => {
+                sa.len() == sb.len() && struct_to_map(sa, fa) == struct_to_map(sb, fb)
+            }
             (Channel(a), Channel(b)) => a == b,
             (FifoLink(la, pa), FifoLink(lb, pb)) => la == lb && pa == pb,
             (Variant(id_a, name_a, p_a), Variant(id_b, name_b, p_b)) => {
@@ -303,6 +570,45 @@ impl<H: HashPolicy> PartialEq for Value<H> {
             }
             _ => false,
         }
+    }
+}
+
+/// Equality of two structs of one shape, with the key hashes the equality of
+/// the maps they stand for performs recorded as other lookups. That equality
+/// walks the left map in order; for each entry it looks the key up in the
+/// right map, stops at the first differing value, and otherwise adds the key
+/// to a set. Once every entry matched, it looks each right key up in the set.
+fn struct_fields_eq<H: HashPolicy>(a: &ValueSeq<H>, b: &ValueSeq<H>) -> bool {
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if x != y {
+            if !H::EAGER {
+                util_stats::record_struct_other_lookups(i as u64 + 1 + set_insert_key_hashes(i));
+            }
+            return false;
+        }
+    }
+    if !H::EAGER {
+        let n = a.len();
+        util_stats::record_struct_other_lookups(2 * n as u64 + set_insert_key_hashes(n));
+    }
+    true
+}
+
+/// The entries of a map or a struct as `(key, value)` pairs in ascending key
+/// order.
+fn sorted_entries<H: HashPolicy>(v: &Value<H>) -> Vec<(Value<H>, &Value<H>)> {
+    match &v.kind {
+        ValueKind::Map(m) => {
+            let mut out: Vec<_> = m.iter().map(|(k, v)| (k.clone(), v)).collect();
+            out.sort_by(|x, y| x.0.cmp(&y.0));
+            out
+        }
+        ValueKind::Struct(shape, fields) => shape
+            .sorted
+            .iter()
+            .map(|&i| (Value::<H>::string(shape.names[i].clone()), &fields[i]))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 impl<H: HashPolicy> Eq for Value<H> {}
@@ -332,6 +638,18 @@ impl<H: HashPolicy> Ord for Value<H> {
                 b_vec.sort_by(|x, y| x.0.cmp(y.0));
                 a_vec.cmp(&b_vec)
             }
+            (Struct(sa, fa), Struct(sb, fb)) if std::ptr::eq(*sa, *sb) => {
+                for &i in sa.sorted.iter() {
+                    match fa[i].cmp(&fb[i]) {
+                        Ordering::Equal => {}
+                        other => return other,
+                    }
+                }
+                Ordering::Equal
+            }
+            (Struct(_, _) | Map(_), Struct(_, _) | Map(_)) => {
+                sorted_entries(self).cmp(&sorted_entries(other))
+            }
             (Channel(a), Channel(b)) => a.cmp(b),
             (FifoLink(la, pa), FifoLink(lb, pb)) => (la, pa).cmp(&(lb, pb)),
             (Variant(id_a, name_a, p_a), Variant(id_b, name_b, p_b)) => {
@@ -354,8 +672,8 @@ impl<H: HashPolicy> Ord for Value<H> {
             (_, Tuple(_)) => Ordering::Greater,
             (List(_), _) => Ordering::Less,
             (_, List(_)) => Ordering::Greater,
-            (Map(_), _) => Ordering::Less,
-            (_, Map(_)) => Ordering::Greater,
+            (Map(_) | Struct(_, _), _) => Ordering::Less,
+            (_, Map(_) | Struct(_, _)) => Ordering::Greater,
             (Channel(_), _) => Ordering::Less,
             (_, Channel(_)) => Ordering::Greater,
             (FifoLink(_, _), _) => Ordering::Less,
@@ -392,6 +710,7 @@ impl<H: HashPolicy> ValueKind<H> {
                 | ValueKind::Tuple(_)
                 | ValueKind::List(_)
                 | ValueKind::Map(_)
+                | ValueKind::Struct(_, _)
                 | ValueKind::Variant(_, _, _)
         )
     }
@@ -512,6 +831,19 @@ impl<H: HashPolicy> Value<H> {
                 }
                 out.write_str(" }")
             }
+            Struct(shape, fields) => {
+                out.write_str("{ ")?;
+                for (i, (name, v)) in shape.names.iter().zip(fields.iter()).enumerate() {
+                    if i > 0 {
+                        out.write_str(", ")?;
+                    }
+                    out.write_char('"')?;
+                    out.write_str(name)?;
+                    out.write_str("\": ")?;
+                    v.write_to(out)?;
+                }
+                out.write_str(" }")
+            }
             Variant(_, name, None) => out.write_str(name),
             Variant(_, name, Some(payload)) => {
                 out.write_str(name)?;
@@ -535,7 +867,7 @@ impl<H: HashPolicy> Value<H> {
         match &self.kind {
             Int(_) => "int",
             Bool(_) => "bool",
-            Map(_) => "map",
+            Map(_) | Struct(_, _) => "map",
             List(_) => "list",
             Option(_) => "option",
             Channel(_) => "channel",
@@ -824,6 +1156,7 @@ mod tests {
                     }
                     write!(f, " }}")
                 }
+                Struct(_, _) => write!(f, "{}", Reference(&self.0.clone().into_map_form())),
                 Variant(_, name, None) => write!(f, "{}", name),
                 Variant(_, name, Some(payload)) => write!(f, "{}({})", name, Reference(payload)),
             }
@@ -1189,6 +1522,305 @@ mod lazy_signature_tests {
                 .map(|(k, v)| (k.0.clone(), *v as i64))
                 .collect();
             assert_eq!(a, b, "round {round}");
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod struct_tests {
+    use super::*;
+    use crate::analysis::resolver::NameId;
+    use crate::simulator::core::eval::{Operand, update_collection};
+    use crate::simulator::hash_utils::{NoHashing, WithHashing};
+    use std::collections::hash_map::DefaultHasher;
+
+    /// The key sets of the structs the VR specification builds.
+    pub(crate) const VR_KEY_SETS: [&[&str]; 6] = [
+        &["kind", "key", "uid"],
+        &["view", "op"],
+        &["log", "normal_view", "op_number", "commit_number"],
+        &["is_primary", "key", "value", "primary"],
+        &["request", "commit_number"],
+        &["view", "nonce", "log", "op_number", "commit_number", "sender"],
+    ];
+
+    fn names(set: &[&str]) -> Vec<EcoString> {
+        set.iter().map(|k| EcoString::from(*k)).collect()
+    }
+
+    /// Admitted key sets drawn from a fixed pseudo-random sequence, of every
+    /// size a shape allows.
+    pub(crate) fn generated_key_sets() -> Vec<Vec<String>> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let mut out: Vec<Vec<String>> = Vec::new();
+        let mut per_size = [0usize; STRUCT_MAX_FIELDS + 1];
+        for _ in 0..20_000 {
+            let size = 1 + next(STRUCT_MAX_FIELDS as u64) as usize;
+            if per_size[size] >= 4 {
+                continue;
+            }
+            let mut set: Vec<String> = Vec::new();
+            while set.len() < size {
+                let name = format!("field_{}", next(400));
+                if !set.contains(&name) {
+                    set.push(name);
+                }
+            }
+            let ns: Vec<EcoString> = set.iter().map(|s| EcoString::from(s.as_str())).collect();
+            if struct_shape(&ns).is_some() {
+                per_size[size] += 1;
+                out.push(set);
+            }
+        }
+        assert!(per_size[1..].iter().all(|&c| c > 0), "every size is generated: {per_size:?}");
+        out
+    }
+
+    /// Field values of several kinds for each key, varied by `seed`. A nested
+    /// struct appears as a struct in the first list and as its map in the
+    /// second.
+    fn field_values<H: HashPolicy>(n: usize, seed: usize) -> (Vec<Value<H>>, Vec<Value<H>>) {
+        let mut as_struct = Vec::new();
+        let mut as_map = Vec::new();
+        for i in 0..n {
+            let (s, m) = match (i + seed) % 8 {
+                0 => {
+                    let v = Value::<H>::int((i * 31 + seed) as i64);
+                    (v.clone(), v)
+                }
+                1 => {
+                    let v = Value::<H>::string(EcoString::from(format!("v{}", (i + seed) % 3)));
+                    (v.clone(), v)
+                }
+                2 => {
+                    let v = Value::<H>::list((0..(seed % 3)).map(|j| Value::<H>::int(j as i64)).collect());
+                    (v.clone(), v)
+                }
+                3 => struct_and_map::<H, _>(VR_KEY_SETS[1], seed / 2),
+                4 => {
+                    let v = Value::<H>::option_some(Value::<H>::bool(seed % 2 == 0));
+                    (v.clone(), v)
+                }
+                5 => {
+                    let v = Value::<H>::tuple([Value::<H>::int(i as i64), Value::<H>::unit()].into_iter().collect());
+                    (v.clone(), v)
+                }
+                6 => {
+                    let mut m = ValueMap::<H>::new();
+                    m.insert(Value::<H>::int(seed as i64 % 2), Value::<H>::string("x".into()));
+                    let v = Value::<H>::map(m);
+                    (v.clone(), v)
+                }
+                _ => {
+                    let v = Value::<H>::node(NodeId {
+                        role: NameId(0),
+                        index: seed % 3,
+                    });
+                    (v.clone(), v)
+                }
+            };
+            as_struct.push(s);
+            as_map.push(m);
+        }
+        (as_struct, as_map)
+    }
+
+    /// A struct of the key set and the map its literal builds, inserting the
+    /// keys in the order given.
+    pub(crate) fn struct_and_map<H: HashPolicy, S: AsRef<str>>(set: &[S], seed: usize) -> (Value<H>, Value<H>) {
+        let ns: Vec<EcoString> = set.iter().map(|k| EcoString::from(k.as_ref())).collect();
+        let shape = struct_shape(&ns).expect("admitted key set");
+        let (sv, mv) = field_values::<H>(ns.len(), seed);
+        let mut m = ValueMap::<H>::new();
+        let mut fields = vec![Value::<H>::unit(); ns.len()];
+        for ((k, s), v) in ns.iter().zip(sv).zip(mv) {
+            m.insert(Value::<H>::string(k.clone()), v);
+            fields[shape.position(k).unwrap()] = s;
+        }
+        (Value::<H>::struct_of(shape, fields.into_iter().collect()), Value::<H>::map(m))
+    }
+
+    fn key_hash_events() -> u64 {
+        util_stats::pending_evaluator_events()[2]
+    }
+
+    fn std_hash<T: Hash>(t: &T) -> u64 {
+        let mut h = DefaultHasher::new();
+        t.hash(&mut h);
+        h.finish()
+    }
+
+    fn fx_hash<T: Hash>(t: &T) -> u64 {
+        let mut h = FxHasher::default();
+        t.hash(&mut h);
+        h.finish()
+    }
+
+    fn entries<H: HashPolicy>(m: &ValueMap<H>) -> String {
+        m.iter().map(|(k, v)| format!("{k:?}={v:?};")).collect()
+    }
+
+    fn cases<H: HashPolicy>() -> Vec<(Value<H>, Value<H>)> {
+        let mut out = Vec::new();
+        let generated = generated_key_sets();
+        for seed in 0..4 {
+            for set in VR_KEY_SETS {
+                out.push(struct_and_map::<H, _>(set, seed));
+                let mut reversed = set.to_vec();
+                reversed.reverse();
+                out.push(struct_and_map::<H, _>(&reversed, seed));
+            }
+            for set in generated.iter().step_by(3) {
+                out.push(struct_and_map::<H, _>(set, seed));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn vr_key_sets_are_admitted_in_map_iteration_order() {
+        for set in VR_KEY_SETS {
+            let shape = struct_shape(&names(set)).expect("VR key set is a shape");
+            let mut forward = ValueMap::<NoHashing>::new();
+            let mut backward = ValueMap::<NoHashing>::new();
+            for k in set {
+                forward.insert(Value::string(EcoString::from(*k)), Value::unit());
+            }
+            for k in set.iter().rev() {
+                backward.insert(Value::string(EcoString::from(*k)), Value::unit());
+            }
+            let order: Vec<String> = shape.names().iter().map(|n| n.to_string()).collect();
+            let f: Vec<String> = forward.iter().map(|(k, _)| k.to_string().trim_matches('"').to_string()).collect();
+            let b: Vec<String> = backward.iter().map(|(k, _)| k.to_string().trim_matches('"').to_string()).collect();
+            assert_eq!(order, f, "{set:?}");
+            assert_eq!(order, b, "{set:?}");
+            assert!(std::ptr::eq(shape, struct_shape(&names(set)).unwrap()));
+        }
+        assert_eq!(
+            struct_shape(&names(&["kind", "key", "uid"])).map(|s| s as *const _),
+            struct_shape(&names(&["uid", "kind", "key"])).map(|s| s as *const _)
+        );
+        assert!(struct_shape(&names(&["a", "a"])).is_none());
+        assert!(struct_shape(&[]).is_none());
+    }
+
+    fn check_single<H: HashPolicy>(s: &Value<H>, m: &Value<H>) {
+        assert!(matches!(s.kind, ValueKind::Struct(_, _)));
+        assert_eq!(s.sig, m.sig, "{m:?}");
+        assert_eq!(fx_hash(s), fx_hash(m), "{m:?}");
+        assert_eq!(std_hash(s), std_hash(m), "{m:?}");
+        assert_eq!(s.to_string(), m.to_string());
+        assert_eq!(format!("{s:?}"), format!("{m:?}"));
+        assert_eq!(format!("{s:#?}"), format!("{m:#?}"));
+        assert_eq!(s.type_name(), m.type_name());
+        assert!(s == m && m == s && *s == s.clone());
+        assert_eq!(s.cmp(m), Ordering::Equal);
+        let ValueKind::Struct(shape, fields) = &s.kind else { unreachable!() };
+        let ValueKind::Map(map) = &m.kind else { unreachable!() };
+        let mut rebuilt = struct_to_map(shape, fields);
+        let mut reference = map.clone();
+        assert_eq!(entries(&rebuilt), entries(&reference));
+        assert_eq!(format!("{rebuilt:?}"), format!("{reference:?}"));
+        for i in 0..24 {
+            let k = Value::<H>::string(EcoString::from(format!("extra_{i}")));
+            rebuilt.insert(k.clone(), Value::<H>::int(i));
+            reference.insert(k, Value::<H>::int(i));
+            assert_eq!(entries(&rebuilt), entries(&reference), "insert {i}");
+        }
+        for name in shape.names() {
+            let k = Value::<H>::string(name.clone());
+            let mut a = struct_to_map(shape, fields);
+            let mut b = map.clone();
+            a.remove(&k);
+            b.remove(&k);
+            assert_eq!(entries(&a), entries(&b), "remove {name}");
+            rebuilt.remove(&k);
+            reference.remove(&k);
+            assert_eq!(entries(&rebuilt), entries(&reference), "remove {name} after inserts");
+        }
+        for (i, name) in shape.names().iter().enumerate() {
+            for key in [Value::<H>::string(name.clone()), Value::<H>::string("not_a_field".into()), Value::<H>::int(3)] {
+                let replacement = Value::<H>::int(1000 + i as i64);
+                let before = key_hash_events();
+                let a = update_collection(s.clone(), Operand::Borrowed(&key), replacement.clone());
+                let mid = key_hash_events();
+                let b = update_collection(m.clone(), Operand::Borrowed(&key), replacement);
+                let after = key_hash_events();
+                let (a, b) = (a.unwrap(), b.unwrap());
+                assert_eq!(mid.wrapping_sub(before), after.wrapping_sub(mid), "store {key:?}");
+                assert_eq!(format!("{a:?}"), format!("{b:?}"));
+                assert_eq!(a.sig, b.sig);
+                assert!(a == b);
+            }
+        }
+    }
+
+    fn check_pair<H: HashPolicy>(a: &(Value<H>, Value<H>), b: &(Value<H>, Value<H>)) {
+        let expected_eq = a.1 == b.1;
+        let expected_ord = a.1.cmp(&b.1);
+        for (x, y) in [(&a.0, &b.0), (&a.0, &b.1), (&a.1, &b.0)] {
+            let before = key_hash_events();
+            let _ = a.1 == b.1;
+            let mid = key_hash_events();
+            let eq = *x == *y;
+            let after = key_hash_events();
+            assert_eq!(eq, expected_eq, "{x:?} == {y:?}");
+            assert_eq!(mid.wrapping_sub(before), after.wrapping_sub(mid), "hash events of {x:?} == {y:?}");
+            assert_eq!(x.cmp(y), expected_ord, "{x:?} cmp {y:?}");
+        }
+    }
+
+    fn check_all<H: HashPolicy>() {
+        let cases = cases::<H>();
+        for (s, m) in &cases {
+            check_single(s, m);
+        }
+        for a in &cases {
+            for b in &cases {
+                check_pair(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn structs_observe_as_their_maps_with_eager_signatures() {
+        check_all::<WithHashing>();
+    }
+
+    #[test]
+    fn structs_observe_as_their_maps_with_deferred_signatures() {
+        check_all::<NoHashing>();
+    }
+
+    #[test]
+    fn equal_structs_differing_in_one_field_count_the_map_equality_hashes() {
+        for set in VR_KEY_SETS.iter().copied().chain([&["field_1"][..]]) {
+            let n = set.len();
+            for differ in 0..=n {
+                let (s, m) = struct_and_map::<NoHashing, _>(set, 1);
+                let ValueKind::Struct(shape, fields) = &s.kind else { unreachable!() };
+                let mut other_fields = fields.clone();
+                let mut other_map = m.as_map().unwrap().clone();
+                if differ < n {
+                    other_fields.make_mut()[differ] = Value::int(-1);
+                    other_map.insert(Value::string(shape.names()[differ].clone()), Value::int(-1));
+                }
+                let t = Value::<NoHashing>::struct_of(shape, other_fields);
+                let u = Value::<NoHashing>::map(other_map);
+                let before = key_hash_events();
+                let expected = m == u;
+                let mid = key_hash_events();
+                let got = s == t;
+                let after = key_hash_events();
+                assert_eq!(expected, got);
+                assert_eq!(mid - before, after - mid, "{set:?} differing at {differ}");
+            }
         }
     }
 }
