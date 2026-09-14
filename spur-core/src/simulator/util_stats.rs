@@ -156,6 +156,10 @@ static HW_TEXT_BUFFERS_DROPPED_OVERSIZE: AtomicU64 = AtomicU64::new(0);
 static HW_INT_DICT_MEMO: AtomicU64 = AtomicU64::new(0);
 static HW_INT_DICT_DIRECT: AtomicU64 = AtomicU64::new(0);
 static HW_INT_DICT_HASHED: AtomicU64 = AtomicU64::new(0);
+static HW_STR_STATS_COMPARED: AtomicU64 = AtomicU64::new(0);
+static HW_STR_STATS_CELLS: AtomicU64 = AtomicU64::new(0);
+static HW_GATHER_CALLS: AtomicU64 = AtomicU64::new(0);
+static HW_GATHER_COPIES_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Advanced by every session reset. A per-thread counter block remembers the
 /// value it was activated under and is dropped rather than folded when the
@@ -886,6 +890,10 @@ pub fn set_enabled(on: bool) {
             &HW_INT_DICT_MEMO,
             &HW_INT_DICT_DIRECT,
             &HW_INT_DICT_HASHED,
+            &HW_STR_STATS_COMPARED,
+            &HW_STR_STATS_CELLS,
+            &HW_GATHER_CALLS,
+            &HW_GATHER_COPIES_SKIPPED,
             &TIMELINE_CONSTANT_SHORT_CIRCUITS,
             &TIMELINE_CONSTANT_INSERTS,
             &RUN_SETUP_PROGRAM_CLONES_AVOIDED,
@@ -5908,7 +5916,11 @@ impl PrintContentStats {
 /// buffer too large to recycle. Every integer value the parquet dictionary
 /// encoder interned is one of `int_dict_memo` (it took the key of the value
 /// just before it), `int_dict_direct` (found by value in the small-value
-/// table) or `int_dict_hashed` (found through the hash table).
+/// table) or `int_dict_hashed` (found through the hash table). Of the
+/// `str_stats_cells` string values whose page keeps a min and max,
+/// `str_stats_compared` were compared against them. Of the `gather_calls`
+/// integer batches written by index, `gather_copies_skipped` were written
+/// straight from the column without copying.
 #[derive(Serialize, Debug)]
 pub struct HistoryWriterStats {
     pub busy_ns: u64,
@@ -5921,6 +5933,10 @@ pub struct HistoryWriterStats {
     pub int_dict_memo: u64,
     pub int_dict_direct: u64,
     pub int_dict_hashed: u64,
+    pub str_stats_compared: u64,
+    pub str_stats_cells: u64,
+    pub gather_calls: u64,
+    pub gather_copies_skipped: u64,
 }
 
 impl HistoryWriterStats {
@@ -5936,8 +5952,30 @@ impl HistoryWriterStats {
             int_dict_memo: HW_INT_DICT_MEMO.load(Ordering::Relaxed),
             int_dict_direct: HW_INT_DICT_DIRECT.load(Ordering::Relaxed),
             int_dict_hashed: HW_INT_DICT_HASHED.load(Ordering::Relaxed),
+            str_stats_compared: HW_STR_STATS_COMPARED.load(Ordering::Relaxed),
+            str_stats_cells: HW_STR_STATS_CELLS.load(Ordering::Relaxed),
+            gather_calls: HW_GATHER_CALLS.load(Ordering::Relaxed),
+            gather_copies_skipped: HW_GATHER_COPIES_SKIPPED.load(Ordering::Relaxed),
         }
     }
+}
+
+/// A history writer's page statistics and batch gathers since its previous
+/// reading.
+#[inline]
+pub fn record_history_writer_page_paths(
+    str_stats_compared: u64,
+    str_stats_cells: u64,
+    gather_calls: u64,
+    gather_copies_skipped: u64,
+) {
+    if !enabled() {
+        return;
+    }
+    HW_STR_STATS_COMPARED.fetch_add(str_stats_compared, Ordering::Relaxed);
+    HW_STR_STATS_CELLS.fetch_add(str_stats_cells, Ordering::Relaxed);
+    HW_GATHER_CALLS.fetch_add(gather_calls, Ordering::Relaxed);
+    HW_GATHER_COPIES_SKIPPED.fetch_add(gather_copies_skipped, Ordering::Relaxed);
 }
 
 /// A history writer's integer dictionary lookups since its previous reading,

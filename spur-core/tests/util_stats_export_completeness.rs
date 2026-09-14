@@ -1550,6 +1550,10 @@ fn history_writer(m: &mut Marks) -> HistoryWriterStats {
         int_dict_memo: m.int(),
         int_dict_direct: m.int(),
         int_dict_hashed: m.int(),
+        str_stats_compared: m.int(),
+        str_stats_cells: m.int(),
+        gather_calls: m.int(),
+        gather_copies_skipped: m.int(),
     }
 }
 
@@ -1565,6 +1569,10 @@ fn history_writer_leaves(prefix: &str, h: &HistoryWriterStats) -> Vec<(String, V
         int_dict_memo,
         int_dict_direct,
         int_dict_hashed,
+        str_stats_compared,
+        str_stats_cells,
+        gather_calls,
+        gather_copies_skipped,
     } = h;
     vec![
         leaf(prefix, "busy_ns", *busy_ns),
@@ -1577,6 +1585,10 @@ fn history_writer_leaves(prefix: &str, h: &HistoryWriterStats) -> Vec<(String, V
         leaf(prefix, "int_dict_memo", *int_dict_memo),
         leaf(prefix, "int_dict_direct", *int_dict_direct),
         leaf(prefix, "int_dict_hashed", *int_dict_hashed),
+        leaf(prefix, "str_stats_compared", *str_stats_compared),
+        leaf(prefix, "str_stats_cells", *str_stats_cells),
+        leaf(prefix, "gather_calls", *gather_calls),
+        leaf(prefix, "gather_copies_skipped", *gather_copies_skipped),
     ]
 }
 

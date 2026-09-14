@@ -30,12 +30,25 @@ pub struct WriteTally {
     pub int_dict_direct: u64,
     /// Integer dictionary values looked up through the hash table.
     pub int_dict_hashed: u64,
+    /// Byte-array values compared against their page's min and max.
+    pub str_stats_compared: u64,
+    /// Byte-array values whose page keeps a min and max.
+    pub str_stats_cells: u64,
+    /// Primitive value batches written by index.
+    pub gather_calls: u64,
+    /// Of `gather_calls`, the batches whose indices were contiguous and were
+    /// written from the source slice without a copy.
+    pub gather_copies_skipped: u64,
 }
 
 const ZERO: WriteTally = WriteTally {
     int_dict_memo: 0,
     int_dict_direct: 0,
     int_dict_hashed: 0,
+    str_stats_compared: 0,
+    str_stats_cells: 0,
+    gather_calls: 0,
+    gather_copies_skipped: 0,
 };
 
 thread_local! {
@@ -53,6 +66,24 @@ pub(crate) fn add_int_dict(memo: u64, direct: u64, hashed: u64) {
         v.int_dict_memo += memo;
         v.int_dict_direct += direct;
         v.int_dict_hashed += hashed;
+        t.set(v);
+    });
+}
+
+pub(crate) fn add_str_stats(cells: u64, compared: u64) {
+    TALLY.with(|t| {
+        let mut v = t.get();
+        v.str_stats_cells += cells;
+        v.str_stats_compared += compared;
+        t.set(v);
+    });
+}
+
+pub(crate) fn add_gather(copy_skipped: bool) {
+    TALLY.with(|t| {
+        let mut v = t.get();
+        v.gather_calls += 1;
+        v.gather_copies_skipped += u64::from(copy_skipped);
         t.set(v);
     });
 }

@@ -1092,6 +1092,12 @@ fn record_encoder_tally() {
         tally.int_dict_direct,
         tally.int_dict_hashed,
     );
+    util_stats::record_history_writer_page_paths(
+        tally.str_stats_compared,
+        tally.str_stats_cells,
+        tally.gather_calls,
+        tally.gather_copies_skipped,
+    );
 }
 
 fn record_writer_busy(started: Option<Instant>) {

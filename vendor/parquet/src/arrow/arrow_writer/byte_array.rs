@@ -337,6 +337,11 @@ struct DictEncoder {
     interner: Interner<ByteArrayStorage>,
     indices: Vec<u64>,
     variable_length_bytes: i64,
+    /// One bit per key, set when the key first occurs in the buffered page.
+    /// Every data page flush clears it.
+    page_keys_seen: Vec<u64>,
+    /// The keys whose bits are set in `page_keys_seen`.
+    page_keys: Vec<u64>,
 }
 
 impl DictEncoder {
@@ -354,6 +359,52 @@ impl DictEncoder {
             self.indices.push(interned);
             self.variable_length_bytes += value.as_ref().len() as i64;
         }
+    }
+
+    /// Encodes `values` to the in-progress page and folds into `min_value`
+    /// and `max_value` only the values whose key is new to the page. The min
+    /// and max over a page's distinct values are those over all its values,
+    /// so `min_value` and `max_value` must cover exactly the buffered page.
+    /// Returns how many values were compared.
+    fn encode_with_min_max<T>(
+        &mut self,
+        values: T,
+        indices: &[usize],
+        min_value: &mut Option<ByteArray>,
+        max_value: &mut Option<ByteArray>,
+    ) -> u64
+    where
+        T: ArrayAccessor + Copy,
+        T::Item: AsRef<[u8]>,
+    {
+        self.indices.reserve(indices.len());
+
+        let mut compared = 0;
+        for idx in indices {
+            let value = values.value(*idx);
+            let bytes = value.as_ref();
+            let key = self.interner.intern(bytes);
+            self.indices.push(key);
+            self.variable_length_bytes += bytes.len() as i64;
+
+            let word = (key / 64) as usize;
+            let bit = 1u64 << (key % 64);
+            if word >= self.page_keys_seen.len() {
+                self.page_keys_seen.resize(word + 1, 0);
+            }
+            if self.page_keys_seen[word] & bit == 0 {
+                self.page_keys_seen[word] |= bit;
+                self.page_keys.push(key);
+                compared += 1;
+                if min_value.as_ref().is_none_or(|m| m.data() > bytes) {
+                    *min_value = Some(bytes.to_vec().into());
+                }
+                if max_value.as_ref().is_none_or(|m| m.data() < bytes) {
+                    *max_value = Some(bytes.to_vec().into());
+                }
+            }
+        }
+        compared
     }
 
     fn bit_width(&self) -> u8 {
@@ -400,6 +451,12 @@ impl DictEncoder {
         }
 
         self.indices.clear();
+
+        // Every set bit belongs to a listed key, so clearing a listed key's
+        // whole word leaves no bit of the flushed page behind.
+        for key in self.page_keys.drain(..) {
+            self.page_keys_seen[(key / 64) as usize] = 0;
+        }
 
         // Capture value of variable_length_bytes and reset for next page
         let variable_length_bytes = Some(self.variable_length_bytes);
@@ -556,17 +613,27 @@ where
     T: ArrayAccessor + Copy,
     T::Item: Copy + Ord + AsRef<[u8]>,
 {
+    // With a dictionary, min and max come from the values new to the page
+    // while interning.
+    let min_max_from_keys = encoder.statistics_enabled != EnabledStatistics::None
+        && encoder.geo_stats_accumulator.is_none()
+        && encoder.dict_encoder.is_some();
+
     if encoder.statistics_enabled != EnabledStatistics::None {
         if let Some(accumulator) = encoder.geo_stats_accumulator.as_mut() {
             update_geo_stats_accumulator(accumulator.as_mut(), values, indices.iter().cloned());
-        } else if let Some((min, max)) = compute_min_max(values, indices.iter().cloned()) {
-            if encoder.min_value.as_ref().is_none_or(|m| m > &min) {
-                encoder.min_value = Some(min);
-            }
+        } else if !min_max_from_keys {
+            if let Some((min, max)) = compute_min_max(values, indices.iter().cloned()) {
+                if encoder.min_value.as_ref().is_none_or(|m| m > &min) {
+                    encoder.min_value = Some(min);
+                }
 
-            if encoder.max_value.as_ref().is_none_or(|m| m < &max) {
-                encoder.max_value = Some(max);
+                if encoder.max_value.as_ref().is_none_or(|m| m < &max) {
+                    encoder.max_value = Some(max);
+                }
             }
+            let cells = indices.len() as u64;
+            crate::write_tally::add_str_stats(cells, cells);
         }
     }
 
@@ -579,6 +646,15 @@ where
     }
 
     match &mut encoder.dict_encoder {
+        Some(dict_encoder) if min_max_from_keys => {
+            let compared = dict_encoder.encode_with_min_max(
+                values,
+                indices,
+                &mut encoder.min_value,
+                &mut encoder.max_value,
+            );
+            crate::write_tally::add_str_stats(indices.len() as u64, compared);
+        }
         Some(dict_encoder) => dict_encoder.encode(values, indices),
         None => encoder.fallback.encode(values, indices),
     }
