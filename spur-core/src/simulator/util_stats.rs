@@ -125,8 +125,6 @@ static GP_BATCHES: AtomicU64 = AtomicU64::new(0);
 static GP_CAPACITY_GATED_BATCHES: AtomicU64 = AtomicU64::new(0);
 static GP_UNFILLED_IN_UNGATED_BATCHES: AtomicU64 = AtomicU64::new(0);
 static GP_FRESH_AHEAD_LAUNCHED: AtomicU64 = AtomicU64::new(0);
-static GP_SHADOW_BATCHES_CHECKED: AtomicU64 = AtomicU64::new(0);
-static GP_SHADOW_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static GP_BATCHED_WORKER_IDLE_NS: AtomicU64 = AtomicU64::new(0);
 static GP_BATCHED_RUN_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static GP_BATCHED_POOL_WALL_NS: AtomicU64 = AtomicU64::new(0);
@@ -894,8 +892,6 @@ pub fn set_enabled(on: bool) {
             &GP_CAPACITY_GATED_BATCHES,
             &GP_UNFILLED_IN_UNGATED_BATCHES,
             &GP_FRESH_AHEAD_LAUNCHED,
-            &GP_SHADOW_BATCHES_CHECKED,
-            &GP_SHADOW_MISMATCHES,
             &GP_BATCHED_WORKER_IDLE_NS,
             &GP_BATCHED_RUN_WALL_NS,
             &GP_BATCHED_POOL_WALL_NS,
@@ -2950,8 +2946,6 @@ pub struct GridPoolSession {
     pub capacity_gated_batches: u64,
     pub unfilled_in_ungated_batches: u64,
     pub fresh_ahead_launched: u64,
-    pub shadow_batches_checked: u64,
-    pub shadow_mismatches: u64,
     pub writer_blocked_ns: u64,
 }
 
@@ -2970,8 +2964,6 @@ pub fn record_grid_pool(s: &GridPoolSession) {
     GP_CAPACITY_GATED_BATCHES.fetch_add(s.capacity_gated_batches, Ordering::Relaxed);
     GP_UNFILLED_IN_UNGATED_BATCHES.fetch_add(s.unfilled_in_ungated_batches, Ordering::Relaxed);
     GP_FRESH_AHEAD_LAUNCHED.fetch_add(s.fresh_ahead_launched, Ordering::Relaxed);
-    GP_SHADOW_BATCHES_CHECKED.fetch_add(s.shadow_batches_checked, Ordering::Relaxed);
-    GP_SHADOW_MISMATCHES.fetch_add(s.shadow_mismatches, Ordering::Relaxed);
     GP_WRITER_BLOCKED_NS.fetch_add(s.writer_blocked_ns, Ordering::Relaxed);
 }
 
@@ -7135,11 +7127,9 @@ impl ReplayStats {
 /// `unfilled_in_ungated_batches` counts slots that found the corpus empty in
 /// a batch that passed that test, and is zero whenever assignment is exact.
 /// `fresh_ahead_launched` counts fresh runs started before their batch's
-/// slots were drawn. The `shadow_` leaves count only in debug builds: batches
-/// whose assignment was recomputed by a sequential reference, and runs whose
-/// assignment differed from it. The `batched_` leaves cover strategies that
-/// run a batch to completion as a whole, where every worker waits for the
-/// batch's slowest run. `writer_blocked_ns` is the part of grid `run_wall_ns`
+/// slots were drawn. The `batched_` leaves cover strategies that run a batch
+/// to completion as a whole, where every worker waits for the batch's
+/// slowest run. `writer_blocked_ns` is the part of grid `run_wall_ns`
 /// that runs spent waiting for room in the history writer's queue, so
 /// `(run_wall_ns - writer_blocked_ns) / (workers x pool_wall_ns)` is busy
 /// share with that waiting removed.
@@ -7154,8 +7144,6 @@ pub struct GridPoolStats {
     pub capacity_gated_batches: u64,
     pub unfilled_in_ungated_batches: u64,
     pub fresh_ahead_launched: u64,
-    pub shadow_batches_checked: u64,
-    pub shadow_mismatches: u64,
     pub batched_worker_idle_ns: u64,
     pub batched_run_wall_ns: u64,
     pub batched_pool_wall_ns: u64,
@@ -7176,8 +7164,6 @@ impl GridPoolStats {
             capacity_gated_batches: GP_CAPACITY_GATED_BATCHES.load(Ordering::Relaxed),
             unfilled_in_ungated_batches: GP_UNFILLED_IN_UNGATED_BATCHES.load(Ordering::Relaxed),
             fresh_ahead_launched: GP_FRESH_AHEAD_LAUNCHED.load(Ordering::Relaxed),
-            shadow_batches_checked: GP_SHADOW_BATCHES_CHECKED.load(Ordering::Relaxed),
-            shadow_mismatches: GP_SHADOW_MISMATCHES.load(Ordering::Relaxed),
             batched_worker_idle_ns: GP_BATCHED_WORKER_IDLE_NS.load(Ordering::Relaxed),
             batched_run_wall_ns: GP_BATCHED_RUN_WALL_NS.load(Ordering::Relaxed),
             batched_pool_wall_ns: GP_BATCHED_POOL_WALL_NS.load(Ordering::Relaxed),

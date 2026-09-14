@@ -449,9 +449,6 @@ pub(crate) struct GridArm<F: Feedback> {
     batch_size: usize,
     arm_seed: u64,
     assigner: Assigner<SingleRunConfig>,
-    /// A sequential reference assignment checked against every batch; kept
-    /// only in debug builds.
-    shadow: Option<Assigner<SingleRunConfig>>,
 }
 
 /// What one run of a grid-arm batch is.
@@ -646,7 +643,6 @@ impl<F: Feedback> GridArm<F> {
             batch_size,
             arm_seed,
             assigner: Assigner::new(grid_len),
-            shadow: cfg!(debug_assertions).then(|| Assigner::new(grid_len)),
         }
     }
 }
@@ -671,7 +667,6 @@ impl<F: Feedback> Arm for GridArm<F> {
         let blocked_before = util_stats::history_writer_blocked_ns();
         let mut pool = run_ordered_release(
             &mut self.assigner,
-            self.shadow.as_mut(),
             self.batch_size,
             rayon::current_num_threads(),
             ctx.run_counter,
@@ -766,26 +761,6 @@ impl<C: Clone> Batch<C> {
         self.assigned[pos] = true;
         self.ready += 1;
     }
-
-    /// Whether position `pos` holds the run `expected` names.
-    fn holds(&self, pos: usize, expected: &GridRun<C>) -> bool {
-        match expected {
-            GridRun::Fresh { config_index } => self.fresh_index[pos] == Some(*config_index),
-            GridRun::Child { seed, prefix } => match &self.runs[pos] {
-                Some(GridRun::Child {
-                    seed: got,
-                    prefix: got_prefix,
-                }) => {
-                    got_prefix == prefix
-                        && got.config_index == seed.config_index
-                        && got.workload_seed == seed.workload_seed
-                        && got.cut_step == seed.cut_step
-                        && got.tape[..] == seed.tape[..]
-                }
-                _ => false,
-            },
-        }
-    }
 }
 
 /// A finished job: its batch, its position, its outcome (`None` when the
@@ -837,13 +812,11 @@ struct PoolResult {
 }
 
 /// Assigns every not yet assigned position of a batch in position order,
-/// drawing its slots, then checks the batch against the sequential
-/// reference when one is kept. Every earlier batch's admissions must have
-/// been applied.
+/// drawing its slots. Every earlier batch's admissions must have been
+/// applied.
 fn release_batch<C: Clone>(
     batch: &mut Batch<C>,
     assigner: &mut Assigner<C>,
-    shadow: Option<&mut Assigner<C>>,
     session: &mut util_stats::GridPoolSession,
 ) {
     for pos in 0..batch.len() {
@@ -858,15 +831,6 @@ fn release_batch<C: Clone>(
             }
         }
         batch.set(pos, run);
-    }
-    if let Some(shadow) = shadow {
-        session.shadow_batches_checked += 1;
-        for pos in 0..batch.len() {
-            let (expected, _) = shadow.assign(batch.first_id + pos as i64);
-            if !batch.holds(pos, &expected) {
-                session.shadow_mismatches += 1;
-            }
-        }
     }
     batch.released = true;
 }
@@ -884,7 +848,6 @@ fn release_batch<C: Clone>(
 /// before assigning the next. With one worker, runs also start in id order.
 fn run_ordered_release<C, R>(
     assigner: &mut Assigner<C>,
-    mut shadow: Option<&mut Assigner<C>>,
     batch_size: usize,
     workers: usize,
     run_counter: &AtomicI64,
@@ -923,7 +886,7 @@ where
                 }
                 if !batch.released {
                     let before = batch.ready;
-                    release_batch(batch, assigner, shadow.as_deref_mut(), &mut session);
+                    release_batch(batch, assigner, &mut session);
                     ready += batch.ready - before;
                 }
                 if batch.fresh_unfinished > 0 {
@@ -932,9 +895,6 @@ where
                 }
                 for pos in 0..batch.len() {
                     if let Some(seed) = batch.admits[pos].take() {
-                        if let Some(shadow) = shadow.as_deref_mut() {
-                            shadow.admit(seed.clone());
-                        }
                         assigner.admit(seed);
                         util_stats::record_replay_parent_admitted();
                     }
@@ -984,7 +944,7 @@ where
                 }
                 let mut batch = Batch::new(first_id, count, slots, covered);
                 if all_admitted {
-                    release_batch(&mut batch, assigner, shadow.as_deref_mut(), &mut session);
+                    release_batch(&mut batch, assigner, &mut session);
                 } else {
                     for pos in 0..count {
                         if !replay_corpus::is_slot(first_id + pos as i64) {
@@ -1945,7 +1905,6 @@ mod tests {
         let ref_counter = AtomicI64::new(0);
         let pooled = Synthetic::new(admit_one_in, true);
         let mut assigner = Assigner::<u64>::new(grid_len);
-        let mut shadow = Assigner::<u64>::new(grid_len);
         let counter = AtomicI64::new(0);
         let mut total = util_stats::GridPoolSession::default();
         for _ in 0..slices {
@@ -1958,7 +1917,6 @@ mod tests {
             );
             let result = run_ordered_release(
                 &mut assigner,
-                Some(&mut shadow),
                 batch_size,
                 workers,
                 &counter,
@@ -1987,8 +1945,6 @@ mod tests {
             total.capacity_gated_batches += result.session.capacity_gated_batches;
             total.unfilled_in_ungated_batches += result.session.unfilled_in_ungated_batches;
             total.fresh_ahead_launched += result.session.fresh_ahead_launched;
-            total.shadow_batches_checked += result.session.shadow_batches_checked;
-            total.shadow_mismatches += result.session.shadow_mismatches;
         }
         assert_eq!(
             pooled.assignments(),
@@ -1999,8 +1955,6 @@ mod tests {
             !ref_assigner.admitted.is_empty(),
             "the synthetic arm admitted nothing, so the check is vacuous"
         );
-        assert_eq!(total.shadow_mismatches, 0);
-        assert_eq!(total.shadow_batches_checked, total.batches);
         assert_eq!(total.unfilled_in_ungated_batches, 0);
         total
     }
@@ -2031,7 +1985,6 @@ mod tests {
         let starts = std::sync::Mutex::new(Vec::new());
         run_ordered_release(
             &mut assigner,
-            None,
             8,
             1,
             &counter,
@@ -2047,17 +2000,20 @@ mod tests {
 
     #[test]
     fn ordered_release_drains_every_run_at_slice_end() {
+        let nine_batches = |_: u64, batches: u64| (batches < 9).then_some(usize::MAX);
+        let reference = Synthetic::new(2, false);
+        let mut ref_assigner = Assigner::<u64>::new(5);
+        let ref_counter = AtomicI64::new(0);
+        sequential_reference(&mut ref_assigner, 10, &ref_counter, nine_batches, &reference);
         let synthetic = Synthetic::new(2, true);
         let mut assigner = Assigner::<u64>::new(5);
-        let mut shadow = Assigner::<u64>::new(5);
         let counter = AtomicI64::new(0);
         let result = run_ordered_release(
             &mut assigner,
-            Some(&mut shadow),
             10,
             8,
             &counter,
-            |_, batches| (batches < 9).then_some(usize::MAX),
+            nine_batches,
             &|run_id, run| synthetic.run(run_id, run),
         );
         assert_eq!(result.session.runs, 90);
@@ -2068,7 +2024,12 @@ mod tests {
             "runs were left in flight"
         );
         assert_eq!(counter.load(Ordering::Relaxed), 90);
-        assert_eq!(result.session.shadow_mismatches, 0);
+        assert_eq!(
+            synthetic.assignments(),
+            reference.assignments(),
+            "assignment by run id"
+        );
+        assert_eq!(assigner.admitted, ref_assigner.admitted, "admission sequence");
         assert!(
             result.session.job_wall_ns <= result.session.workers * result.session.pool_wall_ns,
             "job wall exceeds worker capacity: {:?}",
@@ -2076,24 +2037,6 @@ mod tests {
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert_eq!(synthetic.finished.load(Ordering::Relaxed), 90);
-    }
-
-    #[test]
-    fn a_shadow_that_disagrees_is_counted() {
-        let synthetic = Synthetic::new(2, false);
-        let mut assigner = Assigner::<u64>::new(5);
-        let mut shadow = Assigner::<u64>::new(4);
-        let counter = AtomicI64::new(0);
-        let result = run_ordered_release(
-            &mut assigner,
-            Some(&mut shadow),
-            10,
-            4,
-            &counter,
-            runs_budget(100),
-            &|run_id, run| synthetic.run(run_id, run),
-        );
-        assert!(result.session.shadow_mismatches > 0);
     }
 
     #[test]
