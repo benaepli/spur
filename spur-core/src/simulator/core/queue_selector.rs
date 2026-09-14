@@ -8,16 +8,18 @@ pub enum QueueSelection {
     Timer,
 }
 
+/// Eligible runnables per queue. `local_queue_sizes` is borrowed from a
+/// buffer the caller reuses across steps.
 #[derive(Debug)]
-pub struct QueueInfo {
-    pub local_queue_sizes: Vec<usize>,
+pub struct QueueInfo<'a> {
+    pub local_queue_sizes: &'a [usize],
     pub network_queue_size: usize,
     pub timer_queue_size: usize,
     #[allow(dead_code)]
     pub step: i32,
 }
 
-impl QueueInfo {
+impl QueueInfo<'_> {
     fn total_local(&self) -> usize {
         self.local_queue_sizes.iter().sum()
     }
@@ -316,9 +318,9 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
-    fn contested_info() -> QueueInfo {
+    fn contested_info() -> QueueInfo<'static> {
         QueueInfo {
-            local_queue_sizes: vec![1],
+            local_queue_sizes: &[1],
             network_queue_size: 1,
             timer_queue_size: 1,
             step: 0,

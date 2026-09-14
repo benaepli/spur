@@ -680,6 +680,9 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         .map(|(id, _)| *id)
         .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
 
+    // Eligible runnables per local queue, rewritten by every scheduling step.
+    let mut local_queue_sizes: Vec<usize> = Vec::new();
+
     for step in 0..effective_cap {
         if engine.is_complete() {
             info!("Plan {} completed in {} steps", run_id, step);
@@ -958,6 +961,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 partial_fanout_crash_bias,
                 timer_ctx_mode,
                 &reservations,
+                &mut local_queue_sizes,
                 rng,
             )?;
 

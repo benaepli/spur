@@ -432,6 +432,9 @@ static MA_FLIPPED_CONFIGURED: AtomicU64 = AtomicU64::new(0);
 static MA_CONFIGURED_SUM: AtomicU64 = AtomicU64::new(0);
 static RWP_ENABLED: AtomicBool = AtomicBool::new(false);
 static RWP_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static SCHED_ELIGIBLE_KNOWN: AtomicU64 = AtomicU64::new(0);
+static SCHED_ELIGIBLE_BUILT: AtomicU64 = AtomicU64::new(0);
+static SCHED_ELIGIBLE_BUILT_LONG: AtomicU64 = AtomicU64::new(0);
 static RWP_EVALUATED: AtomicU64 = AtomicU64::new(0);
 static RWP_PRESENT: AtomicU64 = AtomicU64::new(0);
 static RWP_CONTESTED: AtomicU64 = AtomicU64::new(0);
@@ -850,6 +853,9 @@ pub fn set_enabled(on: bool) {
             &RWP_CONTESTED,
             &RWP_WON,
             &RWP_FLIPPED,
+            &SCHED_ELIGIBLE_KNOWN,
+            &SCHED_ELIGIBLE_BUILT,
+            &SCHED_ELIGIBLE_BUILT_LONG,
             &STATS_LOCAL_FOLDS,
             &STATS_LOCAL_FOLDED_INCREMENTS,
             &HW_BUSY_NS,
@@ -1382,6 +1388,26 @@ pub fn record_recovery_placebo(
     }
     if flipped {
         bump(|b| &b.rwp_flipped, &RWP_FLIPPED, 1);
+    }
+}
+
+/// One scheduling step handed a non-empty eligible list to within-queue
+/// selection. `known` means the list was every index of a queue the
+/// eligibility pass admitted in full, so no list was built; otherwise a list
+/// was built by filtering the queue, and `long` means only because the queue
+/// was admitted in full but is longer than the lendable index range.
+#[inline]
+pub fn record_eligible_list(known: bool, long: bool) {
+    if !enabled() {
+        return;
+    }
+    if known {
+        bump(|b| &b.sched_eligible_known, &SCHED_ELIGIBLE_KNOWN, 1);
+    } else {
+        bump(|b| &b.sched_eligible_built, &SCHED_ELIGIBLE_BUILT, 1);
+        if long {
+            bump(|b| &b.sched_eligible_built_long, &SCHED_ELIGIBLE_BUILT_LONG, 1);
+        }
     }
 }
 
@@ -4894,6 +4920,29 @@ impl RecoveryPlaceboStats {
     }
 }
 
+/// How the scheduler obtained the eligible list of each queue it selected
+/// within. `eligible_known` counts lists that were every index of a queue
+/// admitted in full, lent without building; `eligible_built` counts lists
+/// built by filtering the queue, and `eligible_built_long` the built lists of
+/// queues admitted in full but longer than the lendable index range. Known
+/// plus built is the number of within-queue selections.
+#[derive(Serialize, Debug)]
+pub struct SchedStats {
+    pub eligible_known: u64,
+    pub eligible_built: u64,
+    pub eligible_built_long: u64,
+}
+
+impl SchedStats {
+    fn read() -> Self {
+        Self {
+            eligible_known: SCHED_ELIGIBLE_KNOWN.load(Ordering::Relaxed),
+            eligible_built: SCHED_ELIGIBLE_BUILT.load(Ordering::Relaxed),
+            eligible_built_long: SCHED_ELIGIBLE_BUILT_LONG.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The learned-run-cap block: probe traffic, completions the cap would have
 /// cut off, and gauges of what the learner currently holds.
 #[derive(Serialize)]
@@ -6192,6 +6241,9 @@ struct RunCounters {
     rwp_contested: Cell<u64>,
     rwp_won: Cell<u64>,
     rwp_flipped: Cell<u64>,
+    sched_eligible_known: Cell<u64>,
+    sched_eligible_built: Cell<u64>,
+    sched_eligible_built_long: Cell<u64>,
     ca_steps_with_crash_eligible: Cell<u64>,
     ca_offered: Cell<u64>,
     timer_steer_evaluated: Cell<u64>,
@@ -6249,6 +6301,9 @@ impl RunCounters {
             rwp_contested: Cell::new(0),
             rwp_won: Cell::new(0),
             rwp_flipped: Cell::new(0),
+            sched_eligible_known: Cell::new(0),
+            sched_eligible_built: Cell::new(0),
+            sched_eligible_built_long: Cell::new(0),
             ca_steps_with_crash_eligible: Cell::new(0),
             ca_offered: Cell::new(0),
             timer_steer_evaluated: Cell::new(0),
@@ -6305,6 +6360,9 @@ impl RunCounters {
             (&self.rwp_contested, &RWP_CONTESTED),
             (&self.rwp_won, &RWP_WON),
             (&self.rwp_flipped, &RWP_FLIPPED),
+            (&self.sched_eligible_known, &SCHED_ELIGIBLE_KNOWN),
+            (&self.sched_eligible_built, &SCHED_ELIGIBLE_BUILT),
+            (&self.sched_eligible_built_long, &SCHED_ELIGIBLE_BUILT_LONG),
             (&self.ca_steps_with_crash_eligible, &CA_STEPS_WITH_CRASH_ELIGIBLE),
             (&self.ca_offered, &CA_OFFERED),
             (&self.timer_steer_evaluated, &TIMER_STEER_EVALUATED),
@@ -7245,6 +7303,7 @@ pub struct UtilizationSnapshot {
     pub steer_reach: SteerReachStats,
     pub multiplier_authority: MultiplierAuthorityStats,
     pub recovery_weight_placebo: RecoveryPlaceboStats,
+    pub sched: SchedStats,
     pub purgatory: PurgatoryStats,
     pub aos: AosStats,
     pub dedup: DedupStats,
@@ -7403,6 +7462,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         },
         multiplier_authority: MultiplierAuthorityStats::read(),
         recovery_weight_placebo: RecoveryPlaceboStats::read(),
+        sched: SchedStats::read(),
         purgatory: PurgatoryStats {
             delayed_sends: PURGATORY_DELAYED_SENDS.load(Ordering::Relaxed),
             holds_down_receiver: PURGATORY_HOLDS_DOWN_RECEIVER.load(Ordering::Relaxed),

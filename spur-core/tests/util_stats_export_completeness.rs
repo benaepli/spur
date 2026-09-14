@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1234,6 +1234,27 @@ fn ghost_signal_leaves(prefix: &str, g: &GhostSignalStats) -> Vec<(String, Value
     vec![leaf(prefix, "fired_runs", *fired_runs)]
 }
 
+fn sched(m: &mut Marks) -> SchedStats {
+    SchedStats {
+        eligible_known: m.int(),
+        eligible_built: m.int(),
+        eligible_built_long: m.int(),
+    }
+}
+
+fn sched_leaves(prefix: &str, s: &SchedStats) -> Vec<(String, Value)> {
+    let SchedStats {
+        eligible_known,
+        eligible_built,
+        eligible_built_long,
+    } = s;
+    vec![
+        leaf(prefix, "eligible_known", *eligible_known),
+        leaf(prefix, "eligible_built", *eligible_built),
+        leaf(prefix, "eligible_built_long", *eligible_built_long),
+    ]
+}
+
 fn frame(m: &mut Marks) -> FrameStats {
     FrameStats {
         calls: m.int(),
@@ -2243,6 +2264,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         steer_reach: _,
         multiplier_authority: _,
         recovery_weight_placebo: _,
+        sched: _,
         purgatory: _,
         aos: _,
         dedup: _,
@@ -2301,6 +2323,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "steer_reach",
         "multiplier_authority",
         "recovery_weight_placebo",
+        "sched",
         "purgatory",
         "aos",
         "dedup",
@@ -2417,6 +2440,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.crash_phase = crash_phase(&mut m);
     s.victim_swap = victim_swap(&mut m);
     s.ghost_signal = ghost_signal(&mut m);
+    s.sched = sched(&mut m);
     s.frame = frame(&mut m);
     s.frame_layout = frame_layout(&mut m);
     s.value_sig = value_sig(&mut m);
@@ -2455,6 +2479,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(crash_phase_leaves("crash_phase", &s.crash_phase));
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
     expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
+    expected.extend(sched_leaves("sched", &s.sched));
     expected.extend(frame_leaves("frame", &s.frame));
     expected.extend(frame_layout_leaves("frame_layout", &s.frame_layout));
     expected.extend(value_sig_leaves("value_sig", &s.value_sig));
@@ -2518,6 +2543,7 @@ fn every_counter_field_reaches_the_written_json() {
         "crash_phase",
         "victim_swap",
         "ghost_signal",
+        "sched",
         "frame",
         "frame_layout",
         "value_sig",

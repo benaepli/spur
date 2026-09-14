@@ -467,6 +467,65 @@ fn audit_steer_preference<H: HashPolicy, F: Feedback>(
     }
 }
 
+/// Every index below its length, lent as the eligible list of a queue whose
+/// eligibility pass admitted all of its runnables.
+static IDENTITY_INDICES: [usize; 128] = {
+    let mut indices = [0usize; 128];
+    let mut i = 0;
+    while i < indices.len() {
+        indices[i] = i;
+        i += 1;
+    }
+    indices
+};
+
+/// The eligible indices of one queue, in queue order.
+enum EligibleList {
+    /// Every index below the queue length.
+    Known(usize),
+    /// The indices a filter over the queue kept.
+    Built(Vec<usize>),
+}
+
+impl EligibleList {
+    /// The eligible list of a queue holding `len` runnables, of which the
+    /// eligibility pass that sized the queue for selection admitted
+    /// `admitted`. `keep` must be that same predicate taken by index, and
+    /// nothing it reads may have changed since that pass: a queue admitted
+    /// in full is then known to keep every index without a second pass.
+    #[inline(always)]
+    fn new(len: usize, admitted: usize, keep: impl FnMut(&usize) -> bool) -> Self {
+        if admitted == len && len <= IDENTITY_INDICES.len() {
+            EligibleList::Known(len)
+        } else {
+            let mut built = Vec::with_capacity(admitted);
+            built.extend((0..len).filter(keep));
+            EligibleList::Built(built)
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            EligibleList::Known(len) => &IDENTITY_INDICES[..*len],
+            EligibleList::Built(built) => built,
+        }
+    }
+}
+
+/// Counts how the non-empty eligible list of a queue holding `len`
+/// runnables, `admitted` of them eligible, was obtained.
+#[inline(always)]
+fn record_eligible_list(len: usize, admitted: usize) {
+    if util_stats::enabled() {
+        let full = admitted == len;
+        util_stats::record_eligible_list(
+            full && len <= IDENTITY_INDICES.len(),
+            full && len > IDENTITY_INDICES.len(),
+        );
+    }
+}
+
 /// Select an eligible item from a single queue, returning its index and
 /// the predicates true of it.
 ///
@@ -1043,6 +1102,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     partial_fanout_crash_bias: f64,
     timer_ctx_mode: timer_context::RunMode,
     reservations: &[Reservation],
+    local_queue_sizes: &mut Vec<usize>,
     rng: &mut impl StreamRng,
 ) -> Result<ScheduleResult<H>, RuntimeError> {
     if state.all_queues_empty() {
@@ -1187,12 +1247,15 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         state.timer_queue.iter().filter(|r| !is_ineligible(r)).count()
     };
 
-    let info = QueueInfo {
-        local_queue_sizes: state
+    local_queue_sizes.clear();
+    local_queue_sizes.extend(
+        state
             .local_queues
             .iter()
-            .map(|q| q.iter().filter(|r| !is_ineligible(r)).count())
-            .collect(),
+            .map(|q| q.iter().filter(|r| !is_ineligible(r)).count()),
+    );
+    let info = QueueInfo {
+        local_queue_sizes,
         network_queue_size: state.network_queue.iter().filter(|r| !is_ineligible(r)).count(),
         timer_queue_size,
         step: state.crash_info.current_step,
@@ -1271,16 +1334,17 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     let (runnable, chosen_slot, chosen_mask) = match selection {
         QueueSelection::Local(node_idx) => {
             let queue = &state.local_queues[node_idx];
-            let eligible: Vec<usize> = (0..queue.len())
-                .filter(|&i| !is_ineligible(&queue[i]))
-                .collect();
+            let admitted = info.local_queue_sizes.get(node_idx).copied().unwrap_or(0);
+            let eligible = EligibleList::new(queue.len(), admitted, |&i| !is_ineligible(&queue[i]));
+            let eligible = eligible.as_slice();
             if eligible.is_empty() {
                 record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
+            record_eligible_list(queue.len(), admitted);
             let (idx, mask) = select_within_queue::<H, F>(
                 queue,
-                &eligible,
+                eligible,
                 feedback,
                 snapshot,
                 state,
@@ -1296,16 +1360,17 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         }
         QueueSelection::Network => {
             let queue = &state.network_queue;
-            let eligible: Vec<usize> = (0..queue.len())
-                .filter(|&i| !is_ineligible(&queue[i]))
-                .collect();
+            let admitted = info.network_queue_size;
+            let eligible = EligibleList::new(queue.len(), admitted, |&i| !is_ineligible(&queue[i]));
+            let eligible = eligible.as_slice();
             if eligible.is_empty() {
                 record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
+            record_eligible_list(queue.len(), admitted);
             let (drawn, drawn_mask) = select_within_queue::<H, F>(
                 queue,
-                &eligible,
+                eligible,
                 feedback,
                 snapshot,
                 state,
@@ -1313,9 +1378,9 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 within_queue,
                 rng,
             );
-            let idx = fresh_first_dispatch(state, &eligible, drawn);
-            let idx = pair_order_dispatch(state, &eligible, idx);
-            observe_rush_dispatch(state, &eligible, idx);
+            let idx = fresh_first_dispatch(state, eligible, drawn);
+            let idx = pair_order_dispatch(state, eligible, idx);
+            observe_rush_dispatch(state, eligible, idx);
             let delivered_op = state.network_queue[idx].causal_operation_id();
             note_first_delivery(state, delivered_op);
             // The mask names the predicates true of the record the step
@@ -1329,33 +1394,32 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         }
         QueueSelection::Timer => {
             let queue = &state.timer_queue;
-            let eligible: Vec<usize> = if strict_timers {
-                (0..queue.len())
-                    .filter(|&i| {
-                        if is_ineligible(&queue[i]) {
-                            return false;
-                        }
-                        if let Runnable::Timer(t) = &queue[i] {
-                            t.label.as_ref().is_none_or(|l| {
-                                state.allowed_timers.contains(&(t.node.index, l.clone()))
-                            })
-                        } else {
-                            true
-                        }
-                    })
-                    .collect()
+            let admitted = info.timer_queue_size;
+            let eligible = if strict_timers {
+                EligibleList::new(queue.len(), admitted, |&i| {
+                    if is_ineligible(&queue[i]) {
+                        return false;
+                    }
+                    if let Runnable::Timer(t) = &queue[i] {
+                        t.label.as_ref().is_none_or(|l| {
+                            state.allowed_timers.contains(&(t.node.index, l.clone()))
+                        })
+                    } else {
+                        true
+                    }
+                })
             } else {
-                (0..queue.len())
-                    .filter(|&i| !is_ineligible(&queue[i]))
-                    .collect()
+                EligibleList::new(queue.len(), admitted, |&i| !is_ineligible(&queue[i]))
             };
+            let eligible = eligible.as_slice();
             if eligible.is_empty() {
                 record_unscheduled(&audit);
                 return Ok(ScheduleResult::None);
             }
+            record_eligible_list(queue.len(), admitted);
             let (idx, mask) = select_within_queue::<H, F>(
                 queue,
-                &eligible,
+                eligible,
                 feedback,
                 snapshot,
                 state,
@@ -3376,7 +3440,7 @@ mod tests {
         state.net_stale_records = 1;
         state.net_requests = 1;
         let info = QueueInfo {
-            local_queue_sizes: vec![1],
+            local_queue_sizes: &[1],
             network_queue_size: 4,
             timer_queue_size: 0,
             step: 0,
@@ -3397,7 +3461,7 @@ mod tests {
         state.send_ledger[0].recent = 1;
         state.send_ledger[0].trigger = HandlerTrigger::Delivery;
         let info = QueueInfo {
-            local_queue_sizes: vec![1],
+            local_queue_sizes: &[1],
             network_queue_size: 40,
             timer_queue_size: 0,
             step: 0,
@@ -3964,5 +4028,44 @@ mod tests {
             );
             assert_eq!(idx, 0);
         }
+    }
+
+    /// The lent list equals the filtered list for every queue length,
+    /// including lengths past the lendable range, and is lent exactly when
+    /// the queue was admitted in full within that range.
+    #[test]
+    fn eligible_list_matches_the_filtered_queue_at_every_length() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let range = IDENTITY_INDICES.len();
+        let mut lent = 0;
+        let mut long = 0;
+        for len in 0..=(3 * range) {
+            for density in [0u64, 1, 8, 64] {
+                let rejected: Vec<bool> = (0..len)
+                    .map(|_| density != 0 && rng.next_u64() % density == 0)
+                    .collect();
+                let keep = |&i: &usize| !rejected[i];
+                let reference: Vec<usize> = (0..len).filter(keep).collect();
+                let admitted = rejected.iter().filter(|r| !**r).count();
+                let list = EligibleList::new(len, admitted, keep);
+                assert_eq!(list.as_slice(), &reference[..], "len {len} density {density}");
+                let full = admitted == len;
+                match &list {
+                    EligibleList::Known(n) => {
+                        assert!(full && len <= range, "len {len} lent while not admitted in full");
+                        assert_eq!(*n, len);
+                        lent += 1;
+                    }
+                    EligibleList::Built(built) => {
+                        assert!(!full || len > range, "len {len} built while lendable");
+                        assert!(built.capacity() >= admitted);
+                        if full {
+                            long += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(lent > range && long > range, "lent {lent}, long {long}");
     }
 }
