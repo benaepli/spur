@@ -87,6 +87,12 @@ impl<S: Storage> Interner<S> {
         &self.storage
     }
 
+    /// Returns the storage for pushing directly. A value pushed this way is
+    /// not in the deduplication table, so it must never be interned.
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.storage
+    }
+
     /// Unwraps the inner storage
     #[cfg(feature = "arrow")]
     pub fn into_inner(self) -> S {

@@ -153,6 +153,9 @@ static HW_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static HW_TEXT_BUFFERS_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 static HW_TEXT_BUFFERS_RECYCLED: AtomicU64 = AtomicU64::new(0);
 static HW_TEXT_BUFFERS_DROPPED_OVERSIZE: AtomicU64 = AtomicU64::new(0);
+static HW_INT_DICT_MEMO: AtomicU64 = AtomicU64::new(0);
+static HW_INT_DICT_DIRECT: AtomicU64 = AtomicU64::new(0);
+static HW_INT_DICT_HASHED: AtomicU64 = AtomicU64::new(0);
 
 /// Advanced by every session reset. A per-thread counter block remembers the
 /// value it was activated under and is dropped rather than folded when the
@@ -880,6 +883,9 @@ pub fn set_enabled(on: bool) {
             &HW_TEXT_BUFFERS_ALLOCATED,
             &HW_TEXT_BUFFERS_RECYCLED,
             &HW_TEXT_BUFFERS_DROPPED_OVERSIZE,
+            &HW_INT_DICT_MEMO,
+            &HW_INT_DICT_DIRECT,
+            &HW_INT_DICT_HASHED,
             &TIMELINE_CONSTANT_SHORT_CIRCUITS,
             &TIMELINE_CONSTANT_INSERTS,
             &RUN_SETUP_PROGRAM_CLONES_AVOIDED,
@@ -5899,7 +5905,10 @@ impl PrintContentStats {
 /// when the run gave storage to a buffer that began it without any,
 /// `text_buffers_recycled` when a writer returned a buffer's storage to the
 /// free list, and `text_buffers_dropped_oversize` when a writer freed a
-/// buffer too large to recycle.
+/// buffer too large to recycle. Every integer value the parquet dictionary
+/// encoder interned is one of `int_dict_memo` (it took the key of the value
+/// just before it), `int_dict_direct` (found by value in the small-value
+/// table) or `int_dict_hashed` (found through the hash table).
 #[derive(Serialize, Debug)]
 pub struct HistoryWriterStats {
     pub busy_ns: u64,
@@ -5909,6 +5918,9 @@ pub struct HistoryWriterStats {
     pub text_buffers_allocated: u64,
     pub text_buffers_recycled: u64,
     pub text_buffers_dropped_oversize: u64,
+    pub int_dict_memo: u64,
+    pub int_dict_direct: u64,
+    pub int_dict_hashed: u64,
 }
 
 impl HistoryWriterStats {
@@ -5921,8 +5933,23 @@ impl HistoryWriterStats {
             text_buffers_allocated: HW_TEXT_BUFFERS_ALLOCATED.load(Ordering::Relaxed),
             text_buffers_recycled: HW_TEXT_BUFFERS_RECYCLED.load(Ordering::Relaxed),
             text_buffers_dropped_oversize: HW_TEXT_BUFFERS_DROPPED_OVERSIZE.load(Ordering::Relaxed),
+            int_dict_memo: HW_INT_DICT_MEMO.load(Ordering::Relaxed),
+            int_dict_direct: HW_INT_DICT_DIRECT.load(Ordering::Relaxed),
+            int_dict_hashed: HW_INT_DICT_HASHED.load(Ordering::Relaxed),
         }
     }
+}
+
+/// A history writer's integer dictionary lookups since its previous reading,
+/// split by the path each value took.
+#[inline]
+pub fn record_history_writer_int_dict(memo: u64, direct: u64, hashed: u64) {
+    if !enabled() {
+        return;
+    }
+    HW_INT_DICT_MEMO.fetch_add(memo, Ordering::Relaxed);
+    HW_INT_DICT_DIRECT.fetch_add(direct, Ordering::Relaxed);
+    HW_INT_DICT_HASHED.fetch_add(hashed, Ordering::Relaxed);
 }
 
 /// A history writer took one run from its queue.

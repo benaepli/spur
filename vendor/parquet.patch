@@ -1,0 +1,197 @@
+diff --git a/vendor/parquet/src/encodings/encoding/dict_encoder.rs b/vendor/parquet/src/encodings/encoding/dict_encoder.rs
+index 79a1f24..3677fb0 100644
+--- a/vendor/parquet/src/encodings/encoding/dict_encoder.rs
++++ b/vendor/parquet/src/encodings/encoding/dict_encoder.rs
+@@ -83,8 +83,22 @@ pub struct DictEncoder<T: DataType> {
+ 
+     /// The buffered indices
+     indices: Vec<u64>,
++
++    /// For INT32 and INT64 columns, the key plus one of each value `v` in
++    /// `SMALL_INT_START..SMALL_INT_END`, at index `v - SMALL_INT_START`, and 0
++    /// for a value not yet seen. These values never enter the interner's
++    /// hash table, so every value is found through exactly one of the two
++    /// and keys keep first-appearance order.
++    small_int_keys: Vec<u32>,
++
++    /// The integer value put last and its key.
++    last_int: Option<(i64, u64)>,
+ }
+ 
++/// Integer values looked up by value rather than by hash.
++const SMALL_INT_START: i64 = -1;
++const SMALL_INT_END: i64 = 65_535;
++
+ impl<T: DataType> DictEncoder<T> {
+     /// Creates new dictionary encoder.
+     pub fn new(desc: ColumnDescPtr) -> Self {
+@@ -97,6 +111,8 @@ impl<T: DataType> DictEncoder<T> {
+         Self {
+             interner: Interner::new(storage),
+             indices: vec![],
++            small_int_keys: vec![],
++            last_int: None,
+         }
+     }
+ 
+@@ -144,6 +160,52 @@ impl<T: DataType> DictEncoder<T> {
+         self.indices.push(self.interner.intern(value));
+     }
+ 
++    /// Puts INT32 or INT64 values, assigning each the key interning it would
++    /// assign. Whether a value uses the small-value table depends only on the
++    /// value, and a repeat of the last value reuses a key already assigned.
++    fn put_integers(&mut self, values: &[T::T]) {
++        let mut memo = 0u64;
++        let mut direct = 0u64;
++        let mut hashed = 0u64;
++        for value in values {
++            let Ok(v) = value.as_i64() else {
++                unreachable!("INT32 and INT64 values convert to i64")
++            };
++            let key = match self.last_int {
++                Some((last, key)) if last == v => {
++                    memo += 1;
++                    key
++                }
++                _ => {
++                    let key = if (SMALL_INT_START..SMALL_INT_END).contains(&v) {
++                        direct += 1;
++                        let slot = (v - SMALL_INT_START) as usize;
++                        if slot >= self.small_int_keys.len() {
++                            self.small_int_keys.resize(slot + 1, 0);
++                        }
++                        match self.small_int_keys[slot] {
++                            0 => {
++                                let key = self.interner.storage_mut().push(value);
++                                // A dictionary is flushed long before it holds 2^32 entries.
++                                self.small_int_keys[slot] =
++                                    u32::try_from(key + 1).expect("dictionary key fits in u32");
++                                key
++                            }
++                            stored => u64::from(stored - 1),
++                        }
++                    } else {
++                        hashed += 1;
++                        self.interner.intern(value)
++                    };
++                    self.last_int = Some((v, key));
++                    key
++                }
++            };
++            self.indices.push(key);
++        }
++        crate::write_tally::add_int_dict(memo, direct, hashed);
++    }
++
+     #[inline]
+     fn bit_width(&self) -> u8 {
+         num_required_bits(self.num_entries().saturating_sub(1) as u64)
+@@ -153,8 +215,12 @@ impl<T: DataType> DictEncoder<T> {
+ impl<T: DataType> Encoder<T> for DictEncoder<T> {
+     fn put(&mut self, values: &[T::T]) -> Result<()> {
+         self.indices.reserve(values.len());
+-        for i in values {
+-            self.put_one(i)
++        if matches!(T::get_physical_type(), Type::INT32 | Type::INT64) {
++            self.put_integers(values);
++        } else {
++            for i in values {
++                self.put_one(i)
++            }
+         }
+         Ok(())
+     }
+diff --git a/vendor/parquet/src/lib.rs b/vendor/parquet/src/lib.rs
+index 98106a2..723ecbf 100644
+--- a/vendor/parquet/src/lib.rs
++++ b/vendor/parquet/src/lib.rs
+@@ -201,6 +201,7 @@ pub mod schema;
+ mod parquet_macros;
+ mod parquet_thrift;
+ pub mod thrift;
++pub mod write_tally;
+ /// What data is needed to read the next item from a decoder.
+ ///
+ /// This is used to communicate between the decoder and the caller
+diff --git a/vendor/parquet/src/util/interner.rs b/vendor/parquet/src/util/interner.rs
+index 34c7d13..6688c12 100644
+--- a/vendor/parquet/src/util/interner.rs
++++ b/vendor/parquet/src/util/interner.rs
+@@ -87,6 +87,12 @@ impl<S: Storage> Interner<S> {
+         &self.storage
+     }
+ 
++    /// Returns the storage for pushing directly. A value pushed this way is
++    /// not in the deduplication table, so it must never be interned.
++    pub fn storage_mut(&mut self) -> &mut S {
++        &mut self.storage
++    }
++
+     /// Unwraps the inner storage
+     #[cfg(feature = "arrow")]
+     pub fn into_inner(self) -> S {
+diff --git a/vendor/parquet/src/write_tally.rs b/vendor/parquet/src/write_tally.rs
+new file mode 100644
+index 0000000..7799d7d
+--- /dev/null
++++ b/vendor/parquet/src/write_tally.rs
+@@ -0,0 +1,58 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++//! Counts of the paths the column encoders take. Counts grow on the thread
++//! that encodes and are read and cleared by [`take`] on that same thread.
++
++use std::cell::Cell;
++
++/// Counts accumulated on one thread since the last [`take`].
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct WriteTally {
++    /// Integer dictionary values that took the key of the value put just
++    /// before them.
++    pub int_dict_memo: u64,
++    /// Integer dictionary values looked up by value in the small-value table.
++    pub int_dict_direct: u64,
++    /// Integer dictionary values looked up through the hash table.
++    pub int_dict_hashed: u64,
++}
++
++const ZERO: WriteTally = WriteTally {
++    int_dict_memo: 0,
++    int_dict_direct: 0,
++    int_dict_hashed: 0,
++};
++
++thread_local! {
++    static TALLY: Cell<WriteTally> = const { Cell::new(ZERO) };
++}
++
++/// Returns this thread's counts and clears them.
++pub fn take() -> WriteTally {
++    TALLY.with(|t| t.replace(ZERO))
++}
++
++pub(crate) fn add_int_dict(memo: u64, direct: u64, hashed: u64) {
++    TALLY.with(|t| {
++        let mut v = t.get();
++        v.int_dict_memo += memo;
++        v.int_dict_direct += direct;
++        v.int_dict_hashed += hashed;
++        t.set(v);
++    });
++}

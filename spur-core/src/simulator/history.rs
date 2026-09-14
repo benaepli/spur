@@ -1074,11 +1074,24 @@ fn writer_loop(
             }
             HistoryCommand::Shutdown => break,
         }
+        record_encoder_tally();
         record_writer_busy(started);
     }
     let started = util_stats::enabled().then(Instant::now);
     batch.finish();
+    record_encoder_tally();
     record_writer_busy(started);
+}
+
+/// Moves the path counts the parquet encoders kept on this thread into the
+/// session totals.
+fn record_encoder_tally() {
+    let tally = parquet::write_tally::take();
+    util_stats::record_history_writer_int_dict(
+        tally.int_dict_memo,
+        tally.int_dict_direct,
+        tally.int_dict_hashed,
+    );
 }
 
 fn record_writer_busy(started: Option<Instant>) {

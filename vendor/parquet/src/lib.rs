@@ -201,6 +201,7 @@ pub mod schema;
 mod parquet_macros;
 mod parquet_thrift;
 pub mod thrift;
+pub mod write_tally;
 /// What data is needed to read the next item from a decoder.
 ///
 /// This is used to communicate between the decoder and the caller

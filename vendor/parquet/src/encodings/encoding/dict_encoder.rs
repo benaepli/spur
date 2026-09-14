@@ -83,7 +83,21 @@ pub struct DictEncoder<T: DataType> {
 
     /// The buffered indices
     indices: Vec<u64>,
+
+    /// For INT32 and INT64 columns, the key plus one of each value `v` in
+    /// `SMALL_INT_START..SMALL_INT_END`, at index `v - SMALL_INT_START`, and 0
+    /// for a value not yet seen. These values never enter the interner's
+    /// hash table, so every value is found through exactly one of the two
+    /// and keys keep first-appearance order.
+    small_int_keys: Vec<u32>,
+
+    /// The integer value put last and its key.
+    last_int: Option<(i64, u64)>,
 }
+
+/// Integer values looked up by value rather than by hash.
+const SMALL_INT_START: i64 = -1;
+const SMALL_INT_END: i64 = 65_535;
 
 impl<T: DataType> DictEncoder<T> {
     /// Creates new dictionary encoder.
@@ -97,6 +111,8 @@ impl<T: DataType> DictEncoder<T> {
         Self {
             interner: Interner::new(storage),
             indices: vec![],
+            small_int_keys: vec![],
+            last_int: None,
         }
     }
 
@@ -144,6 +160,52 @@ impl<T: DataType> DictEncoder<T> {
         self.indices.push(self.interner.intern(value));
     }
 
+    /// Puts INT32 or INT64 values, assigning each the key interning it would
+    /// assign. Whether a value uses the small-value table depends only on the
+    /// value, and a repeat of the last value reuses a key already assigned.
+    fn put_integers(&mut self, values: &[T::T]) {
+        let mut memo = 0u64;
+        let mut direct = 0u64;
+        let mut hashed = 0u64;
+        for value in values {
+            let Ok(v) = value.as_i64() else {
+                unreachable!("INT32 and INT64 values convert to i64")
+            };
+            let key = match self.last_int {
+                Some((last, key)) if last == v => {
+                    memo += 1;
+                    key
+                }
+                _ => {
+                    let key = if (SMALL_INT_START..SMALL_INT_END).contains(&v) {
+                        direct += 1;
+                        let slot = (v - SMALL_INT_START) as usize;
+                        if slot >= self.small_int_keys.len() {
+                            self.small_int_keys.resize(slot + 1, 0);
+                        }
+                        match self.small_int_keys[slot] {
+                            0 => {
+                                let key = self.interner.storage_mut().push(value);
+                                // A dictionary is flushed long before it holds 2^32 entries.
+                                self.small_int_keys[slot] =
+                                    u32::try_from(key + 1).expect("dictionary key fits in u32");
+                                key
+                            }
+                            stored => u64::from(stored - 1),
+                        }
+                    } else {
+                        hashed += 1;
+                        self.interner.intern(value)
+                    };
+                    self.last_int = Some((v, key));
+                    key
+                }
+            };
+            self.indices.push(key);
+        }
+        crate::write_tally::add_int_dict(memo, direct, hashed);
+    }
+
     #[inline]
     fn bit_width(&self) -> u8 {
         num_required_bits(self.num_entries().saturating_sub(1) as u64)
@@ -153,8 +215,12 @@ impl<T: DataType> DictEncoder<T> {
 impl<T: DataType> Encoder<T> for DictEncoder<T> {
     fn put(&mut self, values: &[T::T]) -> Result<()> {
         self.indices.reserve(values.len());
-        for i in values {
-            self.put_one(i)
+        if matches!(T::get_physical_type(), Type::INT32 | Type::INT64) {
+            self.put_integers(values);
+        } else {
+            for i in values {
+                self.put_one(i)
+            }
         }
         Ok(())
     }

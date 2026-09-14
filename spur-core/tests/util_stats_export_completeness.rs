@@ -1547,6 +1547,9 @@ fn history_writer(m: &mut Marks) -> HistoryWriterStats {
         text_buffers_allocated: m.int(),
         text_buffers_recycled: m.int(),
         text_buffers_dropped_oversize: m.int(),
+        int_dict_memo: m.int(),
+        int_dict_direct: m.int(),
+        int_dict_hashed: m.int(),
     }
 }
 
@@ -1559,6 +1562,9 @@ fn history_writer_leaves(prefix: &str, h: &HistoryWriterStats) -> Vec<(String, V
         text_buffers_allocated,
         text_buffers_recycled,
         text_buffers_dropped_oversize,
+        int_dict_memo,
+        int_dict_direct,
+        int_dict_hashed,
     } = h;
     vec![
         leaf(prefix, "busy_ns", *busy_ns),
@@ -1568,6 +1574,9 @@ fn history_writer_leaves(prefix: &str, h: &HistoryWriterStats) -> Vec<(String, V
         leaf(prefix, "text_buffers_allocated", *text_buffers_allocated),
         leaf(prefix, "text_buffers_recycled", *text_buffers_recycled),
         leaf(prefix, "text_buffers_dropped_oversize", *text_buffers_dropped_oversize),
+        leaf(prefix, "int_dict_memo", *int_dict_memo),
+        leaf(prefix, "int_dict_direct", *int_dict_direct),
+        leaf(prefix, "int_dict_hashed", *int_dict_hashed),
     ]
 }
 
