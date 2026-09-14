@@ -55,10 +55,15 @@ impl TextBuffer {
     /// The text from byte `start` to the end; empty when `start` is not a
     /// character boundary within the buffer.
     pub fn str_from(&self, start: usize) -> &str {
-        self.0
-            .get(start..)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("")
+        if !self.is_char_boundary(start) {
+            util_stats::record_str_from_off_boundary();
+            return "";
+        }
+        // SAFETY: every append is a whole `&str` or a complete JSON text and
+        // every truncation returns to an earlier length, so the bytes are
+        // UTF-8. `start` is a character boundary no further than the end, so
+        // the bytes from `start` on are UTF-8 as well.
+        unsafe { std::str::from_utf8_unchecked(&self.0[start..]) }
     }
 
     /// Whether byte offset `i` falls between two characters of the text or
@@ -253,6 +258,32 @@ mod tests {
         reused.log_content.push_str("line");
         reused.trace_payload.push_str("[]");
         assert_eq!(reused.allocated_this_run(), 1, "only the trace buffer lacked storage");
+    }
+
+    #[test]
+    fn text_from_every_offset_matches_the_checked_conversion() {
+        use std::collections::BTreeMap;
+        use std::fmt::Write;
+        let mut t = TextBuffer::default();
+        t.push_str("a\u{e9}\u{20ac}\u{1f600}e\u{301}");
+        assert!(t.push_json("q\"\u{7ff}\n\u{10ffff}"));
+        let before_failure = t.len();
+        let unkeyable: BTreeMap<Vec<i32>, i32> = [(vec![1], 2)].into_iter().collect();
+        assert!(!t.push_json(&unkeyable), "a map with list keys is not JSON");
+        assert_eq!(t.len(), before_failure, "a failed append leaves nothing behind");
+        write!(t, "{}|{}", -12, "\u{800}").expect("writing to a buffer succeeds");
+        t.push_str("");
+        t.push_str("\u{80}z");
+        for start in 0..=t.len() + 2 {
+            let checked = t
+                .0
+                .get(start..)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .unwrap_or("");
+            assert_eq!(t.str_from(start), checked, "offset {start}");
+        }
+        assert_eq!(TextBuffer::default().str_from(0), "");
+        assert_eq!(TextBuffer::default().str_from(1), "");
     }
 
     #[test]

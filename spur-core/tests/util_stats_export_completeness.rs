@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, ValueStructStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDeliverStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, PlanReadyStats, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, ValueStructStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TextBufferStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDeliverStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, PlanReadyStats, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1316,6 +1316,8 @@ fn value_sig_leaves(prefix: &str, v: &ValueSigStats) -> Vec<(String, Value)> {
 fn value_struct(m: &mut Marks) -> ValueStructStats {
     ValueStructStats {
         literals: m.int(),
+        literals_in_order: m.int(),
+        literals_permuted: m.int(),
         key_hashes_avoided: m.int(),
         literal_entries: m.int(),
         field_reads: m.int(),
@@ -1329,6 +1331,8 @@ fn value_struct(m: &mut Marks) -> ValueStructStats {
 fn value_struct_leaves(prefix: &str, v: &ValueStructStats) -> Vec<(String, Value)> {
     let ValueStructStats {
         literals,
+        literals_in_order,
+        literals_permuted,
         key_hashes_avoided,
         literal_entries,
         field_reads,
@@ -1339,6 +1343,8 @@ fn value_struct_leaves(prefix: &str, v: &ValueStructStats) -> Vec<(String, Value
     } = v;
     vec![
         leaf(prefix, "literals", *literals),
+        leaf(prefix, "literals_in_order", *literals_in_order),
+        leaf(prefix, "literals_permuted", *literals_permuted),
         leaf(prefix, "key_hashes_avoided", *key_hashes_avoided),
         leaf(prefix, "literal_entries", *literal_entries),
         leaf(prefix, "field_reads", *field_reads),
@@ -1665,6 +1671,19 @@ fn plan_ready_leaves(prefix: &str, p: &PlanReadyStats) -> Vec<(String, Value)> {
         leaf(prefix, "scans_empty", *scans_empty),
         leaf(prefix, "events_released", *events_released),
     ]
+}
+
+fn text_buffer(m: &mut Marks) -> TextBufferStats {
+    TextBufferStats {
+        str_from_off_boundary: m.int(),
+    }
+}
+
+fn text_buffer_leaves(prefix: &str, t: &TextBufferStats) -> Vec<(String, Value)> {
+    let TextBufferStats {
+        str_from_off_boundary,
+    } = t;
+    vec![leaf(prefix, "str_from_off_boundary", *str_from_off_boundary)]
 }
 
 fn plan_deliver(m: &mut Marks) -> PlanDeliverStats {
@@ -2395,6 +2414,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         history_format: _,
         plan_ready: _,
         plan_deliver: _,
+        text_buffer: _,
     } = s;
     vec![
         "rng_streams",
@@ -2457,6 +2477,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "history_format",
         "plan_ready",
         "plan_deliver",
+        "text_buffer",
     ]
 }
 
@@ -2552,6 +2573,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.history_format = history_format(&mut m);
     s.plan_ready = plan_ready(&mut m);
     s.plan_deliver = plan_deliver(&mut m);
+    s.text_buffer = text_buffer(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
     expected.extend(plan_deps_leaves("plan_deps", &s.plan_deps));
@@ -2593,6 +2615,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(history_format_leaves("history_format", &s.history_format));
     expected.extend(plan_ready_leaves("plan_ready", &s.plan_ready));
     expected.extend(plan_deliver_leaves("plan_deliver", &s.plan_deliver));
+    expected.extend(text_buffer_leaves("text_buffer", &s.text_buffer));
     (s, expected)
 }
 
@@ -2660,6 +2683,7 @@ fn every_counter_field_reaches_the_written_json() {
         "history_format",
         "plan_ready",
         "plan_deliver",
+        "text_buffer",
     ] {
         let mut actual = BTreeMap::new();
         leaves(&parsed[block], block, &mut actual);

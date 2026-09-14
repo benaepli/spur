@@ -42,7 +42,7 @@ const MAP_ROOT_WIDTH: u32 = 32;
 
 /// Most keys a struct shape may have. A root node holding fewer than half
 /// its width keeps every entry at the slot it was inserted into.
-const STRUCT_MAX_FIELDS: usize = 15;
+pub(crate) const STRUCT_MAX_FIELDS: usize = 15;
 
 /// The key set of a map literal whose keys are distinct string literals,
 /// stored as a slice of field values instead of a hash map.
@@ -748,8 +748,10 @@ impl Decimal {
     }
 
     pub fn as_str(&self) -> &str {
-        // The buffer holds only ASCII digits and an optional leading sign.
-        std::str::from_utf8(&self.buf[self.start..]).unwrap_or("")
+        // SAFETY: `of_u64` writes only ASCII digits from `start` to the end of
+        // the buffer and `of_i64` adds only an ASCII '-' just before them, so
+        // the bytes from `start` on are UTF-8.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[self.start..]) }
     }
 }
 
@@ -1194,6 +1196,19 @@ mod tests {
         }
         for n in [0u64, 1, 9, 10, 12345, u64::MAX, usize::MAX as u64] {
             assert_eq!(Decimal::of_u64(n).as_str(), n.to_string());
+        }
+        let mut ten = 1u64;
+        for shift in 0..64 {
+            let two = 1u64 << shift;
+            for n in [two - 1, two, two + 1, ten.wrapping_sub(1), ten, ten.wrapping_add(1)] {
+                assert_eq!(Decimal::of_u64(n).as_str(), n.to_string());
+                assert_eq!(Decimal::of_i64(n as i64).as_str(), (n as i64).to_string());
+                assert_eq!(
+                    Decimal::of_i64((n as i64).wrapping_neg()).as_str(),
+                    (n as i64).wrapping_neg().to_string()
+                );
+            }
+            ten = ten.wrapping_mul(10);
         }
     }
 

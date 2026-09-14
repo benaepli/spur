@@ -8,13 +8,32 @@ use crate::compiler::cfg::{CExpr, Opnd};
 use crate::simulator::core::error::RuntimeError;
 use crate::simulator::core::eval::{Operand, update_collection};
 use crate::simulator::core::values::{
-    Decimal, Env, Value, ValueKind, ValueMap, ValueSeq, struct_get, struct_to_map,
+    Decimal, Env, STRUCT_MAX_FIELDS, Value, ValueKind, ValueMap, ValueSeq, struct_get,
+    struct_to_map,
 };
 use crate::simulator::hash_utils::HashPolicy;
 use crate::simulator::util_stats::{self, InterpreterTally};
 use ecow::EcoString;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Moves each field value from its evaluation index to its shape position.
+/// `fields[i].0` is the shape position of the value at index `i`, and the
+/// positions are distinct and below `slots.len()`, which a struct shape keeps
+/// at most `STRUCT_MAX_FIELDS`.
+fn place_struct_fields<H: HashPolicy>(slots: &mut [Value<H>], fields: &[(usize, Opnd)]) {
+    let mut target = [0usize; STRUCT_MAX_FIELDS];
+    for (i, (pos, _)) in fields.iter().enumerate() {
+        target[i] = *pos;
+    }
+    for i in 0..slots.len() {
+        while target[i] != i {
+            let j = target[i];
+            slots.swap(i, j);
+            target.swap(i, j);
+        }
+    }
+}
 
 /// Reads a slot in place, recording the same event `eval_operand` records
 /// for a variable.
@@ -211,12 +230,15 @@ pub fn ceval<H: HashPolicy>(
             Ok(Value::<H>::map(m))
         }
         CExpr::StructLit(shape, fields) => {
-            let mut vals = ValueSeq::<H>::from_elem(Value::<H>::unit(), fields.len());
-            let slots = vals.make_mut();
+            let mut vals = ValueSeq::<H>::with_capacity(fields.len());
+            let mut in_order = true;
             for (done, (pos, v)) in fields.iter().enumerate() {
                 t.leaf_operands_inline += 1;
                 match cvalue(l, n, v, r, t) {
-                    Ok(val) => slots[*pos] = val,
+                    Ok(val) => {
+                        in_order &= *pos == done;
+                        vals.push(val);
+                    }
                     Err(e) => {
                         if !H::EAGER {
                             util_stats::record_struct_literal_failed(done as u64);
@@ -225,7 +247,13 @@ pub fn ceval<H: HashPolicy>(
                     }
                 }
             }
-            util_stats::record_struct_literal(if H::EAGER { 0 } else { fields.len() as u64 });
+            if !in_order {
+                place_struct_fields(vals.make_mut(), fields);
+            }
+            util_stats::record_struct_literal(
+                if H::EAGER { 0 } else { fields.len() as u64 },
+                in_order,
+            );
             Ok(Value::<H>::struct_of(shape, vals))
         }
         CExpr::Find(col, key) => {

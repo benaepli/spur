@@ -476,6 +476,118 @@ fn struct_shaped_map_literals_decode_to_struct_literals() {
     struct_literals_evaluate_like_eval::<NoHashing>();
 }
 
+fn struct_literal_positions(e: &Opnd) -> Vec<usize> {
+    match e {
+        Opnd::Tree(t) => match &**t {
+            CExpr::StructLit(_, fields) => fields.iter().map(|(pos, _)| *pos).collect(),
+            _ => panic!("not a struct literal"),
+        },
+        _ => panic!("not a struct literal"),
+    }
+}
+
+fn struct_literals_count_their_field_order<H: HashPolicy>() {
+    use crate::simulator::core::values::struct_shape;
+    use crate::simulator::core::values::struct_tests::VR_KEY_SETS;
+    let l = local_env::<H>();
+    let n = node_env::<H>();
+    let roles = HashMap::new();
+    let (mut in_order_seen, mut permuted_seen) = (0, 0);
+    for set in VR_KEY_SETS {
+        let names: Vec<EcoString> = set.iter().map(|k| EcoString::from(*k)).collect();
+        let shape = struct_shape(&names).expect("a VR key set is a struct shape");
+        let mut sorted: Vec<&str> = set.to_vec();
+        sorted.sort_by_key(|k| shape.position(k));
+        let mut reversed = sorted.clone();
+        reversed.reverse();
+        for keys in [set.to_vec(), sorted, reversed] {
+            let lit = vr_literal(&keys);
+            let decoded = opnd(&lit);
+            let positions = struct_literal_positions(&decoded);
+            let in_order = positions.iter().enumerate().all(|(i, pos)| i == *pos);
+            let before = util_stats::pending_struct_literal_counts();
+            let legacy = eval(&l, &n, &lit, &roles);
+            let mut t = InterpreterTally::new();
+            let compiled = cvalue(&l, &n, &decoded, &roles, &mut t);
+            let after = util_stats::pending_struct_literal_counts();
+            let a = legacy.expect("the literal evaluates");
+            let c = compiled.expect("the literal evaluates");
+            assert!(a == c && a.sig == c.sig, "{keys:?}");
+            assert_eq!(
+                [after[0] - before[0], after[1] - before[1], after[2] - before[2]],
+                [1, in_order as u64, !in_order as u64],
+                "{keys:?}"
+            );
+            if in_order {
+                in_order_seen += 1;
+            } else {
+                permuted_seen += 1;
+            }
+        }
+    }
+    assert!(in_order_seen > 0 && permuted_seen > 0);
+}
+
+fn struct_literals_fail_at_the_failing_field<H: HashPolicy>() {
+    use crate::simulator::core::values::struct_tests::VR_KEY_SETS;
+    let l = local_env::<H>();
+    let n = node_env::<H>();
+    let roles = HashMap::new();
+    let failing = Expr::Plus(b(&Expr::Bool(true)), b(&Expr::Int(1)));
+    let mut checked = 0;
+    for set in VR_KEY_SETS.iter().filter(|set| set.len() >= 3) {
+        for fail_at in 0..set.len() {
+            let lit = Expr::Map(
+                set.iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        let v = if i == fail_at {
+                            failing.clone()
+                        } else {
+                            Expr::List(vec![Expr::Int(i as i64), s(k)])
+                        };
+                        (s(k), v)
+                    })
+                    .collect(),
+            );
+            assert!(is_struct_literal(&lit), "{set:?}");
+            let decoded = opnd(&lit);
+            let literals_before = util_stats::pending_struct_literal_counts();
+            let before = util_stats::pending_evaluator_events();
+            let legacy = eval(&l, &n, &lit, &roles);
+            let mid = util_stats::pending_evaluator_events();
+            let mut t = InterpreterTally::new();
+            let compiled = cvalue(&l, &n, &decoded, &roles, &mut t);
+            let after = util_stats::pending_evaluator_events();
+            assert!(compiled.is_err(), "{set:?} failing at {fail_at}");
+            assert_eq!(outcome(&legacy), outcome(&compiled), "{set:?} failing at {fail_at}");
+            assert_eq!(events_between(before, mid), events_between(mid, after));
+            if !H::EAGER {
+                assert_eq!(
+                    after[2].wrapping_sub(mid[2]),
+                    fail_at as u64,
+                    "the fields before the failing one count as literal entries"
+                );
+            }
+            assert_eq!(
+                util_stats::pending_struct_literal_counts(),
+                literals_before,
+                "a failed literal is not counted as a literal"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0);
+}
+
+#[test]
+fn struct_literals_place_fields_and_count_their_order_under_both_policies() {
+    struct_literals_count_their_field_order::<WithHashing>();
+    struct_literals_count_their_field_order::<NoHashing>();
+    struct_literals_fail_at_the_failing_field::<WithHashing>();
+    struct_literals_fail_at_the_failing_field::<NoHashing>();
+}
+
 #[test]
 fn slot_and_literal_operands_are_read_without_entering_the_tree_evaluator() {
     let l = local_env::<NoHashing>();

@@ -100,6 +100,9 @@ static FRAME_DEFAULT_SLOTS_FILLED: AtomicU64 = AtomicU64::new(0);
 static FRAME_PARAMS_FILLED: AtomicU64 = AtomicU64::new(0);
 static VALUE_SIG_LEAF_HASHES_DEFERRED: AtomicU64 = AtomicU64::new(0);
 static VALUE_STRUCT_LITERALS: AtomicU64 = AtomicU64::new(0);
+static VALUE_STRUCT_LITERALS_IN_ORDER: AtomicU64 = AtomicU64::new(0);
+static VALUE_STRUCT_LITERALS_PERMUTED: AtomicU64 = AtomicU64::new(0);
+static TEXT_BUFFER_STR_FROM_OFF_BOUNDARY: AtomicU64 = AtomicU64::new(0);
 static VALUE_STRUCT_LITERAL_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static VALUE_STRUCT_FIELD_READS: AtomicU64 = AtomicU64::new(0);
 static VALUE_STRUCT_OTHER_LOOKUPS: AtomicU64 = AtomicU64::new(0);
@@ -887,6 +890,9 @@ pub fn set_enabled(on: bool) {
             &FRAME_PARAMS_FILLED,
             &VALUE_SIG_LEAF_HASHES_DEFERRED,
             &VALUE_STRUCT_LITERALS,
+            &VALUE_STRUCT_LITERALS_IN_ORDER,
+            &VALUE_STRUCT_LITERALS_PERMUTED,
+            &TEXT_BUFFER_STR_FROM_OFF_BOUNDARY,
             &VALUE_STRUCT_LITERAL_ENTRIES,
             &VALUE_STRUCT_FIELD_READS,
             &VALUE_STRUCT_OTHER_LOOKUPS,
@@ -1983,6 +1989,8 @@ thread_local! {
     /// each, drained into the session totals where the frame counts fold.
     static LEAF_HASHES_DEFERRED_RUN: Cell<u64> = const { Cell::new(0) };
     static STRUCT_LITERALS_RUN: Cell<u64> = const { Cell::new(0) };
+    static STRUCT_LITERALS_IN_ORDER_RUN: Cell<u64> = const { Cell::new(0) };
+    static STRUCT_LITERALS_PERMUTED_RUN: Cell<u64> = const { Cell::new(0) };
     static STRUCT_LITERAL_ENTRIES_RUN: Cell<u64> = const { Cell::new(0) };
     static STRUCT_FIELD_READS_RUN: Cell<u64> = const { Cell::new(0) };
     static STRUCT_OTHER_LOOKUPS_RUN: Cell<u64> = const { Cell::new(0) };
@@ -5588,6 +5596,31 @@ impl FrameStats {
     }
 }
 
+/// Requests for a text buffer's text from an offset that is not a character
+/// boundary within it; each got empty text.
+#[derive(Serialize, Debug)]
+pub struct TextBufferStats {
+    pub str_from_off_boundary: u64,
+}
+
+impl TextBufferStats {
+    fn read() -> Self {
+        Self {
+            str_from_off_boundary: TEXT_BUFFER_STR_FROM_OFF_BOUNDARY.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A text buffer's text was requested from an offset that is not a character
+/// boundary within it.
+#[inline]
+pub fn record_str_from_off_boundary() {
+    if !enabled() {
+        return;
+    }
+    TEXT_BUFFER_STR_FROM_OFF_BOUNDARY.fetch_add(1, Ordering::Relaxed);
+}
+
 /// How run steps took released plan events. A step either scanned the plan's
 /// statuses (`scans`) or skipped the scan because no event was ready
 /// (`scans_skipped`), so the two sum to `steer_authority.steps_total` whenever
@@ -5684,6 +5717,8 @@ impl ValueSigStats {
 }
 
 /// Map literals with distinct string keys stored as field slices.
+/// `literals_in_order` and `literals_permuted` split `literals` by whether the
+/// fields were evaluated in shape position order or moved into it afterwards.
 /// `key_hashes_avoided` is the sum of `literal_entries`, `field_reads` and
 /// `other_lookups`: the deferred leaf hashes the map form of those values
 /// would have recorded and the struct form did not. `fallback_key_hashes` are
@@ -5694,6 +5729,8 @@ impl ValueSigStats {
 #[derive(Serialize, Debug)]
 pub struct ValueStructStats {
     pub literals: u64,
+    pub literals_in_order: u64,
+    pub literals_permuted: u64,
     pub key_hashes_avoided: u64,
     pub literal_entries: u64,
     pub field_reads: u64,
@@ -5710,6 +5747,8 @@ impl ValueStructStats {
         let other_lookups = VALUE_STRUCT_OTHER_LOOKUPS.load(Ordering::Relaxed);
         Self {
             literals: VALUE_STRUCT_LITERALS.load(Ordering::Relaxed),
+            literals_in_order: VALUE_STRUCT_LITERALS_IN_ORDER.load(Ordering::Relaxed),
+            literals_permuted: VALUE_STRUCT_LITERALS_PERMUTED.load(Ordering::Relaxed),
             key_hashes_avoided: literal_entries + field_reads + other_lookups,
             literal_entries,
             field_reads,
@@ -6159,10 +6198,16 @@ fn add_to_cell(cell: &'static std::thread::LocalKey<Cell<u64>>, n: u64) {
 }
 
 /// A map literal was built as a struct. `key_hashes` is the number of key
-/// hashes its map form would have recorded as deferred leaf hashes.
+/// hashes its map form would have recorded as deferred leaf hashes, and
+/// `in_order` is whether its fields were evaluated in shape position order.
 #[inline]
-pub fn record_struct_literal(key_hashes: u64) {
+pub fn record_struct_literal(key_hashes: u64, in_order: bool) {
     tick(&STRUCT_LITERALS_RUN);
+    tick(if in_order {
+        &STRUCT_LITERALS_IN_ORDER_RUN
+    } else {
+        &STRUCT_LITERALS_PERMUTED_RUN
+    });
     add_to_cell(&STRUCT_LITERAL_ENTRIES_RUN, key_hashes);
 }
 
@@ -6291,6 +6336,16 @@ pub fn pending_interpreter_tally() -> InterpreterTally {
 /// read in place that were handles, those that were scalars, and leaf values
 /// hashed with a deferred signature.
 #[cfg(test)]
+#[cfg(test)]
+pub(crate) fn pending_struct_literal_counts() -> [u64; 3] {
+    [
+        &STRUCT_LITERALS_RUN,
+        &STRUCT_LITERALS_IN_ORDER_RUN,
+        &STRUCT_LITERALS_PERMUTED_RUN,
+    ]
+    .map(|cell| cell.with(|c| c.get()))
+}
+
 pub(crate) fn pending_evaluator_events() -> [u64; 3] {
     // The third event is the deferred leaf hashes the evaluation would have
     // recorded had every struct been its map: hashes a struct skipped are
@@ -6362,6 +6417,8 @@ pub fn flush_frame_stats() {
     let drained = [
         (&LEAF_HASHES_DEFERRED_RUN, &VALUE_SIG_LEAF_HASHES_DEFERRED),
         (&STRUCT_LITERALS_RUN, &VALUE_STRUCT_LITERALS),
+        (&STRUCT_LITERALS_IN_ORDER_RUN, &VALUE_STRUCT_LITERALS_IN_ORDER),
+        (&STRUCT_LITERALS_PERMUTED_RUN, &VALUE_STRUCT_LITERALS_PERMUTED),
         (&STRUCT_LITERAL_ENTRIES_RUN, &VALUE_STRUCT_LITERAL_ENTRIES),
         (&STRUCT_FIELD_READS_RUN, &VALUE_STRUCT_FIELD_READS),
         (&STRUCT_OTHER_LOOKUPS_RUN, &VALUE_STRUCT_OTHER_LOOKUPS),
@@ -7562,6 +7619,7 @@ pub struct UtilizationSnapshot {
     pub value_struct: ValueStructStats,
     pub plan_ready: PlanReadyStats,
     pub plan_deliver: PlanDeliverStats,
+    pub text_buffer: TextBufferStats,
     pub eval_borrow: EvalBorrowStats,
     pub run_buffers: RunBufferStats,
     pub print_content: PrintContentStats,
@@ -7795,6 +7853,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         value_struct: ValueStructStats::read(),
         plan_ready: PlanReadyStats::read(),
         plan_deliver: PlanDeliverStats::read(),
+        text_buffer: TextBufferStats::read(),
         eval_borrow: EvalBorrowStats::read(),
         run_buffers: RunBufferStats::read(),
         print_content: PrintContentStats::read(),
