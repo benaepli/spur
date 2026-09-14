@@ -19,7 +19,7 @@ use crate::simulator::config_override;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::explorer::{
     AosExplorer, CurriculumExplorer, CurriculumRnrExplorer, EXPLORER_CONFIG_KEYS, ExploreSummary,
-    ExplorerConfig, RunAttribution, SessionSummary, SingleRunConfig, StepCtx, StepReport, Strategy,
+    ExplorerConfig, RunAttribution, SessionSummary, SingleRunConfig, StepCtx, Strategy,
     check_top_level_keys, dispatch_feedback, run_single_simulation,
 };
 use crate::simulator::feedback::{
@@ -31,12 +31,11 @@ use crate::simulator::rng::{LiveRng, RecordRng, ReplayRng, SCHEDULE_SALT, WORKLO
 use crate::simulator::run_variant;
 use crate::simulator::util_stats;
 use log::{error, info};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Instant;
 
@@ -348,10 +347,57 @@ pub fn arm_config(
     Ok(config)
 }
 
-/// One strategy with persistent state; `step` runs one internally parallel
-/// batch of at most `max_runs` runs where the strategy can honour a cap.
+/// Where one slice stops issuing runs: its budget, its start, and the
+/// session's cancellation flag.
+pub(crate) struct SliceLimit<'a> {
+    budget: SliceBudget,
+    started: Instant,
+    cancelled: &'a AtomicBool,
+}
+
+impl SliceLimit<'_> {
+    /// The most runs the next batch may issue once `issued` runs in `batches`
+    /// batches have been issued, or `None` when the slice is over. The first
+    /// batch is always issued unless the session was cancelled, which also
+    /// sets `cancelled`.
+    fn next_batch(&self, issued: u64, batches: u64, cancelled: &mut bool) -> Option<usize> {
+        if batches > 0 {
+            let spent = match self.budget {
+                SliceBudget::Runs(n) => issued >= n,
+                SliceBudget::Seconds(s) => self.started.elapsed().as_secs_f64() >= s,
+            };
+            if spent {
+                return None;
+            }
+        }
+        if self.cancelled.load(Ordering::Relaxed) {
+            *cancelled = true;
+            return None;
+        }
+        match self.budget {
+            SliceBudget::Runs(n) => match n.saturating_sub(issued) as usize {
+                0 => None,
+                remaining => Some(remaining),
+            },
+            SliceBudget::Seconds(_) => Some(usize::MAX),
+        }
+    }
+}
+
+/// The runs a slice issued, those among them that failed, and whether the
+/// slice ended on cancellation.
+#[derive(Default)]
+pub(crate) struct SliceOutcome {
+    runs: u64,
+    failed: u64,
+    cancelled: bool,
+}
+
+/// One strategy with persistent state. `run_slice` issues runs until the
+/// limit ends the slice and returns only once every run it issued has
+/// finished, so no run of one slice is in flight during another.
 pub(crate) trait Arm {
-    fn step(&mut self, ctx: &StepCtx, max_runs: usize) -> StepReport;
+    fn run_slice(&mut self, ctx: &StepCtx, limit: &SliceLimit) -> SliceOutcome;
     fn vertex_coverage(&self) -> Option<HashMap<usize, u64>>;
     fn epochs(&self) -> u64 {
         0
@@ -361,8 +407,22 @@ pub(crate) trait Arm {
 struct StrategyArm<F: Feedback>(Box<dyn Strategy<F>>);
 
 impl<F: Feedback> Arm for StrategyArm<F> {
-    fn step(&mut self, ctx: &StepCtx, _max_runs: usize) -> StepReport {
-        self.0.step(ctx)
+    fn run_slice(&mut self, ctx: &StepCtx, limit: &SliceLimit) -> SliceOutcome {
+        let mut out = SliceOutcome::default();
+        let mut batches = 0u64;
+        while limit
+            .next_batch(out.runs, batches, &mut out.cancelled)
+            .is_some()
+        {
+            let report = self.0.step(ctx);
+            out.runs += report.runs;
+            out.failed += report.failed;
+            batches += 1;
+            if report.runs == 0 {
+                break;
+            }
+        }
+        out
     }
     fn vertex_coverage(&self) -> Option<HashMap<usize, u64>> {
         self.0.vertex_coverage()
@@ -377,69 +437,105 @@ impl<F: Feedback> Arm for StrategyArm<F> {
 /// at the signal, and a run whose id is a replay slot becomes a child of the
 /// next parent in turn when the corpus holds one. Only fresh runs advance
 /// the grid cursor, so children do not thin the grid's coverage.
+///
+/// Runs are issued in batches whose assignment and corpus admissions are
+/// exactly those of running each batch to completion before assigning the
+/// next; `run_ordered_release` keeps workers busy across a batch's slowest
+/// runs without changing either.
 pub(crate) struct GridArm<F: Feedback> {
     config: ExplorerConfig,
     configs: Vec<SingleRunConfig>,
-    cursor: u64,
     global_state: GlobalState<F>,
     batch_size: usize,
     arm_seed: u64,
-    corpus: Corpus<SingleRunConfig>,
+    assigner: Assigner<SingleRunConfig>,
+    /// A sequential reference assignment checked against every batch; kept
+    /// only in debug builds.
+    shadow: Option<Assigner<SingleRunConfig>>,
 }
 
 /// What one run of a grid-arm batch is.
-enum GridRun {
+enum GridRun<C> {
     Fresh { config_index: usize },
-    Child { seed: Seed<SingleRunConfig>, prefix: bool },
+    Child { seed: Seed<C>, prefix: bool },
 }
 
 /// What a grid-arm run hands back: its score, and the corpus entry it earned
 /// when it was a fresh run that fired the signal.
-struct GridOutcome {
+struct GridOutcome<C> {
     score: Option<f64>,
-    admit: Option<Seed<SingleRunConfig>>,
+    admit: Option<Seed<C>>,
 }
 
-impl<F: Feedback> GridArm<F> {
-    fn new(config: ExplorerConfig, batch_size: usize, arm_seed: u64) -> Self {
-        let configs = config.expand_grid();
+/// The grid cursor and the replay corpus: the state a run's assignment reads.
+struct Assigner<C> {
+    grid_len: u64,
+    cursor: u64,
+    corpus: Corpus<C>,
+    #[cfg(test)]
+    admitted: Vec<u64>,
+}
+
+impl<C: Clone> Assigner<C> {
+    fn new(grid_len: usize) -> Self {
         Self {
-            config,
-            configs,
+            grid_len: grid_len as u64,
             cursor: 0,
-            global_state: GlobalState::new(),
-            batch_size,
-            arm_seed,
             corpus: Corpus::new(),
+            #[cfg(test)]
+            admitted: Vec::new(),
         }
     }
 
-    fn fresh(&mut self) -> GridRun {
-        let config_index = (self.cursor % self.configs.len() as u64) as usize;
+    fn fresh(&mut self) -> GridRun<C> {
+        let config_index = (self.cursor % self.grid_len) as usize;
         self.cursor += 1;
         GridRun::Fresh { config_index }
     }
 
-    fn assign(&mut self, run_id: i64) -> GridRun {
+    /// The run `run_id` is, and whether it is a slot that found the corpus
+    /// empty and runs fresh instead.
+    fn assign(&mut self, run_id: i64) -> (GridRun<C>, bool) {
         if !replay_corpus::is_slot(run_id) {
-            return self.fresh();
+            return (self.fresh(), false);
         }
         match self.corpus.next_child() {
-            Some(seed) => GridRun::Child {
-                seed,
-                prefix: replay_corpus::is_prefix(run_id),
-            },
-            None => {
-                util_stats::record_replay_slot_unfilled();
-                self.fresh()
-            }
+            Some(seed) => (
+                GridRun::Child {
+                    seed,
+                    prefix: replay_corpus::is_prefix(run_id),
+                },
+                false,
+            ),
+            None => (self.fresh(), true),
         }
     }
 
-    fn run(&self, ctx: &StepCtx, run_id: i64, run: &GridRun) -> GridOutcome {
+    fn admit(&mut self, seed: Seed<C>) {
+        #[cfg(test)]
+        self.admitted.push(seed.workload_seed);
+        self.corpus.admit(seed);
+    }
+}
+
+/// The borrowed state a grid run reads, shared by every worker.
+struct GridRunner<'a, F: Feedback> {
+    configs: &'a [SingleRunConfig],
+    global_state: &'a GlobalState<F>,
+    weights: &'a CoverageConfig,
+    arm_seed: u64,
+}
+
+impl<F: Feedback> GridRunner<'_, F> {
+    fn run(
+        &self,
+        ctx: &StepCtx,
+        run_id: i64,
+        run: &GridRun<SingleRunConfig>,
+    ) -> GridOutcome<SingleRunConfig> {
         let bits = run_variant::grid_arm_bits(run_id);
         let schedule_seed = derive_seed(self.arm_seed, run_id, SCHEDULE_SALT);
-        let weights = &self.config.feedback.weights;
+        let weights = self.weights;
         match run {
             GridRun::Fresh { config_index } => {
                 let config_index = *config_index;
@@ -447,7 +543,7 @@ impl<F: Feedback> GridArm<F> {
                 let result = run_single_simulation::<F, RecordRng>(
                     ctx.program,
                     ctx.writer,
-                    &self.global_state,
+                    self.global_state,
                     run_id,
                     &self.configs[config_index],
                     weights,
@@ -494,7 +590,7 @@ impl<F: Feedback> GridArm<F> {
                     run_single_simulation::<F, ReplayRng>(
                         ctx.program,
                         ctx.writer,
-                        &self.global_state,
+                        self.global_state,
                         run_id,
                         &seed.cfg,
                         weights,
@@ -507,7 +603,7 @@ impl<F: Feedback> GridArm<F> {
                     run_single_simulation::<F, LiveRng>(
                         ctx.program,
                         ctx.writer,
-                        &self.global_state,
+                        self.global_state,
                         run_id,
                         &seed.cfg,
                         weights,
@@ -539,42 +635,56 @@ impl<F: Feedback> GridArm<F> {
     }
 }
 
+impl<F: Feedback> GridArm<F> {
+    fn new(config: ExplorerConfig, batch_size: usize, arm_seed: u64) -> Self {
+        let configs = config.expand_grid();
+        let grid_len = configs.len();
+        Self {
+            config,
+            configs,
+            global_state: GlobalState::new(),
+            batch_size,
+            arm_seed,
+            assigner: Assigner::new(grid_len),
+            shadow: cfg!(debug_assertions).then(|| Assigner::new(grid_len)),
+        }
+    }
+}
+
 impl<F: Feedback> Arm for GridArm<F> {
-    fn step(&mut self, ctx: &StepCtx, max_runs: usize) -> StepReport {
+    fn run_slice(&mut self, ctx: &StepCtx, limit: &SliceLimit) -> SliceOutcome {
+        let mut cancelled = false;
         if self.configs.is_empty() {
-            return StepReport {
+            limit.next_batch(0, 0, &mut cancelled);
+            return SliceOutcome {
                 runs: 0,
                 failed: 0,
-                best_score: 0.0,
+                cancelled,
             };
         }
-        let count = self.batch_size.min(max_runs.max(1));
-        let batch: Vec<(i64, GridRun)> = (0..count)
-            .map(|_| {
-                let run_id = ctx.run_counter.fetch_add(1, Ordering::Relaxed);
-                (run_id, self.assign(run_id))
-            })
-            .collect();
-        let outcomes: Vec<GridOutcome> = batch
-            .par_iter()
-            .map(|(run_id, run)| self.run(ctx, *run_id, run))
-            .collect();
-        let mut failed = 0;
-        let mut best_score = 0.0f64;
-        for outcome in outcomes {
-            match outcome.score {
-                Some(s) => best_score = best_score.max(s),
-                None => failed += 1,
-            }
-            if let Some(seed) = outcome.admit {
-                self.corpus.admit(seed);
-                util_stats::record_replay_parent_admitted();
-            }
-        }
-        StepReport {
-            runs: count as u64,
-            failed,
-            best_score,
+        let runner = GridRunner {
+            configs: &self.configs,
+            global_state: &self.global_state,
+            weights: &self.config.feedback.weights,
+            arm_seed: self.arm_seed,
+        };
+        let blocked_before = util_stats::history_writer_blocked_ns();
+        let mut pool = run_ordered_release(
+            &mut self.assigner,
+            self.shadow.as_mut(),
+            self.batch_size,
+            rayon::current_num_threads(),
+            ctx.run_counter,
+            |issued, batches| limit.next_batch(issued, batches, &mut cancelled),
+            &|run_id, run| runner.run(ctx, run_id, run),
+        );
+        pool.session.writer_blocked_ns =
+            util_stats::history_writer_blocked_ns().saturating_sub(blocked_before);
+        util_stats::record_grid_pool(&pool.session);
+        SliceOutcome {
+            runs: pool.session.runs,
+            failed: pool.failed,
+            cancelled,
         }
     }
 
@@ -587,9 +697,381 @@ impl<F: Feedback> Arm for GridArm<F> {
         if per_epoch == 0 {
             0
         } else {
-            self.cursor / per_epoch
+            self.assigner.cursor / per_epoch
         }
     }
+}
+
+/// Batches, beyond the oldest batch whose slots are not yet drawn, that may
+/// have their fresh runs assigned and started.
+const LOOKAHEAD_BATCHES: usize = 4;
+
+/// One batch of the ordered-release pool.
+///
+/// A batch is `covered` when, at its issue, the corpus's remaining children
+/// less the slots reserved by earlier undrawn batches were at least its own
+/// slot count. Children only fall by the draws reserved, and admissions
+/// never lower them, so no slot of a covered batch finds the corpus empty
+/// and its fresh runs take the grid cursor's next values in position order.
+/// Only a covered batch has its fresh runs assigned before its slots are
+/// drawn. Slots are drawn once every earlier batch's admissions are applied,
+/// and a batch's admissions are applied in position order once its slots are
+/// drawn and its fresh runs have finished: the corpus sees the same draws and
+/// admissions, in the same order, as batches run one at a time.
+struct Batch<C> {
+    first_id: i64,
+    slots: u64,
+    covered: bool,
+    released: bool,
+    admitted: bool,
+    runs: Vec<Option<GridRun<C>>>,
+    assigned: Vec<bool>,
+    fresh_index: Vec<Option<usize>>,
+    launched: Vec<bool>,
+    admits: Vec<Option<Seed<C>>>,
+    ready: usize,
+    fresh_unfinished: usize,
+    unfinished: usize,
+}
+
+impl<C: Clone> Batch<C> {
+    fn new(first_id: i64, count: usize, slots: u64, covered: bool) -> Self {
+        Self {
+            first_id,
+            slots,
+            covered,
+            released: false,
+            admitted: false,
+            runs: (0..count).map(|_| None).collect(),
+            assigned: vec![false; count],
+            fresh_index: vec![None; count],
+            launched: vec![false; count],
+            admits: (0..count).map(|_| None).collect(),
+            ready: 0,
+            fresh_unfinished: 0,
+            unfinished: count,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.runs.len()
+    }
+
+    fn set(&mut self, pos: usize, run: GridRun<C>) {
+        if let GridRun::Fresh { config_index } = run {
+            self.fresh_index[pos] = Some(config_index);
+            self.fresh_unfinished += 1;
+        }
+        self.runs[pos] = Some(run);
+        self.assigned[pos] = true;
+        self.ready += 1;
+    }
+
+    /// Whether position `pos` holds the run `expected` names.
+    fn holds(&self, pos: usize, expected: &GridRun<C>) -> bool {
+        match expected {
+            GridRun::Fresh { config_index } => self.fresh_index[pos] == Some(*config_index),
+            GridRun::Child { seed, prefix } => match &self.runs[pos] {
+                Some(GridRun::Child {
+                    seed: got,
+                    prefix: got_prefix,
+                }) => {
+                    got_prefix == prefix
+                        && got.config_index == seed.config_index
+                        && got.workload_seed == seed.workload_seed
+                        && got.cut_step == seed.cut_step
+                        && got.tape[..] == seed.tape[..]
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+/// A finished job: its batch, its position, its outcome (`None` when the
+/// run panicked) and its wall time on the worker.
+struct Completion<C> {
+    batch: u64,
+    pos: usize,
+    outcome: Option<GridOutcome<C>>,
+    wall_ns: u64,
+}
+
+/// Sends a job's completion exactly once, including when the run unwinds,
+/// so the coordinator never waits for a job that is gone.
+struct CompletionSender<C> {
+    tx: mpsc::Sender<Completion<C>>,
+    batch: u64,
+    pos: usize,
+    started: Instant,
+    sent: bool,
+}
+
+impl<C> CompletionSender<C> {
+    fn send(mut self, outcome: GridOutcome<C>) {
+        self.deliver(Some(outcome));
+    }
+
+    fn deliver(&mut self, outcome: Option<GridOutcome<C>>) {
+        self.sent = true;
+        let _ = self.tx.send(Completion {
+            batch: self.batch,
+            pos: self.pos,
+            outcome,
+            wall_ns: self.started.elapsed().as_nanos() as u64,
+        });
+    }
+}
+
+impl<C> Drop for CompletionSender<C> {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.deliver(None);
+        }
+    }
+}
+
+struct PoolResult {
+    session: util_stats::GridPoolSession,
+    failed: u64,
+}
+
+/// Assigns every not yet assigned position of a batch in position order,
+/// drawing its slots, then checks the batch against the sequential
+/// reference when one is kept. Every earlier batch's admissions must have
+/// been applied.
+fn release_batch<C: Clone>(
+    batch: &mut Batch<C>,
+    assigner: &mut Assigner<C>,
+    shadow: Option<&mut Assigner<C>>,
+    session: &mut util_stats::GridPoolSession,
+) {
+    for pos in 0..batch.len() {
+        if batch.assigned[pos] {
+            continue;
+        }
+        let (run, unfilled) = assigner.assign(batch.first_id + pos as i64);
+        if unfilled {
+            util_stats::record_replay_slot_unfilled();
+            if batch.covered {
+                session.unfilled_in_ungated_batches += 1;
+            }
+        }
+        batch.set(pos, run);
+    }
+    if let Some(shadow) = shadow {
+        session.shadow_batches_checked += 1;
+        for pos in 0..batch.len() {
+            let (expected, _) = shadow.assign(batch.first_id + pos as i64);
+            if !batch.holds(pos, &expected) {
+                session.shadow_mismatches += 1;
+            }
+        }
+    }
+    batch.released = true;
+}
+
+/// Runs batches of at most `batch_size` runs on `workers` workers until
+/// `next_batch` ends the slice, then drains: when this returns, every run it
+/// issued has finished and every admission has been applied.
+///
+/// `next_batch(issued, batches)` gives the most runs the next batch may
+/// issue, or `None` to stop issuing. Run ids are taken from `run_counter` in
+/// order, a batch at a time, and nothing else may take ids while this runs.
+/// Every run id's assignment and the corpus's sequence of draws and
+/// admissions are those of assigning a batch whole, running it to
+/// completion and admitting its fresh runs' entries in position order
+/// before assigning the next. With one worker, runs also start in id order.
+fn run_ordered_release<C, R>(
+    assigner: &mut Assigner<C>,
+    mut shadow: Option<&mut Assigner<C>>,
+    batch_size: usize,
+    workers: usize,
+    run_counter: &AtomicI64,
+    mut next_batch: impl FnMut(u64, u64) -> Option<usize>,
+    run: &R,
+) -> PoolResult
+where
+    C: Clone + Send,
+    R: Fn(i64, &GridRun<C>) -> GridOutcome<C> + Sync,
+{
+    let workers = workers.max(1);
+    let batch_size = batch_size.max(1);
+    let mut session = util_stats::GridPoolSession {
+        workers: workers as u64,
+        ..Default::default()
+    };
+    let mut failed = 0u64;
+    let mut window: VecDeque<Batch<C>> = VecDeque::new();
+    let mut front_seq = 0u64;
+    let mut in_flight = 0usize;
+    let mut ready = 0usize;
+    let mut stopped = false;
+    let pool_started = Instant::now();
+    let (tx, rx) = mpsc::channel::<Completion<C>>();
+
+    rayon::in_place_scope(|scope| {
+        loop {
+            // Draw slots and apply admissions, both in batch order.
+            let mut earlier_admitted = true;
+            for batch in window.iter_mut() {
+                if batch.admitted {
+                    continue;
+                }
+                if !earlier_admitted {
+                    break;
+                }
+                if !batch.released {
+                    let before = batch.ready;
+                    release_batch(batch, assigner, shadow.as_deref_mut(), &mut session);
+                    ready += batch.ready - before;
+                }
+                if batch.fresh_unfinished > 0 {
+                    earlier_admitted = false;
+                    continue;
+                }
+                for pos in 0..batch.len() {
+                    if let Some(seed) = batch.admits[pos].take() {
+                        if let Some(shadow) = shadow.as_deref_mut() {
+                            shadow.admit(seed.clone());
+                        }
+                        assigner.admit(seed);
+                        util_stats::record_replay_parent_admitted();
+                    }
+                }
+                batch.admitted = true;
+            }
+            while window
+                .front()
+                .is_some_and(|b| b.admitted && b.unfinished == 0)
+            {
+                window.pop_front();
+                front_seq += 1;
+            }
+
+            // Issue batches only while workers would otherwise go without work.
+            while !stopped && in_flight + ready < workers {
+                let all_admitted = window.iter().all(|b| b.admitted);
+                let undrawn = window.iter().filter(|b| !b.released).count();
+                if !all_admitted && undrawn > LOOKAHEAD_BATCHES {
+                    break;
+                }
+                let Some(cap) = next_batch(session.runs, session.batches) else {
+                    stopped = true;
+                    break;
+                };
+                let count = batch_size.min(cap);
+                let first_id = run_counter.load(Ordering::Relaxed);
+                let slots = (0..count)
+                    .filter(|&i| replay_corpus::is_slot(first_id + i as i64))
+                    .count() as u64;
+                let reserved: u64 = window
+                    .iter()
+                    .filter(|b| !b.released)
+                    .map(|b| b.slots)
+                    .sum();
+                let covered = assigner.corpus.remaining_children() >= reserved + slots;
+                if !all_admitted && !covered {
+                    break;
+                }
+                for _ in 0..count {
+                    run_counter.fetch_add(1, Ordering::Relaxed);
+                }
+                session.runs += count as u64;
+                session.batches += 1;
+                if !covered {
+                    session.capacity_gated_batches += 1;
+                }
+                let mut batch = Batch::new(first_id, count, slots, covered);
+                if all_admitted {
+                    release_batch(&mut batch, assigner, shadow.as_deref_mut(), &mut session);
+                } else {
+                    for pos in 0..count {
+                        if !replay_corpus::is_slot(first_id + pos as i64) {
+                            batch.set(pos, assigner.fresh());
+                        }
+                    }
+                }
+                ready += batch.ready;
+                window.push_back(batch);
+            }
+
+            // Start runs oldest batch first, in position order.
+            for (i, batch) in window.iter_mut().enumerate() {
+                if in_flight >= workers {
+                    break;
+                }
+                if batch.ready == 0 {
+                    continue;
+                }
+                for pos in 0..batch.len() {
+                    if in_flight >= workers || batch.ready == 0 {
+                        break;
+                    }
+                    if batch.launched[pos] {
+                        continue;
+                    }
+                    let Some(grid_run) = batch.runs[pos].take() else {
+                        continue;
+                    };
+                    batch.launched[pos] = true;
+                    batch.ready -= 1;
+                    ready -= 1;
+                    in_flight += 1;
+                    if !batch.released {
+                        session.fresh_ahead_launched += 1;
+                    }
+                    let run_id = batch.first_id + pos as i64;
+                    let tx = tx.clone();
+                    let seq = front_seq + i as u64;
+                    scope.spawn(move |_| {
+                        let sender = CompletionSender {
+                            tx,
+                            batch: seq,
+                            pos,
+                            started: Instant::now(),
+                            sent: false,
+                        };
+                        let outcome = run(run_id, &grid_run);
+                        drop(grid_run);
+                        sender.send(outcome);
+                    });
+                }
+            }
+
+            if in_flight == 0 {
+                debug_assert!(stopped && ready == 0);
+                debug_assert!(window.iter().all(|b| b.admitted && b.unfinished == 0));
+                break;
+            }
+
+            let mut next = rx.recv().ok();
+            while let Some(done) = next {
+                in_flight -= 1;
+                session.job_wall_ns += done.wall_ns;
+                let batch = &mut window[(done.batch - front_seq) as usize];
+                batch.unfinished -= 1;
+                let fresh = batch.fresh_index[done.pos].is_some();
+                if fresh {
+                    batch.fresh_unfinished -= 1;
+                }
+                match done.outcome {
+                    Some(outcome) => {
+                        if outcome.score.is_none() {
+                            failed += 1;
+                        }
+                        if fresh {
+                            batch.admits[done.pos] = outcome.admit;
+                        }
+                    }
+                    None => failed += 1,
+                }
+                next = rx.try_recv().ok();
+            }
+        }
+    });
+    session.pool_wall_ns = pool_started.elapsed().as_nanos() as u64;
+    PoolResult { session, failed }
 }
 
 struct BuiltArm {
@@ -1060,32 +1542,16 @@ fn run_campaign_impl(
         let before = util_stats::snapshot_value();
         let started = session_start.elapsed();
         let slice_start = Instant::now();
-        let mut slice_runs: u64 = 0;
-        loop {
-            if cancelled.load(Ordering::Relaxed) {
-                was_cancelled = true;
-                break;
-            }
-            let remaining = match slice.budget {
-                SliceBudget::Runs(n) => n.saturating_sub(slice_runs) as usize,
-                SliceBudget::Seconds(_) => usize::MAX,
-            };
-            if remaining == 0 {
-                break;
-            }
-            let report = arm.arm.step(&ctx, remaining);
-            slice_runs += report.runs;
-            runs_failed += report.failed;
-            if report.runs == 0 {
-                break;
-            }
-            let spent = match slice.budget {
-                SliceBudget::Runs(n) => slice_runs >= n,
-                SliceBudget::Seconds(s) => slice_start.elapsed().as_secs_f64() >= s,
-            };
-            if spent {
-                break;
-            }
+        let limit = SliceLimit {
+            budget: slice.budget,
+            started: slice_start,
+            cancelled: cancelled.as_ref(),
+        };
+        let outcome = arm.arm.run_slice(&ctx, &limit);
+        let slice_runs = outcome.runs;
+        runs_failed += outcome.failed;
+        if outcome.cancelled {
+            was_cancelled = true;
         }
         let wall_ms = slice_start.elapsed().as_millis() as u64;
         let delta = util_stats::delta(&before, &util_stats::snapshot_value());
@@ -1342,6 +1808,317 @@ mod tests {
         assert!(b.validate().unwrap_err().contains("eta"));
         b = block(0, r#"{"kind": "round_robin"}"#);
         assert!(b.validate().unwrap_err().contains("non-empty"));
+    }
+
+    /// How a synthetic run was assigned, comparable across executions.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Assigned {
+        Fresh(usize),
+        Child {
+            parent: u64,
+            prefix: bool,
+            config_index: usize,
+        },
+    }
+
+    fn mix(id: i64) -> u64 {
+        let mut x = (id as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    /// A synthetic grid run: a fresh run earns a corpus entry when its id
+    /// hashes into one of `admit_one_in` buckets, children never do, and the
+    /// run sleeps a hash of its id so completions arrive out of order.
+    struct Synthetic {
+        admit_one_in: u64,
+        sleep: bool,
+        log: std::sync::Mutex<Vec<(i64, Assigned)>>,
+        finished: std::sync::atomic::AtomicU64,
+    }
+
+    impl Synthetic {
+        fn new(admit_one_in: u64, sleep: bool) -> Self {
+            Self {
+                admit_one_in,
+                sleep,
+                log: std::sync::Mutex::new(Vec::new()),
+                finished: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn run(&self, run_id: i64, run: &GridRun<u64>) -> GridOutcome<u64> {
+            if self.sleep {
+                std::thread::sleep(std::time::Duration::from_micros(mix(run_id) % 400));
+            }
+            let (assigned, admit) = match run {
+                GridRun::Fresh { config_index } => {
+                    let admit = (mix(run_id ^ 0x55) % self.admit_one_in == 0).then(|| Seed {
+                        tape: vec![run_id as u64, 7].into(),
+                        workload_seed: run_id as u64,
+                        cfg: run_id as u64,
+                        config_index: *config_index,
+                        cut_step: run_id as i32,
+                    });
+                    (Assigned::Fresh(*config_index), admit)
+                }
+                GridRun::Child { seed, prefix } => (
+                    Assigned::Child {
+                        parent: seed.workload_seed,
+                        prefix: *prefix,
+                        config_index: seed.config_index,
+                    },
+                    None,
+                ),
+            };
+            self.log.lock().unwrap().push((run_id, assigned));
+            self.finished.fetch_add(1, Ordering::Relaxed);
+            GridOutcome {
+                score: Some(0.0),
+                admit,
+            }
+        }
+
+        fn assignments(&self) -> Vec<(i64, Assigned)> {
+            let mut log = self.log.lock().unwrap().clone();
+            log.sort_by_key(|(id, _)| *id);
+            log
+        }
+    }
+
+    /// Batches assigned whole, run to completion in position order and
+    /// admitted in position order, one at a time.
+    fn sequential_reference(
+        assigner: &mut Assigner<u64>,
+        batch_size: usize,
+        run_counter: &AtomicI64,
+        mut next_batch: impl FnMut(u64, u64) -> Option<usize>,
+        synthetic: &Synthetic,
+    ) {
+        let (mut issued, mut batches) = (0u64, 0u64);
+        while let Some(cap) = next_batch(issued, batches) {
+            let count = batch_size.min(cap);
+            let batch: Vec<(i64, GridRun<u64>)> = (0..count)
+                .map(|_| {
+                    let run_id = run_counter.fetch_add(1, Ordering::Relaxed);
+                    (run_id, assigner.assign(run_id).0)
+                })
+                .collect();
+            let outcomes: Vec<GridOutcome<u64>> = batch
+                .iter()
+                .map(|(run_id, run)| synthetic.run(*run_id, run))
+                .collect();
+            for outcome in outcomes {
+                if let Some(seed) = outcome.admit {
+                    assigner.admit(seed);
+                }
+            }
+            issued += count as u64;
+            batches += 1;
+        }
+    }
+
+    fn runs_budget(total: u64) -> impl FnMut(u64, u64) -> Option<usize> {
+        move |issued, batches| {
+            if batches > 0 && issued >= total {
+                None
+            } else {
+                Some(total.saturating_sub(issued) as usize).filter(|&r| r > 0)
+            }
+        }
+    }
+
+    /// Runs `slices` slices of `slice_runs` runs through the pool and through
+    /// the sequential reference, and requires identical assignments,
+    /// admission sequences and cursors after every slice.
+    fn pool_matches_reference(
+        admit_one_in: u64,
+        batch_size: usize,
+        workers: usize,
+        slices: usize,
+        slice_runs: u64,
+    ) -> util_stats::GridPoolSession {
+        let grid_len = 7;
+        let reference = Synthetic::new(admit_one_in, false);
+        let mut ref_assigner = Assigner::<u64>::new(grid_len);
+        let ref_counter = AtomicI64::new(0);
+        let pooled = Synthetic::new(admit_one_in, true);
+        let mut assigner = Assigner::<u64>::new(grid_len);
+        let mut shadow = Assigner::<u64>::new(grid_len);
+        let counter = AtomicI64::new(0);
+        let mut total = util_stats::GridPoolSession::default();
+        for _ in 0..slices {
+            sequential_reference(
+                &mut ref_assigner,
+                batch_size,
+                &ref_counter,
+                runs_budget(slice_runs),
+                &reference,
+            );
+            let result = run_ordered_release(
+                &mut assigner,
+                Some(&mut shadow),
+                batch_size,
+                workers,
+                &counter,
+                runs_budget(slice_runs),
+                &|run_id, run| pooled.run(run_id, run),
+            );
+            assert_eq!(
+                pooled.finished.load(Ordering::Relaxed),
+                counter.load(Ordering::Relaxed) as u64,
+                "a run was still in flight when the slice returned"
+            );
+            assert_eq!(result.session.runs, slice_runs);
+            assert_eq!(result.failed, 0);
+            assert_eq!(assigner.admitted, ref_assigner.admitted, "admission sequence");
+            assert_eq!(assigner.cursor, ref_assigner.cursor, "grid cursor");
+            assert_eq!(
+                assigner.corpus.remaining_children(),
+                ref_assigner.corpus.remaining_children()
+            );
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                ref_counter.load(Ordering::Relaxed)
+            );
+            total.runs += result.session.runs;
+            total.batches += result.session.batches;
+            total.capacity_gated_batches += result.session.capacity_gated_batches;
+            total.unfilled_in_ungated_batches += result.session.unfilled_in_ungated_batches;
+            total.fresh_ahead_launched += result.session.fresh_ahead_launched;
+            total.shadow_batches_checked += result.session.shadow_batches_checked;
+            total.shadow_mismatches += result.session.shadow_mismatches;
+        }
+        assert_eq!(
+            pooled.assignments(),
+            reference.assignments(),
+            "assignment by run id"
+        );
+        assert!(
+            !ref_assigner.admitted.is_empty(),
+            "the synthetic arm admitted nothing, so the check is vacuous"
+        );
+        assert_eq!(total.shadow_mismatches, 0);
+        assert_eq!(total.shadow_batches_checked, total.batches);
+        assert_eq!(total.unfilled_in_ungated_batches, 0);
+        total
+    }
+
+    #[test]
+    fn ordered_release_matches_sequential_batches_with_a_full_corpus() {
+        let total = pool_matches_reference(2, 16, 6, 3, 437);
+        assert!(
+            total.fresh_ahead_launched > 0,
+            "no fresh run started ahead: {total:?}"
+        );
+    }
+
+    #[test]
+    fn ordered_release_matches_sequential_batches_when_the_corpus_runs_empty() {
+        let total = pool_matches_reference(23, 16, 6, 3, 437);
+        assert!(
+            total.capacity_gated_batches > 0,
+            "no batch was gated on an empty corpus: {total:?}"
+        );
+    }
+
+    #[test]
+    fn ordered_release_at_one_worker_starts_runs_in_id_order() {
+        let synthetic = Synthetic::new(3, false);
+        let mut assigner = Assigner::<u64>::new(5);
+        let counter = AtomicI64::new(0);
+        let starts = std::sync::Mutex::new(Vec::new());
+        run_ordered_release(
+            &mut assigner,
+            None,
+            8,
+            1,
+            &counter,
+            runs_budget(203),
+            &|run_id, run| {
+                starts.lock().unwrap().push(run_id);
+                synthetic.run(run_id, run)
+            },
+        );
+        let starts = starts.into_inner().unwrap();
+        assert_eq!(starts, (0..203).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn ordered_release_drains_every_run_at_slice_end() {
+        let synthetic = Synthetic::new(2, true);
+        let mut assigner = Assigner::<u64>::new(5);
+        let mut shadow = Assigner::<u64>::new(5);
+        let counter = AtomicI64::new(0);
+        let result = run_ordered_release(
+            &mut assigner,
+            Some(&mut shadow),
+            10,
+            8,
+            &counter,
+            |_, batches| (batches < 9).then_some(usize::MAX),
+            &|run_id, run| synthetic.run(run_id, run),
+        );
+        assert_eq!(result.session.runs, 90);
+        assert_eq!(result.session.batches, 9);
+        assert_eq!(
+            synthetic.finished.load(Ordering::Relaxed),
+            90,
+            "runs were left in flight"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 90);
+        assert_eq!(result.session.shadow_mismatches, 0);
+        assert!(
+            result.session.job_wall_ns <= result.session.workers * result.session.pool_wall_ns,
+            "job wall exceeds worker capacity: {:?}",
+            result.session
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(synthetic.finished.load(Ordering::Relaxed), 90);
+    }
+
+    #[test]
+    fn a_shadow_that_disagrees_is_counted() {
+        let synthetic = Synthetic::new(2, false);
+        let mut assigner = Assigner::<u64>::new(5);
+        let mut shadow = Assigner::<u64>::new(4);
+        let counter = AtomicI64::new(0);
+        let result = run_ordered_release(
+            &mut assigner,
+            Some(&mut shadow),
+            10,
+            4,
+            &counter,
+            runs_budget(100),
+            &|run_id, run| synthetic.run(run_id, run),
+        );
+        assert!(result.session.shadow_mismatches > 0);
+    }
+
+    #[test]
+    fn slice_limit_issues_a_first_batch_and_stops_on_budget_or_cancel() {
+        let flag = AtomicBool::new(false);
+        let limit = SliceLimit {
+            budget: SliceBudget::Runs(100),
+            started: Instant::now(),
+            cancelled: &flag,
+        };
+        let mut cancelled = false;
+        assert_eq!(limit.next_batch(0, 0, &mut cancelled), Some(100));
+        assert_eq!(limit.next_batch(60, 1, &mut cancelled), Some(40));
+        assert_eq!(limit.next_batch(100, 2, &mut cancelled), None);
+        assert!(!cancelled);
+        let timed = SliceLimit {
+            budget: SliceBudget::Seconds(0.0),
+            started: Instant::now(),
+            cancelled: &flag,
+        };
+        assert_eq!(timed.next_batch(0, 0, &mut cancelled), Some(usize::MAX));
+        assert_eq!(timed.next_batch(60, 1, &mut cancelled), None);
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(limit.next_batch(0, 0, &mut cancelled), None);
+        assert!(cancelled);
     }
 
     #[test]

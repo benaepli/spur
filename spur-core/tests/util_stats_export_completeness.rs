@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    CallTargetStats, ChannelTableStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1370,6 +1370,69 @@ fn call_targets_leaves(prefix: &str, c: &CallTargetStats) -> Vec<(String, Value)
     ]
 }
 
+fn grid_pool(m: &mut Marks) -> GridPoolStats {
+    GridPoolStats {
+        worker_idle_ns: m.int(),
+        run_wall_ns: m.int(),
+        pool_wall_ns: m.int(),
+        pools: m.int(),
+        runs: m.int(),
+        batches: m.int(),
+        capacity_gated_batches: m.int(),
+        unfilled_in_ungated_batches: m.int(),
+        fresh_ahead_launched: m.int(),
+        shadow_batches_checked: m.int(),
+        shadow_mismatches: m.int(),
+        batched_worker_idle_ns: m.int(),
+        batched_run_wall_ns: m.int(),
+        batched_pool_wall_ns: m.int(),
+        batched_batches: m.int(),
+        batched_runs: m.int(),
+        writer_blocked_ns: m.int(),
+    }
+}
+
+fn grid_pool_leaves(prefix: &str, g: &GridPoolStats) -> Vec<(String, Value)> {
+    let GridPoolStats {
+        worker_idle_ns,
+        run_wall_ns,
+        pool_wall_ns,
+        pools,
+        runs,
+        batches,
+        capacity_gated_batches,
+        unfilled_in_ungated_batches,
+        fresh_ahead_launched,
+        shadow_batches_checked,
+        shadow_mismatches,
+        batched_worker_idle_ns,
+        batched_run_wall_ns,
+        batched_pool_wall_ns,
+        batched_batches,
+        batched_runs,
+        writer_blocked_ns,
+    } = g;
+    vec![
+        leaf(prefix, "worker_idle_ns", *worker_idle_ns),
+        leaf(prefix, "run_wall_ns", *run_wall_ns),
+        leaf(prefix, "pool_wall_ns", *pool_wall_ns),
+        leaf(prefix, "pools", *pools),
+        leaf(prefix, "runs", *runs),
+        leaf(prefix, "batches", *batches),
+        leaf(prefix, "capacity_gated_batches", *capacity_gated_batches),
+        leaf(prefix, "unfilled_in_ungated_batches", *unfilled_in_ungated_batches),
+        leaf(prefix, "fresh_ahead_launched", *fresh_ahead_launched),
+        leaf(prefix, "shadow_batches_checked", *shadow_batches_checked),
+        leaf(prefix, "shadow_mismatches", *shadow_mismatches),
+        leaf(prefix, "batched_worker_idle_ns", *batched_worker_idle_ns),
+        leaf(prefix, "batched_run_wall_ns", *batched_run_wall_ns),
+        leaf(prefix, "batched_pool_wall_ns", *batched_pool_wall_ns),
+        leaf(prefix, "batched_batches", *batched_batches),
+        leaf(prefix, "batched_runs", *batched_runs),
+        leaf(prefix, "writer_blocked_ns", *writer_blocked_ns),
+    ]
+}
+
 fn channel_table(m: &mut Marks) -> ChannelTableStats {
     ChannelTableStats {
         lookups: m.int(),
@@ -2211,6 +2274,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         timeline_keys: _,
         steer_terms: _,
         history_writer: _,
+        grid_pool: _,
         timeline: _,
         run_setup: _,
         trace_format: _,
@@ -2267,6 +2331,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "timeline_keys",
         "steer_terms",
         "history_writer",
+        "grid_pool",
         "timeline",
         "run_setup",
         "trace_format",
@@ -2356,6 +2421,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.timer_context = timer_context(&mut m);
     s.plan_deps = plan_deps(&mut m);
     s.history_writer = history_writer(&mut m);
+    s.grid_pool = grid_pool(&mut m);
     s.timeline = timeline(&mut m);
     s.run_setup = run_setup(&mut m);
     s.trace_format = trace_format(&mut m);
@@ -2391,6 +2457,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(replay_leaves("replay", &s.replay));
     expected.extend(timer_context_leaves("timer_context", &s.timer_context));
     expected.extend(history_writer_leaves("history_writer", &s.history_writer));
+    expected.extend(grid_pool_leaves("grid_pool", &s.grid_pool));
     expected.extend(timeline_leaves("timeline", &s.timeline));
     expected.extend(run_setup_leaves("run_setup", &s.run_setup));
     expected.extend(trace_format_leaves("trace_format", &s.trace_format));
@@ -2452,6 +2519,7 @@ fn every_counter_field_reaches_the_written_json() {
         "replay",
         "timer_context",
         "history_writer",
+        "grid_pool",
         "timeline",
         "run_setup",
         "trace_format",

@@ -2448,16 +2448,19 @@ impl<F: Feedback> Strategy<F> for AosExplorer<F> {
             let ids: Vec<i64> = (0..self.batch_size)
                 .map(|_| ctx.run_counter.fetch_add(1, Ordering::Relaxed))
                 .collect();
+            let pool_started = std::time::Instant::now();
+            let job_wall_ns = std::sync::atomic::AtomicU64::new(0);
             let seeds: Vec<AosChild> = ids
                 .par_iter()
                 .map(|&run_id| {
+                    let job_started = std::time::Instant::now();
                     let mut cfg_rng = SmallRng::seed_from_u64(derive_seed(
                         ctx.session_seed,
                         run_id,
                         CONFIG_SALT,
                     ));
                     let cfg = SingleRunConfig::random(&self.envelope, &mut cfg_rng);
-                    run_recorded::<F>(
+                    let child = run_recorded::<F>(
                         ctx.program,
                         ctx.writer,
                         &self.global_state,
@@ -2466,9 +2469,17 @@ impl<F: Feedback> Strategy<F> for AosExplorer<F> {
                         ctx.session_seed,
                         run_id,
                         ctx.attribution,
-                    )
+                    );
+                    job_wall_ns.fetch_add(job_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    child
                 })
                 .collect();
+            util_stats::record_batched_pool(
+                rayon::current_num_threads() as u64,
+                ids.len() as u64,
+                pool_started.elapsed().as_nanos() as u64,
+                job_wall_ns.into_inner(),
+            );
             for child in seeds {
                 aos_credit_and_insert(
                     child,
@@ -2494,10 +2505,13 @@ impl<F: Feedback> Strategy<F> for AosExplorer<F> {
                     (run_id, op, parent)
                 })
                 .collect();
+            let pool_started = std::time::Instant::now();
+            let job_wall_ns = std::sync::atomic::AtomicU64::new(0);
             let children: Vec<AosChild> = picks
                 .par_iter()
                 .map(|(run_id, op, parent)| {
-                    run_aos_child::<F>(
+                    let job_started = std::time::Instant::now();
+                    let child = run_aos_child::<F>(
                         ctx.program,
                         ctx.writer,
                         &self.global_state,
@@ -2507,9 +2521,17 @@ impl<F: Feedback> Strategy<F> for AosExplorer<F> {
                         *op,
                         parent,
                         ctx.attribution,
-                    )
+                    );
+                    job_wall_ns.fetch_add(job_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    child
                 })
                 .collect();
+            util_stats::record_batched_pool(
+                rayon::current_num_threads() as u64,
+                picks.len() as u64,
+                pool_started.elapsed().as_nanos() as u64,
+                job_wall_ns.into_inner(),
+            );
             for child in children {
                 aos_credit_and_insert(
                     child,

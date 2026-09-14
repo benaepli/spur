@@ -116,6 +116,23 @@ static CALL_TARGETS_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static CHANNEL_TABLE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 static CHANNEL_TABLE_LOOKUP_MISSES: AtomicU64 = AtomicU64::new(0);
 static CHANNEL_TABLE_DENSE_INSERTS: AtomicU64 = AtomicU64::new(0);
+static GP_WORKER_IDLE_NS: AtomicU64 = AtomicU64::new(0);
+static GP_RUN_WALL_NS: AtomicU64 = AtomicU64::new(0);
+static GP_POOL_WALL_NS: AtomicU64 = AtomicU64::new(0);
+static GP_POOLS: AtomicU64 = AtomicU64::new(0);
+static GP_RUNS: AtomicU64 = AtomicU64::new(0);
+static GP_BATCHES: AtomicU64 = AtomicU64::new(0);
+static GP_CAPACITY_GATED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static GP_UNFILLED_IN_UNGATED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static GP_FRESH_AHEAD_LAUNCHED: AtomicU64 = AtomicU64::new(0);
+static GP_SHADOW_BATCHES_CHECKED: AtomicU64 = AtomicU64::new(0);
+static GP_SHADOW_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+static GP_BATCHED_WORKER_IDLE_NS: AtomicU64 = AtomicU64::new(0);
+static GP_BATCHED_RUN_WALL_NS: AtomicU64 = AtomicU64::new(0);
+static GP_BATCHED_POOL_WALL_NS: AtomicU64 = AtomicU64::new(0);
+static GP_BATCHED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static GP_BATCHED_RUNS: AtomicU64 = AtomicU64::new(0);
+static GP_WRITER_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
 static HW_BUSY_NS: AtomicU64 = AtomicU64::new(0);
 static HW_QUEUE_FULL_SENDS: AtomicU64 = AtomicU64::new(0);
 static HW_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
@@ -868,6 +885,23 @@ pub fn set_enabled(on: bool) {
             &CHANNEL_TABLE_LOOKUPS,
             &CHANNEL_TABLE_LOOKUP_MISSES,
             &CHANNEL_TABLE_DENSE_INSERTS,
+            &GP_WORKER_IDLE_NS,
+            &GP_RUN_WALL_NS,
+            &GP_POOL_WALL_NS,
+            &GP_POOLS,
+            &GP_RUNS,
+            &GP_BATCHES,
+            &GP_CAPACITY_GATED_BATCHES,
+            &GP_UNFILLED_IN_UNGATED_BATCHES,
+            &GP_FRESH_AHEAD_LAUNCHED,
+            &GP_SHADOW_BATCHES_CHECKED,
+            &GP_SHADOW_MISMATCHES,
+            &GP_BATCHED_WORKER_IDLE_NS,
+            &GP_BATCHED_RUN_WALL_NS,
+            &GP_BATCHED_POOL_WALL_NS,
+            &GP_BATCHED_BATCHES,
+            &GP_BATCHED_RUNS,
+            &GP_WRITER_BLOCKED_NS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -2900,6 +2934,60 @@ pub fn record_replay_slot_unfilled() {
         return;
     }
     RP_SLOTS_UNFILLED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What one grid-arm slice's ordered-release pool did. `job_wall_ns` sums
+/// every job from its start on a worker to its completion send, including
+/// time its run waited for room in the history writer's queue, which
+/// `writer_blocked_ns` sums over the slice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GridPoolSession {
+    pub workers: u64,
+    pub pool_wall_ns: u64,
+    pub job_wall_ns: u64,
+    pub runs: u64,
+    pub batches: u64,
+    pub capacity_gated_batches: u64,
+    pub unfilled_in_ungated_batches: u64,
+    pub fresh_ahead_launched: u64,
+    pub shadow_batches_checked: u64,
+    pub shadow_mismatches: u64,
+    pub writer_blocked_ns: u64,
+}
+
+/// One grid-arm slice's ordered-release pool drained.
+pub fn record_grid_pool(s: &GridPoolSession) {
+    if !enabled() {
+        return;
+    }
+    let capacity = s.workers.saturating_mul(s.pool_wall_ns);
+    GP_WORKER_IDLE_NS.fetch_add(capacity.saturating_sub(s.job_wall_ns), Ordering::Relaxed);
+    GP_RUN_WALL_NS.fetch_add(s.job_wall_ns, Ordering::Relaxed);
+    GP_POOL_WALL_NS.fetch_add(s.pool_wall_ns, Ordering::Relaxed);
+    GP_POOLS.fetch_add(1, Ordering::Relaxed);
+    GP_RUNS.fetch_add(s.runs, Ordering::Relaxed);
+    GP_BATCHES.fetch_add(s.batches, Ordering::Relaxed);
+    GP_CAPACITY_GATED_BATCHES.fetch_add(s.capacity_gated_batches, Ordering::Relaxed);
+    GP_UNFILLED_IN_UNGATED_BATCHES.fetch_add(s.unfilled_in_ungated_batches, Ordering::Relaxed);
+    GP_FRESH_AHEAD_LAUNCHED.fetch_add(s.fresh_ahead_launched, Ordering::Relaxed);
+    GP_SHADOW_BATCHES_CHECKED.fetch_add(s.shadow_batches_checked, Ordering::Relaxed);
+    GP_SHADOW_MISMATCHES.fetch_add(s.shadow_mismatches, Ordering::Relaxed);
+    GP_WRITER_BLOCKED_NS.fetch_add(s.writer_blocked_ns, Ordering::Relaxed);
+}
+
+/// One batch of `runs` ran to completion as a whole on `workers` workers:
+/// the pool was held for `pool_wall_ns` and the jobs took `job_wall_ns`
+/// between them.
+pub fn record_batched_pool(workers: u64, runs: u64, pool_wall_ns: u64, job_wall_ns: u64) {
+    if !enabled() {
+        return;
+    }
+    let capacity = workers.saturating_mul(pool_wall_ns);
+    GP_BATCHED_WORKER_IDLE_NS.fetch_add(capacity.saturating_sub(job_wall_ns), Ordering::Relaxed);
+    GP_BATCHED_RUN_WALL_NS.fetch_add(job_wall_ns, Ordering::Relaxed);
+    GP_BATCHED_POOL_WALL_NS.fetch_add(pool_wall_ns, Ordering::Relaxed);
+    GP_BATCHED_BATCHES.fetch_add(1, Ordering::Relaxed);
+    GP_BATCHED_RUNS.fetch_add(runs, Ordering::Relaxed);
 }
 
 /// A fresh grid-arm run recorded `words` scheduling draws.
@@ -5649,6 +5737,12 @@ pub fn record_history_writer_busy(busy_ns: u64) {
     HW_BUSY_NS.fetch_add(busy_ns, Ordering::Relaxed);
 }
 
+/// Nanoseconds sends to the history writer have waited for queue room this
+/// session.
+pub fn history_writer_blocked_ns() -> u64 {
+    HW_BLOCKED_NS.load(Ordering::Relaxed)
+}
+
 /// A send to the history writer found its queue full and waited `blocked_ns`
 /// for room.
 #[inline]
@@ -7032,6 +7126,68 @@ impl ReplayStats {
     }
 }
 
+/// Worker time of the thread pool. The `worker_idle_ns`, `run_wall_ns`,
+/// `pool_wall_ns`, `pools`, `runs` and `batches` leaves cover grid arms, whose
+/// batches overlap under ordered release; busy share is `run_wall_ns /
+/// (workers x pool_wall_ns)`. `capacity_gated_batches` counts batches whose
+/// fresh runs could not start before their predecessors finished, because
+/// the corpus could not be shown to cover their slots;
+/// `unfilled_in_ungated_batches` counts slots that found the corpus empty in
+/// a batch that passed that test, and is zero whenever assignment is exact.
+/// `fresh_ahead_launched` counts fresh runs started before their batch's
+/// slots were drawn. The `shadow_` leaves count only in debug builds: batches
+/// whose assignment was recomputed by a sequential reference, and runs whose
+/// assignment differed from it. The `batched_` leaves cover strategies that
+/// run a batch to completion as a whole, where every worker waits for the
+/// batch's slowest run. `writer_blocked_ns` is the part of grid `run_wall_ns`
+/// that runs spent waiting for room in the history writer's queue, so
+/// `(run_wall_ns - writer_blocked_ns) / (workers x pool_wall_ns)` is busy
+/// share with that waiting removed.
+#[derive(Serialize, Debug)]
+pub struct GridPoolStats {
+    pub worker_idle_ns: u64,
+    pub run_wall_ns: u64,
+    pub pool_wall_ns: u64,
+    pub pools: u64,
+    pub runs: u64,
+    pub batches: u64,
+    pub capacity_gated_batches: u64,
+    pub unfilled_in_ungated_batches: u64,
+    pub fresh_ahead_launched: u64,
+    pub shadow_batches_checked: u64,
+    pub shadow_mismatches: u64,
+    pub batched_worker_idle_ns: u64,
+    pub batched_run_wall_ns: u64,
+    pub batched_pool_wall_ns: u64,
+    pub batched_batches: u64,
+    pub batched_runs: u64,
+    pub writer_blocked_ns: u64,
+}
+
+impl GridPoolStats {
+    fn read() -> Self {
+        Self {
+            worker_idle_ns: GP_WORKER_IDLE_NS.load(Ordering::Relaxed),
+            run_wall_ns: GP_RUN_WALL_NS.load(Ordering::Relaxed),
+            pool_wall_ns: GP_POOL_WALL_NS.load(Ordering::Relaxed),
+            pools: GP_POOLS.load(Ordering::Relaxed),
+            runs: GP_RUNS.load(Ordering::Relaxed),
+            batches: GP_BATCHES.load(Ordering::Relaxed),
+            capacity_gated_batches: GP_CAPACITY_GATED_BATCHES.load(Ordering::Relaxed),
+            unfilled_in_ungated_batches: GP_UNFILLED_IN_UNGATED_BATCHES.load(Ordering::Relaxed),
+            fresh_ahead_launched: GP_FRESH_AHEAD_LAUNCHED.load(Ordering::Relaxed),
+            shadow_batches_checked: GP_SHADOW_BATCHES_CHECKED.load(Ordering::Relaxed),
+            shadow_mismatches: GP_SHADOW_MISMATCHES.load(Ordering::Relaxed),
+            batched_worker_idle_ns: GP_BATCHED_WORKER_IDLE_NS.load(Ordering::Relaxed),
+            batched_run_wall_ns: GP_BATCHED_RUN_WALL_NS.load(Ordering::Relaxed),
+            batched_pool_wall_ns: GP_BATCHED_POOL_WALL_NS.load(Ordering::Relaxed),
+            batched_batches: GP_BATCHED_BATCHES.load(Ordering::Relaxed),
+            batched_runs: GP_BATCHED_RUNS.load(Ordering::Relaxed),
+            writer_blocked_ns: GP_WRITER_BLOCKED_NS.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The timer-context block: the learner's probe traffic, the steered rolls
 /// that applied a learned multiplier, the rolls an unsupported selector
 /// excluded, and a gauge of the cells currently engaged. `cells_engaged` is
@@ -7116,6 +7272,7 @@ pub struct UtilizationSnapshot {
     pub timeline_keys: TimelineKeyStats,
     pub steer_terms: SteerTermStats,
     pub history_writer: HistoryWriterStats,
+    pub grid_pool: GridPoolStats,
     pub timeline: TimelineStats,
     pub run_setup: RunSetupStats,
     pub trace_format: TraceFormatStats,
@@ -7343,6 +7500,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         timeline_keys: TimelineKeyStats::read(),
         steer_terms: SteerTermStats::read(),
         history_writer: HistoryWriterStats::read(),
+        grid_pool: GridPoolStats::read(),
         timeline: TimelineStats::read(),
         run_setup: RunSetupStats::read(),
         trace_format: TraceFormatStats::read(),

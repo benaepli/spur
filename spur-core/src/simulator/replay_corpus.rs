@@ -105,6 +105,16 @@ impl<C: Clone> Corpus<C> {
         self.parents.push_back(Parent { seed, children: 0 });
     }
 
+    /// Children the ring can still seed. A child lowers it by exactly one,
+    /// and an admission never lowers it: a parent dropped at capacity has at
+    /// most `CHILDREN_PER_PARENT` left, which the new parent replaces.
+    pub fn remaining_children(&self) -> u64 {
+        self.parents
+            .iter()
+            .map(|p| CHILDREN_PER_PARENT.saturating_sub(p.children) as u64)
+            .sum()
+    }
+
     /// The seed for the next child, from the next parent in turn; `None`
     /// when the ring is empty.
     pub fn next_child(&mut self) -> Option<Seed<C>> {
@@ -200,6 +210,26 @@ mod tests {
         }
         let tail: Vec<u64> = std::iter::from_fn(|| c.next_child()).map(|s| s.cfg).collect();
         assert_eq!(tail, vec![1, 2, 3], "each parent seeds exactly one more child");
+    }
+
+    #[test]
+    fn remaining_children_falls_by_one_per_child_and_never_on_admit() {
+        let mut c = Corpus::new();
+        assert_eq!(c.remaining_children(), 0);
+        for i in 0..(CAPACITY as u64) {
+            c.admit(seed(i));
+        }
+        let mut remaining = c.remaining_children();
+        assert_eq!(remaining, CAPACITY as u64 * CHILDREN_PER_PARENT as u64);
+        for i in 0..2000u64 {
+            if i % 5 == 0 {
+                c.admit(seed(1000 + i));
+                assert!(c.remaining_children() >= remaining, "an admission lowered the count");
+            } else if c.next_child().is_some() {
+                assert_eq!(c.remaining_children() + 1, remaining, "a child did not take exactly one");
+            }
+            remaining = c.remaining_children();
+        }
     }
 
     #[test]
