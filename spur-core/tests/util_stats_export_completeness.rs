@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, ValueStructStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, ValueStructStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDeliverStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, PlanReadyStats, ReplayStats, SchedStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1643,6 +1643,48 @@ fn history_format_leaves(prefix: &str, h: &HistoryFormatStats) -> Vec<(String, V
     vec![leaf(prefix, "ops_streamed", *ops_streamed)]
 }
 
+fn plan_ready(m: &mut Marks) -> PlanReadyStats {
+    PlanReadyStats {
+        scans: m.int(),
+        scans_skipped: m.int(),
+        scans_empty: m.int(),
+        events_released: m.int(),
+    }
+}
+
+fn plan_ready_leaves(prefix: &str, p: &PlanReadyStats) -> Vec<(String, Value)> {
+    let PlanReadyStats {
+        scans,
+        scans_skipped,
+        scans_empty,
+        events_released,
+    } = p;
+    vec![
+        leaf(prefix, "scans", *scans),
+        leaf(prefix, "scans_skipped", *scans_skipped),
+        leaf(prefix, "scans_empty", *scans_empty),
+        leaf(prefix, "events_released", *events_released),
+    ]
+}
+
+fn plan_deliver(m: &mut Marks) -> PlanDeliverStats {
+    PlanDeliverStats {
+        lookups: m.int(),
+        lookups_skipped: m.int(),
+    }
+}
+
+fn plan_deliver_leaves(prefix: &str, p: &PlanDeliverStats) -> Vec<(String, Value)> {
+    let PlanDeliverStats {
+        lookups,
+        lookups_skipped,
+    } = p;
+    vec![
+        leaf(prefix, "lookups", *lookups),
+        leaf(prefix, "lookups_skipped", *lookups_skipped),
+    ]
+}
+
 fn replay(m: &mut Marks) -> ReplayStats {
     ReplayStats {
         parents_admitted: m.int(),
@@ -2351,6 +2393,8 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         run_setup: _,
         trace_format: _,
         history_format: _,
+        plan_ready: _,
+        plan_deliver: _,
     } = s;
     vec![
         "rng_streams",
@@ -2411,6 +2455,8 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "run_setup",
         "trace_format",
         "history_format",
+        "plan_ready",
+        "plan_deliver",
     ]
 }
 
@@ -2504,6 +2550,8 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.run_setup = run_setup(&mut m);
     s.trace_format = trace_format(&mut m);
     s.history_format = history_format(&mut m);
+    s.plan_ready = plan_ready(&mut m);
+    s.plan_deliver = plan_deliver(&mut m);
     let mut expected = steer_authority_leaves("steer_authority", &s.steer_authority);
     expected.extend(termination_leaves("termination", &s.termination));
     expected.extend(plan_deps_leaves("plan_deps", &s.plan_deps));
@@ -2543,6 +2591,8 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(run_setup_leaves("run_setup", &s.run_setup));
     expected.extend(trace_format_leaves("trace_format", &s.trace_format));
     expected.extend(history_format_leaves("history_format", &s.history_format));
+    expected.extend(plan_ready_leaves("plan_ready", &s.plan_ready));
+    expected.extend(plan_deliver_leaves("plan_deliver", &s.plan_deliver));
     (s, expected)
 }
 
@@ -2608,6 +2658,8 @@ fn every_counter_field_reaches_the_written_json() {
         "run_setup",
         "trace_format",
         "history_format",
+        "plan_ready",
+        "plan_deliver",
     ] {
         let mut actual = BTreeMap::new();
         leaves(&parsed[block], block, &mut actual);

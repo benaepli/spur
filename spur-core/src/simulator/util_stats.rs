@@ -105,6 +105,12 @@ static VALUE_STRUCT_FIELD_READS: AtomicU64 = AtomicU64::new(0);
 static VALUE_STRUCT_OTHER_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 static VALUE_STRUCT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static VALUE_STRUCT_FALLBACK_KEY_HASHES: AtomicU64 = AtomicU64::new(0);
+static PLAN_READY_SCANS: AtomicU64 = AtomicU64::new(0);
+static PLAN_READY_SCANS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static PLAN_READY_SCANS_EMPTY: AtomicU64 = AtomicU64::new(0);
+static PLAN_READY_EVENTS_RELEASED: AtomicU64 = AtomicU64::new(0);
+static PLAN_DELIVER_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+static PLAN_DELIVER_LOOKUPS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static EVAL_BORROW_HANDLES_NOT_CLONED: AtomicU64 = AtomicU64::new(0);
 static EVAL_BORROW_SCALARS_NOT_CLONED: AtomicU64 = AtomicU64::new(0);
 static RUN_BUFFERS_CHANNEL_TABLE_GROWS: AtomicU64 = AtomicU64::new(0);
@@ -886,6 +892,12 @@ pub fn set_enabled(on: bool) {
             &VALUE_STRUCT_OTHER_LOOKUPS,
             &VALUE_STRUCT_FALLBACKS,
             &VALUE_STRUCT_FALLBACK_KEY_HASHES,
+            &PLAN_READY_SCANS,
+            &PLAN_READY_SCANS_SKIPPED,
+            &PLAN_READY_SCANS_EMPTY,
+            &PLAN_READY_EVENTS_RELEASED,
+            &PLAN_DELIVER_LOOKUPS,
+            &PLAN_DELIVER_LOOKUPS_SKIPPED,
             &EVAL_BORROW_HANDLES_NOT_CLONED,
             &EVAL_BORROW_SCALARS_NOT_CLONED,
             &RUN_BUFFERS_CHANNEL_TABLE_GROWS,
@@ -5576,6 +5588,86 @@ impl FrameStats {
     }
 }
 
+/// How run steps took released plan events. A step either scanned the plan's
+/// statuses (`scans`) or skipped the scan because no event was ready
+/// (`scans_skipped`), so the two sum to `steer_authority.steps_total` whenever
+/// that is counted. `scans_empty` counts scans that released nothing and
+/// `events_released` the events all scans released.
+#[derive(Serialize, Debug)]
+pub struct PlanReadyStats {
+    pub scans: u64,
+    pub scans_skipped: u64,
+    pub scans_empty: u64,
+    pub events_released: u64,
+}
+
+impl PlanReadyStats {
+    fn read() -> Self {
+        Self {
+            scans: PLAN_READY_SCANS.load(Ordering::Relaxed),
+            scans_skipped: PLAN_READY_SCANS_SKIPPED.load(Ordering::Relaxed),
+            scans_empty: PLAN_READY_SCANS_EMPTY.load(Ordering::Relaxed),
+            events_released: PLAN_READY_EVENTS_RELEASED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Executed records checked against the plan's ready deliver events
+/// (`lookups`), and executed records not checked because no deliver event was
+/// ready (`lookups_skipped`).
+#[derive(Serialize, Debug)]
+pub struct PlanDeliverStats {
+    pub lookups: u64,
+    pub lookups_skipped: u64,
+}
+
+impl PlanDeliverStats {
+    fn read() -> Self {
+        Self {
+            lookups: PLAN_DELIVER_LOOKUPS.load(Ordering::Relaxed),
+            lookups_skipped: PLAN_DELIVER_LOOKUPS_SKIPPED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One run left its plan loop, by any path, having done this plan engine
+/// work. The names match the fields of `PlanReadyStats` and `PlanDeliverStats`.
+#[inline]
+pub fn record_plan_work(
+    scans: u64,
+    scans_skipped: u64,
+    scans_empty: u64,
+    events_released: u64,
+    deliver_lookups: u64,
+    deliver_lookups_skipped: u64,
+) {
+    if !enabled() {
+        return;
+    }
+    if scans > 0 {
+        bump(|b| &b.plan_ready_scans, &PLAN_READY_SCANS, scans);
+    }
+    if scans_skipped > 0 {
+        bump(|b| &b.plan_ready_scans_skipped, &PLAN_READY_SCANS_SKIPPED, scans_skipped);
+    }
+    if scans_empty > 0 {
+        bump(|b| &b.plan_ready_scans_empty, &PLAN_READY_SCANS_EMPTY, scans_empty);
+    }
+    if events_released > 0 {
+        bump(|b| &b.plan_ready_events_released, &PLAN_READY_EVENTS_RELEASED, events_released);
+    }
+    if deliver_lookups > 0 {
+        bump(|b| &b.plan_deliver_lookups, &PLAN_DELIVER_LOOKUPS, deliver_lookups);
+    }
+    if deliver_lookups_skipped > 0 {
+        bump(
+            |b| &b.plan_deliver_lookups_skipped,
+            &PLAN_DELIVER_LOOKUPS_SKIPPED,
+            deliver_lookups_skipped,
+        );
+    }
+}
+
 /// Map-key hashes of leaf values whose signature was computed at hash time
 /// rather than when the value was built.
 #[derive(Serialize, Debug)]
@@ -6383,6 +6475,12 @@ struct RunCounters {
     trace_format_enter_reused: Cell<u64>,
     trace_format_enter_formatted: Cell<u64>,
     history_format_ops_streamed: Cell<u64>,
+    plan_ready_scans: Cell<u64>,
+    plan_ready_scans_skipped: Cell<u64>,
+    plan_ready_scans_empty: Cell<u64>,
+    plan_ready_events_released: Cell<u64>,
+    plan_deliver_lookups: Cell<u64>,
+    plan_deliver_lookups_skipped: Cell<u64>,
 }
 
 impl RunCounters {
@@ -6444,6 +6542,12 @@ impl RunCounters {
             trace_format_enter_reused: Cell::new(0),
             trace_format_enter_formatted: Cell::new(0),
             history_format_ops_streamed: Cell::new(0),
+            plan_ready_scans: Cell::new(0),
+            plan_ready_scans_skipped: Cell::new(0),
+            plan_ready_scans_empty: Cell::new(0),
+            plan_ready_events_released: Cell::new(0),
+            plan_deliver_lookups: Cell::new(0),
+            plan_deliver_lookups_skipped: Cell::new(0),
         }
     }
 
@@ -6496,6 +6600,12 @@ impl RunCounters {
             (&self.trace_format_enter_reused, &TRACE_FORMAT_ENTER_REUSED),
             (&self.trace_format_enter_formatted, &TRACE_FORMAT_ENTER_FORMATTED),
             (&self.history_format_ops_streamed, &HISTORY_FORMAT_OPS_STREAMED),
+            (&self.plan_ready_scans, &PLAN_READY_SCANS),
+            (&self.plan_ready_scans_skipped, &PLAN_READY_SCANS_SKIPPED),
+            (&self.plan_ready_scans_empty, &PLAN_READY_SCANS_EMPTY),
+            (&self.plan_ready_events_released, &PLAN_READY_EVENTS_RELEASED),
+            (&self.plan_deliver_lookups, &PLAN_DELIVER_LOOKUPS),
+            (&self.plan_deliver_lookups_skipped, &PLAN_DELIVER_LOOKUPS_SKIPPED),
         ] {
             f(local, global);
         }
@@ -7450,6 +7560,8 @@ pub struct UtilizationSnapshot {
     pub frame_layout: FrameLayoutStats,
     pub value_sig: ValueSigStats,
     pub value_struct: ValueStructStats,
+    pub plan_ready: PlanReadyStats,
+    pub plan_deliver: PlanDeliverStats,
     pub eval_borrow: EvalBorrowStats,
     pub run_buffers: RunBufferStats,
     pub print_content: PrintContentStats,
@@ -7681,6 +7793,8 @@ pub fn snapshot() -> UtilizationSnapshot {
         frame_layout: FrameLayoutStats::read(),
         value_sig: ValueSigStats::read(),
         value_struct: ValueStructStats::read(),
+        plan_ready: PlanReadyStats::read(),
+        plan_deliver: PlanDeliverStats::read(),
         eval_borrow: EvalBorrowStats::read(),
         run_buffers: RunBufferStats::read(),
         print_content: PrintContentStats::read(),

@@ -418,6 +418,31 @@ pub enum RunOutcome {
     },
 }
 
+/// Plan engine work of one run, counted when the run's plan loop is left by
+/// any path, an error return included.
+#[derive(Default)]
+struct PlanWork {
+    scans: u64,
+    scans_skipped: u64,
+    scans_empty: u64,
+    events_released: u64,
+    deliver_lookups: u64,
+    deliver_lookups_skipped: u64,
+}
+
+impl Drop for PlanWork {
+    fn drop(&mut self) {
+        util_stats::record_plan_work(
+            self.scans,
+            self.scans_skipped,
+            self.scans_empty,
+            self.events_released,
+            self.deliver_lookups,
+            self.deliver_lookups_skipped,
+        );
+    }
+}
+
 /// How a run spent its steps: how many released a runnable, how many offered
 /// queued work the scheduler released none of, and how many had nothing queued
 /// at all. `tail_without_release` is the run of steps up to the current one
@@ -667,6 +692,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     let mut recovered_nodes: HashSet<usize> = HashSet::new();
 
     let mut census = StepCensus::default();
+    let mut plan_work = PlanWork::default();
 
     // Starvation detection: track consecutive no-progress iterations
     let mut no_progress_count: i32 = 0;
@@ -725,11 +751,20 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         path_state.state.release_from_purgatory(step);
 
         // Dispatch ready events
-        let ready_events: Vec<(NodeIndex, PlannedEvent)> = engine
-            .get_ready_events()
-            .into_iter()
-            .map(|(idx, e)| (idx, e.clone()))
-            .collect();
+        let ready_events: Vec<(NodeIndex, PlannedEvent)> = if engine.has_ready() {
+            let released: Vec<(NodeIndex, PlannedEvent)> = engine
+                .get_ready_events()
+                .into_iter()
+                .map(|(idx, e)| (idx, e.clone()))
+                .collect();
+            plan_work.scans += 1;
+            plan_work.scans_empty += released.is_empty() as u64;
+            plan_work.events_released += released.len() as u64;
+            released
+        } else {
+            plan_work.scans_skipped += 1;
+            Vec::new()
+        };
 
         // Requests whose wait ran past expiry. When nothing else in the run
         // can move, the earliest held request is issued now instead, so a
@@ -916,17 +951,23 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
 
         // Build reservations from delivers that are NOT yet ready and NOT completed.
         // These constrain the scheduler from picking their matching runnables early.
-        let reservations: Vec<Reservation> = all_delivers
-            .iter()
-            .filter(|(idx, _)| !ready_delivers.contains(idx) && !completed_delivers.contains(idx))
-            .filter_map(|(_, spec)| {
-                name_to_entry.get(spec.function.as_str()).map(|&entry_pc| Reservation {
-                    entry_pc,
-                    from: spec.from.map(|f| f as usize),
-                    to: spec.to.map(|t| t as usize),
+        let reservations: Vec<Reservation> = if all_delivers.is_empty() {
+            Vec::new()
+        } else {
+            all_delivers
+                .iter()
+                .filter(|(idx, _)| {
+                    !ready_delivers.contains(idx) && !completed_delivers.contains(idx)
                 })
-            })
-            .collect();
+                .filter_map(|(_, spec)| {
+                    name_to_entry.get(spec.function.as_str()).map(|&entry_pc| Reservation {
+                        entry_pc,
+                        from: spec.from.map(|f| f as usize),
+                        to: spec.to.map(|t| t as usize),
+                    })
+                })
+                .collect()
+        };
 
         let history_start_len = path_state.history.len();
 
@@ -1091,7 +1132,12 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         marks.acted_delivery = true;
                     }
                     // Check if this record delivery matches any ready deliver event.
-                    if let Some(&func_name) = entry_to_name.get(&entry_pc) {
+                    let deliver_ready = !ready_delivers.is_empty();
+                    plan_work.deliver_lookups += deliver_ready as u64;
+                    plan_work.deliver_lookups_skipped += !deliver_ready as u64;
+                    if deliver_ready
+                        && let Some(&func_name) = entry_to_name.get(&entry_pc)
+                    {
                         let matched = ready_delivers
                             .iter()
                             .find(|idx| {
