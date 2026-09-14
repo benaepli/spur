@@ -1,4 +1,5 @@
 pub mod compiled;
+mod frame_layout;
 mod ir;
 pub use compiled::{CExpr, CompiledProgram, Op, Opnd};
 pub use ir::*;
@@ -71,6 +72,15 @@ pub struct Compiler {
 
     /// Type ID map for looking up TypeIds during compilation
     type_ids: TypeIdMap,
+
+    /// Whether each function's local slots are renumbered so that slots never
+    /// needed at the same time share a frame position.
+    compact_frames: bool,
+
+    /// Local slot counts summed over the functions compiled so far, as
+    /// declared and as laid out.
+    slots_before: u64,
+    slots_after: u64,
 }
 
 impl Default for Compiler {
@@ -101,7 +111,28 @@ impl Compiler {
             max_node_slots: 1,
             roles: Vec::new(),
             type_ids: TypeIdMap::new(),
+            compact_frames: true,
+            slots_before: 0,
+            slots_after: 0,
         }
+    }
+
+    /// Keeps every function's local slots as declared.
+    #[cfg(test)]
+    pub(crate) fn without_frame_compaction(mut self) -> Self {
+        self.compact_frames = false;
+        self
+    }
+
+    /// Lays out the local slots of the function whose labels start at
+    /// `first_vertex` and counts its slots before and after.
+    fn finish_function(&mut self, first_vertex: Vertex, mut info: FunctionInfo) -> FunctionInfo {
+        self.slots_before += u64::from(info.local_slot_count);
+        if self.compact_frames {
+            frame_layout::compact_function_slots(&mut self.cfg, first_vertex, &mut info);
+        }
+        self.slots_after += u64::from(info.local_slot_count);
+        info
     }
 
     /// Call when starting to compile a new role
@@ -261,6 +292,8 @@ impl Compiler {
             }
         }
 
+        crate::simulator::util_stats::record_frame_layout(self.slots_before, self.slots_after);
+
         let mut program = Program {
             cfg: Cfg { graph: self.cfg },
             rpc: self.rpc_map,
@@ -282,6 +315,7 @@ impl Compiler {
         inits: &[LVarInit],
         qualified_name: String,
     ) -> FunctionInfo {
+        let first_vertex = self.cfg.len();
         // Begin a new function with no parameters
         self.begin_function(&[]);
 
@@ -311,7 +345,7 @@ impl Compiler {
 
         let func_name_id = self.alloc_func_name_id(qualified_name);
 
-        FunctionInfo {
+        let info = FunctionInfo {
             entry,
             name: func_name_id,
             param_count: 0,
@@ -319,10 +353,12 @@ impl Compiler {
             local_defaults: self.current_local_defaults.clone(),
             is_sync: true,
             debug_slot_names: self.current_slot_names.clone(),
-        }
+        };
+        self.finish_function(first_vertex, info)
     }
 
     fn compile_func_def(&mut self, func: LFuncDef) -> FunctionInfo {
+        let first_vertex = self.cfg.len();
         // Collect parameter info: (NameId, display_name)
         let params: Vec<(NameId, String)> = func
             .params
@@ -411,7 +447,7 @@ impl Compiler {
         // Use the existing func.name NameId from the resolver, not a new one
         self.func_name_to_id.insert(qualified_name, func.name);
 
-        FunctionInfo {
+        let info = FunctionInfo {
             entry,
             name: func.name,
             param_count,
@@ -419,7 +455,8 @@ impl Compiler {
             local_defaults: self.current_local_defaults.clone(),
             is_sync: func.is_sync,
             debug_slot_names: self.current_slot_names.clone(),
-        }
+        };
+        self.finish_function(first_vertex, info)
     }
 
 

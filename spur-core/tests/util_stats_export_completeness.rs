@@ -21,7 +21,7 @@ use spur_core::simulator::util_stats::{
     ClientAnchorReleaseStats, ClientAnchorRushStats, ClientAnchorStats,
     CrashCensusStats, CrashPhaseArmStats, CrashPhaseLandingStats, CrashPhaseMovedStats,
     CrashPhaseStats, CrashPlaceStats, DeliveryEffect, DeliveryEffectStats, FreshFirstCensusStats,
-    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
+    CallTargetStats, ChannelTableStats, GridPoolStats, CompiledExprStats, CompiledOpsStats, EvalBorrowStats, FrameLayoutStats, FrameStats, HistoryFormatStats, PrintContentStats, RunBufferStats, ValueSigStats, HistoryWriterStats, RunSetupStats, StatsLocalStats, TimelineStats, TraceFormatStats, FreshFirstHalfStats, FreshFirstStats, GhostSignalStats, PairOrderCensusStats, PairOrderClassCounts, PairOrderHalfStats, PairOrderStats, PlanDepsDensitySplit, PlanDepsStats, PlanDepsTally, ReplayStats, GhostReleaseCellStats, GhostReleaseCellsStats, GhostReleaseSingleCellStats, GhostReleaseSingleCellsStats, GhostReleaseSingleStats, GhostReleaseStats, RunCapStats, StallCapMarks, StallCapStats, StallReleaseCellStats, StallReleaseDependents, StallReleaseStats, SteerAuthorityStats, TerminationStats, TerminationTally,
     TimerContextStats, UtilizationSnapshot, VictimSwapCensusStats, VictimSwapHalfStats,
     VictimSwapStats,
 };
@@ -1261,6 +1261,24 @@ fn frame_leaves(prefix: &str, f: &FrameStats) -> Vec<(String, Value)> {
     ]
 }
 
+fn frame_layout(m: &mut Marks) -> FrameLayoutStats {
+    FrameLayoutStats {
+        program_slots_before: m.int(),
+        program_slots_after: m.int(),
+    }
+}
+
+fn frame_layout_leaves(prefix: &str, f: &FrameLayoutStats) -> Vec<(String, Value)> {
+    let FrameLayoutStats {
+        program_slots_before,
+        program_slots_after,
+    } = f;
+    vec![
+        leaf(prefix, "program_slots_before", *program_slots_before),
+        leaf(prefix, "program_slots_after", *program_slots_after),
+    ]
+}
+
 fn value_sig(m: &mut Marks) -> ValueSigStats {
     ValueSigStats {
         leaf_hashes_deferred: m.int(),
@@ -2250,6 +2268,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         victim_swap: _,
         ghost_signal: _,
         frame: _,
+        frame_layout: _,
         value_sig: _,
         eval_borrow: _,
         run_buffers: _,
@@ -2307,6 +2326,7 @@ fn block_names(s: &UtilizationSnapshot) -> Vec<&'static str> {
         "victim_swap",
         "ghost_signal",
         "frame",
+        "frame_layout",
         "value_sig",
         "eval_borrow",
         "run_buffers",
@@ -2398,6 +2418,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     s.victim_swap = victim_swap(&mut m);
     s.ghost_signal = ghost_signal(&mut m);
     s.frame = frame(&mut m);
+    s.frame_layout = frame_layout(&mut m);
     s.value_sig = value_sig(&mut m);
     s.eval_borrow = eval_borrow(&mut m);
     s.run_buffers = run_buffers(&mut m);
@@ -2435,6 +2456,7 @@ fn marked_snapshot() -> (UtilizationSnapshot, Vec<(String, Value)>) {
     expected.extend(victim_swap_leaves("victim_swap", &s.victim_swap));
     expected.extend(ghost_signal_leaves("ghost_signal", &s.ghost_signal));
     expected.extend(frame_leaves("frame", &s.frame));
+    expected.extend(frame_layout_leaves("frame_layout", &s.frame_layout));
     expected.extend(value_sig_leaves("value_sig", &s.value_sig));
     expected.extend(eval_borrow_leaves("eval_borrow", &s.eval_borrow));
     expected.extend(run_buffers_leaves("run_buffers", &s.run_buffers));
@@ -2497,6 +2519,7 @@ fn every_counter_field_reaches_the_written_json() {
         "victim_swap",
         "ghost_signal",
         "frame",
+        "frame_layout",
         "value_sig",
         "eval_borrow",
         "run_buffers",

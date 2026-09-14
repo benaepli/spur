@@ -150,6 +150,8 @@ static TIMELINE_CONSTANT_INSERTS: AtomicU64 = AtomicU64::new(0);
 static RUN_SETUP_PROGRAM_CLONES_AVOIDED: AtomicU64 = AtomicU64::new(0);
 static TRACE_FORMAT_ENTER_REUSED: AtomicU64 = AtomicU64::new(0);
 static TRACE_FORMAT_ENTER_FORMATTED: AtomicU64 = AtomicU64::new(0);
+static FRAME_LAYOUT_PROGRAM_SLOTS_BEFORE: AtomicU64 = AtomicU64::new(0);
+static FRAME_LAYOUT_PROGRAM_SLOTS_AFTER: AtomicU64 = AtomicU64::new(0);
 static HISTORY_FORMAT_OPS_STREAMED: AtomicU64 = AtomicU64::new(0);
 static FF_SWAPS: AtomicU64 = AtomicU64::new(0);
 static FF_REPEAT_SWAPS: AtomicU64 = AtomicU64::new(0);
@@ -5813,6 +5815,26 @@ impl TraceFormatStats {
     }
 }
 
+/// Local slots summed over the functions of the last program compiled in this
+/// process: as the compiler declared them, and as laid out after slots never
+/// needed at the same time share a position. Set at compile time, before any
+/// session enables recording, so enabling does not clear them; they are
+/// gauges and read as zero in a difference of two snapshots.
+#[derive(Serialize, Debug)]
+pub struct FrameLayoutStats {
+    pub program_slots_before: u64,
+    pub program_slots_after: u64,
+}
+
+impl FrameLayoutStats {
+    fn read() -> Self {
+        Self {
+            program_slots_before: FRAME_LAYOUT_PROGRAM_SLOTS_BEFORE.load(Ordering::Relaxed),
+            program_slots_after: FRAME_LAYOUT_PROGRAM_SLOTS_AFTER.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Operations whose payload was written as JSON text directly from the
 /// values, one per row of the executions table.
 #[derive(Serialize, Debug)]
@@ -5867,6 +5889,14 @@ pub fn record_trace_enter_payload(reused: bool) {
     } else {
         bump(|b| &b.trace_format_enter_formatted, &TRACE_FORMAT_ENTER_FORMATTED, 1);
     }
+}
+
+/// A program was compiled whose functions declared `before` local slots in
+/// total and were laid out in `after`. Recorded whether or not recording is
+/// enabled, since compilation precedes the session.
+pub fn record_frame_layout(before: u64, after: u64) {
+    FRAME_LAYOUT_PROGRAM_SLOTS_BEFORE.store(before, Ordering::Relaxed);
+    FRAME_LAYOUT_PROGRAM_SLOTS_AFTER.store(after, Ordering::Relaxed);
 }
 
 /// `ops` operations had their payload written as JSON text from the values.
@@ -7240,6 +7270,7 @@ pub struct UtilizationSnapshot {
     pub victim_swap: VictimSwapStats,
     pub ghost_signal: GhostSignalStats,
     pub frame: FrameStats,
+    pub frame_layout: FrameLayoutStats,
     pub value_sig: ValueSigStats,
     pub eval_borrow: EvalBorrowStats,
     pub run_buffers: RunBufferStats,
@@ -7468,6 +7499,7 @@ pub fn snapshot() -> UtilizationSnapshot {
         victim_swap: VictimSwapStats::read(),
         ghost_signal: GhostSignalStats::read(),
         frame: FrameStats::read(),
+        frame_layout: FrameLayoutStats::read(),
         value_sig: ValueSigStats::read(),
         eval_borrow: EvalBorrowStats::read(),
         run_buffers: RunBufferStats::read(),

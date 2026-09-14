@@ -98,6 +98,11 @@ impl CompileResult {
 }
 
 pub fn compile(input: &str, name: &str) -> CompileResult {
+    compile_with(input, name, CfgCompiler::new())
+}
+
+/// Runs the whole pipeline with `cfg_compiler` producing the program.
+pub(crate) fn compile_with(input: &str, name: &str, cfg_compiler: CfgCompiler) -> CompileResult {
     let mut result = CompileResult {
         program: None,
         pure: None,
@@ -182,7 +187,6 @@ pub fn compile(input: &str, name: &str) -> CompileResult {
     let _ = liquid_out; // keep the binding alive for both cfgs
     result.pure = Some(pure);
 
-    let cfg_compiler = CfgCompiler::new();
     let program = cfg_compiler.compile_program(lowered, type_ids);
     result.program = Some(program);
 
