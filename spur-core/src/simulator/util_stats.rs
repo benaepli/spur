@@ -6332,10 +6332,8 @@ pub fn pending_interpreter_tally() -> InterpreterTally {
     INTERPRETER_RUN.with(|c| c.get())
 }
 
-/// The running thread's evaluator events not yet drained: variable operands
-/// read in place that were handles, those that were scalars, and leaf values
-/// hashed with a deferred signature.
-#[cfg(test)]
+/// The running thread's struct literal counts not yet drained: all literals,
+/// those whose fields were evaluated in shape order, and those permuted.
 #[cfg(test)]
 pub(crate) fn pending_struct_literal_counts() -> [u64; 3] {
     [
@@ -6346,6 +6344,10 @@ pub(crate) fn pending_struct_literal_counts() -> [u64; 3] {
     .map(|cell| cell.with(|c| c.get()))
 }
 
+/// The running thread's evaluator events not yet drained: variable operands
+/// read in place that were handles, those that were scalars, and leaf values
+/// hashed with a deferred signature.
+#[cfg(test)]
 pub(crate) fn pending_evaluator_events() -> [u64; 3] {
     // The third event is the deferred leaf hashes the evaluation would have
     // recorded had every struct been its map: hashes a struct skipped are
