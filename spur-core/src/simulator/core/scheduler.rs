@@ -4,7 +4,8 @@ use crate::simulator::core::eval::build_frame;
 use crate::simulator::core::exec::{exec, exec_sync_on_node};
 use crate::simulator::core::partition::{activate_partition, heal_partition};
 use crate::simulator::core::queue_selector::{
-    QueueInfo, QueueSelection, QueueSelector, WithinQueueSelector,
+    QueueInfo, QueueSelection, QueueSelector, TimerBiasUse, WithinQueueSelector,
+    select_with_timer_context,
 };
 use crate::simulator::core::state::{
     Continuation, HandlerTrigger, Logger, NodeId, PurgatoryConfig, Record, ReplayCut, Runnable,
@@ -1274,12 +1275,10 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         None => {
             // Steer-off probe runs and steps with no eligible timer take the
             // stock roll. The learned multiplier is read for the context of
-            // the first eligible timer in queue order; the features are
-            // copied into owned locals because the selector call below must
-            // not overlap a borrow of `state`.
-            let bias: Option<f64> = if timer_ctx_mode == timer_context::RunMode::Steered
-                && info.timer_queue_size > 0
-            {
+            // the first eligible timer in queue order. The multiplier read
+            // draws nothing, so reading it only where the roll compares it
+            // leaves every draw in place.
+            let multiplier = || {
                 let head_timer_node = state.timer_queue.iter().find_map(|r| {
                     if is_ineligible(r) {
                         return None;
@@ -1307,19 +1306,20 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                     );
                     timer_context::multiplier(cell)
                 })
-            } else {
-                None
             };
-            let picked = match bias {
-                Some(m) if selector.supports_timer_bias() => {
-                    util_stats::record_timer_context_bias(m);
-                    selector.select_timer_biased(&info, m, rng)
+            let picked = if timer_ctx_mode == timer_context::RunMode::Steered
+                && info.timer_queue_size > 0
+            {
+                let (picked, bias_use) =
+                    select_with_timer_context(selector, &info, multiplier, rng);
+                match bias_use {
+                    TimerBiasUse::Applied(m) => util_stats::record_timer_context_bias(m),
+                    TimerBiasUse::Excluded => util_stats::record_timer_context_excluded(),
+                    TimerBiasUse::Unused => {}
                 }
-                Some(_) => {
-                    util_stats::record_timer_context_excluded();
-                    selector.select(&info, rng)
-                }
-                None => selector.select(&info, rng),
+                picked
+            } else {
+                selector.select(&info, rng)
             };
             match picked {
                 Some(s) => s,

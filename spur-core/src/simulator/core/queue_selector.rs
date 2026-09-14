@@ -40,6 +40,7 @@ pub trait QueueSelector {
     /// Select with the timer's share of the roll multiplied by `timer_bias`.
     /// A selector that does not support the bias makes the stock selection,
     /// drawing exactly what `select` would draw.
+    #[cfg(test)]
     fn select_timer_biased(
         &mut self,
         info: &QueueInfo,
@@ -47,6 +48,60 @@ pub trait QueueSelector {
         rng: &mut impl Rng,
     ) -> Option<QueueSelection> {
         self.select(info, rng)
+    }
+
+    /// Select as `select_timer_biased` would with the bias `timer_bias`
+    /// returns, or as `select` would when it returns None. `timer_bias` is
+    /// called at most once, and only where its value is compared; it must
+    /// not draw from `rng`. A selector that does not support the bias makes
+    /// the stock selection and never calls it.
+    fn select_timer_biased_at_split(
+        &mut self,
+        info: &QueueInfo,
+        _timer_bias: impl FnOnce() -> Option<f64>,
+        rng: &mut impl Rng,
+    ) -> Option<QueueSelection> {
+        self.select(info, rng)
+    }
+}
+
+/// How a step's timer-context multiplier was used by the queue selection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TimerBiasUse {
+    /// No multiplier was compared: none was computed, or the cell had none.
+    Unused,
+    /// The multiplier was applied to the timer share of the roll.
+    Applied(f64),
+    /// A multiplier exists but the selector does not support the bias.
+    Excluded,
+}
+
+/// Select a queue for a step whose timer-context multiplier `multiplier`
+/// may bias the timer share. A selector that supports the bias reads the
+/// multiplier only when its roll reaches the timer and network shares; one
+/// that does not reads it before selecting, so an existing multiplier is
+/// reported as excluded. `multiplier` must not draw from `rng`.
+pub fn select_with_timer_context<Q: QueueSelector>(
+    selector: &mut Q,
+    info: &QueueInfo,
+    multiplier: impl FnOnce() -> Option<f64>,
+    rng: &mut impl Rng,
+) -> (Option<QueueSelection>, TimerBiasUse) {
+    if selector.supports_timer_bias() {
+        let mut applied = None;
+        let picked = selector.select_timer_biased_at_split(
+            info,
+            || {
+                applied = multiplier();
+                applied
+            },
+            rng,
+        );
+        (picked, applied.map_or(TimerBiasUse::Unused, TimerBiasUse::Applied))
+    } else if multiplier().is_some() {
+        (selector.select(info, rng), TimerBiasUse::Excluded)
+    } else {
+        (selector.select(info, rng), TimerBiasUse::Unused)
     }
 }
 
@@ -129,6 +184,7 @@ impl QueueSelector for ProbabilisticSelector {
         true
     }
 
+    #[cfg(test)]
     fn select_timer_biased(
         &mut self,
         info: &QueueInfo,
@@ -149,6 +205,32 @@ impl QueueSelector for ProbabilisticSelector {
             2 // timer
         } else {
             1 // network
+        };
+        self.try_select(primary, info, rng)
+    }
+
+    fn select_timer_biased_at_split(
+        &mut self,
+        info: &QueueInfo,
+        timer_bias: impl FnOnce() -> Option<f64>,
+        rng: &mut impl Rng,
+    ) -> Option<QueueSelection> {
+        if info.total() == 0 {
+            return None;
+        }
+        let roll: f64 = rng.random();
+        let primary = if roll < self.p_local {
+            0 // local
+        } else {
+            let p_timer_eff = match timer_bias() {
+                Some(bias) => (self.p_timer * bias).min((1.0 - self.p_local).max(0.0)),
+                None => self.p_timer,
+            };
+            if roll < self.p_local + p_timer_eff {
+                2 // timer
+            } else {
+                1 // network
+            }
         };
         self.try_select(primary, info, rng)
     }
@@ -224,6 +306,7 @@ impl QueueSelector for AnySelector {
         matches!(self, AnySelector::Probabilistic(_))
     }
 
+    #[cfg(test)]
     fn select_timer_biased(
         &mut self,
         info: &QueueInfo,
@@ -232,6 +315,18 @@ impl QueueSelector for AnySelector {
     ) -> Option<QueueSelection> {
         match self {
             AnySelector::Probabilistic(s) => s.select_timer_biased(info, timer_bias, rng),
+            AnySelector::Preemptive(s) => s.select(info, rng),
+        }
+    }
+
+    fn select_timer_biased_at_split(
+        &mut self,
+        info: &QueueInfo,
+        timer_bias: impl FnOnce() -> Option<f64>,
+        rng: &mut impl Rng,
+    ) -> Option<QueueSelection> {
+        match self {
+            AnySelector::Probabilistic(s) => s.select_timer_biased_at_split(info, timer_bias, rng),
             AnySelector::Preemptive(s) => s.select(info, rng),
         }
     }
@@ -382,6 +477,95 @@ mod tests {
         assert!((promoted - 0.12).abs() < 0.005, "promoted share was {promoted}");
         let suppressed = frequency(&mut s, Some(0.25), 200_000);
         assert!((suppressed - 0.0075).abs() < 0.002, "suppressed share was {suppressed}");
+    }
+
+    /// The selection with the multiplier read before the roll.
+    fn eager_selection<Q: QueueSelector>(
+        selector: &mut Q,
+        info: &QueueInfo,
+        multiplier: Option<f64>,
+        rng: &mut StdRng,
+    ) -> (Option<QueueSelection>, TimerBiasUse) {
+        match multiplier {
+            Some(m) if selector.supports_timer_bias() => {
+                (selector.select_timer_biased(info, m, rng), TimerBiasUse::Applied(m))
+            }
+            Some(_) => (selector.select(info, rng), TimerBiasUse::Excluded),
+            None => (selector.select(info, rng), TimerBiasUse::Unused),
+        }
+    }
+
+    /// Steps both paths in lockstep over varied queue states and multipliers,
+    /// checking selection and stream position after every step. Returns the
+    /// number of steps whose roll reached the split and the number of
+    /// multiplier reads on the split path.
+    fn compare_eager_and_split(template: AnySelector, p_local: Option<f64>) -> (u32, u32) {
+        let multipliers = [None, Some(0.25), Some(1.0), Some(4.0), Some(0.5)];
+        let mut eager = template.clone();
+        let mut split = template;
+        let mut shape = StdRng::seed_from_u64(3);
+        let mut rng_eager = StdRng::seed_from_u64(11);
+        let mut rng_split = StdRng::seed_from_u64(11);
+        let mut past_split = 0u32;
+        let mut reads = 0u32;
+        for step in 0..50_000usize {
+            let locals: Vec<usize> = (0..3).map(|_| shape.random_range(0..3)).collect();
+            let info = QueueInfo {
+                local_queue_sizes: &locals,
+                network_queue_size: shape.random_range(0..3),
+                timer_queue_size: shape.random_range(1..3),
+                step: 0,
+            };
+            let m = multipliers[step % multipliers.len()];
+            let roll: f64 = rng_split.clone().random();
+            let (pick_eager, use_eager) = eager_selection(&mut eager, &info, m, &mut rng_eager);
+            let mut read = false;
+            let (pick_split, use_split) = select_with_timer_context(
+                &mut split,
+                &info,
+                || {
+                    read = true;
+                    m
+                },
+                &mut rng_split,
+            );
+            reads += u32::from(read);
+            assert_eq!(format!("{pick_eager:?}"), format!("{pick_split:?}"), "step {step}");
+            match p_local {
+                Some(p) => {
+                    let reached = roll >= p;
+                    past_split += u32::from(reached);
+                    assert_eq!(read, reached, "step {step}");
+                    let expected = if reached { use_eager } else { TimerBiasUse::Unused };
+                    assert_eq!(use_split, expected, "step {step}");
+                    assert_ne!(use_split, TimerBiasUse::Excluded);
+                }
+                None => {
+                    assert!(read);
+                    assert_eq!(use_split, use_eager, "step {step}");
+                    assert_eq!(use_split, m.map_or(TimerBiasUse::Unused, |_| TimerBiasUse::Excluded));
+                }
+            }
+            let mut probe_eager = rng_eager.clone();
+            let mut probe_split = rng_split.clone();
+            assert_eq!(probe_eager.random::<u64>(), probe_split.random::<u64>(), "step {step}");
+        }
+        (past_split, reads)
+    }
+
+    #[test]
+    fn probabilistic_multiplier_read_at_the_split_matches_the_eager_read() {
+        let template = QueuePolicyConfig::Probabilistic { p_local: 0.80, p_timer: 0.03 }.to_selector();
+        let (past_split, reads) = compare_eager_and_split(template, Some(0.80));
+        assert_eq!(past_split, reads);
+        assert!(past_split > 5_000 && past_split < 15_000, "{past_split} rolls reached the split");
+    }
+
+    #[test]
+    fn preemptive_multiplier_read_stays_eager_and_matches() {
+        let template = QueuePolicyConfig::Preemptive { p_timer: 0.1, preempt_interval: 4 }.to_selector();
+        let (_, reads) = compare_eager_and_split(template, None);
+        assert_eq!(reads, 50_000);
     }
 
     #[test]
