@@ -1086,6 +1086,155 @@ fn phase_read_node<H: HashPolicy>(state: &State<H>, n: usize, servers: usize) ->
     }
 }
 
+/// A planned crash whose victim is already down waits for that node to come
+/// back. Only a retargeted crash can leave a plan in that position, so the
+/// check is confined to runs that retarget; it holds the crash in the queue
+/// rather than dropping it, so the plan's pair still completes.
+fn crashed_victims<H: HashPolicy>(state: &State<H>) -> Option<&OrdSet<NodeId>> {
+    state
+        .retarget
+        .enabled
+        .then_some(&state.crash_info.currently_crashed)
+}
+
+/// What withholds a runnable from this step: a planned crash in
+/// `crash_block_mask` or waiting on a victim that is down, a runnable a
+/// reservation matches, or one a FIFO link has not reached yet.
+struct Ineligibility<'a> {
+    crash_block_mask: u64,
+    crashed_victims: Option<&'a OrdSet<NodeId>>,
+    reservations: &'a [Reservation],
+    link_deliver_seq: &'a imbl::HashMap<crate::simulator::core::values::LinkId, u32>,
+}
+
+impl Ineligibility<'_> {
+    /// Whether `r` is withheld. A withheld crash on a down victim is counted
+    /// each time it is tested.
+    #[inline(always)]
+    fn rejects<H: HashPolicy>(&self, r: &Runnable<H>) -> bool {
+        if self.crash_block_mask != 0
+            && let Runnable::Crash { node_id, .. } = r
+            && node_id.index < u64::BITS as usize
+            && self.crash_block_mask & (1u64 << node_id.index) != 0
+        {
+            return true;
+        }
+        if let Some(crashed) = self.crashed_victims
+            && let Runnable::Crash { node_id, .. } = r
+            && crashed.contains(node_id)
+        {
+            util_stats::record_victim_crashed_hold();
+            return true;
+        }
+        self.reservations.iter().any(|res| res.matches(r))
+            || is_fifo_blocked(r, self.link_deliver_seq)
+    }
+}
+
+/// With no reservation, no FIFO link and no strict timer gate, the only
+/// runnable `Ineligibility` can reject is a planned crash. A runnable carries
+/// a link tag only after its link was created, and creating a link enters it
+/// in `link_deliver_seq`, which never loses an entry within a run.
+fn only_crashes_can_be_ineligible<H: HashPolicy>(
+    state: &State<H>,
+    reservations: &[Reservation],
+    strict_timers: bool,
+) -> bool {
+    reservations.is_empty() && state.link_deliver_seq.is_empty() && !strict_timers
+}
+
+/// The eligible sizes of the network and timer queues, with the eligible
+/// size of every local queue written into `local_queue_sizes`: the counts a
+/// filter of every queue by `is_ineligible`, and by the strict timer gate for
+/// the timer queue, would give. `is_ineligible` must test an `Ineligibility`
+/// over `crash_block_mask`, the run's crashed victims, the step's reservations
+/// and the state's links, and `only_crashes_ineligible` must be
+/// `only_crashes_can_be_ineligible` for the same reservations.
+///
+/// When only a planned crash can be rejected, a queue is filtered only where
+/// such a crash can sit rejected, and every other queue's size is its length.
+/// A planned crash is queued only on its own node's local queue and counted
+/// there by `crash_pending`, so a local queue is filtered only when its node
+/// has a pending crash that is in `crash_block_mask` or whose node is down on
+/// a retargeting run, or when the node has no ledger. Filtering those queues
+/// with the same predicate keeps every count it makes of a withheld crash.
+#[inline(always)]
+fn eligible_counts<H: HashPolicy>(
+    state: &State<H>,
+    only_crashes_ineligible: bool,
+    strict_timers: bool,
+    crash_block_mask: u64,
+    is_ineligible: &impl Fn(&Runnable<H>) -> bool,
+    local_queue_sizes: &mut Vec<usize>,
+) -> (usize, usize) {
+    local_queue_sizes.clear();
+    if !only_crashes_ineligible {
+        let timer_queue_size = if strict_timers {
+            state
+                .timer_queue
+                .iter()
+                .filter(|r| {
+                    if is_ineligible(r) {
+                        return false;
+                    }
+                    if let Runnable::Timer(t) = r {
+                        t.label.as_ref().is_none_or(|l| {
+                            state.allowed_timers.contains(&(t.node.index, l.clone()))
+                        })
+                    } else {
+                        true
+                    }
+                })
+                .count()
+        } else {
+            state.timer_queue.iter().filter(|r| !is_ineligible(r)).count()
+        };
+        local_queue_sizes.extend(
+            state
+                .local_queues
+                .iter()
+                .map(|q| q.iter().filter(|r| !is_ineligible(r)).count()),
+        );
+        let network_queue_size = state.network_queue.iter().filter(|r| !is_ineligible(r)).count();
+        if util_stats::enabled() {
+            let elements = state.local_queues.iter().map(Vec::len).sum::<usize>()
+                + state.network_queue.len()
+                + state.timer_queue.len();
+            util_stats::record_eligibility_pass(true, true, elements as u64);
+        }
+        return (network_queue_size, timer_queue_size);
+    }
+
+    let mut walked = false;
+    let mut walked_elements = 0usize;
+    local_queue_sizes.extend(state.local_queues.iter().enumerate().map(|(n, q)| {
+        let filtered = match state.send_ledger.get(n) {
+            None => true,
+            Some(ledger) => {
+                ledger.crash_pending > 0
+                    && ((n < u64::BITS as usize && crash_block_mask & (1u64 << n) != 0)
+                        || (state.retarget.enabled
+                            && state
+                                .crash_info
+                                .currently_crashed
+                                .iter()
+                                .any(|down| down.index == n)))
+            }
+        };
+        if filtered {
+            walked = true;
+            walked_elements += q.len();
+            q.iter().filter(|r| !is_ineligible(r)).count()
+        } else {
+            q.len()
+        }
+    }));
+    if util_stats::enabled() {
+        util_stats::record_eligibility_pass(walked, false, walked_elements as u64);
+    }
+    (state.network_queue.len(), state.timer_queue.len())
+}
+
 pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
@@ -1139,36 +1288,16 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
         0
     };
 
-    // Helper: check if a runnable is reserved OR FIFO-blocked. Both exclude the
-    // item from scheduling via the same plumbing, so combine them here.
-    let link_deliver_seq = state.link_deliver_seq.clone();
     let crash_block_mask = crash_defer_mask | crash_hold_mask;
-    // A planned crash whose victim is already down waits for that node to
-    // come back. Only a retargeted crash can leave a plan in that position,
-    // so the check is confined to runs that retarget; it holds the crash in
-    // the queue rather than dropping it, so the plan's pair still completes.
-    let crashed_victims: Vec<NodeId> = if state.retarget.enabled {
-        state.crash_info.currently_crashed.iter().copied().collect()
-    } else {
-        Vec::new()
+    let only_crashes_ineligible =
+        only_crashes_can_be_ineligible(state, reservations, strict_timers);
+    let ineligibility = Ineligibility {
+        crash_block_mask,
+        crashed_victims: crashed_victims(state),
+        reservations,
+        link_deliver_seq: &state.link_deliver_seq,
     };
-    let is_ineligible = |r: &Runnable<H>| {
-        if crash_block_mask != 0
-            && let Runnable::Crash { node_id, .. } = r
-            && node_id.index < u64::BITS as usize
-            && crash_block_mask & (1u64 << node_id.index) != 0
-        {
-            return true;
-        }
-        if !crashed_victims.is_empty()
-            && let Runnable::Crash { node_id, .. } = r
-            && crashed_victims.contains(node_id)
-        {
-            util_stats::record_victim_crashed_hold();
-            return true;
-        }
-        reservations.iter().any(|res| res.matches(r)) || is_fifo_blocked(r, &link_deliver_seq)
-    };
+    let is_ineligible = |r: &Runnable<H>| ineligibility.rejects(r);
 
     // Observation-only crash-anchor probe: is there a schedulable crash for a
     // node whose own message is still in flight, and does the step take it?
@@ -1227,37 +1356,17 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // Build QueueInfo, accounting for strict_timers eligibility AND reservations.
     // Subtract reserved items so the QueueSelector doesn't route to queues
     // where all items are reserved (wastes iterations in fully-constrained plans).
-    let timer_queue_size = if strict_timers {
-        state
-            .timer_queue
-            .iter()
-            .filter(|r| {
-                if is_ineligible(r) {
-                    return false;
-                }
-                if let Runnable::Timer(t) = r {
-                    t.label.as_ref().is_none_or(|l| {
-                        state.allowed_timers.contains(&(t.node.index, l.clone()))
-                    })
-                } else {
-                    true
-                }
-            })
-            .count()
-    } else {
-        state.timer_queue.iter().filter(|r| !is_ineligible(r)).count()
-    };
-
-    local_queue_sizes.clear();
-    local_queue_sizes.extend(
-        state
-            .local_queues
-            .iter()
-            .map(|q| q.iter().filter(|r| !is_ineligible(r)).count()),
+    let (network_queue_size, timer_queue_size) = eligible_counts(
+        state,
+        only_crashes_ineligible,
+        strict_timers,
+        crash_block_mask,
+        &is_ineligible,
+        local_queue_sizes,
     );
     let info = QueueInfo {
         local_queue_sizes,
-        network_queue_size: state.network_queue.iter().filter(|r| !is_ineligible(r)).count(),
+        network_queue_size,
         timer_queue_size,
         step: state.crash_info.current_step,
     };
@@ -1280,7 +1389,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             // leaves every draw in place.
             let multiplier = || {
                 let head_timer_node = state.timer_queue.iter().find_map(|r| {
-                    if is_ineligible(r) {
+                    if !only_crashes_ineligible && is_ineligible(r) {
                         return None;
                     }
                     if let Runnable::Timer(t) = r {
@@ -4067,5 +4176,249 @@ mod tests {
             }
         }
         assert!(lent > range && long > range, "lent {lent}, long {long}");
+    }
+
+    fn eligibility_record(
+        state: &mut State<NoHashing>,
+        origin: usize,
+        dest: usize,
+        entry_pc: usize,
+        link_seq: Option<(crate::simulator::core::values::LinkId, u32)>,
+    ) -> Runnable<NoHashing> {
+        Runnable::Record(Record {
+            pc: 0,
+            node: node(dest),
+            origin_node: node(origin),
+            continuation: Continuation::Recover,
+            entry_pc,
+            initial_args: EcoVec::new(),
+            entry_func: crate::analysis::resolver::NameId(0),
+            env: Env::<NoHashing>::with_slots(1),
+            priority: 0.5,
+            causal_operation_id: None,
+            trace_id: None,
+            trace_payload: None,
+            link_seq,
+            origin_incarnation: 0,
+            bias: DeliveryBias::NONE,
+            timer_entry: None,
+            send_ordinal: state.next_send_ordinal(node(origin)),
+            receiver_token_at_send: state.node_state_token(node(dest)),
+        })
+    }
+
+    fn below(rng: &mut StdRng, n: u64) -> u64 {
+        rng.next_u64() % n
+    }
+
+    /// Four nodes with planned crashes, recovers and local records on their
+    /// own queues, remote records, and labelled and unlabelled timers, under
+    /// a drawn mix of FIFO links and tags, a reservation, the strict timer
+    /// gate and its allowed labels, a retargeting run with nodes down, and a
+    /// crash block mask. Returns the state, the reservations, whether timers
+    /// are strict, and the mask.
+    fn eligibility_case(rng: &mut StdRng) -> (State<NoHashing>, Vec<Reservation>, bool, u64) {
+        use crate::simulator::core::state::Timer;
+        use crate::simulator::core::values::{ChannelId, LinkId};
+        const NODES: usize = 4;
+        let mut state = State::<NoHashing>::new(&[(ROLE, NODES)], 1);
+        let fifo = below(rng, 3) == 0;
+        if fifo {
+            state.link_deliver_seq.insert(LinkId(0), 1);
+        }
+        let tag = |rng: &mut StdRng| {
+            (fifo && below(rng, 2) == 0).then(|| (LinkId(0), below(rng, 3) as u32))
+        };
+        for n in 0..NODES {
+            for _ in 0..below(rng, 4) {
+                let r = match below(rng, 4) {
+                    0 => Runnable::Crash {
+                        node_id: node(n),
+                        priority: 0.5,
+                    },
+                    1 => Runnable::Recover {
+                        node_id: node(n),
+                        priority: 0.5,
+                    },
+                    _ => {
+                        let entry = [0, 7][below(rng, 2) as usize];
+                        let link = tag(rng);
+                        eligibility_record(&mut state, n, n, entry, link)
+                    }
+                };
+                state.push_runnable(r);
+            }
+        }
+        for _ in 0..below(rng, 6) {
+            let origin = below(rng, NODES as u64) as usize;
+            let dest = (origin + 1 + below(rng, NODES as u64 - 1) as usize) % NODES;
+            let entry = [0, 7][below(rng, 2) as usize];
+            let link = tag(rng);
+            let r = eligibility_record(&mut state, origin, dest, entry, link);
+            state.push_runnable(r);
+        }
+        for _ in 0..below(rng, 5) {
+            let n = below(rng, NODES as u64) as usize;
+            let label = [None, Some("a".to_string()), Some("b".to_string())]
+                [below(rng, 3) as usize]
+                .clone();
+            state.push_runnable(Runnable::Timer(Timer {
+                pc: 0,
+                node: node(n),
+                channel: ChannelId { node: node(n), id: 0 },
+                priority: 0.5,
+                label,
+            }));
+        }
+        let strict_timers = below(rng, 3) == 0;
+        for n in 0..NODES {
+            if below(rng, 2) == 0 {
+                state.allowed_timers.insert((n, "a".to_string()));
+            }
+        }
+        let reservations = if below(rng, 3) == 0 {
+            vec![Reservation {
+                entry_pc: 7,
+                from: None,
+                to: (below(rng, 2) == 0).then(|| below(rng, NODES as u64) as usize),
+            }]
+        } else {
+            Vec::new()
+        };
+        state.retarget.enabled = below(rng, 2) == 0;
+        for n in 0..NODES {
+            if below(rng, 3) == 0 {
+                state.crash_info.currently_crashed.insert(node(n));
+            }
+        }
+        let mask = rng.next_u64() & 0xf;
+        (state, reservations, strict_timers, mask)
+    }
+
+    /// Every queue filtered runnable by runnable, the eligible sizes
+    /// `eligible_counts` must reproduce.
+    fn filtered_counts(
+        state: &State<NoHashing>,
+        strict_timers: bool,
+        is_ineligible: &impl Fn(&Runnable<NoHashing>) -> bool,
+    ) -> (Vec<usize>, usize, usize) {
+        let timer = state
+            .timer_queue
+            .iter()
+            .filter(|r| {
+                if is_ineligible(r) {
+                    return false;
+                }
+                match r {
+                    Runnable::Timer(t) if strict_timers => t.label.as_ref().is_none_or(|l| {
+                        state.allowed_timers.contains(&(t.node.index, l.clone()))
+                    }),
+                    _ => true,
+                }
+            })
+            .count();
+        let local = state
+            .local_queues
+            .iter()
+            .map(|q| q.iter().filter(|r| !is_ineligible(r)).count())
+            .collect();
+        let network = state.network_queue.iter().filter(|r| !is_ineligible(r)).count();
+        (local, network, timer)
+    }
+
+    /// The eligible sizes equal a filter of every queue, with the same counts
+    /// of crashes held on a down victim, under reservations, FIFO links,
+    /// strict timers, crash block masks and retargeting. A queue is filtered
+    /// exactly when its node's queued crash is masked or its node is down on
+    /// a retargeting run, and every queue is filtered when something other
+    /// than a planned crash can be rejected.
+    #[test]
+    fn eligible_counts_match_a_filter_of_every_queue() {
+        let _serial = crate::simulator::config_override::exclusive_session();
+        util_stats::set_enabled(true);
+        let mut rng = StdRng::seed_from_u64(23);
+        let mut general = [0u32; 3];
+        let mut masked_walks = 0;
+        let mut victim_walks = 0;
+        let mut victim_holds = 0;
+        let mut pending_not_withheld = 0;
+        let mut counted = 0;
+        for case in 0..6000 {
+            let (state, reservations, strict_timers, mask) = eligibility_case(&mut rng);
+            let ineligibility = Ineligibility {
+                crash_block_mask: mask,
+                crashed_victims: crashed_victims(&state),
+                reservations: &reservations,
+                link_deliver_seq: &state.link_deliver_seq,
+            };
+            let is_ineligible = |r: &Runnable<NoHashing>| ineligibility.rejects(r);
+            let s0 = util_stats::snapshot();
+            let reference = filtered_counts(&state, strict_timers, &is_ineligible);
+            let s1 = util_stats::snapshot();
+            let only = only_crashes_can_be_ineligible(&state, &reservations, strict_timers);
+            let mut sizes = Vec::new();
+            let (network, timer) =
+                eligible_counts(&state, only, strict_timers, mask, &is_ineligible, &mut sizes);
+            let s2 = util_stats::snapshot();
+            assert_eq!((sizes, network, timer), reference, "case {case}");
+
+            let holds_reference = s1.victim_swap.victim_crashed_holds - s0.victim_swap.victim_crashed_holds;
+            let holds = s2.victim_swap.victim_crashed_holds - s1.victim_swap.victim_crashed_holds;
+            assert_eq!(holds, holds_reference, "case {case}: crashes held on a down victim");
+            victim_holds += holds;
+
+            let walked_steps = s2.sched.eligibility_walked_steps - s1.sched.eligibility_walked_steps;
+            let counted_steps = s2.sched.eligibility_counted_steps - s1.sched.eligibility_counted_steps;
+            let general_steps = s2.sched.eligibility_general_steps - s1.sched.eligibility_general_steps;
+            let elements =
+                s2.sched.eligibility_walked_elements - s1.sched.eligibility_walked_elements;
+            assert_eq!(walked_steps + counted_steps, 1, "case {case}");
+            if !only {
+                assert_eq!((walked_steps, general_steps), (1, 1), "case {case}");
+                let all = state.local_queues.iter().map(Vec::len).sum::<usize>()
+                    + state.network_queue.len()
+                    + state.timer_queue.len();
+                assert_eq!(elements, all as u64, "case {case}");
+                general[if !reservations.is_empty() {
+                    0
+                } else if !state.link_deliver_seq.is_empty() {
+                    1
+                } else {
+                    2
+                }] += 1;
+                continue;
+            }
+            assert_eq!(general_steps, 0, "case {case}");
+            let mut expected = 0u64;
+            let mut walked = false;
+            for (n, q) in state.local_queues.iter().enumerate() {
+                let has_crash = q.iter().any(|r| matches!(r, Runnable::Crash { .. }));
+                let masked = mask & (1u64 << n) != 0;
+                let down = state.retarget.enabled
+                    && state.crash_info.currently_crashed.contains(&node(n));
+                if has_crash && (masked || down) {
+                    walked = true;
+                    expected += q.len() as u64;
+                    masked_walks += u32::from(masked);
+                    victim_walks += u32::from(down && !masked);
+                } else if has_crash {
+                    pending_not_withheld += 1;
+                }
+            }
+            assert_eq!(walked_steps == 1, walked, "case {case}");
+            assert_eq!(elements, expected, "case {case}");
+            counted += counted_steps;
+        }
+        util_stats::set_enabled(false);
+        assert!(
+            general.iter().all(|&g| g > 0)
+                && masked_walks > 0
+                && victim_walks > 0
+                && victim_holds > 0
+                && pending_not_withheld > 0
+                && counted > 0,
+            "general {general:?} masked {masked_walks} victim {victim_walks} holds {victim_holds} \
+             pending {pending_not_withheld} counted {counted}"
+        );
     }
 }

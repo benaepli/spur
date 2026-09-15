@@ -461,6 +461,10 @@ static RWP_DECISIONS: AtomicU64 = AtomicU64::new(0);
 static SCHED_ELIGIBLE_KNOWN: AtomicU64 = AtomicU64::new(0);
 static SCHED_ELIGIBLE_BUILT: AtomicU64 = AtomicU64::new(0);
 static SCHED_ELIGIBLE_BUILT_LONG: AtomicU64 = AtomicU64::new(0);
+static SCHED_ELIGIBILITY_COUNTED_STEPS: AtomicU64 = AtomicU64::new(0);
+static SCHED_ELIGIBILITY_WALKED_STEPS: AtomicU64 = AtomicU64::new(0);
+static SCHED_ELIGIBILITY_WALKED_ELEMENTS: AtomicU64 = AtomicU64::new(0);
+static SCHED_ELIGIBILITY_GENERAL_STEPS: AtomicU64 = AtomicU64::new(0);
 static RWP_EVALUATED: AtomicU64 = AtomicU64::new(0);
 static RWP_PRESENT: AtomicU64 = AtomicU64::new(0);
 static RWP_CONTESTED: AtomicU64 = AtomicU64::new(0);
@@ -882,6 +886,10 @@ pub fn set_enabled(on: bool) {
             &SCHED_ELIGIBLE_KNOWN,
             &SCHED_ELIGIBLE_BUILT,
             &SCHED_ELIGIBLE_BUILT_LONG,
+            &SCHED_ELIGIBILITY_COUNTED_STEPS,
+            &SCHED_ELIGIBILITY_WALKED_STEPS,
+            &SCHED_ELIGIBILITY_WALKED_ELEMENTS,
+            &SCHED_ELIGIBILITY_GENERAL_STEPS,
             &STATS_LOCAL_FOLDS,
             &STATS_LOCAL_FOLDED_INCREMENTS,
             &HW_BUSY_NS,
@@ -1456,6 +1464,44 @@ pub fn record_eligible_list(known: bool, long: bool) {
         if long {
             bump(|b| &b.sched_eligible_built_long, &SCHED_ELIGIBLE_BUILT_LONG, 1);
         }
+    }
+}
+
+/// One scheduling step sized its queues for selection. `walked` means at
+/// least one queue was filtered runnable by runnable rather than sized by its
+/// length, and `elements` is the number of runnables those filters read.
+/// `general` means every queue was filtered because a reservation, a FIFO
+/// link or the strict timer gate could reject something other than a planned
+/// crash; such a step is also a walked one.
+#[inline]
+pub fn record_eligibility_pass(walked: bool, general: bool, elements: u64) {
+    if !enabled() {
+        return;
+    }
+    if walked {
+        bump(
+            |b| &b.sched_eligibility_walked_steps,
+            &SCHED_ELIGIBILITY_WALKED_STEPS,
+            1,
+        );
+        bump(
+            |b| &b.sched_eligibility_walked_elements,
+            &SCHED_ELIGIBILITY_WALKED_ELEMENTS,
+            elements,
+        );
+    } else {
+        bump(
+            |b| &b.sched_eligibility_counted_steps,
+            &SCHED_ELIGIBILITY_COUNTED_STEPS,
+            1,
+        );
+    }
+    if general {
+        bump(
+            |b| &b.sched_eligibility_general_steps,
+            &SCHED_ELIGIBILITY_GENERAL_STEPS,
+            1,
+        );
     }
 }
 
@@ -4982,11 +5028,23 @@ impl RecoveryPlaceboStats {
 /// built by filtering the queue, and `eligible_built_long` the built lists of
 /// queues admitted in full but longer than the lendable index range. Known
 /// plus built is the number of within-queue selections.
+///
+/// Of the steps that sized their queues for selection,
+/// `eligibility_counted_steps` sized every queue by its length and
+/// `eligibility_walked_steps` filtered at least one queue, reading
+/// `eligibility_walked_elements` runnables in those filters.
+/// `eligibility_general_steps` counts the walked steps that filtered every
+/// queue because something other than a planned crash could be rejected.
+/// Counted plus walked is the number of steps that sized their queues.
 #[derive(Serialize, Debug)]
 pub struct SchedStats {
     pub eligible_known: u64,
     pub eligible_built: u64,
     pub eligible_built_long: u64,
+    pub eligibility_counted_steps: u64,
+    pub eligibility_walked_steps: u64,
+    pub eligibility_walked_elements: u64,
+    pub eligibility_general_steps: u64,
 }
 
 impl SchedStats {
@@ -4995,6 +5053,11 @@ impl SchedStats {
             eligible_known: SCHED_ELIGIBLE_KNOWN.load(Ordering::Relaxed),
             eligible_built: SCHED_ELIGIBLE_BUILT.load(Ordering::Relaxed),
             eligible_built_long: SCHED_ELIGIBLE_BUILT_LONG.load(Ordering::Relaxed),
+            eligibility_counted_steps: SCHED_ELIGIBILITY_COUNTED_STEPS.load(Ordering::Relaxed),
+            eligibility_walked_steps: SCHED_ELIGIBILITY_WALKED_STEPS.load(Ordering::Relaxed),
+            eligibility_walked_elements: SCHED_ELIGIBILITY_WALKED_ELEMENTS
+                .load(Ordering::Relaxed),
+            eligibility_general_steps: SCHED_ELIGIBILITY_GENERAL_STEPS.load(Ordering::Relaxed),
         }
     }
 }
@@ -6604,6 +6667,10 @@ struct RunCounters {
     sched_eligible_known: Cell<u64>,
     sched_eligible_built: Cell<u64>,
     sched_eligible_built_long: Cell<u64>,
+    sched_eligibility_counted_steps: Cell<u64>,
+    sched_eligibility_walked_steps: Cell<u64>,
+    sched_eligibility_walked_elements: Cell<u64>,
+    sched_eligibility_general_steps: Cell<u64>,
     ca_steps_with_crash_eligible: Cell<u64>,
     ca_offered: Cell<u64>,
     timer_steer_evaluated: Cell<u64>,
@@ -6670,6 +6737,10 @@ impl RunCounters {
             sched_eligible_known: Cell::new(0),
             sched_eligible_built: Cell::new(0),
             sched_eligible_built_long: Cell::new(0),
+            sched_eligibility_counted_steps: Cell::new(0),
+            sched_eligibility_walked_steps: Cell::new(0),
+            sched_eligibility_walked_elements: Cell::new(0),
+            sched_eligibility_general_steps: Cell::new(0),
             ca_steps_with_crash_eligible: Cell::new(0),
             ca_offered: Cell::new(0),
             timer_steer_evaluated: Cell::new(0),
@@ -6735,6 +6806,10 @@ impl RunCounters {
             (&self.sched_eligible_known, &SCHED_ELIGIBLE_KNOWN),
             (&self.sched_eligible_built, &SCHED_ELIGIBLE_BUILT),
             (&self.sched_eligible_built_long, &SCHED_ELIGIBLE_BUILT_LONG),
+            (&self.sched_eligibility_counted_steps, &SCHED_ELIGIBILITY_COUNTED_STEPS),
+            (&self.sched_eligibility_walked_steps, &SCHED_ELIGIBILITY_WALKED_STEPS),
+            (&self.sched_eligibility_walked_elements, &SCHED_ELIGIBILITY_WALKED_ELEMENTS),
+            (&self.sched_eligibility_general_steps, &SCHED_ELIGIBILITY_GENERAL_STEPS),
             (&self.ca_steps_with_crash_eligible, &CA_STEPS_WITH_CRASH_ELIGIBLE),
             (&self.ca_offered, &CA_OFFERED),
             (&self.timer_steer_evaluated, &TIMER_STEER_EVALUATED),
