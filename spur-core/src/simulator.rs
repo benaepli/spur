@@ -8,6 +8,7 @@ mod coverage;
 mod curriculum;
 pub mod campaign;
 pub mod explorer;
+pub mod deploy;
 pub mod fault_timing;
 pub mod fresh_first;
 pub mod ghost_absorber;

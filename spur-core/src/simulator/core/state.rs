@@ -669,6 +669,9 @@ pub enum ScheduleResult<H: HashPolicy> {
 
 #[derive(Debug, Clone)]
 pub struct State<H: HashPolicy> {
+    pub deployment: Option<std::sync::Arc<super::super::deploy::Deployment>>,
+    pub deployed_count: usize,
+    pub deployed_nodes: std::sync::Arc<[NodeId]>,
     // `nodes` and the three run queues are owned exclusively by the run that
     // created them; a `State` is never cloned or snapshotted, so plain `Vec`s
     // are the right representation.
@@ -931,7 +934,11 @@ impl<H: HashPolicy> State<H> {
             }
         }
         let num_nodes = nodes.len();
+        let deployed_nodes = role_node_counts.iter().flat_map(|(role, count)| std::iter::repeat_n(*role, *count)).enumerate().map(|(index, role)| NodeId { role, index }).collect();
         Self {
+            deployment: None,
+            deployed_count: num_nodes,
+            deployed_nodes,
             nodes,
             incarnations: vec![0; num_nodes],
             local_queues: (0..num_nodes).map(|_| Vec::new()).collect(),
@@ -1258,7 +1265,7 @@ impl<H: HashPolicy> State<H> {
         } else {
             self.net_stale_records += 1;
         }
-        if rec.origin_node.role != rec.node.role {
+        if rec.origin_node.index >= self.deployed_count {
             self.net_requests += 1;
         }
     }
@@ -1277,7 +1284,7 @@ impl<H: HashPolicy> State<H> {
         } else {
             self.net_stale_records = self.net_stale_records.saturating_sub(1);
         }
-        if rec.origin_node.role != rec.node.role {
+        if rec.origin_node.index >= self.deployed_count {
             self.net_requests = self.net_requests.saturating_sub(1);
         }
     }
@@ -1457,7 +1464,7 @@ impl<H: HashPolicy> State<H> {
         if !ghost_acted || self.incarnation_at(dest) == 0 {
             return;
         }
-        let heard_restarted_peer = (0..servers).any(|peer| {
+        let heard_restarted_peer = (0..servers).filter(|peer| self.deployment.as_ref().is_none_or(|d| d.peers(dest).contains(peer))).any(|peer| {
             let current = self.incarnation_at(peer);
             peer != dest && current > 0 && self.fresh_first.heard_from(dest, peer, current)
         });
@@ -1500,7 +1507,7 @@ impl<H: HashPolicy> State<H> {
     /// restarted origin is still undelivered.
     pub fn request_before_stale(&self, rec: &Record<H>) -> bool {
         rec.origin_node != rec.node
-            && rec.origin_node.role != rec.node.role
+            && rec.origin_node.index >= self.deployed_count
             && self.net_stale_records > 0
     }
 
@@ -1798,7 +1805,9 @@ mod ledger_tests {
 
     /// Three servers and one client; the client is node 3.
     fn state() -> State<NoHashing> {
-        State::new(&[(SERVER, 3), (CLIENT, 1)], 2)
+        let mut state = State::new(&[(SERVER, 3)], 2);
+        state.add_node(CLIENT, 2);
+        state
     }
 
     fn record(state: &mut State<NoHashing>, origin: NodeId, dest: NodeId) -> Record<NoHashing> {
@@ -1855,7 +1864,7 @@ mod ledger_tests {
                     } else {
                         stale += 1;
                     }
-                    if rec.origin_node.role != rec.node.role {
+                    if rec.origin_node.index >= state.deployed_count {
                         requests += 1;
                     }
                 }

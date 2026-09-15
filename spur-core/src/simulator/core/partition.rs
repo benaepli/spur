@@ -18,7 +18,7 @@ pub enum PartitionType {
     },
     /// Overlapping majorities in a ring — each node can reach floor(n/2)+1
     /// nearest neighbors (including itself). No global quorum exists.
-    MajoritiesRing { num_nodes: usize },
+    MajoritiesRing { ring: Vec<NodeId> },
     /// Two halves connected only through one bridge node.
     Bridge {
         bridge: NodeId,
@@ -41,9 +41,9 @@ impl Hash for PartitionType {
                 let b: Vec<_> = side_b.iter().copied().collect();
                 b.hash(state);
             }
-            PartitionType::MajoritiesRing { num_nodes } => {
+            PartitionType::MajoritiesRing { ring } => {
                 2u8.hash(state);
-                num_nodes.hash(state);
+                ring.hash(state);
             }
             PartitionType::Bridge {
                 bridge,
@@ -80,8 +80,8 @@ impl PartitionType {
                 let dest_in_b = side_b.contains(&dest);
                 (src_in_a && dest_in_a) || (src_in_b && dest_in_b)
             }
-            PartitionType::MajoritiesRing { num_nodes } => {
-                let n = *num_nodes;
+            PartitionType::MajoritiesRing { ring } => {
+                let n = ring.len();
                 if n <= 1 {
                     return true;
                 }

@@ -1,9 +1,10 @@
+use crate::simulator::deploy::Deployment;
 use crate::compiler::cfg::Program;
 use crate::simulator::config_override;
 use crate::simulator::core::steer_terms::{ResolvedTerms, SteerTerms};
 use crate::simulator::core::{
-    Logger, NodeId, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
-    Value, WithinQueueSelector, build_frame, exec_sync_on_node,
+    Logger, PurgatoryConfig, QueuePolicyConfig, RuntimeError, SchedulePolicy, State,
+    WithinQueueSelector, build_frame, exec_sync_on_node,
 };
 pub use crate::simulator::core::ReplayCut;
 pub use crate::simulator::coverage::GlobalState;
@@ -18,7 +19,7 @@ use crate::simulator::history::{HistoryWriter, LogBackend, create_writer};
 use crate::simulator::path::generator::{GeneratorConfig, generate_plan};
 use crate::simulator::path::plan::ExecutionPlan;
 pub use crate::simulator::path::RunOutcome;
-use crate::simulator::path::{PathState, Topology, TopologyInfo, exec_plan};
+use crate::simulator::path::{PathState,  exec_plan};
 use crate::simulator::rng::{
     LiveRng, RecRng, RecordRng, Recording, ReplayRng, RngSource, SCHEDULE_SALT, StreamRng,
     StreamSet, WORKLOAD_SALT, derive_seed, mutate_tape,
@@ -778,33 +779,22 @@ impl SingleRunConfig {
 fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feedback>(
     program: &Program,
     logger: &mut L,
-    num_servers: usize,
+    deployment: &Arc<Deployment>,
     snapshot: &F::Snapshot,
     feedback: &mut F::Local,
     purgatory_config: &PurgatoryConfig,
     rng: &mut impl StreamRng,
 ) -> Result<State<H>, RuntimeError> {
-    // Look up role NameIds from the program
-    let server_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "Node")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
 
-    let role_node_counts = vec![(server_role, num_servers)];
+    let role_node_counts: Vec<_> = deployment.nodes.iter().map(|n| (n.role, 1)).collect();
     let mut state = State::<H>::with_channel_capacity(
         &role_node_counts,
         program.max_node_slots as usize,
         crate::simulator::path::channel_table_hint(),
     );
 
-    if let Some(init_fn) = program.get_func_by_name("Node.BASE_NODE_INIT") {
-        for i in 0..num_servers {
-            let node_id = NodeId {
-                role: server_role,
-                index: i,
-            };
+    for &node_id in deployment.nodes.iter() {
+        if let Some(init_fn) = &deployment.functions(node_id.role).base_init {
             let mut env = build_frame::<H>(init_fn, &[]);
             exec_sync_on_node::<H, _, F>(
                 &mut state,
@@ -822,6 +812,8 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: F
         }
     }
 
+    state.deployed_nodes = deployment.nodes.clone();
+    state.deployment = Some(deployment.clone());
     Ok(state)
 }
 
@@ -829,42 +821,16 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feed
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
-    num_servers: usize,
+    deployment: &Arc<Deployment>,
     snapshot: &F::Snapshot,
     feedback: &mut F::Local,
     purgatory_config: &PurgatoryConfig,
     rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
-    let init_fn_name = "Node.Init";
-    let Some(init_fn) = program.get_func_by_name(init_fn_name) else {
-        warn!("{} not found", init_fn_name);
-        return Ok(());
-    };
-
-    let server_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "Node")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
-
-    let peer_list = Value::<H>::list(
-        (0..num_servers)
-            .map(|i| {
-                Value::<H>::node(NodeId {
-                    role: server_role,
-                    index: i,
-                })
-            })
-            .collect(),
-    );
-
-    for i in 0..num_servers {
-        let node_id = NodeId {
-            role: server_role,
-            index: i,
-        };
-        let actuals = [Value::<H>::int(i as i64), peer_list.clone()];
+    let peers = deployment.peer_list();
+    for &node_id in deployment.nodes.iter() {
+        let Some(init_fn) = &deployment.functions(node_id.role).init else { continue; };
+        let actuals = deployment.init_args(node_id, peers.clone());
         let mut env = build_frame(init_fn, &actuals);
 
         exec_sync_on_node::<H, _, F>(
@@ -1043,20 +1009,9 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     // Use NoHashing for exec_plan mode (no state deduplication needed)
     let num_servers = config.num_servers as usize;
 
-    let server_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "Node")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
-    let client_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "ClientInterface")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
-
-    let role_node_counts = vec![(server_role, num_servers)];
+    let deployment = program.deployments.get(num_servers)?;
+    let client_role = deployment.client_role;
+    let role_node_counts: Vec<_> = deployment.nodes.iter().map(|n| (n.role, 1)).collect();
     let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing, F>::new(
         &role_node_counts,
         program.max_node_slots as usize,
@@ -1080,23 +1035,19 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _, F>(
         program,
         &mut path_state.logs,
-        num_servers,
+        &deployment,
         &snapshot,
         &mut path_state.feedback,
         &config.purgatory,
         &mut rec,
     )?;
 
-    let topology_info = TopologyInfo {
-        topology: Topology::Full,
-        num_servers: config.num_servers,
-    };
 
     init_topology::<crate::simulator::hash_utils::NoHashing, _, F>(
         &mut path_state.state,
         &mut path_state.logs,
         program,
-        num_servers,
+        &deployment,
         &snapshot,
         &mut path_state.feedback,
         &config.purgatory,
@@ -1113,7 +1064,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         program,
         plan,
         config.max_iterations,
-        topology_info,
+        &deployment,
         global_state,
         &snapshot,
         run_id,
@@ -1395,20 +1346,9 @@ fn run_single_plan<F: Feedback>(
     let snapshot = F::snapshot(&global_state.feedback);
     let num_servers_usize = num_servers as usize;
 
-    let server_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "Node")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
-    let client_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "ClientInterface")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".to_string()))?;
-
-    let role_node_counts = vec![(server_role, num_servers_usize)];
+    let deployment = program.deployments.get(num_servers_usize)?;
+    let client_role = deployment.client_role;
+    let role_node_counts: Vec<_> = deployment.nodes.iter().map(|n| (n.role, 1)).collect();
     let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing, F>::new(
         &role_node_counts,
         program.max_node_slots as usize,
@@ -1421,23 +1361,19 @@ fn run_single_plan<F: Feedback>(
     path_state.state = initialize_state::<crate::simulator::hash_utils::NoHashing, _, F>(
         program,
         &mut path_state.logs,
-        num_servers_usize,
+        &deployment,
         &snapshot,
         &mut path_state.feedback,
         purgatory_config,
         &mut rng,
     )?;
 
-    let topology_info = TopologyInfo {
-        topology: Topology::Full,
-        num_servers,
-    };
 
     init_topology::<crate::simulator::hash_utils::NoHashing, _, F>(
         &mut path_state.state,
         &mut path_state.logs,
         program,
-        num_servers_usize,
+        &deployment,
         &snapshot,
         &mut path_state.feedback,
         purgatory_config,
@@ -1450,7 +1386,7 @@ fn run_single_plan<F: Feedback>(
         program,
         plan.clone(),
         max_iterations,
-        topology_info,
+        &deployment,
         global_state,
         &snapshot,
         run_id,

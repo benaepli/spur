@@ -721,12 +721,7 @@ fn exec_legacy<H: HashPolicy, L: Logger, F: Feedback>(
     // `record.pc == record.entry_pc` is true only on the first exec entry of a
     // delivery; Recv/Pause re-push with pc advanced past entry.
     if F::CAPTURES_TIMELINE && record.pc == record.entry_pc {
-        let server_role = program
-            .roles
-            .iter()
-            .find(|(_, n)| n == "Node")
-            .map(|(id, _)| *id);
-        if server_role == Some(record.node.role) {
+        if record.node.index < state.deployed_count {
             F::note_delivery(feedback, record.node, record.entry_pc);
         }
     }
@@ -1573,7 +1568,7 @@ fn exec_ops<H: HashPolicy, L: Logger, F: Feedback>(
     // delivery; Recv/Pause re-push with pc advanced past entry.
     if F::CAPTURES_TIMELINE
         && record.pc == record.entry_pc
-        && program.compiled.server_role == Some(record.node.role)
+        && record.node.index < state.deployed_count
     {
         F::note_delivery(feedback, record.node, record.entry_pc);
     }

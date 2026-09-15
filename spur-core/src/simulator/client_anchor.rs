@@ -110,18 +110,11 @@ pub fn arm(run_id: i64) -> Arm {
     }
 }
 
-/// Whether a window opened at `step`: some server among the first `servers`
-/// ledgers took a fault-crossing delivery at this step that wrote its state,
-/// and the handler it woke sent to every peer with all of those sends still
-/// in the air. `servers` includes the node itself, so a full fan-out is
-/// `servers - 1` sends; a single server has no peers and never opens one.
-pub fn fanout_window(ledgers: &[SendLedger], servers: usize, step: i32) -> bool {
-    let peers = servers.saturating_sub(1) as u32;
-    if peers == 0 {
-        return false;
-    }
-    ledgers.iter().take(servers).any(|l| {
-        l.trigger == HandlerTrigger::Delivery
+/// A single-member group has no peers and cannot open a fan-out window.
+pub fn fanout_window(ledgers: &[SendLedger], widths: &[u32], step: i32) -> bool {
+    ledgers.iter().zip(widths).any(|(l, &peers)| {
+        peers > 0
+            && l.trigger == HandlerTrigger::Delivery
             && l.last_ghost_step == step
             && l.last_ghost_acted
             && l.recent >= peers
@@ -381,32 +374,32 @@ mod tests {
     #[test]
     fn an_acted_ghost_with_a_full_fanout_in_flight_opens_a_window() {
         let ledgers = [SendLedger::default(), ledger(7, true, 2, 2), SendLedger::default()];
-        assert!(fanout_window(&ledgers, 3, 7));
-        assert!(!fanout_window(&ledgers, 3, 8), "the window is the step of the delivery");
+        assert!(fanout_window(&ledgers, &[2; 3], 7));
+        assert!(!fanout_window(&ledgers, &[2; 3], 8), "the window is the step of the delivery");
         let more = [SendLedger::default(), ledger(7, true, 2, 5), SendLedger::default()];
-        assert!(fanout_window(&more, 3, 7), "older sends in flight do not close it");
+        assert!(fanout_window(&more, &[2; 3], 7), "older sends in flight do not close it");
     }
 
     #[test]
     fn a_partial_fanout_or_an_inert_ghost_opens_nothing() {
         let partial = [SendLedger::default(), ledger(7, true, 1, 1), SendLedger::default()];
-        assert!(!fanout_window(&partial, 3, 7));
+        assert!(!fanout_window(&partial, &[2; 3], 7));
         let inert = [SendLedger::default(), ledger(7, false, 2, 2), SendLedger::default()];
-        assert!(!fanout_window(&inert, 3, 7));
+        assert!(!fanout_window(&inert, &[2; 3], 7));
         let timer = [SendLedger {
             trigger: HandlerTrigger::Timer,
             ..ledger(7, true, 2, 2)
         }];
-        assert!(!fanout_window(&timer, 3, 7), "a timer handler is not a delivery");
+        assert!(!fanout_window(&timer, &[2; 3], 7), "a timer handler is not a delivery");
         let landed = [SendLedger::default(), ledger(7, true, 2, 1), SendLedger::default()];
-        assert!(!fanout_window(&landed, 3, 7), "in_flight below recent is not a full fan-out");
+        assert!(!fanout_window(&landed, &[2; 3], 7), "in_flight below recent is not a full fan-out");
     }
 
     #[test]
     fn a_client_ledger_and_a_lone_server_never_open_a_window() {
         let ledgers = [SendLedger::default(), SendLedger::default(), ledger(7, true, 2, 2)];
-        assert!(!fanout_window(&ledgers, 2, 7), "the third ledger is a client's");
-        assert!(!fanout_window(&[ledger(7, true, 0, 0)], 1, 7));
+        assert!(!fanout_window(&ledgers, &[1; 2], 7), "the third ledger is a client's");
+        assert!(!fanout_window(&[ledger(7, true, 0, 0)], &[0; 1], 7));
     }
 
     #[test]

@@ -188,6 +188,8 @@ impl Cfg {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Program {
+    #[serde(skip)]
+    pub deployments: crate::simulator::deploy::DeploymentCatalog,
     // The CFG is just a list of all vertices.
     // The `Vertex` indices in `Label` and `FunctionInfo`
     // are indices into this Vec.
@@ -234,6 +236,7 @@ impl Program {
     /// Builds the execution form of the graph from the current labels.
     pub fn decode(&mut self) {
         self.compiled = super::compiled::CompiledProgram::build(self);
+        self.deployments = crate::simulator::deploy::DeploymentCatalog::new(self);
     }
 
     /// Look up a function by its qualified name (e.g., "Node.Init").

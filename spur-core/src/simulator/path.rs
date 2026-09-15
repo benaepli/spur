@@ -37,16 +37,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 pub mod generator;
 pub mod plan;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Topology {
-    Full,
-}
-
-#[derive(Clone, Debug)]
-pub struct TopologyInfo {
-    pub topology: Topology,
-    pub num_servers: i32,
-}
+use crate::simulator::deploy::Deployment;
 
 /// A run's log and trace rows and the text they point into.
 #[derive(Debug, Default)]
@@ -243,9 +234,12 @@ fn schedule_client_op<H: HashPolicy>(
         ),
     };
 
-    let op_func = prog
-        .get_func_by_name(op_name)
-        .ok_or_else(|| RuntimeError::MissingRequiredFunction(op_name.to_string()))?;
+    let functions = prog.deployments.functions(client_node_id.role);
+    let op_func = match op_spec {
+        ClientOpSpec::Write(..) => &functions.write,
+        ClientOpSpec::Read(..) => &functions.read,
+        ClientOpSpec::Rmw(..) => &functions.rmw,
+    }.as_ref().ok_or_else(|| RuntimeError::MissingRequiredFunction(op_name.to_string()))?;
     let initial_args: EcoVec<Value<H>> = actuals.iter().cloned().collect();
     let env = build_frame(op_func, &initial_args);
 
@@ -355,7 +349,7 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
     // Get a client node from the pool (creates one if needed)
     let (client_node_id, is_new) = path_state.client_pool.get(&mut path_state.state);
 
-    if is_new && let Some(init_fn) = program.get_func_by_name("ClientInterface.BASE_NODE_INIT") {
+    if is_new && let Some(init_fn) = program.deployments.functions(client_node_id.role).base_init.as_ref() {
         let mut env = build_frame::<H>(init_fn, &[]);
         if let Err(e) = crate::simulator::core::exec_sync_on_node::<H, _, F>(
             &mut path_state.state,
@@ -578,7 +572,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     program: &Program,
     plan: ExecutionPlan,
     max_iterations: i32,
-    topology: TopologyInfo,
+    deployment: &Deployment,
     global_state: &GlobalState<F>,
     snapshot: &F::Snapshot,
     run_id: i64,
@@ -698,13 +692,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     let mut no_progress_count: i32 = 0;
     const STARVATION_WARN_THRESHOLD: i32 = 500;
 
-    // Look up role NameIds from the program
-    let server_role = program
-        .roles
-        .iter()
-        .find(|(_, name)| name == "Node")
-        .map(|(id, _)| *id)
-        .ok_or_else(|| RuntimeError::RoleNotFound("Node".to_string()))?;
+    let server_role = deployment.nodes[0].role;
 
     // Eligible runnables per local queue, rewritten by every scheduling step.
     let mut local_queue_sizes: Vec<usize> = Vec::new();
@@ -925,10 +913,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     pending_allow_timer.insert(key, node_idx);
                 }
                 EventAction::Partition(spec) => {
-                    let partition_type = spec.to_partition_type(
-                        server_role,
-                        topology.num_servers,
-                    );
+                    let partition_type = spec.to_partition_type(&deployment.groups[0].members);
                     path_state.state.push_runnable(Runnable::Partition {
                         partition_type,
                         priority: policy.sample(rng, RunnableCategory::Partition),
@@ -991,7 +976,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 program,
                 snapshot,
                 &mut path_state.feedback,
-                &topology,
+                deployment,
                 global_state,
                 policy,
                 strict_timers,
@@ -1171,7 +1156,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
         // records what it held at its first window.
         if client_anchor::fanout_window(
             &path_state.state.send_ledger,
-            topology.num_servers.max(0) as usize,
+            &deployment.fanout_width,
             step,
         ) {
             util_stats::record_client_anchor_window(anchored);

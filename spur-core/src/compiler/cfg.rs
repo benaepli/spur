@@ -296,6 +296,7 @@ impl Compiler {
         crate::simulator::util_stats::record_frame_layout(self.slots_before, self.slots_after);
 
         let mut program = Program {
+            deployments: Default::default(),
             cfg: Cfg { graph: self.cfg },
             rpc: self.rpc_map,
             func_name_to_id: self.func_name_to_id,

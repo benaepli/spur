@@ -8,7 +8,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use thiserror::Error;
 
-use crate::analysis::resolver::NameId;
 use crate::simulator::core::{
     PurgatoryConfig, QueuePolicyConfig, SchedulePolicy, WithinQueueSelector,
 };
@@ -50,12 +49,10 @@ pub enum PartitionSpec {
 
 impl PartitionSpec {
     /// Convert a plan config PartitionSpec into a runtime PartitionType.
-    pub fn to_partition_type(&self, server_role: NameId, num_servers: i32) -> PartitionType {
-        let make_node = |idx: i32| NodeId {
-            role: server_role,
-            index: idx as usize,
-        };
-        let n = num_servers as usize;
+    pub fn to_partition_type(&self, members: &[NodeId]) -> PartitionType {
+        let make_node = |idx: i32| members[idx as usize];
+        let n = members.len();
+        let num_servers = n as i32;
         match self {
             PartitionSpec::IsolateOne { node } => PartitionType::IsolateOne(make_node(*node)),
             PartitionSpec::Halves { side_a } => {
@@ -66,7 +63,7 @@ impl PartitionSpec {
                     .collect();
                 PartitionType::Halves { side_a: a, side_b: b }
             }
-            PartitionSpec::MajoritiesRing => PartitionType::MajoritiesRing { num_nodes: n },
+            PartitionSpec::MajoritiesRing => PartitionType::MajoritiesRing { ring: members.to_vec() },
             PartitionSpec::Bridge { bridge } => {
                 let bridge_node = make_node(*bridge);
                 let mid = n / 2;

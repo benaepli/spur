@@ -108,6 +108,7 @@ impl TestProgramBuilder {
 
     fn build_undecoded(self) -> Program {
         Program {
+            deployments: Default::default(),
             cfg: Cfg { graph: self.labels },
             rpc: HashMap::new(),
             func_name_to_id: HashMap::new(),

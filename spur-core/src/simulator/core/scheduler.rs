@@ -22,8 +22,7 @@ use crate::simulator::ghost_release;
 use crate::simulator::coverage::GlobalState;
 use crate::simulator::feedback::Feedback;
 use crate::simulator::hash_utils::HashPolicy;
-use crate::simulator::path::Topology;
-use crate::simulator::path::TopologyInfo;
+use crate::simulator::deploy::Deployment;
 use crate::simulator::rng::{Stream, StreamRng};
 use crate::simulator::timer_context;
 use crate::simulator::util_stats;
@@ -960,10 +959,7 @@ fn release_one<H: HashPolicy>(
     let nodes = 0..state.crash_hold_until.len();
     let via_ranking = |state: &State<H>| {
         nodes.clone().filter(|&n| is_held(state, n)).find(|&n| {
-            let planned = NodeId {
-                role: v.role,
-                index: n,
-            };
+            let planned = state.deployed_nodes[n];
             matches!(
                 absorber_decision(state, planned, servers).choice,
                 ghost_absorber::Choice::Retarget { node, .. } if node == v.index
@@ -1003,10 +999,7 @@ fn forced_victim<H: HashPolicy>(state: &mut State<H>, planned: NodeId) -> Option
         return None;
     }
     state.ghost_release.forced_victim = None;
-    let victim = NodeId {
-        role: planned.role,
-        index: v,
-    };
+    let victim = state.deployed_nodes[v];
     if state.crash_info.currently_crashed.contains(&victim) || state.retarget.has_pending_pair(v) {
         return None;
     }
@@ -1033,10 +1026,7 @@ fn note_ghost_release_apply<H: HashPolicy>(state: &mut State<H>, planned: NodeId
     gr.released_mask &= !bit;
     let double = gr.last_released_apply.take().is_some_and(|(v0, s0)| {
         step - s0 <= 8
-            && down.contains(&NodeId {
-                role: victim.role,
-                index: v0,
-            })
+            && down.contains(&state.deployed_nodes[v0])
     });
     if fired {
         gr.last_released_apply = Some((victim.index, step));
@@ -1241,7 +1231,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     program: &Program,
     snapshot: &F::Snapshot,
     feedback: &mut F::Local,
-    topology: &TopologyInfo,
+    deployment: &Deployment,
     global_state: &GlobalState<F>,
     policy: &SchedulePolicy,
     strict_timers: bool,
@@ -1275,7 +1265,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // trigger still expires on its step.
     let crash_pending = state.nodes_with_pending_crash() > 0;
     let crash_hold_mask = if crash_pending {
-        crash_hold_mask(state, topology.num_servers.max(0) as usize, rng)
+        crash_hold_mask(state, deployment.node_count(), rng)
     } else {
         util_stats::record_crash_scans_skipped();
         let step_now = state.crash_info.current_step;
@@ -1571,7 +1561,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
             // is applied to, which may differ from the planned victim. Only
             // the phase arm is keyed on the planned node, the node the hold
             // was armed on.
-            let servers = topology.num_servers.max(0) as usize;
+            let servers = deployment.node_count();
             let victim = forced_victim(state, node_id)
                 .unwrap_or_else(|| retarget_crash(state, node_id, servers));
             note_ghost_release_apply(state, node_id, victim);
@@ -1609,7 +1599,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                 state,
                 logger,
                 program,
-                topology,
+                deployment,
                 node_id,
                 global_state,
                 snapshot,
@@ -1768,7 +1758,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                             record_dest,
                             entry_step,
                         );
-                        let servers = topology.num_servers.max(0) as usize;
+                        let servers = deployment.node_count();
                         if record_dest.index < servers
                             && state.client_anchor.caused_post_fault(r.causal_operation_id)
                         {
@@ -1902,7 +1892,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
                             record_dest,
                             entry_step,
                             acted,
-                            topology.num_servers.max(0) as usize,
+                            deployment.node_count(),
                         );
                     }
                     if let Some(before) = ghost {
@@ -1989,10 +1979,7 @@ fn retarget_crash<H: HashPolicy>(state: &State<H>, planned: NodeId, servers: usi
     let (outcome, victim) = match decision.choice {
         ghost_absorber::Choice::Retarget { node, acted } => (
             util_stats::VictimSwap::Applied { acted },
-            NodeId {
-                role: planned.role,
-                index: node,
-            },
+            state.deployed_nodes[node],
         ),
         ghost_absorber::Choice::SameVictim => (util_stats::VictimSwap::SameVictim, planned),
         ghost_absorber::Choice::NoAbsorber => (util_stats::VictimSwap::NoAbsorber, planned),
@@ -2016,10 +2003,9 @@ fn absorber_decision<H: HashPolicy>(
         &state.send_ledger,
         servers,
         |n| {
-            !state.crash_info.currently_crashed.contains(&NodeId {
-                role: planned.role,
-                index: n,
-            })
+            n < 64
+                && state.deployment.as_ref().is_none_or(|d| d.can_retarget(planned.index, n))
+                && !state.crash_info.currently_crashed.contains(&state.deployed_nodes[n])
         },
         |n| {
             state.retarget.has_pending_pair(n)
@@ -2302,7 +2288,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
     state: &mut State<H>,
     logger: &mut L,
     program: &Program,
-    topology: &TopologyInfo,
+    deployment: &Deployment,
     node_id: NodeId,
     global_state: &GlobalState<F>,
     snapshot: &F::Snapshot,
@@ -2340,7 +2326,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
 
     state.nodes[node_id.index] = Env::<H>::default();
     reinit_node::<H, L, F>(
-        topology,
+        deployment,
         state,
         logger,
         program,
@@ -2367,7 +2353,7 @@ fn recover_crashed_node<H: HashPolicy, L: Logger, F: Feedback>(
 }
 
 fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
-    topology: &TopologyInfo,
+    deployment: &Deployment,
     state: &mut State<H>,
     logger: &mut L,
     prog: &Program,
@@ -2381,8 +2367,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
 ) -> Result<(), RuntimeError> {
     use crate::compiler::cfg::{SELF_SLOT, VarSlot};
 
-    let init_fn = prog
-        .get_func_by_name("Node.BASE_NODE_INIT")
+    let init_fn = deployment.functions(node_id.role).base_init.as_ref()
         .ok_or_else(|| RuntimeError::MissingRequiredFunction("Node.BASE_NODE_INIT".to_string()))?;
 
     if let VarSlot::Node(self_idx, _) = SELF_SLOT {
@@ -2406,7 +2391,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
     )?;
 
     recover_node::<H, L, F>(
-        topology,
+        deployment,
         state,
         logger,
         prog,
@@ -2421,7 +2406,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
 }
 
 fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
-    topology: &TopologyInfo,
+    deployment: &Deployment,
     state: &mut State<H>,
     logger: &mut L,
     prog: &Program,
@@ -2433,25 +2418,11 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
     purgatory_config: &PurgatoryConfig,
     rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
-    let Some(recover_fn) = prog.get_func_by_name("Node.RecoverInit") else {
+    let Some(recover_fn) = deployment.functions(node_id.role).recover_init.as_ref() else {
         return Ok(());
     };
 
-    let actuals = match topology.topology {
-        Topology::Full => vec![
-            Value::<H>::int(node_id.index as i64),
-            Value::<H>::list(
-                (0..topology.num_servers)
-                    .map(|j| {
-                        Value::<H>::node(NodeId {
-                            role: node_id.role,
-                            index: j as usize,
-                        })
-                    })
-                    .collect(),
-            ),
-        ],
-    };
+    let actuals = deployment.init_args(node_id, deployment.peer_list());
 
     let initial_args: EcoVec<Value<H>> = actuals.into_iter().collect();
     let env = build_frame(recover_fn, &initial_args);

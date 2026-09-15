@@ -242,8 +242,6 @@ pub struct CompiledProgram {
     /// Callees of the call labels, in first-seen vertex order, each equal to
     /// the program's entry for that name.
     pub call_functions: Vec<FunctionInfo>,
-    /// The role named "Node", if the program declares one.
-    pub server_role: Option<NameId>,
 }
 
 impl CompiledProgram {
@@ -288,11 +286,6 @@ impl CompiledProgram {
         CompiledProgram {
             ops,
             call_functions: builder.call_functions,
-            server_role: program
-                .roles
-                .iter()
-                .find(|(_, n)| n == "Node")
-                .map(|(id, _)| *id),
         }
     }
 
