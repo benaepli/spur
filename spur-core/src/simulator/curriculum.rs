@@ -88,22 +88,6 @@ fn pick_density(values: &[f64], concurrency: f64) -> f64 {
         .unwrap_or(0.5)
 }
 
-/// Round `n` toward the nearest odd value inside `[lo, hi]`, preferring upward.
-/// Quorum protocols want odd cluster sizes; if no odd value fits, returns `n`.
-fn prefer_odd(n: i32, lo: i32, hi: i32) -> i32 {
-    if n % 2 != 0 {
-        return n;
-    }
-    let up = n + 1;
-    let down = n - 1;
-    if up <= hi {
-        up
-    } else if down >= lo {
-        down
-    } else {
-        n
-    }
-}
 
 /// Build a `Shaped` schedule policy from the default, overriding the `recover`
 /// band center (a higher center means higher recover priority at the
@@ -145,11 +129,7 @@ fn shaped_with_recover_center(center: f64) -> SchedulePolicy {
 /// is not inert.
 pub fn lower(knobs: &Knobs, constraints: &ExplorerConfig, _rng: &mut impl Rng) -> SingleRunConfig {
     // scale -> sizes
-    let num_servers = prefer_odd(
-        lerp_range(&constraints.num_servers_range, knobs.scale),
-        constraints.num_servers_range.min,
-        constraints.num_servers_range.max,
-    );
+    let selected = constraints.deploy_space().lower(knobs.scale);
     let num_write_ops = lerp_range(&constraints.num_write_ops_range, knobs.scale);
     let num_read_ops = lerp_range(&constraints.num_read_ops_range, knobs.scale);
     let num_rmw_ops = lerp_range(&constraints.num_rmw_ops_range, knobs.scale);
@@ -201,10 +181,15 @@ pub fn lower(knobs: &Knobs, constraints: &ExplorerConfig, _rng: &mut impl Rng) -
         constraints.within_queue_selector.clone()
     };
 
-    crate::simulator::util_stats::record_curriculum_lowering(num_crashes, num_servers);
+    crate::simulator::util_stats::record_curriculum_lowering(
+        num_crashes,
+        selected.deployment.node_count() as i32,
+    );
 
     SingleRunConfig {
-        num_servers,
+        deployment: selected.deployment,
+        deployment_id: selected.id,
+        params: selected.params,
         num_write_ops,
         num_read_ops,
         num_rmw_ops,
@@ -310,7 +295,7 @@ mod tests {
     /// A representative envelope mirroring a typical falsification config.
     fn test_constraints() -> ExplorerConfig {
         let json = r#"{
-            "num_servers": {"min": 3, "max": 5, "step": 2},
+            "params": {"n": {"min": 3, "max": 5, "step": 2}},
             "num_write_ops": {"min": 2, "max": 6},
             "num_read_ops": {"min": 1, "max": 4},
             "num_keys": {"min": 1, "max": 2},
@@ -321,7 +306,9 @@ mod tests {
             "num_runs_per_config": 1,
             "max_iterations": 1000
         }"#;
-        serde_json::from_str(json).expect("valid test config")
+        let mut config: ExplorerConfig = serde_json::from_str(json).expect("valid test config");
+        crate::simulator::explorer::test_deploy::bind(&mut config);
+        config
     }
 
     #[test]
@@ -362,7 +349,7 @@ mod tests {
             WithinQueueSelector::Tournament { .. }
         ));
         // Sizes stay within the envelope.
-        assert!((3..=5).contains(&cfg.num_servers));
+        assert!((3..=5).contains(&cfg.deployment.node_count()));
         assert!((2..=6).contains(&cfg.num_write_ops));
     }
 
@@ -394,7 +381,7 @@ mod tests {
             fault_tightness: 0.0,
         };
         let cfg = lower(&knobs, &c, &mut rng);
-        assert_eq!(cfg.num_servers, 3); // range min, already odd
+        assert_eq!(cfg.deployment.node_count(), 3); // range min
         assert_eq!(cfg.num_crashes, 0); // loose, so no crashes
         assert_eq!(cfg.max_concurrent_writes, Some(1)); // near-sequential
         // Low concurrency picks the highest density offered.

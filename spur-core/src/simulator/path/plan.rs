@@ -1,5 +1,7 @@
-use crate::simulator::plan_config::PartitionSpec;
+use crate::simulator::core::partition::PartitionType;
+use crate::simulator::core::state::NodeId;
 use ecow::EcoString;
+use imbl::OrdSet;
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
@@ -14,27 +16,69 @@ pub enum PlanError {
     NotInProgress(NodeIndex),
 }
 
+/// A client operation and its destination; `None` for an operation that
+/// takes no destination.
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum ClientOpSpec {
-    Write(i32, EcoString),
-    Read(i32, EcoString),
-    Rmw(i32, EcoString),
+    Write(Option<NodeId>, EcoString),
+    Read(Option<NodeId>, EcoString),
+    Rmw(Option<NodeId>, EcoString),
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub struct DeliverSpec {
     pub function: String,
-    pub from: Option<i32>,
-    pub to: Option<i32>,
+    pub from: Option<NodeId>,
+    pub to: Option<NodeId>,
+}
+
+/// A partition over resolved nodes. Positions in `side_a` and `bridge` index
+/// `group`.
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
+pub enum PartitionAction {
+    IsolateOne(NodeId),
+    Halves { group: Vec<NodeId>, side_a: Vec<usize> },
+    MajoritiesRing { group: Vec<NodeId> },
+    Bridge { group: Vec<NodeId>, bridge: usize },
+}
+
+impl PartitionAction {
+    pub fn to_partition_type(&self) -> PartitionType {
+        match self {
+            PartitionAction::IsolateOne(node) => PartitionType::IsolateOne(*node),
+            PartitionAction::Halves { group, side_a } => {
+                let a: OrdSet<NodeId> = side_a.iter().map(|&i| group[i]).collect();
+                let b: OrdSet<NodeId> = (0..group.len())
+                    .filter(|i| !side_a.contains(i))
+                    .map(|i| group[i])
+                    .collect();
+                PartitionType::Halves { side_a: a, side_b: b }
+            }
+            PartitionAction::MajoritiesRing { group } => {
+                PartitionType::MajoritiesRing { ring: group.clone() }
+            }
+            PartitionAction::Bridge { group, bridge } => {
+                let mid = group.len() / 2;
+                let side = |positions: std::ops::Range<usize>| -> OrdSet<NodeId> {
+                    positions.filter(|i| i != bridge).map(|i| group[i]).collect()
+                };
+                PartitionType::Bridge {
+                    bridge: group[*bridge],
+                    side_a: side(0..mid),
+                    side_b: side(mid..group.len()),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum EventAction {
     ClientRequest(ClientOpSpec),
-    CrashNode(i32),
-    RecoverNode(i32),
-    AllowTimer(i32, String),
-    Partition(PartitionSpec),
+    CrashNode(NodeId),
+    RecoverNode(NodeId),
+    AllowTimer(NodeId, String),
+    Partition(PartitionAction),
     Heal,
     Deliver(DeliverSpec),
 }
@@ -186,6 +230,10 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
+    fn node(index: usize) -> NodeId {
+        NodeId { role: crate::analysis::resolver::NameId(0), index }
+    }
+
     fn assert_counts_exact(engine: &PlanEngine) {
         let ready = engine
             .statuses
@@ -284,7 +332,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0x9e37_79b9);
         for seed in 0..600u64 {
             let config = GeneratorConfig {
-                num_servers: 3,
+                deployment: std::sync::Arc::new(crate::simulator::deploy::Deployment::test_cluster(3)),
                 num_write_ops: rng.random_range(0..5),
                 num_read_ops: rng.random_range(0..9),
                 num_rmw_ops: rng.random_range(0..3),
@@ -307,23 +355,25 @@ mod tests {
         for _ in 0..300 {
             let mut plan = ExecutionPlan::new();
             let event = |action| PlannedEvent { action };
-            let timer = plan.add_node(event(EventAction::AllowTimer(1, "tick".to_string())));
+            let timer = plan.add_node(event(EventAction::AllowTimer(node(1), "tick".to_string())));
             let deliver = plan.add_node(event(EventAction::Deliver(DeliverSpec {
                 function: "Prepare".to_string(),
-                from: Some(0),
+                from: Some(node(0)),
                 to: None,
             })));
             let partition =
-                plan.add_node(event(EventAction::Partition(PartitionSpec::MajoritiesRing)));
+                plan.add_node(event(EventAction::Partition(PartitionAction::MajoritiesRing {
+                    group: (0..3).map(node).collect(),
+                })));
             let heal = plan.add_node(event(EventAction::Heal));
-            let crash = plan.add_node(event(EventAction::CrashNode(2)));
-            let recover = plan.add_node(event(EventAction::RecoverNode(2)));
+            let crash = plan.add_node(event(EventAction::CrashNode(node(2))));
+            let recover = plan.add_node(event(EventAction::RecoverNode(node(2))));
             let write = plan.add_node(event(EventAction::ClientRequest(ClientOpSpec::Write(
-                0,
+                Some(node(0)),
                 "k".into(),
             ))));
             let read = plan.add_node(event(EventAction::ClientRequest(ClientOpSpec::Read(
-                1,
+                Some(node(1)),
                 "k".into(),
             ))));
             plan.add_edge(timer, deliver, ());
@@ -341,10 +391,10 @@ mod tests {
     fn completing_an_unreleased_event_keeps_the_counts() {
         let mut plan = ExecutionPlan::new();
         let event = |action| PlannedEvent { action };
-        let a = plan.add_node(event(EventAction::CrashNode(0)));
-        let b = plan.add_node(event(EventAction::RecoverNode(0)));
+        let a = plan.add_node(event(EventAction::CrashNode(node(0))));
+        let b = plan.add_node(event(EventAction::RecoverNode(node(0))));
         let c = plan.add_node(event(EventAction::Heal));
-        let d = plan.add_node(event(EventAction::CrashNode(1)));
+        let d = plan.add_node(event(EventAction::CrashNode(node(1))));
         plan.add_edge(a, b, ());
         plan.add_edge(c, d, ());
         let mut engine = PlanEngine::new(plan);

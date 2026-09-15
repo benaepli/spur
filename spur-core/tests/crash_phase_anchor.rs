@@ -23,7 +23,7 @@ use std::sync::Arc;
 const SPEC: &str = include_str!("fixtures/fanout.spur");
 
 const CONFIG: &str = r#"{
-  "num_servers": {"min": 3, "max": 3, "step": 1},
+  "params": {"n": {"min": 3, "max": 3, "step": 1}},
   "num_write_ops": {"min": 4, "max": 4, "step": 1},
   "num_read_ops": {"min": 2, "max": 2, "step": 1},
   "num_keys": {"min": 1, "max": 1, "step": 1},
@@ -87,7 +87,13 @@ fn run_session(run_ids: &[i64], out: &Path) {
     let program = compiler::compile(SPEC, "fanout.spur")
         .into_program()
         .expect("spec compiles");
-    let config: ExplorerConfig = serde_json::from_str(CONFIG).expect("config parses");
+    let mut config: ExplorerConfig = serde_json::from_str(CONFIG).expect("config parses");
+    config
+        .bind(
+            &program,
+            &std::sync::Arc::new(std::sync::Mutex::new(spur_core::simulator::deploy::params::DeployCache::default())),
+        )
+        .expect("config binds");
     let run_config = config
         .expand_grid()
         .into_iter()

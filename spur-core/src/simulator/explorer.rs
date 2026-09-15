@@ -1,4 +1,6 @@
 use crate::simulator::deploy::Deployment;
+use crate::simulator::deploy::params::{DeployCache, ParamTuple};
+use crate::simulator::deploy::space::{DeploySpace, Selected};
 use crate::compiler::cfg::Program;
 use crate::simulator::config_override;
 use crate::simulator::core::steer_terms::{ResolvedTerms, SteerTerms};
@@ -42,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::thread;
 
@@ -78,6 +80,48 @@ pub struct SessionSummary {
     /// Time spent draining the history writer after the last run, outside
     /// `wall_ms`.
     pub writer_flush_ms: u64,
+    /// The deploy function every deployment of the session comes from.
+    pub deploy: String,
+    /// Distinct deployments the session's parameter tuples built.
+    pub deployments_built: u64,
+    /// Parameter tuples the deploy rejected.
+    pub deploy_rejections: u64,
+    /// Parameter tuples that built a deployment equal to an earlier one.
+    pub tuples_aliased: u64,
+}
+
+/// Each deployment the session built, in id order, with the alias tuples
+/// that selected it.
+pub(crate) fn cached_deployments(space: &DeploySpace) -> Vec<(Arc<Deployment>, Vec<serde_json::Value>)> {
+    let cache = space.cache.lock().unwrap();
+    cache
+        .deployments
+        .iter()
+        .cloned()
+        .zip(cache.aliases.iter().cloned())
+        .collect()
+}
+
+/// The deploy name, deployments built, tuples rejected and tuples aliased.
+pub(crate) fn deploy_summary(space: &DeploySpace) -> (String, u64, u64, u64) {
+    let cache = space.cache.lock().unwrap();
+    (
+        space.deploy.name.clone(),
+        cache.deployments.len() as u64,
+        cache.rejections as u64,
+        cache.tuples_aliased as u64,
+    )
+}
+
+pub(crate) fn write_deployment_tables(
+    output_path: &str,
+    program: &Program,
+    deployments: &[(Arc<Deployment>, Vec<serde_json::Value>)],
+) {
+    let path = std::path::Path::new(output_path);
+    if let Err(e) = crate::simulator::history::write_deployments(path, program, deployments) {
+        error!("Failed to write deployment tables: {}", e);
+    }
 }
 
 /// Resolves a runtime `FeedbackConfig` to a monomorphized call. Each arm binds
@@ -183,8 +227,18 @@ fn default_crash_placement_fraction() -> f64 {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExplorerConfig {
-    #[serde(rename = "num_servers")]
-    pub num_servers_range: Range,
+    /// The `@deploy` function that builds each run's deployment; may be
+    /// omitted when the program defines exactly one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<String>,
+
+    /// One entry per field of the deploy's parameter struct.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub params: serde_json::Value,
+
+    /// The evaluated parameter space, set by `bind`.
+    #[serde(skip)]
+    pub deploy_space: Option<Arc<DeploySpace>>,
 
     #[serde(rename = "num_write_ops")]
     pub num_write_ops_range: Range,
@@ -359,7 +413,8 @@ pub struct ExplorerConfig {
 /// listing it here makes strict mode reject configs that use it, which the
 /// `strict_config_keys_*` tests below catch.
 pub const EXPLORER_CONFIG_KEYS: &[&str] = &[
-    "num_servers",
+    "deploy",
+    "params",
     "num_write_ops",
     "num_read_ops",
     "num_rmw_ops",
@@ -440,9 +495,6 @@ impl ExplorerConfig {
         self.feedback
             .validate()
             .map_err(|e| format!("feedback config error: {}", e))?;
-        self.num_servers_range
-            .validate()
-            .map_err(|e| format!("num_servers range error: {}", e))?;
         self.num_write_ops_range
             .validate()
             .map_err(|e| format!("num_write_ops range error: {}", e))?;
@@ -502,16 +554,37 @@ impl ExplorerConfig {
             .expect("steer_terms were validated with the config")
     }
 
+    /// Evaluates every tuple of the deploy's parameter space through the
+    /// session's shared cache; every other use of the config reads the result.
+    pub fn bind(&mut self, program: &Program, cache: &Arc<Mutex<DeployCache>>) -> Result<(), String> {
+        let space = DeploySpace::bind(program, self.deploy.as_deref(), &self.params, cache)?;
+        let client = space.deploy.client;
+        if self.num_rmw_ops_range.max > 0 && program.role_table.functions(client).rmw.is_none() {
+            return Err(format!(
+                "num_rmw_ops allows RMW operations but client {} defines no RMW",
+                program.id_to_name[&client]
+            ));
+        }
+        self.deploy_space = Some(Arc::new(space));
+        Ok(())
+    }
+
+    pub fn deploy_space(&self) -> &DeploySpace {
+        self.deploy_space
+            .as_deref()
+            .expect("an explorer config is bound to its program before use")
+    }
+
     /// Every configuration of the grid in the producer's nesting order:
-    /// servers, writes, reads, rmws, keys, crashes, partitions, concurrent
-    /// writes, density.
+    /// deployments smallest first, writes, reads, rmws, keys, crashes,
+    /// partitions, concurrent writes, density.
     pub fn expand_grid(&self) -> Vec<SingleRunConfig> {
         let all_max_concurrent: Vec<Option<i32>> = match &self.max_concurrent_writes_range {
             Some(r) => r.expand().into_iter().map(Some).collect(),
             None => vec![None],
         };
         let mut configs = Vec::new();
-        for &num_servers in &self.num_servers_range.expand() {
+        for selected in self.deploy_space().grid() {
             for &num_write_ops in &self.num_write_ops_range.expand() {
                 for &num_read_ops in &self.num_read_ops_range.expand() {
                     for &num_rmw_ops in &self.num_rmw_ops_range.expand() {
@@ -521,7 +594,9 @@ impl ExplorerConfig {
                                     for &max_concurrent_writes in &all_max_concurrent {
                                         for &dependency_density in &self.dependency_density_values {
                                             configs.push(SingleRunConfig {
-                                                num_servers,
+                                                deployment: selected.deployment.clone(),
+                                                deployment_id: selected.id,
+                                                params: selected.params.clone(),
                                                 num_write_ops,
                                                 num_read_ops,
                                                 num_rmw_ops,
@@ -627,7 +702,11 @@ fn default_emit_acted_fraction() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct SingleRunConfig {
-    pub num_servers: i32,
+    pub deployment: Arc<Deployment>,
+    pub deployment_id: u32,
+    /// The tuple that selected the deployment, which may be an alias of the
+    /// tuple that first built it.
+    pub params: ParamTuple,
     pub num_write_ops: i32,
     pub num_read_ops: i32,
     pub num_rmw_ops: i32,
@@ -671,10 +750,11 @@ impl SingleRunConfig {
             };
             QueuePolicyConfig::Probabilistic { p_local, p_timer }
         };
+        let selected = constraints.deploy_space().random(rng);
         SingleRunConfig {
-            num_servers: rng.random_range(
-                constraints.num_servers_range.min..=constraints.num_servers_range.max,
-            ),
+            deployment: selected.deployment,
+            deployment_id: selected.id,
+            params: selected.params,
             num_write_ops: rng.random_range(
                 constraints.num_write_ops_range.min..=constraints.num_write_ops_range.max,
             ),
@@ -726,7 +806,15 @@ impl SingleRunConfig {
             }
         }
 
-        new_config.num_servers = mutate_int(rng, self.num_servers, &constraints.num_servers_range);
+        let parent = Selected {
+            params: self.params.clone(),
+            id: self.deployment_id,
+            deployment: self.deployment.clone(),
+        };
+        let child = constraints.deploy_space().mutate(&parent, rng);
+        new_config.deployment = child.deployment;
+        new_config.deployment_id = child.id;
+        new_config.params = child.params;
         new_config.num_write_ops = mutate_int(rng, self.num_write_ops, &constraints.num_write_ops_range);
         new_config.num_read_ops = mutate_int(rng, self.num_read_ops, &constraints.num_read_ops_range);
         new_config.num_rmw_ops = mutate_int(rng, self.num_rmw_ops, &constraints.num_rmw_ops_range);
@@ -785,7 +873,6 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: F
     purgatory_config: &PurgatoryConfig,
     rng: &mut impl StreamRng,
 ) -> Result<State<H>, RuntimeError> {
-
     let role_node_counts: Vec<_> = deployment.nodes.iter().map(|n| (n.role, 1)).collect();
     let mut state = State::<H>::with_channel_capacity(
         &role_node_counts,
@@ -794,6 +881,8 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: F
     );
 
     for &node_id in deployment.nodes.iter() {
+        // Variable initializers read the role parameter.
+        state.set_context(node_id.index, deployment.context::<H>(node_id.index));
         if let Some(init_fn) = &deployment.functions(node_id.role).base_init {
             let mut env = build_frame::<H>(init_fn, &[]);
             exec_sync_on_node::<H, _, F>(
@@ -827,11 +916,9 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feed
     purgatory_config: &PurgatoryConfig,
     rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
-    let peers = deployment.peer_list();
     for &node_id in deployment.nodes.iter() {
         let Some(init_fn) = &deployment.functions(node_id.role).init else { continue; };
-        let actuals = deployment.init_args(node_id, peers.clone());
-        let mut env = build_frame(init_fn, &actuals);
+        let mut env = build_frame::<H>(init_fn, &[]);
 
         exec_sync_on_node::<H, _, F>(
             state,
@@ -933,6 +1020,8 @@ fn run_row(
     arms: &ArmSet,
     learner: Option<arm_selector::Learner>,
     crash_hold_drawn: bool,
+    deployment_id: i32,
+    params: &serde_json::Value,
 ) -> crate::simulator::history::PersistableRun {
     let (steps_used, end_reason) = match outcome {
         RunOutcome::Completed { steps } => (*steps, "plan_complete"),
@@ -962,6 +1051,8 @@ fn run_row(
         variant: crate::simulator::run_variant::of(run_id, arms, learner, crash_hold_drawn)
             | run_variant::recover_deps_bits(RecoverDeps::of_workload_seed(workload_seed))
             | attribution.variant_bits,
+        deployment_id,
+        params: params.to_string(),
     }
 }
 
@@ -988,7 +1079,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     // cell.
     let recover_deps = RecoverDeps::of_workload_seed(workload_seed);
     let gen_config = GeneratorConfig {
-        num_servers: config.num_servers,
+        deployment: config.deployment.clone(),
         num_write_ops: config.num_write_ops,
         num_read_ops: config.num_read_ops,
         num_rmw_ops: config.num_rmw_ops,
@@ -1006,10 +1097,7 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
     let mut workload_rng = SmallRng::seed_from_u64(workload_seed);
     let plan = generate_plan(gen_config, &mut workload_rng);
 
-    // Use NoHashing for exec_plan mode (no state deduplication needed)
-    let num_servers = config.num_servers as usize;
-
-    let deployment = program.deployments.get(num_servers)?;
+    let deployment = config.deployment.clone();
     let client_role = deployment.client_role;
     let role_node_counts: Vec<_> = deployment.nodes.iter().map(|n| (n.role, 1)).collect();
     let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing, F>::new(
@@ -1128,6 +1216,8 @@ pub fn run_single_simulation<F: Feedback, S: RngSource>(
         &arms,
         choice.learner,
         path_state.state.crash_hold_drawn,
+        config.deployment_id as i32,
+        &config.params.values,
     ));
 
     Ok(RunResult {
@@ -1151,7 +1241,7 @@ pub fn run_explorer(
     info!("Config: {}", config_json_path);
 
     let config_json = config_override::load_config_text(config_json_path)?;
-    let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+    let mut config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
         config_override::check_override_paths(&config, &config_override::active_overrides())?;
@@ -1160,6 +1250,10 @@ pub fn run_explorer(
     // Validate configuration before proceeding
     config
         .validate()
+        .map_err(|e| format!("Configuration validation failed: {}", e))?;
+    let deploy_cache = Arc::new(Mutex::new(DeployCache::default()));
+    config
+        .bind(program, &deploy_cache)
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     info!("session_seed = {}", config.session_seed);
@@ -1205,10 +1299,11 @@ fn run_explorer_impl<F: Feedback>(
     }
     for (index, c) in configs.iter().enumerate() {
         info!(
-            "Config {}/{}: s{}_w{}_r{}_rmw{}_k{}_crash{}_part{}_mcw{}_d{:.2}",
+            "Config {}/{}: dep{}{}_w{}_r{}_rmw{}_k{}_crash{}_part{}_mcw{}_d{:.2}",
             index + 1,
             configs.len(),
-            c.num_servers,
+            c.deployment_id,
+            c.params.values,
             c.num_write_ops,
             c.num_read_ops,
             c.num_rmw_ops,
@@ -1294,6 +1389,9 @@ fn run_explorer_impl<F: Feedback>(
     // Shutdown the writer, waiting for all pending writes to complete
     writer.shutdown();
     let writer_flush_ms = flush_start.elapsed().as_millis() as u64;
+    write_deployment_tables(output_path, program, &cached_deployments(config.deploy_space()));
+    let (deploy, deployments_built, deploy_rejections, tuples_aliased) =
+        deploy_summary(config.deploy_space());
 
     let session = SessionSummary {
         wall_ms,
@@ -1303,6 +1401,10 @@ fn run_explorer_impl<F: Feedback>(
         wall_budget_sec: config.wall_budget_sec,
         budget_hit: budget_hit.load(Ordering::Relaxed),
         writer_flush_ms,
+        deploy,
+        deployments_built,
+        deploy_rejections,
+        tuples_aliased,
     };
     info!(
         "Execution explorer finished: {} runs in {} ms{}",
@@ -1329,7 +1431,7 @@ fn run_single_plan<F: Feedback>(
     global_state: &GlobalState<F>,
     run_id: i64,
     plan: &ExecutionPlan,
-    num_servers: i32,
+    deployment: Arc<Deployment>,
     max_iterations: i32,
     policy: &SchedulePolicy,
     strict_timers: bool,
@@ -1344,9 +1446,6 @@ fn run_single_plan<F: Feedback>(
 ) -> Result<f64, Box<dyn Error>> {
     let started = std::time::Instant::now();
     let snapshot = F::snapshot(&global_state.feedback);
-    let num_servers_usize = num_servers as usize;
-
-    let deployment = program.deployments.get(num_servers_usize)?;
     let client_role = deployment.client_role;
     let role_node_counts: Vec<_> = deployment.nodes.iter().map(|n| (n.role, 1)).collect();
     let mut path_state = PathState::<crate::simulator::hash_utils::NoHashing, F>::new(
@@ -1424,6 +1523,8 @@ fn run_single_plan<F: Feedback>(
         &arms,
         None,
         path_state.state.crash_hold_drawn,
+        0,
+        &deployment.canonical_params,
     ));
 
     Ok(plan_score)
@@ -1458,8 +1559,12 @@ fn run_plan_impl<F: Feedback>(
     backend: LogBackend,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<ExploreSummary, Box<dyn Error>> {
-    let plan = config
-        .to_execution_plan()
+    let crate::simulator::plan_config::ResolvedPlan {
+        deployment,
+        graph: plan,
+        json: resolved_json,
+    } = config
+        .resolve(program)
         .map_err(|e| format!("Failed to build execution plan: {}", e))?;
 
     info!(
@@ -1468,12 +1573,19 @@ fn run_plan_impl<F: Feedback>(
         plan.edge_count()
     );
     info!(
-        "Running {} times with {} servers",
-        config.num_runs, config.num_servers
+        "Running {} times on deploy {} with params {} ({} nodes)",
+        config.num_runs,
+        resolved_json["deploy"],
+        resolved_json["params"],
+        deployment.node_count()
     );
 
     let weights = config.feedback.weights;
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
+    std::fs::write(
+        std::path::Path::new(output_path).join("plan_resolved.json"),
+        serde_json::to_string_pretty(&resolved_json)?,
+    )?;
     let global_state = Arc::new(GlobalState::<F>::new());
 
     let runs: Vec<i64> = (1..=config.num_runs as i64).collect();
@@ -1490,7 +1602,7 @@ fn run_plan_impl<F: Feedback>(
             &global_state,
             run_id,
             &plan,
-            config.num_servers,
+            deployment.clone(),
             config.max_iterations,
             &config.schedule_policy,
             config.strict_timers,
@@ -1515,6 +1627,7 @@ fn run_plan_impl<F: Feedback>(
     });
 
     writer.shutdown();
+    write_deployment_tables(output_path, program, &[(deployment.clone(), vec![])]);
     info!("Plan runner finished.");
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&global_state.feedback),
@@ -1536,7 +1649,7 @@ pub fn run_explorer_genetic(
     info!("Config: {}", config_json_path);
 
     let config_json = config_override::load_config_text(config_json_path)?;
-    let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+    let mut config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
         config_override::check_override_paths(&config, &config_override::active_overrides())?;
@@ -1545,6 +1658,10 @@ pub fn run_explorer_genetic(
     // Validate configuration before proceeding
     config
         .validate()
+        .map_err(|e| format!("Configuration validation failed: {}", e))?;
+    let deploy_cache = Arc::new(Mutex::new(DeployCache::default()));
+    config
+        .bind(program, &deploy_cache)
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     info!("session_seed = {}", config.session_seed);
@@ -1657,6 +1774,7 @@ fn run_explorer_genetic_impl<F: Feedback>(
     }
 
     writer.shutdown();
+    write_deployment_tables(output_path, program, &cached_deployments(config.deploy_space()));
 
     info!("Genetic explorer finished.");
     Ok(ExploreSummary {
@@ -1970,13 +2088,17 @@ pub fn run_explorer_aos(
     info!("Config: {}", config_json_path);
 
     let config_json = config_override::load_config_text(config_json_path)?;
-    let config: ExplorerConfig = serde_json::from_str(&config_json)?;
+    let mut config: ExplorerConfig = serde_json::from_str(&config_json)?;
     if config.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS])?;
         config_override::check_override_paths(&config, &config_override::active_overrides())?;
     }
     config
         .validate()
+        .map_err(|e| format!("Configuration validation failed: {}", e))?;
+    let deploy_cache = Arc::new(Mutex::new(DeployCache::default()));
+    config
+        .bind(program, &deploy_cache)
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     if !matches!(
@@ -2053,6 +2175,10 @@ fn run_explorer_aos_impl<F: Feedback>(
 
     let batch_size = config.population_size.max(1);
     let num_batches = config.num_generations.max(1);
+    let deploy_space = config
+        .deploy_space
+        .clone()
+        .expect("an explorer config is bound to its program before use");
     let mut aos = AosExplorer::<F>::new(config, batch_size, weights, session_seed);
 
     let attribution = RunAttribution::mode("aos");
@@ -2086,6 +2212,7 @@ fn run_explorer_aos_impl<F: Feedback>(
     }
 
     writer.shutdown();
+    write_deployment_tables(output_path, program, &cached_deployments(&deploy_space));
     info!("AOS controller finished.");
     Ok(ExploreSummary {
         vertex_coverage: F::vertex_coverage(&aos.global_state.feedback),
@@ -2660,13 +2787,19 @@ pub fn run_explorer_continuous(
     info!("Config: {}", config_json_path);
 
     let config_json = config_override::load_config_text(config_json_path)?;
-    let config: ContinuousConfig = serde_json::from_str(&config_json)?;
+    let mut config: ContinuousConfig = serde_json::from_str(&config_json)?;
     if config.envelope.strict_config_keys {
         check_top_level_keys(&config_json, &[EXPLORER_CONFIG_KEYS, CONTINUOUS_CONFIG_KEYS])?;
         config_override::check_override_paths(&config, &config_override::active_overrides())?;
     }
     config
         .validate()
+        .map_err(|e| format!("Configuration validation failed: {}", e))?;
+
+    let deploy_cache = Arc::new(Mutex::new(DeployCache::default()));
+    config
+        .envelope
+        .bind(program, &deploy_cache)
         .map_err(|e| format!("Configuration validation failed: {}", e))?;
 
     info!("Continuous session_seed = {}", config.envelope.session_seed);
@@ -2780,6 +2913,7 @@ fn run_explorer_continuous_impl<F: Feedback>(
     }
 
     writer.shutdown();
+    write_deployment_tables(output_path, program, &cached_deployments(config.envelope.deploy_space()));
     info!("Continuous explorer finished after {} runs.", total_runs);
     Ok(ExploreSummary {
         vertex_coverage,
@@ -2793,7 +2927,7 @@ mod strict_config_keys_tests {
     use super::*;
 
     const MINIMAL: &str = r#"{
-        "num_servers": {"min": 3, "max": 3},
+        "params": {"n": {"min": 3, "max": 3}},
         "num_write_ops": {"min": 2, "max": 2},
         "num_read_ops": {"min": 2, "max": 2},
         "num_crashes": {"min": 0, "max": 0},
@@ -2863,7 +2997,8 @@ mod strict_config_keys_tests {
         let cfg = MINIMAL
             .replace("\"num_crashes\": {\"min\": 0, \"max\": 0}", "\"num_crashes\": {\"min\": 0, \"max\": 1}")
             .replace("[0.0]", "[0.0, 0.5]");
-        let parsed: ExplorerConfig = serde_json::from_str(&cfg).expect("parses");
+        let mut parsed: ExplorerConfig = serde_json::from_str(&cfg).expect("parses");
+        test_deploy::bind(&mut parsed);
         let grid = parsed.expand_grid();
         let shape: Vec<(i32, f64)> = grid
             .iter()
@@ -2901,5 +3036,56 @@ mod strict_config_keys_tests {
         )
         .expect("parses");
         assert!(strict.strict_config_keys);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_deploy {
+    use super::*;
+    use std::sync::OnceLock;
+
+    const SPEC: &str = r#"
+type Cluster { @quorum nodes: list<Node>; };
+type ClusterParams { @scale n: int; };
+
+role Node(cluster: Cluster) {
+    fn Init() {}
+}
+
+client KVClient(sys: Cluster) {
+    async fn Write(dest: Node, key: string, uid: int) {}
+    async fn Read(dest: Node, key: string): list<int> { [] }
+    async fn RMW(dest: Node, key: string, uid: int): list<int> { [] }
+}
+
+fn cluster(n: int): Cluster {
+    var nodes: list<Node> = spawn<Node>(n);
+    var c: Cluster = Cluster { nodes: nodes };
+    provide_all(nodes, c);
+    c
+}
+
+@deploy(client = KVClient)
+fn Main(p: ClusterParams): Cluster? {
+    if (p.n < 1) { return nil; }
+    cluster(p.n)
+}
+"#;
+
+    /// A program whose one deploy builds a single cluster of `n` nodes.
+    pub(crate) fn program() -> &'static Program {
+        static PROGRAM: OnceLock<Program> = OnceLock::new();
+        PROGRAM.get_or_init(|| {
+            crate::compiler::compile(SPEC, "test_deploy.spur")
+                .into_program()
+                .expect("the test deploy spec compiles")
+        })
+    }
+
+    /// Binds `config` to the test program through a cache of its own.
+    pub(crate) fn bind(config: &mut ExplorerConfig) {
+        config
+            .bind(program(), &Arc::new(Mutex::new(DeployCache::default())))
+            .expect("the test config binds");
     }
 }

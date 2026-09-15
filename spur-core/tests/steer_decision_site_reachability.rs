@@ -25,7 +25,7 @@ const SPEC: &str = include_str!("../../../bin/spur/VR.spur");
 /// small enough to run in a test. Only the weight on one score predicate and
 /// the session seed vary.
 const CONFIG: &str = r#"{
-  "num_servers": {"min": 3, "max": 3, "step": 1},
+  "params": {"n": {"min": 3, "max": 3, "step": 1}},
   "num_write_ops": {"min": 2, "max": 2, "step": 1},
   "num_read_ops": {"min": 4, "max": 4, "step": 2},
   "num_keys": {"min": 1, "max": 1, "step": 1},

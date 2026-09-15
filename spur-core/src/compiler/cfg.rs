@@ -139,8 +139,8 @@ impl Compiler {
     /// Call when starting to compile a new role
     fn begin_role(&mut self, param: NameId, var_inits: &[LVarInit]) {
         self.node_slots.clear();
-        self.node_slots.insert(param, 1);
-        self.next_node_slot = 2;
+        self.node_slots.insert(param, CTX_SLOT);
+        self.next_node_slot = CTX_SLOT + 1;
 
         for init in var_inits {
             self.node_slots.insert(init.name, self.next_node_slot);
@@ -298,7 +298,7 @@ impl Compiler {
 
         let mut program = Program {
             topology: program.topology,
-            deployments: Default::default(),
+            role_table: Default::default(),
             cfg: Cfg { graph: self.cfg },
             rpc: self.rpc_map,
             func_name_to_id: self.func_name_to_id,

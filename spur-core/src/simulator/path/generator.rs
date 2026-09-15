@@ -4,8 +4,11 @@ use petgraph::visit::EdgeRef;
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-use crate::simulator::path::plan::{ClientOpSpec, EventAction, ExecutionPlan, PlannedEvent};
-use crate::simulator::plan_config::PartitionSpec;
+use std::sync::Arc;
+
+use crate::simulator::core::state::NodeId;
+use crate::simulator::deploy::Deployment;
+use crate::simulator::path::plan::{ClientOpSpec, EventAction, ExecutionPlan, PartitionAction, PlannedEvent};
 use crate::simulator::recover_deps::RecoverDeps;
 
 #[derive(Debug, Clone)]
@@ -23,7 +26,7 @@ enum PairPos {
 
 /// Configuration for the plan generator.
 pub struct GeneratorConfig {
-    pub num_servers: i32,
+    pub deployment: Arc<Deployment>,
     // Client operations
     pub num_write_ops: i32,
     pub num_read_ops: i32,
@@ -64,28 +67,32 @@ fn generate_base_actions(config: &GeneratorConfig, rng: &mut impl Rng) -> Vec<Ac
     let num_keys = config.num_keys.max(1);
 
     for _ in 0..config.num_write_ops {
-        let server = rng.random_range(0..config.num_servers);
+        let dest = draw_destination(&config.deployment.destinations[0], rng);
         let key = format!("key{}", rng.random_range(1..=num_keys));
-        let action = ClientOpSpec::Write(server, ecow::EcoString::from(key));
+        let action = ClientOpSpec::Write(dest, ecow::EcoString::from(key));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
     for _ in 0..config.num_read_ops {
-        let server = rng.random_range(0..config.num_servers);
+        let dest = draw_destination(&config.deployment.destinations[1], rng);
         let key = format!("key{}", rng.random_range(1..=num_keys));
-        let action = ClientOpSpec::Read(server, ecow::EcoString::from(key));
+        let action = ClientOpSpec::Read(dest, ecow::EcoString::from(key));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
     for _ in 0..config.num_rmw_ops {
-        let server = rng.random_range(0..config.num_servers);
+        let dest = draw_destination(&config.deployment.destinations[2], rng);
         let key = format!("key{}", rng.random_range(1..=num_keys));
-        let action = ClientOpSpec::Rmw(server, ecow::EcoString::from(key));
+        let action = ClientOpSpec::Rmw(dest, ecow::EcoString::from(key));
         actions.push(ActionStub::Single(EventAction::ClientRequest(action)));
     }
 
+    let candidates = &config.deployment.crash_candidates;
     for _ in 0..config.num_crashes {
-        let s = rng.random_range(0..config.num_servers);
+        if candidates.is_empty() {
+            break;
+        }
+        let s = config.deployment.nodes[candidates[draw_position(candidates.len(), rng)]];
         actions.push(ActionStub::Paired(
             EventAction::CrashNode(s),
             EventAction::RecoverNode(s),
@@ -93,9 +100,11 @@ fn generate_base_actions(config: &GeneratorConfig, rng: &mut impl Rng) -> Vec<Ac
     }
 
     for _ in 0..config.num_partitions {
-        let spec = random_partition_spec(config.num_servers, rng);
+        let Some(partition) = random_partition(&config.deployment, rng) else {
+            break;
+        };
         actions.push(ActionStub::Paired(
-            EventAction::Partition(spec),
+            EventAction::Partition(partition),
             EventAction::Heal,
         ));
     }
@@ -103,28 +112,69 @@ fn generate_base_actions(config: &GeneratorConfig, rng: &mut impl Rng) -> Vec<Ac
     actions
 }
 
-/// Generate a random PartitionSpec given the number of servers.
-fn random_partition_spec(num_servers: i32, rng: &mut impl Rng) -> PartitionSpec {
-    match rng.random_range(0..4) {
-        0 => PartitionSpec::IsolateOne {
-            node: rng.random_range(0..num_servers),
-        },
-        1 => {
-            // Random non-empty proper subset for side_a
-            let mut side_a: Vec<i32> = (0..num_servers)
-                .filter(|_| rng.random_bool(0.5))
-                .collect();
-            if side_a.is_empty() {
-                side_a.push(rng.random_range(0..num_servers));
-            } else if side_a.len() == num_servers as usize {
-                side_a.remove(rng.random_range(0..side_a.len()));
+/// A position below `len`, drawn as an `i32` range so the draw consumes the
+/// workload stream exactly as a draw over a server count did.
+fn draw_position(len: usize, rng: &mut impl Rng) -> usize {
+    rng.random_range(0..len as i32) as usize
+}
+
+fn draw_destination(candidates: &Option<Vec<NodeId>>, rng: &mut impl Rng) -> Option<NodeId> {
+    candidates
+        .as_ref()
+        .map(|nodes| nodes[draw_position(nodes.len(), rng)])
+}
+
+/// The members of the group a group-shaped partition applies to. A shape
+/// that prefers quorum groups uses them when any exist. A single candidate
+/// takes no draw.
+fn choose_group(deployment: &Deployment, prefer_quorum: bool, rng: &mut impl Rng) -> Option<Vec<NodeId>> {
+    let non_empty = || deployment.groups.iter().filter(|g| !g.members.is_empty());
+    let quorum: Vec<_> = non_empty().filter(|g| g.quorum).collect();
+    let candidates: Vec<_> = if prefer_quorum && !quorum.is_empty() {
+        quorum
+    } else {
+        non_empty().collect()
+    };
+    match candidates.len() {
+        0 => None,
+        1 => Some(candidates[0].members.clone()),
+        n => Some(candidates[rng.random_range(0..n)].members.clone()),
+    }
+}
+
+/// A random partition, redrawing the shape until one has an eligible target.
+/// A deployment with no nodes has none.
+fn random_partition(deployment: &Deployment, rng: &mut impl Rng) -> Option<PartitionAction> {
+    if deployment.nodes.is_empty() {
+        return None;
+    }
+    loop {
+        match rng.random_range(0..4) {
+            0 => {
+                let node = deployment.nodes[draw_position(deployment.nodes.len(), rng)];
+                return Some(PartitionAction::IsolateOne(node));
             }
-            PartitionSpec::Halves { side_a }
+            1 => {
+                let Some(group) = choose_group(deployment, false, rng) else { continue };
+                let n = group.len();
+                let mut side_a: Vec<usize> = (0..n).filter(|_| rng.random_bool(0.5)).collect();
+                if side_a.is_empty() {
+                    side_a.push(draw_position(n, rng));
+                } else if side_a.len() == n {
+                    side_a.remove(rng.random_range(0..side_a.len()));
+                }
+                return Some(PartitionAction::Halves { group, side_a });
+            }
+            2 => {
+                let Some(group) = choose_group(deployment, true, rng) else { continue };
+                return Some(PartitionAction::MajoritiesRing { group });
+            }
+            _ => {
+                let Some(group) = choose_group(deployment, true, rng) else { continue };
+                let bridge = draw_position(group.len(), rng);
+                return Some(PartitionAction::Bridge { group, bridge });
+            }
         }
-        2 => PartitionSpec::MajoritiesRing,
-        _ => PartitionSpec::Bridge {
-            bridge: rng.random_range(0..num_servers),
-        },
     }
 }
 
@@ -133,7 +183,7 @@ pub fn generate_plan(config: GeneratorConfig, rng: &mut impl Rng) -> ExecutionPl
     let mut graph: DiGraph<PlannedEvent, ()> = DiGraph::new();
 
     // Track crash/recover pairs and serialization
-    let mut last_recovery: HashMap<i32, NodeIndex> = HashMap::new(); // server_id -> last recover node
+    let mut last_recovery: HashMap<NodeId, NodeIndex> = HashMap::new(); // node -> its last recover
     // Track partition/heal serialization (only one partition active at a time)
     let mut last_heal: Option<NodeIndex> = None;
 
@@ -319,7 +369,7 @@ mod tests {
 
     fn config(post_fault_client_ops: i32) -> GeneratorConfig {
         GeneratorConfig {
-            num_servers: 3,
+            deployment: Arc::new(Deployment::test_cluster(3)),
             num_write_ops: 3,
             num_read_ops: 4,
             num_rmw_ops: 0,
@@ -353,6 +403,24 @@ mod tests {
         generate_plan(cfg, &mut rng)
     }
 
+    /// An action printed with node indices where it names nodes, the form the
+    /// baseline digests were taken over.
+    fn index_form(action: &EventAction) -> String {
+        match action {
+            EventAction::ClientRequest(op) => {
+                let (name, dest, key) = match op {
+                    ClientOpSpec::Write(d, k) => ("Write", d, k),
+                    ClientOpSpec::Read(d, k) => ("Read", d, k),
+                    ClientOpSpec::Rmw(d, k) => ("Rmw", d, k),
+                };
+                format!("ClientRequest({name}({}, {key:?}))", dest.expect("a destination").index)
+            }
+            EventAction::CrashNode(n) => format!("CrashNode({})", n.index),
+            EventAction::RecoverNode(n) => format!("RecoverNode({})", n.index),
+            other => format!("{other:?}"),
+        }
+    }
+
     /// A digest of the node list and the edge list in storage order, so two
     /// plans agree only when they are the same graph laid out the same way.
     fn fingerprint(plan: &ExecutionPlan) -> u64 {
@@ -364,7 +432,7 @@ mod tests {
             }
         };
         for idx in plan.node_indices() {
-            eat(&format!("{:?};", plan[idx].action));
+            eat(&format!("{};", index_form(&plan[idx].action)));
         }
         for e in plan.raw_edges() {
             eat(&format!("{}->{};", e.source().index(), e.target().index()));

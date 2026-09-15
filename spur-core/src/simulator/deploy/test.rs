@@ -3,7 +3,7 @@ use serde_json::json;
 
 use super::params::{DeployCache, DeployOutcome};
 use super::*;
-use crate::simulator::core::{PurgatoryConfig, SchedulePolicy, State, build_frame, exec_sync_on_node};
+use crate::simulator::core::{PurgatoryConfig, RuntimeError, SchedulePolicy, State, build_frame, exec_sync_on_node};
 use crate::simulator::feedback::NoFeedback;
 use crate::simulator::hash_utils::NoHashing;
 use crate::simulator::path::Logs;
@@ -227,4 +227,80 @@ fn allocation_without_an_allocator_is_a_runtime_error() {
         &mut rng,
     );
     assert!(matches!(result, Err(RuntimeError::AllocationOutsideDeploy)), "{result:?}");
+}
+
+fn bind(program: &Program, name: &str, params: serde_json::Value, cache: &Arc<std::sync::Mutex<DeployCache>>) -> Result<super::space::DeploySpace, String> {
+    super::space::DeploySpace::bind(program, Some(name), &params, cache)
+}
+
+#[test]
+fn a_bound_space_lists_each_deployment_once_smallest_first() {
+    let program = program();
+    let cache = Arc::new(std::sync::Mutex::new(DeployCache::default()));
+    let space = bind(&program, "Odd", json!({"n": {"min": 0, "max": 5}}), &cache).unwrap();
+    let grid: Vec<_> = space
+        .grid()
+        .iter()
+        .map(|s| (s.params.values.clone(), s.deployment.node_count()))
+        .collect();
+    assert_eq!(grid, vec![(json!({"n": 1}), 1), (json!({"n": 2}), 3), (json!({"n": 4}), 5)]);
+    let again = bind(&program, "Odd", json!({"n": {"min": 3, "max": 3}}), &cache).unwrap();
+    assert_eq!(again.grid()[0].id, space.grid()[1].id, "ids are shared across binds of one session");
+}
+
+#[test]
+fn draws_never_select_a_rejected_tuple() {
+    let program = program();
+    let cache = Arc::new(std::sync::Mutex::new(DeployCache::default()));
+    let space = bind(&program, "Odd", json!({"n": {"min": 0, "max": 5}}), &cache).unwrap();
+    let mut rng = SmallRng::seed_from_u64(7);
+    for _ in 0..200 {
+        let drawn = space.random(&mut rng);
+        assert_ne!(drawn.params.values, json!({"n": 0}));
+        let child = space.mutate(&drawn, &mut rng);
+        assert_ne!(child.params.values, json!({"n": 0}));
+    }
+    assert_eq!(space.lower(0.0).params.values, json!({"n": 1}), "a rejected lowering falls back to the smallest");
+    assert_eq!(space.lower(1.0).params.values, json!({"n": 5}));
+    assert_eq!(space.lower(1.0).deployment.node_count(), 5);
+}
+
+#[test]
+fn binding_rejects_oversized_spaces_and_missing_params() {
+    let program = program();
+    let cache = Arc::new(std::sync::Mutex::new(DeployCache::default()));
+    let error = bind(&program, "Odd", json!({"n": {"min": 1, "max": 5000}}), &cache).unwrap_err();
+    assert!(error.contains("more than"), "{error}");
+    let error = bind(&program, "Odd", serde_json::Value::Null, &cache).unwrap_err();
+    assert!(error.contains("params is required"), "{error}");
+    let space = bind(&program, "Interleaved", serde_json::Value::Null, &cache).unwrap();
+    assert_eq!(space.grid().len(), 1);
+}
+
+/// A value's structure with the per-policy signatures and marker types removed.
+fn shape<H: crate::simulator::hash_utils::HashPolicy>(value: &Value<H>) -> String {
+    let text = format!("{:?}", value.kind).replace("WithHashing", "NoHashing");
+    let mut out = String::new();
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find("sig: ") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + "sig: ".len()..];
+        rest = &tail[tail.find(',').expect("a signature is followed by a comma") + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn contexts_are_shared_under_no_hashing_and_copied_under_hashing() {
+    use crate::simulator::hash_utils::WithHashing;
+    let program = program();
+    let d = build(&program, "Interleaved", json!({})).unwrap().unwrap();
+    let plain: Value<NoHashing> = d.context(0);
+    let hashed: Value<WithHashing> = d.context(0);
+    assert_eq!(shape(&plain), shape(&hashed));
+    assert_eq!(shape(&d.root_value::<WithHashing>()), shape(&d.root));
+    assert!(d.functions(d.client_role).write.is_some());
+    assert!(d.functions(d.nodes[2].role).init.is_some());
+    assert_eq!(d.model(), "kv");
 }

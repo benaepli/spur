@@ -21,7 +21,7 @@ const SPEC: &str = include_str!("fixtures/kv.spur");
 /// No faults, one fixed session seed, strict keys on. Every difference between
 /// the two sessions below therefore comes from the override alone.
 const CONFIG: &str = r#"{
-  "num_servers": {"min": 3, "max": 3, "step": 1},
+  "params": {"n": {"min": 3, "max": 3, "step": 1}},
   "num_write_ops": {"min": 1, "max": 1, "step": 1},
   "num_read_ops": {"min": 1, "max": 1, "step": 1},
   "num_keys": {"min": 1, "max": 1, "step": 1},

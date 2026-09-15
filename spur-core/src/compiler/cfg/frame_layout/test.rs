@@ -403,7 +403,7 @@ fn every_spec_function_layout_keeps_every_read() {
 }
 
 const LOOP_SPEC: &str = r#"
-role Node {
+role Node(unused: int) {
     var total: int = 0;
 
     fn Count(n: int): int {

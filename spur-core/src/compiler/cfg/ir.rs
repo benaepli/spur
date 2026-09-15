@@ -31,6 +31,8 @@ pub enum VarSlot {
 
 /// Slot 0 in node env is reserved for 'self'
 pub const SELF_SLOT: VarSlot = VarSlot::Node(0, SELF_NAME);
+/// Node slot holding the role parameter.
+pub const CTX_SLOT: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Expr {
@@ -195,7 +197,7 @@ pub struct Program {
     #[serde(skip)]
     pub topology: spur_ast::types::TopologyMetadata,
     #[serde(skip)]
-    pub deployments: crate::simulator::deploy::DeploymentCatalog,
+    pub role_table: std::sync::Arc<crate::simulator::deploy::RoleTable>,
     // The CFG is just a list of all vertices.
     // The `Vertex` indices in `Label` and `FunctionInfo`
     // are indices into this Vec.
@@ -242,7 +244,7 @@ impl Program {
     /// Builds the execution form of the graph from the current labels.
     pub fn decode(&mut self) {
         self.compiled = super::compiled::CompiledProgram::build(self);
-        self.deployments = crate::simulator::deploy::DeploymentCatalog::new(self);
+        self.role_table = std::sync::Arc::new(crate::simulator::deploy::RoleTable::new(self));
     }
 
     /// Look up a function by its qualified name (e.g., "Node.Init").

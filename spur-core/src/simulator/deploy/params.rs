@@ -138,7 +138,7 @@ impl DeployCache {
             Some(deployment) => {
                 let equal = self.by_hash.get(&deployment.hash).into_iter().flatten().copied().find(|&id| {
                     let other = &self.deployments[id as usize];
-                    other.spec.as_ref().map(|d| d.id) == Some(deploy.id)
+                    other.spec.id == deploy.id
                         && super::evaluate::canonical_value(&other.root) == super::evaluate::canonical_value(&deployment.root)
                         && other.nodes == deployment.nodes
                         && other.contexts.iter().map(super::evaluate::canonical_value).eq(deployment.contexts.iter().map(super::evaluate::canonical_value))

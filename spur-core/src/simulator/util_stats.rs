@@ -4341,13 +4341,13 @@ impl TimelineKeyStats {
 /// The curriculum lowered its knobs into one concrete run config. Zero here
 /// means the curriculum was not on the path that produced these runs.
 #[inline]
-pub fn record_curriculum_lowering(num_crashes: i32, num_servers: i32) {
+pub fn record_curriculum_lowering(num_crashes: i32, node_count: i32) {
     if !enabled() {
         return;
     }
     CURRICULUM_LOWERED_RUNS.fetch_add(1, Ordering::Relaxed);
     CURRICULUM_CRASHES_SUM.fetch_add(num_crashes.max(0) as u64, Ordering::Relaxed);
-    CURRICULUM_SERVERS_SUM.fetch_add(num_servers.max(0) as u64, Ordering::Relaxed);
+    CURRICULUM_SERVERS_SUM.fetch_add(node_count.max(0) as u64, Ordering::Relaxed);
 }
 
 #[derive(Serialize)]

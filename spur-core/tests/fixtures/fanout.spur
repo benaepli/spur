@@ -6,21 +6,25 @@
 // The peer list carries the node itself, and a message a node sends to
 // itself is never in flight, so the loops skip it.
 
-role Node {
+type Cluster {
+    @quorum nodes: list<Node>;
+};
+
+type ClusterParams {
+    @scale n: int;
+};
+
+role Node(cluster: Cluster) {
     var db: map<string, int> = {};
     var ticks: int = 0;
-    var me: int = 0;
-    var peers: list<Node> = [];
+    var me: int = index_of(cluster.nodes, self)!;
+    var peers: list<Node> = cluster.nodes;
 
-    fn Init(me_: int, peers_: list<Node>) {
-        me = me_;
-        peers = peers_;
+    fn Init() {
         Heartbeat();
     }
 
-    async fn RecoverInit(me_: int, peers_: list<Node>) {
-        me = me_;
-        peers = peers_;
+    async fn RecoverInit() {
         Heartbeat();
     }
 
@@ -58,12 +62,27 @@ role Node {
     }
 }
 
-ClientInterface {
+fn cluster(n: int): Cluster {
+    var nodes: list<Node> = spawn<Node>(n);
+    var c: Cluster = Cluster { nodes: nodes };
+    provide_all(nodes, c);
+    c
+}
+
+@deploy(client = KVClient)
+fn Main(p: ClusterParams): Cluster? {
+    if (p.n < 1) {
+        return nil;
+    }
+    cluster(p.n)
+}
+
+client KVClient(sys: Cluster) {
     async fn Write(dest: Node, key: string, uid: int) {
         <-dest->Write(key, uid);
     }
 
-    async fn Read(dest: Node, key: string): int {
-        return <-dest->Read(key);
+    async fn Read(dest: Node, key: string): list<int> {
+        return [<-dest->Read(key)];
     }
 }

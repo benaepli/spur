@@ -10,7 +10,7 @@ type Person {
     address: Address;
 };
 
-role Registry {
+role Registry(unused: int) {
     var record: Person = Person {
         name: "Alice",
         age: 30,
@@ -45,7 +45,7 @@ role Registry {
     }
 }
 
-ClientInterface {
+role Client(unused: int) {
     async fn update_city(reg: Registry, city: string) {
         <-reg->UpdateCity(city);
     }

@@ -1,6 +1,6 @@
 type Value = int;
 
-role Head {
+role Head(unused: int) {
     var db: map<string, Value> = {"hi": 0};
 
     fn write1(key: string, value: Value) {
@@ -22,7 +22,7 @@ role Head {
     }
 }
 
-ClientInterface {
+role Client(unused: int) {
     async fn write(node: Head, key: string, value: Value) {
         <-node->WritePlusOne(key, value);
     }

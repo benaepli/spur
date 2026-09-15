@@ -13,6 +13,7 @@
 //! A budget in seconds ends the session on active time and is not
 //! reproducible run for run; `deterministic_slice_runs` sizes slices in runs
 //! for a reproducible campaign.
+use crate::simulator::deploy::params::DeployCache;
 
 use crate::compiler::cfg::Program;
 use crate::simulator::config_override;
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
+use std::sync::Mutex;
 use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Instant;
@@ -1401,9 +1403,13 @@ pub fn run_explorer_campaign(
         return Err("campaign: halving and bandit allocations read the utilization counters, so `stats` must be true".into());
     }
     let envelope_value: Value = serde_json::from_str(&config_json)?;
+    let deploy_cache = Arc::new(Mutex::new(DeployCache::default()));
     let mut arm_configs = Vec::with_capacity(config.campaign.arms.len());
     for spec in &config.campaign.arms {
-        arm_configs.push(arm_config(&envelope_value, spec, strict)?);
+        let mut arm = arm_config(&envelope_value, spec, strict)?;
+        arm.bind(program, &deploy_cache)
+            .map_err(|e| format!("campaign: arm `{}`: {}", spec.id, e))?;
+        arm_configs.push(arm);
     }
 
     info!("campaign session_seed = {}", config.envelope.session_seed);
@@ -1459,6 +1465,7 @@ fn run_campaign_impl(
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
     let run_counter = AtomicI64::new(0);
 
+    let deploy_space = arm_configs.first().and_then(|c| c.deploy_space.clone());
     let mut arms: Vec<BuiltArm> = block
         .arms
         .iter()
@@ -1547,6 +1554,14 @@ fn run_campaign_impl(
     let flush_start = Instant::now();
     writer.shutdown();
     let writer_flush_ms = flush_start.elapsed().as_millis() as u64;
+    let space = deploy_space.as_deref().expect("a campaign has at least one bound arm");
+    crate::simulator::explorer::write_deployment_tables(
+        output_path,
+        program,
+        &crate::simulator::explorer::cached_deployments(space),
+    );
+    let (deploy, deployments_built, deploy_rejections, tuples_aliased) =
+        crate::simulator::explorer::deploy_summary(space);
 
     let mut vertex_coverage: Option<HashMap<usize, u64>> = None;
     for arm in &arms {
@@ -1593,6 +1608,10 @@ fn run_campaign_impl(
             wall_budget_sec: block.wall_budget_sec,
             budget_hit: !was_cancelled && block.deterministic_slice_runs.is_none(),
             writer_flush_ms,
+            deploy,
+            deployments_built,
+            deploy_rejections,
+            tuples_aliased,
         }),
         campaign: Some(CampaignReport {
             wall_budget_sec: block.wall_budget_sec,
@@ -1616,7 +1635,7 @@ mod tests {
     use super::*;
 
     const MINIMAL: &str = r#"{
-        "num_servers": {"min": 3, "max": 3},
+        "params": {"n": {"min": 3, "max": 3}},
         "num_write_ops": {"min": 2, "max": 2},
         "num_read_ops": {"min": 2, "max": 2},
         "num_crashes": {"min": 0, "max": 0},

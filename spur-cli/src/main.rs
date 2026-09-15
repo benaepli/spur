@@ -95,6 +95,9 @@ enum Commands {
         /// `SPUR_CONFIG_SET` environment variable.
         #[arg(long = "set", value_name = "PATH=VALUE")]
         set: Vec<String>,
+        /// The `@deploy` function to use, overriding the config's `deploy`.
+        #[arg(long)]
+        deploy: Option<String>,
         /// Explorer type to use
         #[arg(short, long, value_enum, default_value_t = ExplorerType::Standard)]
         explorer: ExplorerType,
@@ -112,6 +115,9 @@ enum Commands {
         /// Plan configuration JSON file
         #[arg(short = 'p', long)]
         plan: PathBuf,
+        /// The `@deploy` function to use, overriding the plan's `deploy`.
+        #[arg(long)]
+        deploy: Option<String>,
         /// Output directory for results
         #[arg(short, long)]
         output_dir: PathBuf,
@@ -225,6 +231,7 @@ fn main() {
             config,
             output_dir,
             set,
+            deploy,
             explorer,
             log_backend,
             yes,
@@ -233,6 +240,7 @@ fn main() {
             config,
             output_dir,
             set,
+            deploy,
             explorer,
             log_backend.into(),
             yes,
@@ -240,10 +248,11 @@ fn main() {
         Commands::RunPlan {
             spec,
             plan,
+            deploy,
             output_dir,
             log_backend,
             yes,
-        } => run_run_plan(spec, plan, output_dir, log_backend.into(), yes),
+        } => run_run_plan(spec, plan, deploy, output_dir, log_backend.into(), yes),
         Commands::Debug(args) => match args.command {
             DebugSubcommands::Logs {
                 db,
@@ -464,11 +473,15 @@ fn run_explore(
     spec_path: PathBuf,
     config_path: PathBuf,
     output_dir: PathBuf,
-    config_overrides: Vec<String>,
+    mut config_overrides: Vec<String>,
+    deploy: Option<String>,
     explorer_type: ExplorerType,
     backend: LogBackend,
     yes: bool,
 ) -> Result<()> {
+    if let Some(name) = deploy {
+        config_overrides.push(format!("deploy={name}"));
+    }
     config_override::set_extra_overrides(config_overrides);
     let active = config_override::active_overrides();
     if !active.is_empty() {
@@ -716,10 +729,14 @@ fn write_coverage_heatmap(
 fn run_run_plan(
     spec_path: PathBuf,
     plan_path: PathBuf,
+    deploy: Option<String>,
     output_dir: PathBuf,
     backend: LogBackend,
     yes: bool,
 ) -> Result<()> {
+    if let Some(name) = deploy {
+        config_override::set_extra_overrides(vec![format!("deploy={name}")]);
+    }
     let source_code = fs::read_to_string(&spec_path)
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 

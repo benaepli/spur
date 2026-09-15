@@ -2,11 +2,19 @@
 // node state and one whose firing changes nothing. Used by tests that measure
 // what a timer firing does to the node that waited for it.
 
-role Node {
+type Cluster {
+    @quorum nodes: list<Node>;
+};
+
+type ClusterParams {
+    @scale n: int;
+};
+
+role Node(cluster: Cluster) {
     var db: map<string, int> = {};
     var ticks: int = 0;
 
-    fn Init(me: int, peers: list<Node>) {
+    fn Init() {
         Tick();
         Idle();
     }
@@ -37,12 +45,27 @@ role Node {
     }
 }
 
-ClientInterface {
+fn cluster(n: int): Cluster {
+    var nodes: list<Node> = spawn<Node>(n);
+    var c: Cluster = Cluster { nodes: nodes };
+    provide_all(nodes, c);
+    c
+}
+
+@deploy(client = KVClient)
+fn Main(p: ClusterParams): Cluster? {
+    if (p.n < 1) {
+        return nil;
+    }
+    cluster(p.n)
+}
+
+client KVClient(sys: Cluster) {
     async fn Write(dest: Node, key: string, uid: int) {
         <-dest->Write(key, uid);
     }
 
-    async fn Read(dest: Node, key: string): int {
-        return <-dest->Read(key);
+    async fn Read(dest: Node, key: string): list<int> {
+        return [<-dest->Read(key)];
     }
 }

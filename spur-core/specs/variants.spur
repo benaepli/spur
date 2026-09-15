@@ -5,7 +5,7 @@ type Status enum {
     Code(int),
 };
 
-role Test {
+role Test(unused: int) {
     fn assert(cond: bool) {}
 
     fn main() {
