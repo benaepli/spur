@@ -379,6 +379,10 @@ impl CoreLowerer {
                         BuiltinFn::IntToString => BuiltinKind::IntToString,
                         BuiltinFn::BoolToString => BuiltinKind::BoolToString,
                         BuiltinFn::RoleToString => BuiltinKind::RoleToString,
+                        BuiltinFn::Spawn(_) => BuiltinKind::Spawn,
+                        BuiltinFn::Provide => BuiltinKind::Provide,
+                        BuiltinFn::ProvideAll => BuiltinKind::ProvideAll,
+                        BuiltinFn::IndexOf => BuiltinKind::IndexOf,
                         BuiltinFn::UniqueId => BuiltinKind::UniqueId,
                     };
                     let arg_types: Vec<CType> = args
@@ -2046,6 +2050,10 @@ impl CoreLowerer {
                         BuiltinFn::IntToString => BuiltinKind::IntToString,
                         BuiltinFn::BoolToString => BuiltinKind::BoolToString,
                         BuiltinFn::RoleToString => BuiltinKind::RoleToString,
+                        BuiltinFn::Spawn(_) => BuiltinKind::Spawn,
+                        BuiltinFn::Provide => BuiltinKind::Provide,
+                        BuiltinFn::ProvideAll => BuiltinKind::ProvideAll,
+                        BuiltinFn::IndexOf => BuiltinKind::IndexOf,
                         BuiltinFn::UniqueId => BuiltinKind::UniqueId,
                     };
                     let arg_types: Vec<CType> =

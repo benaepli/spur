@@ -45,6 +45,7 @@ fn subexpressions(e: &Expr) -> Vec<&Expr> {
         | Expr::Times(a, b)
         | Expr::Div(a, b)
         | Expr::Mod(a, b)
+        | Expr::IndexOf(a, b)
         | Expr::Min(a, b)
         | Expr::Coalesce(a, b)
         | Expr::SafeFind(a, b) => vec![&**a, &**b],
@@ -109,6 +110,8 @@ fn events(label: &Label, at: Vertex) -> (Vec<Event>, Vec<Vertex>) {
             store_of(lhs, Reach::Always, &mut ev);
             vec![*n]
         }
+        Label::Spawn(_, count, lhs, n, _) => { reads_of(count, &mut ev); store_of(lhs, Reach::Always, &mut ev); vec![*n] }
+        Label::Provide(h, v, n, _) | Label::ProvideAll(h, v, n, _) => { reads_of(h, &mut ev); reads_of(v, &mut ev); vec![*n] }
         Label::RetrieveData(_, lhs, n) => {
             store_of(lhs, Reach::Always, &mut ev);
             vec![*n]

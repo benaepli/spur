@@ -199,6 +199,7 @@ pub struct AFuncDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ARoleDef {
+    pub param: AFuncParam,
     pub name: NameId,
     pub original_name: String,
     pub var_inits: Vec<AVarInit>,

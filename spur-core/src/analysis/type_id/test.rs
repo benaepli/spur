@@ -9,6 +9,7 @@ fn id(i: usize) -> NameId {
 
 fn empty_program() -> TypedProgram {
     TypedProgram {
+        topology: Default::default(),
         top_level_defs: Vec::new(),
         next_name_id: 100,
         id_to_name: HashMap::new(),

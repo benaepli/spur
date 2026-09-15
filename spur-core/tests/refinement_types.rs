@@ -5,10 +5,10 @@ fn minimal_spec_with_refinement(refinement: &str) -> String {
         r#"
 type Pos = {refinement};
 
-role Node {{
+role Node(ctx: int) {{
     var x: Pos = 0;
 
-    fn Init(me: int) {{}}
+    fn Init() {{}}
 
     @trace
     async fn HandleRequest(req: int) {{
@@ -16,9 +16,9 @@ role Node {{
     }}
 }}
 
-ClientInterface {{
-    async fn Write(dest: Node, key: string, value: string) {{ }}
-    async fn Read(dest: Node, key: string): string? {{ nil }}
+client KV(sys: int) {{
+    async fn Write(dest: Node, key: string, uid: int) {{ }}
+    async fn Read(dest: Node, key: string): list<int> {{ [] }}
 }}
 "#
     )
@@ -40,10 +40,10 @@ fn test_parse_refined_int() {
 #[test]
 fn test_refined_function_param() {
     let src = r#"
-role Node {
+role Node(ctx: int) {
     var x: int = 0;
 
-    fn Init(me: int) {}
+    fn Init() {}
 
     @trace
     async fn HandleRequest(n: int { x | x > 0 }) {
@@ -51,9 +51,9 @@ role Node {
     }
 }
 
-ClientInterface {
-    async fn Write(dest: Node, key: string, value: string) { }
-    async fn Read(dest: Node, key: string): string? { nil }
+client KV(sys: int) {
+    async fn Write(dest: Node, key: string, uid: int) { }
+    async fn Read(dest: Node, key: string): list<int> { [] }
 }
 "#;
     let result = compile(src, "test");
@@ -64,19 +64,19 @@ ClientInterface {
 #[test]
 fn test_refined_return_type() {
     let src = r#"
-role Node {
+role Node(ctx: int) {
     var x: int = 0;
 
-    fn Init(me: int) {}
+    fn Init() {}
 
     fn getPositive(): int { x | x > 0 } {
         return 1;
     }
 }
 
-ClientInterface {
-    async fn Write(dest: Node, key: string, value: string) { }
-    async fn Read(dest: Node, key: string): string? { nil }
+client KV(sys: int) {
+    async fn Write(dest: Node, key: string, uid: int) { }
+    async fn Read(dest: Node, key: string): list<int> { [] }
 }
 "#;
     let result = compile(src, "test");
@@ -92,18 +92,18 @@ type Container {
     name: string;
 }
 
-role Node {
+role Node(ctx: int) {
     var data: Container = Container { value: 1, name: "a" };
 
-    fn Init(me: int) {}
+    fn Init() {}
 
     @trace
     async fn HandleRequest(req: int) {}
 }
 
-ClientInterface {
-    async fn Write(dest: Node, key: string, value: string) { }
-    async fn Read(dest: Node, key: string): string? { nil }
+client KV(sys: int) {
+    async fn Write(dest: Node, key: string, uid: int) { }
+    async fn Read(dest: Node, key: string): list<int> { [] }
 }
 "#;
     let result = compile(src, "test");
@@ -121,10 +121,10 @@ fn test_refined_non_bool_body_rejected() {
 #[test]
 fn test_refinement_compatibility_with_inner() {
     let src = r#"
-role Node {
+role Node(ctx: int) {
     var x: int { v | v > 0 } = 0;
 
-    fn Init(me: int) {}
+    fn Init() {}
 
     @trace
     async fn HandleRequest(req: int) {
@@ -132,9 +132,9 @@ role Node {
     }
 }
 
-ClientInterface {
-    async fn Write(dest: Node, key: string, value: string) { }
-    async fn Read(dest: Node, key: string): string? { nil }
+client KV(sys: int) {
+    async fn Write(dest: Node, key: string, uid: int) { }
+    async fn Read(dest: Node, key: string): list<int> { [] }
 }
 "#;
     let result = compile(src, "test");
@@ -154,18 +154,18 @@ fn test_refinement_complex_body() {
 fn test_refinement_nested_type() {
     // Refined type inside a list
     let src = r#"
-role Node {
+role Node(ctx: int) {
     var x: list<int { y | y > 0 }> = [];
 
-    fn Init(me: int) {}
+    fn Init() {}
 
     @trace
     async fn HandleRequest(req: int) {}
 }
 
-ClientInterface {
-    async fn Write(dest: Node, key: string, value: string) { }
-    async fn Read(dest: Node, key: string): string? { nil }
+client KV(sys: int) {
+    async fn Write(dest: Node, key: string, uid: int) { }
+    async fn Read(dest: Node, key: string): list<int> { [] }
 }
 "#;
     let result = compile(src, "test");
@@ -177,10 +177,10 @@ ClientInterface {
 fn test_refinement_with_builtin_call() {
     // Body uses len() builtin — should be allowed
     let src = r#"
-role Node {
+role Node(ctx: int) {
     var items: list<int> = [];
 
-    fn Init(me: int) {}
+    fn Init() {}
 
     @trace
     async fn HandleRequest(req: int) {
@@ -188,9 +188,9 @@ role Node {
     }
 }
 
-ClientInterface {
-    async fn Write(dest: Node, key: string, value: string) { }
-    async fn Read(dest: Node, key: string): string? { nil }
+client KV(sys: int) {
+    async fn Write(dest: Node, key: string, uid: int) { }
+    async fn Read(dest: Node, key: string): list<int> { [] }
 }
 "#;
     let result = compile(src, "test");

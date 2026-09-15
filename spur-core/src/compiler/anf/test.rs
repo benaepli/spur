@@ -279,6 +279,7 @@ fn make_program(params: Vec<LFuncParam>, mut tail_exprs: Vec<LExpr>) -> LProgram
         .collect();
 
     LProgram {
+        topology: Default::default(),
         top_level_defs: vec![LTopLevelDef::FreeFunc(LFuncDef {
             name: id(99),
             original_name: "test_fn".to_string(),

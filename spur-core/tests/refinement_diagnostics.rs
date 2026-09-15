@@ -26,10 +26,10 @@ fn failed_refinement_pinpoints_sub_expression() {
     // culprit: the annotated type rules out negative values, so the
     // subtype check on the right-hand side fails.
     let src = r#"
-role Node {
+role Node(ctx: int) {
     var x: int = 0;
 
-    fn Init(me: int) {}
+    fn Init() {}
 
     fn failsRefine(): int {
         var bad: int { v | v >= 0 } = -1;
@@ -40,9 +40,9 @@ role Node {
     async fn HandleRequest(req: int) {}
 }
 
-ClientInterface {
-    async fn Write(dest: Node, key: string, value: string) { }
-    async fn Read(dest: Node, key: string): string? { nil }
+client KV(sys: int) {
+    async fn Write(dest: Node, key: string, uid: int) { }
+    async fn Read(dest: Node, key: string): list<int> { [] }
 }
 "#;
 

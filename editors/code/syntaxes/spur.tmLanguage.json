@@ -130,7 +130,7 @@
 				},
 				{
 					"name": "storage.type.spur",
-					"match": "\\b(fn|async|map|list|chan|role|ClientInterface|type|options)\\b"
+					"match": "\\b(fn|async|map|list|chan|role|client|spawn|type|options)\\b"
 				},
 				{
 					"name": "storage.type.primitive.spur",
@@ -138,7 +138,7 @@
 				},
 				{
 					"name": "support.function.builtin.spur",
-					"match": "\\b(append|prepend|len|min|println|int_to_string|exists|head|tail|erase|store|make|send|recv|rpc_call|set_timer|persist_data|discard_data|retrieve_data)\\b"
+					"match": "\\b(append|prepend|len|min|println|int_to_string|exists|head|tail|erase|store|make|send|recv|rpc_call|set_timer|persist_data|discard_data|retrieve_data|provide|provide_all|index_of)\\b"
 				},
 				{
 					"name": "keyword.operator.spur",
@@ -151,6 +151,10 @@
 				{
 					"name": "constant.language.spur",
 					"match": "\\b(true|false|nil)\\b"
+				},
+				{
+					"name": "variable.language.self.spur",
+					"match": "\\bself\\b"
 				},
 				{
 					"name": "constant.numeric.integer.spur",
@@ -177,7 +181,7 @@
 				},
 				{
 					"name": "meta.role.declaration.spur",
-					"match": "\\b(role)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+					"match": "\\b(role|client)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
 					"captures": {
 						"1": {
 							"name": "storage.type.spur"
@@ -203,11 +207,14 @@
 					}
 				},
 				{
-					"name": "meta.client.declaration.spur",
-					"match": "\\b(ClientInterface)\\b",
+					"name": "meta.annotation.spur",
+					"match": "(@)([a-zA-Z_][a-zA-Z0-9_]*)",
 					"captures": {
 						"1": {
-							"name": "storage.type.spur"
+							"name": "punctuation.definition.annotation.spur"
+						},
+						"2": {
+							"name": "storage.type.annotation.spur"
 						}
 					}
 				}

@@ -107,6 +107,9 @@ fn generate_dot_content<W: Write>(prog: &Program, w: &mut DotWriter<W>) -> io::R
             | Label::MakeChannel(_, _, next)
             | Label::SetTimer(_, next, _)
             | Label::MakeFifoLink(_, _, next)
+            | Label::Spawn(_, _, _, next, _)
+            | Label::Provide(_, _, next, _)
+            | Label::ProvideAll(_, _, next, _)
             | Label::UniqueId(_, next)
             | Label::Send(_, _, next)
             | Label::Recv(_, _, next)
@@ -231,6 +234,7 @@ fn generate_html_label(prog: &Program, _v: usize, label: &Label) -> (String, Str
                 html_escape(&pretty_expr(prog, peer))
             );
         }
+        Label::Spawn(..) | Label::Provide(..) | Label::ProvideAll(..) => { header_color = "#C8E6C9"; content = html_escape(&format!("{label:?}")); }
         Label::UniqueId(lhs, _) => {
             header_color = "#C8E6C9"; // Green
             content = format!(
@@ -513,6 +517,7 @@ fn pretty_expr(prog: &Program, expr: &Expr) -> String {
         Expr::Times(l, r) => format!("{} * {}", pretty_expr(prog, l), pretty_expr(prog, r)),
         Expr::Div(l, r) => format!("{} / {}", pretty_expr(prog, l), pretty_expr(prog, r)),
         Expr::Mod(l, r) => format!("{} % {}", pretty_expr(prog, l), pretty_expr(prog, r)),
+        Expr::IndexOf(l, r) => format!("index_of({}, {})", pretty_expr(prog, l), pretty_expr(prog, r)),
         Expr::Min(l, r) => format!("min({}, {})", pretty_expr(prog, l), pretty_expr(prog, r)),
         Expr::Tuple(items) => {
             let elems: Vec<_> = items.iter().map(|e| pretty_expr(prog, e)).collect();
@@ -580,6 +585,9 @@ fn get_neighbors(label: &Label) -> Vec<CfgVertex> {
         | Label::MakeChannel(_, _, n)
         | Label::SetTimer(_, n, _)
         | Label::MakeFifoLink(_, _, n)
+        | Label::Spawn(_, _, _, n, _)
+        | Label::Provide(_, _, n, _)
+        | Label::ProvideAll(_, _, n, _)
         | Label::UniqueId(_, n)
         | Label::Send(_, _, n)
         | Label::Recv(_, _, n)

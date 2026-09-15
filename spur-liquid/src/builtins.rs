@@ -5,6 +5,10 @@ use spur_ast::name::NameId;
 /// produces exactly one extern entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BuiltinKind {
+    Spawn,
+    Provide,
+    ProvideAll,
+    IndexOf,
     // Array ops
     ArrayEmpty,
     ArrayAppend,
@@ -116,6 +120,10 @@ impl BuiltinKind {
             BuiltinKind::IntToString => "int_to_string".into(),
             BuiltinKind::BoolToString => "bool_to_string".into(),
             BuiltinKind::RoleToString => "role_to_string".into(),
+            BuiltinKind::Spawn => "spawn".into(),
+            BuiltinKind::Provide => "provide".into(),
+            BuiltinKind::ProvideAll => "provide_all".into(),
+            BuiltinKind::IndexOf => "index_of".into(),
             BuiltinKind::UniqueId => "unique_id".into(),
         }
     }

@@ -13,6 +13,10 @@ impl std::fmt::Display for NameId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinFn {
+    Spawn(NameId),
+    Provide,
+    ProvideAll,
+    IndexOf,
     Println,
     IntToString,
     BoolToString,
@@ -25,6 +29,9 @@ impl FromStr for BuiltinFn {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "provide" => Ok(BuiltinFn::Provide),
+            "provide_all" => Ok(BuiltinFn::ProvideAll),
+            "index_of" => Ok(BuiltinFn::IndexOf),
             "println" => Ok(BuiltinFn::Println),
             "int_to_string" => Ok(BuiltinFn::IntToString),
             "bool_to_string" => Ok(BuiltinFn::BoolToString),

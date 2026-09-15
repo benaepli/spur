@@ -30,6 +30,14 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Evaluate a deployment and print its nodes and groups.
+    Deploy {
+        spec: PathBuf,
+        #[arg(long)]
+        deploy: Option<String>,
+        #[arg(long, default_value = "{}")]
+        params: String,
+    },
     /// Compile a specification file to a directory containing
     /// program.json (CFG IR), cfg.svg (CFG visualization), and
     /// program.pir (Pure / SSA IR).
@@ -198,6 +206,7 @@ fn main() {
     let args = Args::parse();
 
     let result = match args.command {
+        Commands::Deploy { spec, deploy, params } => run_deploy(spec, deploy, params),
         Commands::Compile {
             spec,
             output_dir,
@@ -897,5 +906,16 @@ fn run_debug_traces(db_path: PathBuf, run_id: i64, node_id: Option<i64>) -> Resu
     }
     println!("{:-<120}", "");
 
+    Ok(())
+}
+
+fn run_deploy(spec: PathBuf, deploy: Option<String>, params: String) -> Result<()> {
+    let source = fs::read_to_string(&spec)?;
+    let program = spur_core::compiler::compile(&source, &spec.to_string_lossy()).into_program()?;
+    let entry = spur_core::simulator::deploy::select_deploy(&program, deploy.as_deref()).map_err(anyhow::Error::msg)?;
+    let params = serde_json::from_str(&params)?;
+    let deployment = spur_core::simulator::deploy::evaluate_deploy(&program, entry, &params).map_err(anyhow::Error::msg)?;
+    let result = deployment.map(|d| d.report(&program)).unwrap_or_else(|| serde_json::json!({"rejected": true}));
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }

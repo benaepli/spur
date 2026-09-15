@@ -75,6 +75,7 @@ fn visit_expr(expr: &mut Expr, f: &mut impl FnMut(Access, &mut u32)) {
         | Expr::Times(a, b)
         | Expr::Div(a, b)
         | Expr::Mod(a, b)
+        | Expr::IndexOf(a, b)
         | Expr::Min(a, b)
         | Expr::Coalesce(a, b)
         | Expr::SafeFind(a, b) => {
@@ -127,6 +128,8 @@ fn visit_label(label: &mut Label, f: &mut impl FnMut(Access, &mut u32)) {
             visit_expr(peer, f);
             visit_lhs(lhs, Access::Write, f);
         }
+        Label::Spawn(_, count, lhs, _, _) => { visit_expr(count, f); visit_lhs(lhs, Access::Write, f); }
+        Label::Provide(handle, value, _, _) | Label::ProvideAll(handle, value, _, _) => { visit_expr(handle, f); visit_expr(value, f); }
         Label::UniqueId(lhs, _) => visit_lhs(lhs, Access::Write, f),
         Label::Send(chan, value, _) => {
             visit_expr(chan, f);
@@ -179,6 +182,9 @@ pub(super) fn successors(label: &Label) -> [Option<Vertex>; 2] {
         | Label::MakeChannel(_, _, n)
         | Label::SetTimer(_, n, _)
         | Label::MakeFifoLink(_, _, n)
+        | Label::Spawn(_, _, _, n, _)
+        | Label::Provide(_, _, n, _)
+        | Label::ProvideAll(_, _, n, _)
         | Label::UniqueId(_, n)
         | Label::Send(_, _, n)
         | Label::Recv(_, _, n)

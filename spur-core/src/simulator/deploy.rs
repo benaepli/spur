@@ -1,3 +1,8 @@
+pub mod allocator;
+pub mod evaluate;
+pub mod params;
+pub mod path;
+pub use evaluate::{evaluate_deploy, select_deploy};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +25,7 @@ pub struct RoleFunctions {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Group {
+    pub paths: Vec<String>,
     pub role: NameId,
     pub members: Vec<NodeId>,
     pub quorum: bool,
@@ -27,6 +33,13 @@ pub struct Group {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Deployment {
+    pub spec: Option<spur_ast::types::DeployMetadata>,
+    pub root: Value<super::hash_utils::NoHashing>,
+    pub contexts: Vec<Value<super::hash_utils::NoHashing>>,
+    pub ordinals: Vec<usize>,
+    pub paths: Vec<Option<String>>,
+    pub hash: u64,
+    pub canonical_params: serde_json::Value,
     pub nodes: Arc<[NodeId]>,
     pub groups: Vec<Group>,
     pub fanout_width: Vec<u32>,
@@ -140,7 +153,9 @@ impl DeploymentCatalog {
                     })
                     .collect();
                 Arc::new(Deployment {
+                    spec: None, root: Value::unit(), contexts: vec![], ordinals: (0..count).collect(), paths: vec![None; count], hash: 0, canonical_params: serde_json::json!({}),
                     groups: vec![Group {
+                        paths: vec!["nodes".into()],
                         role: server,
                         members: nodes.to_vec(),
                         quorum: true,
@@ -156,6 +171,9 @@ impl DeploymentCatalog {
             .clone())
     }
 }
+
+#[cfg(test)]
+mod test;
 
 #[cfg(test)]
 mod tests {

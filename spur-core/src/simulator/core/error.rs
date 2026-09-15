@@ -2,6 +2,10 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
 pub enum RuntimeError {
+    #[error("allocation is only allowed during deploy evaluation")]
+    AllocationOutsideDeploy,
+    #[error("deploy allocation error: {0}")]
+    DeployAllocation(String),
     #[error("type error: expected {expected}, got {got}")]
     TypeError {
         expected: &'static str,

@@ -476,6 +476,11 @@ pub fn eval<H: HashPolicy>(
             }
             Ok(vec[i].clone())
         }
+        Expr::IndexOf(xs, x) => {
+            let xs = eval_operand(local_env, node_env, xs, role_names)?;
+            let x = eval_operand(local_env, node_env, x, role_names)?;
+            Ok(match xs.as_list()?.iter().position(|v| v == &*x) { Some(i) => Value::option_some(Value::int(i as i64)), None => Value::option_none() })
+        }
         Expr::Min(e1, e2) => {
             let v1 = eval_operand(local_env, node_env, e1, role_names)?.as_int()?;
             let v2 = eval_operand(local_env, node_env, e2, role_names)?.as_int()?;
