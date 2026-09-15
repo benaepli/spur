@@ -1560,7 +1560,7 @@ fn run_campaign_impl(
         program,
         &crate::simulator::explorer::cached_deployments(space),
     );
-    let (deploy, deployments_built, deploy_rejections, tuples_aliased) =
+    let (deploy, deployments_built, deploy_rejections, tuples_aliased, nodes_beyond_mask_width) =
         crate::simulator::explorer::deploy_summary(space);
 
     let mut vertex_coverage: Option<HashMap<usize, u64>> = None;
@@ -1612,6 +1612,7 @@ fn run_campaign_impl(
             deployments_built,
             deploy_rejections,
             tuples_aliased,
+            nodes_beyond_mask_width,
         }),
         campaign: Some(CampaignReport {
             wall_budget_sec: block.wall_budget_sec,

@@ -88,6 +88,9 @@ pub struct SessionSummary {
     pub deploy_rejections: u64,
     /// Parameter tuples that built a deployment equal to an earlier one.
     pub tuples_aliased: u64,
+    /// Nodes past index 63 in the largest deployment, which the 64-bit
+    /// crash-hold and retarget masks never select.
+    pub nodes_beyond_mask_width: u64,
 }
 
 /// Each deployment the session built, in id order, with the alias tuples
@@ -102,14 +105,22 @@ pub(crate) fn cached_deployments(space: &DeploySpace) -> Vec<(Arc<Deployment>, V
         .collect()
 }
 
-/// The deploy name, deployments built, tuples rejected and tuples aliased.
-pub(crate) fn deploy_summary(space: &DeploySpace) -> (String, u64, u64, u64) {
+/// The deploy name, deployments built, tuples rejected, tuples aliased, and
+/// nodes beyond the 64-bit mask width in the largest deployment.
+pub(crate) fn deploy_summary(space: &DeploySpace) -> (String, u64, u64, u64, u64) {
     let cache = space.cache.lock().unwrap();
+    let beyond = cache
+        .deployments
+        .iter()
+        .map(|d| d.node_count().saturating_sub(64) as u64)
+        .max()
+        .unwrap_or(0);
     (
         space.deploy.name.clone(),
         cache.deployments.len() as u64,
         cache.rejections as u64,
         cache.tuples_aliased as u64,
+        beyond,
     )
 }
 
@@ -559,6 +570,17 @@ impl ExplorerConfig {
     pub fn bind(&mut self, program: &Program, cache: &Arc<Mutex<DeployCache>>) -> Result<(), String> {
         let space = DeploySpace::bind(program, self.deploy.as_deref(), &self.params, cache)?;
         let client = space.deploy.client;
+        let ops = [("Write", self.num_write_ops_range.max), ("Read", self.num_read_ops_range.max), ("RMW", self.num_rmw_ops_range.max)];
+        for selected in space.grid() {
+            for (index, (op, max)) in ops.iter().enumerate() {
+                if *max > 0 && selected.deployment.destinations[index].as_ref().is_some_and(|nodes| nodes.is_empty()) {
+                    return Err(format!(
+                        "params {} build a deployment with no node for {op} to address",
+                        selected.params.values
+                    ));
+                }
+            }
+        }
         if self.num_rmw_ops_range.max > 0 && program.role_table.functions(client).rmw.is_none() {
             return Err(format!(
                 "num_rmw_ops allows RMW operations but client {} defines no RMW",
@@ -1390,7 +1412,7 @@ fn run_explorer_impl<F: Feedback>(
     writer.shutdown();
     let writer_flush_ms = flush_start.elapsed().as_millis() as u64;
     write_deployment_tables(output_path, program, &cached_deployments(config.deploy_space()));
-    let (deploy, deployments_built, deploy_rejections, tuples_aliased) =
+    let (deploy, deployments_built, deploy_rejections, tuples_aliased, nodes_beyond_mask_width) =
         deploy_summary(config.deploy_space());
 
     let session = SessionSummary {
@@ -1405,6 +1427,7 @@ fn run_explorer_impl<F: Feedback>(
         deployments_built,
         deploy_rejections,
         tuples_aliased,
+        nodes_beyond_mask_width,
     };
     info!(
         "Execution explorer finished: {} runs in {} ms{}",
