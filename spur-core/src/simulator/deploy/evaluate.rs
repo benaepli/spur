@@ -104,11 +104,16 @@ fn evaluate_inner(program: &Program, deploy: &DeployMetadata, params: &Json) -> 
     let nodes: Arc<[NodeId]> = allocator.nodes.iter().map(|n| n.id).collect();
     let contexts = allocator.nodes.iter().map(|n| n.ctx.clone().unwrap()).collect();
     let ordinals = allocator.nodes.iter().map(|n| n.ordinal).collect();
+    let destinations = ["Write", "Read", "RMW"].map(|op| {
+        let role = program.topology.roles.get(&deploy.client)?.destinations.get(op).copied().flatten()?;
+        Some(allocator.nodes.iter().map(|n| n.id).filter(|n| n.role == role).collect())
+    });
     let mut deployment = Deployment {
+        destinations,
         nodes, contexts, ordinals,
-        spec: Some(deploy.clone()), root, hash: 0, canonical_params: params.clone(),
+        spec: deploy.clone(), root, hash: 0, canonical_params: params.clone(),
         paths: vec![None; count], groups: vec![], fanout_width: vec![0; count], crash_candidates: (0..count).collect(),
-        peer_indices: vec![vec![]; count], client_role: deploy.client, roles: program.deployments.roles.clone(),
+        peer_indices: vec![vec![]; count], client_role: deploy.client, roles: program.role_table.clone(),
     };
     let mut reachable = HashSet::new();
     walk(&deployment.root.clone(), &deploy.root, Some("$".into()), false, &program.topology, &mut deployment, &mut reachable);
@@ -185,7 +190,7 @@ impl Deployment {
             let count = roles.get(key).and_then(Json::as_u64).unwrap_or(0);
             roles.insert(key.clone(), json!(count + 1));
         }
-        json!({ "deploy": self.spec.as_ref().map(|d| &d.name), "hash": self.hash, "params": self.canonical_params, "roles": roles,
+        json!({ "deploy": self.spec.name, "hash": self.hash, "params": self.canonical_params, "roles": roles,
             "nodes": self.nodes.iter().map(|n| json!({"index": n.index, "role": program.id_to_name[&n.role], "ordinal": self.ordinals[n.index], "path": self.paths[n.index]})).collect::<Vec<_>>(),
             "groups": self.groups.iter().map(|g| json!({"path": g.paths.first(), "aliases": g.paths.iter().skip(1).collect::<Vec<_>>(), "role": program.id_to_name[&g.role], "members": g.members.iter().map(|n| n.index).collect::<Vec<_>>(), "quorum": g.quorum})).collect::<Vec<_>>() })
     }

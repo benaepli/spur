@@ -286,7 +286,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{
-                 "num_servers": {"min": 3, "max": 3, "step": 1},
+                 "params": {"n": {"min": 3, "max": 3, "step": 1}},
                  "num_crashes": {"min": 1, "max": 3, "step": 1},
                  "purgatory": {"delay_probability": 0.15},
                  "num_runs_per_config": 100,
@@ -373,7 +373,7 @@ mod tests {
         use crate::simulator::explorer::ExplorerConfig;
 
         let base = r#"{
-             "num_servers": {"min": 3, "max": 3, "step": 1},
+             "params": {"n": {"min": 3, "max": 3, "step": 1}},
              "num_write_ops": {"min": 1, "max": 1, "step": 1},
              "num_read_ops": {"min": 1, "max": 1, "step": 1},
              "num_crashes": {"min": 0, "max": 0, "step": 1},

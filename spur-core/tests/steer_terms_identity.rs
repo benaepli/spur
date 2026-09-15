@@ -18,7 +18,7 @@ const SPEC: &str = include_str!("fixtures/relay.spur");
 /// Two peers, faults on, a fixed seed with isolated draw streams, strict
 /// keys. `{{TERMS}}` is where a session puts its terms and legacy keys.
 const CONFIG: &str = r#"{
-  "num_servers": {"min": 2, "max": 2, "step": 1},
+  "params": {"n": {"min": 2, "max": 2, "step": 1}},
   "num_write_ops": {"min": 1, "max": 2, "step": 1},
   "num_read_ops": {"min": 1, "max": 1, "step": 1},
   "num_keys": {"min": 1, "max": 1, "step": 1},

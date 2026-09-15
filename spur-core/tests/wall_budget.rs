@@ -20,7 +20,7 @@ const SPEC: &str = include_str!("fixtures/kv.spur");
 
 /// One configuration, so the grid alone is a known number of runs.
 const CONFIG: &str = r#"{
-  "num_servers": {"min": 3, "max": 3, "step": 1},
+  "params": {"n": {"min": 3, "max": 3, "step": 1}},
   "num_write_ops": {"min": 1, "max": 1, "step": 1},
   "num_read_ops": {"min": 1, "max": 1, "step": 1},
   "num_keys": {"min": 1, "max": 1, "step": 1},
@@ -35,7 +35,7 @@ const CONFIG: &str = r#"{
 
 /// Six configurations, so a cut has a grid to leave unbalanced.
 const GRID_CONFIG: &str = r#"{
-  "num_servers": {"min": 3, "max": 3, "step": 1},
+  "params": {"n": {"min": 3, "max": 3, "step": 1}},
   "num_write_ops": {"min": 1, "max": 3, "step": 1},
   "num_read_ops": {"min": 1, "max": 2, "step": 1},
   "num_keys": {"min": 1, "max": 1, "step": 1},

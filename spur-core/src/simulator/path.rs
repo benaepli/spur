@@ -194,52 +194,30 @@ fn schedule_client_op<H: HashPolicy>(
     op_id: i32,
     op_spec: &ClientOpSpec,
     client_node_id: NodeId,
-    server_role: NameId,
     policy: &SchedulePolicy,
     rng: &mut impl StreamRng,
 ) -> Result<(), RuntimeError> {
     let client_id = client_node_id.index as i32;
-    let (op_name, actuals) = match op_spec {
-        ClientOpSpec::Write(target, key) => (
-            "ClientInterface.Write",
-            vec![
-                Value::<H>::node(NodeId {
-                    role: server_role,
-                    index: *target as usize,
-                }),
-                Value::<H>::string(EcoString::from(key.as_str())),
-                Value::<H>::int(op_id as i64),
-            ],
-        ),
-        ClientOpSpec::Read(target, key) => (
-            "ClientInterface.Read",
-            vec![
-                Value::<H>::node(NodeId {
-                    role: server_role,
-                    index: *target as usize,
-                }),
-                Value::<H>::string(EcoString::from(key.as_str())),
-            ],
-        ),
-        ClientOpSpec::Rmw(target, key) => (
-            "ClientInterface.RMW",
-            vec![
-                Value::<H>::node(NodeId {
-                    role: server_role,
-                    index: *target as usize,
-                }),
-                Value::<H>::string(EcoString::from(key.as_str())),
-                Value::<H>::int(op_id as i64),
-            ],
-        ),
+    let functions = prog.role_table.functions(client_node_id.role);
+    let (op_name, op_func, dest, key, uid) = match op_spec {
+        ClientOpSpec::Write(dest, key) => ("Client.Write", &functions.write, dest, key, Some(op_id)),
+        ClientOpSpec::Read(dest, key) => ("Client.Read", &functions.read, dest, key, None),
+        ClientOpSpec::Rmw(dest, key) => ("Client.RMW", &functions.rmw, dest, key, Some(op_id)),
     };
-
-    let functions = prog.deployments.functions(client_node_id.role);
-    let op_func = match op_spec {
-        ClientOpSpec::Write(..) => &functions.write,
-        ClientOpSpec::Read(..) => &functions.read,
-        ClientOpSpec::Rmw(..) => &functions.rmw,
-    }.as_ref().ok_or_else(|| RuntimeError::MissingRequiredFunction(op_name.to_string()))?;
+    let op_func = op_func
+        .as_ref()
+        .ok_or_else(|| RuntimeError::MissingRequiredFunction(op_name.to_string()))?;
+    // The invocation row always has the shape [dest, key, uid] (Read has no
+    // uid), with unit for an operation that takes no destination; the
+    // function receives only its own parameters.
+    let mut payload = vec![
+        dest.map(Value::<H>::node).unwrap_or_else(Value::<H>::unit),
+        Value::<H>::string(EcoString::from(key.as_str())),
+    ];
+    if let Some(uid) = uid {
+        payload.push(Value::<H>::int(uid as i64));
+    }
+    let actuals = &payload[usize::from(dest.is_none())..];
     let initial_args: EcoVec<Value<H>> = actuals.iter().cloned().collect();
     let env = build_frame(op_func, &initial_args);
 
@@ -247,7 +225,7 @@ fn schedule_client_op<H: HashPolicy>(
         client_id,
         op_action: op_name.to_string(),
         kind: OpKind::Invocation,
-        payload: actuals,
+        payload,
         unique_id: op_id,
         step: state.crash_info.current_step,
     });
@@ -282,28 +260,6 @@ fn schedule_client_op<H: HashPolicy>(
     Ok(())
 }
 
-fn validate_node<H: HashPolicy>(
-    state: &State<H>,
-    index: usize,
-    expected_role: NameId,
-) -> Result<NodeId, RuntimeError> {
-    if index >= state.nodes.len() {
-        return Err(RuntimeError::IndexOutOfBounds {
-            index,
-            len: state.nodes.len(),
-        });
-    }
-    let node_val = state.nodes[index].get(0);
-    let node_id = node_val.as_node()?;
-    if node_id.role != expected_role {
-        return Err(RuntimeError::TypeError {
-            expected: "node with correct role",
-            got: "node with incorrect role",
-        });
-    }
-    Ok(node_id)
-}
-
 /// Hand the planned client request at `plan_node` to a client node. The
 /// invocation is recorded at the current step, so a request the run held
 /// back is recorded when it is issued, not when the plan made it ready.
@@ -313,7 +269,7 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
     snapshot: &F::Snapshot,
     policy: &SchedulePolicy,
     purgatory_config: &PurgatoryConfig,
-    server_role: NameId,
+    deployment: &Deployment,
     plan_node: NodeIndex,
     op_spec: &ClientOpSpec,
     post_fault: bool,
@@ -349,7 +305,12 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
     // Get a client node from the pool (creates one if needed)
     let (client_node_id, is_new) = path_state.client_pool.get(&mut path_state.state);
 
-    if is_new && let Some(init_fn) = program.deployments.functions(client_node_id.role).base_init.as_ref() {
+    if is_new {
+        path_state
+            .state
+            .set_context(client_node_id.index, deployment.root_value::<H>());
+    }
+    if is_new && let Some(init_fn) = program.role_table.functions(client_node_id.role).base_init.as_ref() {
         let mut env = build_frame::<H>(init_fn, &[]);
         if let Err(e) = crate::simulator::core::exec_sync_on_node::<H, _, F>(
             &mut path_state.state,
@@ -372,14 +333,6 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
         }
     }
 
-    // Validate target server in op_spec
-    let target_idx = match op_spec {
-        ClientOpSpec::Write(t, _) => *t as usize,
-        ClientOpSpec::Read(t, _) => *t as usize,
-        ClientOpSpec::Rmw(t, _) => *t as usize,
-    };
-    validate_node(&path_state.state, target_idx, server_role)?;
-
     schedule_client_op(
         &mut path_state.state,
         &mut path_state.history,
@@ -387,7 +340,6 @@ fn invoke_client_request<H: HashPolicy, F: Feedback>(
         *op_id_counter,
         op_spec,
         client_node_id,
-        server_role,
         policy,
         rng,
     )
@@ -692,7 +644,6 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
     let mut no_progress_count: i32 = 0;
     const STARVATION_WARN_THRESHOLD: i32 = 500;
 
-    let server_role = deployment.nodes[0].role;
 
     // Eligible runnables per local queue, rewritten by every scheduling step.
     let mut local_queue_sizes: Vec<usize> = Vec::new();
@@ -823,7 +774,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 snapshot,
                 policy,
                 purgatory_config,
-                server_role,
+                deployment,
                 plan_node,
                 &op_spec,
                 true,
@@ -857,7 +808,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                         snapshot,
                         policy,
                         purgatory_config,
-                        server_role,
+                        deployment,
                         node_idx,
                         op_spec,
                         post_fault,
@@ -867,8 +818,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     )?;
                 }
                 EventAction::CrashNode(node_id) => {
-                    let nid =
-                        validate_node(&path_state.state, *node_id as usize, server_role)?;
+                    let nid = *node_id;
                     path_state.state.push_runnable(Runnable::Crash {
                         node_id: nid,
                         priority: policy.sample(rng, RunnableCategory::Crash),
@@ -898,8 +848,7 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     pending_crash.insert(nid.index, node_idx);
                 }
                 EventAction::RecoverNode(node_id) => {
-                    let nid =
-                        validate_node(&path_state.state, *node_id as usize, server_role)?;
+                    let nid = *node_id;
                     let target = victim_remap.remove(&nid.index).unwrap_or(nid);
                     path_state.state.push_runnable(Runnable::Recover {
                         node_id: target,
@@ -908,12 +857,12 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                     pending_recover.insert(target.index, node_idx);
                 }
                 EventAction::AllowTimer(node_id, label) => {
-                    let key = (*node_id as usize, label.clone());
+                    let key = (node_id.index, label.clone());
                     path_state.state.allowed_timers.insert(key.clone());
                     pending_allow_timer.insert(key, node_idx);
                 }
                 EventAction::Partition(spec) => {
-                    let partition_type = spec.to_partition_type(&deployment.groups[0].members);
+                    let partition_type = spec.to_partition_type();
                     path_state.state.push_runnable(Runnable::Partition {
                         partition_type,
                         priority: policy.sample(rng, RunnableCategory::Partition),
@@ -947,8 +896,8 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                 .filter_map(|(_, spec)| {
                     name_to_entry.get(spec.function.as_str()).map(|&entry_pc| Reservation {
                         entry_pc,
-                        from: spec.from.map(|f| f as usize),
-                        to: spec.to.map(|t| t as usize),
+                        from: spec.from.map(|n| n.index),
+                        to: spec.to.map(|n| n.index),
                     })
                 })
                 .collect()
@@ -1130,10 +1079,10 @@ pub fn exec_plan<H: HashPolicy, F: Feedback>(
                                     spec.function == func_name
                                         && spec
                                             .to
-                                            .is_none_or(|t| dest_node.index == t as usize)
+                                            .is_none_or(|t| dest_node.index == t.index)
                                         && spec
                                             .from
-                                            .is_none_or(|f| origin_node.index == f as usize)
+                                            .is_none_or(|f| origin_node.index == f.index)
                                 } else {
                                     false
                                 }
@@ -1371,7 +1320,11 @@ mod tests {
             .into_program()
             .expect("the fixture compiles");
         let server_role = role(&program, "Node");
-        let client_role = role(&program, "ClientInterface");
+        let client_role = role(&program, "KVClient");
+        let deploy = crate::simulator::deploy::select_deploy(&program, None).expect("one deploy");
+        let deployment = crate::simulator::deploy::evaluate_deploy(&program, deploy, &serde_json::json!({"n": 3}))
+            .expect("the deploy evaluates")
+            .expect("n = 3 is accepted");
         let mut path_state = PathState::<NoHashing, NoFeedback>::new(
             &[(server_role, 3)],
             program.max_node_slots as usize,
@@ -1390,7 +1343,8 @@ mod tests {
         let mut held: HoldQueue<(NodeIndex, ClientOpSpec)> = HoldQueue::default();
 
         path_state.state.crash_info.current_step = 3;
-        held.hold((NodeIndex::new(4), ClientOpSpec::Write(1, "k".into())), 3);
+        let dest = NodeId { role: server_role, index: 1 };
+        held.hold((NodeIndex::new(4), ClientOpSpec::Write(Some(dest), "k".into())), 3);
         assert!(path_state.history.is_empty(), "holding writes no row");
         assert_eq!(path_state.state.total_runnable_count(), 0);
 
@@ -1415,7 +1369,7 @@ mod tests {
                 &(),
                 &policy,
                 &purgatory,
-                server_role,
+                &deployment,
                 plan_node,
                 &spec,
                 true,
@@ -1429,7 +1383,7 @@ mod tests {
         let row = &path_state.history[0];
         assert_eq!(row.step, issue_step, "the invocation row carries the issue step");
         assert!(matches!(row.kind, OpKind::Invocation));
-        assert_eq!(row.op_action, "ClientInterface.Write");
+        assert_eq!(row.op_action, "Client.Write");
         assert_eq!(row.unique_id, 1);
         assert_eq!(in_progress.get(&1), Some(&NodeIndex::new(4)));
         assert_eq!(

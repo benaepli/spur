@@ -16,7 +16,7 @@ fn clamp(val: int, lo: int, hi: int): int {
     return max(lo, min2(val, hi));
 }
 
-role Node {
+role Node(unused: int) {
     var x: int = 0;
 
     fn get_clamped(): int {
@@ -28,7 +28,7 @@ role Node {
     }
 }
 
-ClientInterface {
+role Client(unused: int) {
     async fn set(dest: Node, v: int): () {
         dest->SetValue(v);
     }

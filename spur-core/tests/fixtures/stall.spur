@@ -3,7 +3,15 @@
 // no progress mark after the request is issued. The role and client-interface
 // names are the ones the explorer looks up.
 
-role Node {
+type Cluster {
+    @quorum nodes: list<Node>;
+};
+
+type ClusterParams {
+    @scale n: int;
+};
+
+role Node(cluster: Cluster) {
     var ready: bool = false;
 
     async fn Try(key: string, uid: int): bool {
@@ -15,7 +23,22 @@ role Node {
     }
 }
 
-ClientInterface {
+fn cluster(n: int): Cluster {
+    var nodes: list<Node> = spawn<Node>(n);
+    var c: Cluster = Cluster { nodes: nodes };
+    provide_all(nodes, c);
+    c
+}
+
+@deploy(client = KVClient)
+fn Main(p: ClusterParams): Cluster? {
+    if (p.n < 1) {
+        return nil;
+    }
+    cluster(p.n)
+}
+
+client KVClient(sys: Cluster) {
     async fn Write(dest: Node, key: string, uid: int) {
         var ok: bool = false;
         for ;; {
@@ -26,7 +49,7 @@ ClientInterface {
         }
     }
 
-    async fn Read(dest: Node, key: string): int {
-        return <-dest->Read(key);
+    async fn Read(dest: Node, key: string): list<int> {
+        return [<-dest->Read(key)];
     }
 }

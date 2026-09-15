@@ -130,6 +130,11 @@ pub struct PersistableRun {
     /// Bitfield naming the session-global mechanisms that selected this run
     /// and whether placed crashes acted; see `run_variant`.
     pub variant: i32,
+    /// The deployment the run used; -1 when the run failed before one was
+    /// chosen.
+    pub deployment_id: i32,
+    /// JSON object of the parameter tuple that selected the deployment.
+    pub params: String,
 }
 
 #[cfg(test)]
@@ -816,6 +821,8 @@ fn runs_schema() -> Arc<Schema> {
         Field::new("timers_idle_acted", DataType::Int32, false),
         Field::new("max_inert_streak", DataType::Int32, false),
         Field::new("variant", DataType::Int32, false),
+        Field::new("deployment_id", DataType::Int32, false),
+        Field::new("params", DataType::Utf8, false),
     ]))
 }
 
@@ -844,6 +851,8 @@ fn append_runs_batch(
     let timers_idle_acted = timer_col(|r| r.timers_idle_acted);
     let max_inert_streak = timer_col(|r| r.max_inert_streak);
     let variants = timer_col(|r| r.variant);
+    let deployment_ids = timer_col(|r| r.deployment_id);
+    let params: StringArray = runs.iter().map(|r| r.params.as_str()).collect::<Vec<_>>().into();
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -865,6 +874,8 @@ fn append_runs_batch(
             Arc::new(timers_idle_acted),
             Arc::new(max_inert_streak),
             Arc::new(variants),
+            Arc::new(deployment_ids),
+            Arc::new(params),
         ],
     )?;
     writer.write(&batch)?;
@@ -1309,6 +1320,8 @@ mod parquet_writer_tests {
             timers_idle_acted: 0,
             max_inert_streak: 0,
             variant: 0,
+            deployment_id: 0,
+            params: "{}".into(),
         }
     }
 
@@ -1775,4 +1788,104 @@ mod payload_json_tests {
         check_structs::<NoHashing>();
         check_structs::<WithHashing>();
     }
+}
+
+/// Writes the `deployments` and `deployment_nodes` tables beside `runs`, one
+/// file each. Entry `i` of `deployments` is deployment id `i`, with the alias
+/// tuples that selected it besides its first.
+pub fn write_deployments(
+    output_dir: &Path,
+    program: &crate::compiler::cfg::Program,
+    deployments: &[(Arc<crate::simulator::deploy::Deployment>, Vec<serde_json::Value>)],
+) -> Result<(), Box<dyn Error>> {
+    let name = |id: crate::analysis::resolver::NameId| {
+        program.id_to_name.get(&id).cloned().unwrap_or_default()
+    };
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("deployment_id", DataType::Int32, false),
+        Field::new("deploy", DataType::Utf8, false),
+        Field::new("client", DataType::Utf8, false),
+        Field::new("model", DataType::Utf8, false),
+        Field::new("params", DataType::Utf8, false),
+        Field::new("aliases", DataType::Utf8, false),
+        Field::new("hash", DataType::UInt64, false),
+        Field::new("node_count", DataType::Int32, false),
+        Field::new("roles", DataType::Utf8, false),
+        Field::new("groups", DataType::Utf8, false),
+    ]));
+    let column = |f: &dyn Fn(&crate::simulator::deploy::Deployment, &[serde_json::Value]) -> String| -> StringArray {
+        deployments.iter().map(|(d, aliases)| f(d, aliases)).collect::<Vec<_>>().into()
+    };
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from((0..deployments.len() as i32).collect::<Vec<_>>())),
+            Arc::new(column(&|d, _| d.spec.name.clone())),
+            Arc::new(column(&|d, _| name(d.client_role))),
+            Arc::new(column(&|d, _| d.model().to_string())),
+            Arc::new(column(&|d, _| d.canonical_params.to_string())),
+            Arc::new(column(&|_, aliases| serde_json::Value::from(aliases.to_vec()).to_string())),
+            Arc::new(UInt64Array::from(deployments.iter().map(|(d, _)| d.hash).collect::<Vec<_>>())),
+            Arc::new(Int32Array::from(deployments.iter().map(|(d, _)| d.node_count() as i32).collect::<Vec<_>>())),
+            Arc::new(column(&|d, _| {
+                let mut roles = serde_json::Map::new();
+                for node in d.nodes.iter() {
+                    let count = roles.entry(name(node.role)).or_insert(serde_json::json!(0));
+                    *count = serde_json::json!(count.as_u64().unwrap_or(0) + 1);
+                }
+                serde_json::Value::Object(roles).to_string()
+            })),
+            Arc::new(column(&|d, _| {
+                let groups: Vec<_> = d
+                    .groups
+                    .iter()
+                    .map(|g| {
+                        serde_json::json!({
+                            "path": g.paths.first(),
+                            "aliases": &g.paths[g.paths.len().min(1)..],
+                            "role": name(g.role),
+                            "members": g.members.iter().map(|n| n.index).collect::<Vec<_>>(),
+                            "quorum": g.quorum,
+                        })
+                    })
+                    .collect();
+                serde_json::Value::from(groups).to_string()
+            })),
+        ],
+    )?;
+    let dir = output_dir.join("deployments");
+    std::fs::create_dir_all(&dir)?;
+    let mut writer = open_parquet_writer(&dir.join("part-0.parquet"), schema)?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let node_schema = Arc::new(Schema::new(vec![
+        Field::new("deployment_id", DataType::Int32, false),
+        Field::new("node_index", DataType::Int32, false),
+        Field::new("role", DataType::Utf8, false),
+        Field::new("ordinal", DataType::Int32, false),
+        Field::new("path", DataType::Utf8, true),
+    ]));
+    let rows: Vec<_> = deployments
+        .iter()
+        .enumerate()
+        .flat_map(|(id, (d, _))| d.nodes.iter().map(move |n| (id as i32, d, *n)))
+        .collect();
+    let node_batch = RecordBatch::try_new(
+        node_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>())),
+            Arc::new(Int32Array::from(rows.iter().map(|(_, _, n)| n.index as i32).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|(_, _, n)| name(n.role)).collect::<Vec<_>>())),
+            Arc::new(Int32Array::from(rows.iter().map(|(_, d, n)| d.ordinals[n.index] as i32).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|(_, d, n)| d.paths[n.index].clone()).collect::<Vec<_>>())),
+        ],
+    )?;
+    let dir = output_dir.join("deployment_nodes");
+    std::fs::create_dir_all(&dir)?;
+    let mut writer = open_parquet_writer(&dir.join("part-0.parquet"), node_schema)?;
+    writer.write(&node_batch)?;
+    writer.close()?;
+    Ok(())
 }

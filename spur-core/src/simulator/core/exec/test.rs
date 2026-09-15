@@ -108,7 +108,7 @@ impl TestProgramBuilder {
 
     fn build_undecoded(self) -> Program {
         Program {
-            deployments: Default::default(),
+            role_table: Default::default(),
             topology: Default::default(),
             cfg: Cfg { graph: self.labels },
             rpc: HashMap::new(),

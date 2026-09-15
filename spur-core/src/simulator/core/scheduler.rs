@@ -2373,6 +2373,7 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
     if let VarSlot::Node(self_idx, _) = SELF_SLOT {
         state.nodes[node_id.index].set(self_idx, Value::<H>::node(node_id));
     }
+    state.set_context(node_id.index, deployment.context::<H>(node_id.index));
 
     let mut env = build_frame::<H>(init_fn, &[]);
 
@@ -2422,9 +2423,7 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         return Ok(());
     };
 
-    let actuals = deployment.init_args(node_id, deployment.peer_list());
-
-    let initial_args: EcoVec<Value<H>> = actuals.into_iter().collect();
+    let initial_args: EcoVec<Value<H>> = EcoVec::new();
     let env = build_frame(recover_fn, &initial_args);
 
     let record = Record {

@@ -1094,6 +1094,11 @@ impl<H: HashPolicy> State<H> {
         node_id
     }
 
+    /// Stores a node's role parameter, which every function of its role reads.
+    pub fn set_context(&mut self, node: usize, ctx: Value<H>) {
+        self.nodes[node].set(crate::compiler::cfg::CTX_SLOT, ctx);
+    }
+
     /// How many times `node` has recovered from a crash so far.
     #[inline]
     pub fn incarnation(&self, node: NodeId) -> u32 {

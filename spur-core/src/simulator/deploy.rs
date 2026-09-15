@@ -2,14 +2,16 @@ pub mod allocator;
 pub mod evaluate;
 pub mod params;
 pub mod path;
+pub mod space;
 pub use evaluate::{evaluate_deploy, select_deploy};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::any::Any;
+use std::sync::Arc;
 
-use super::core::error::RuntimeError;
+use spur_ast::types::DeployMetadata;
+
 use super::core::state::NodeId;
-use super::core::values::Value;
-use super::hash_utils::HashPolicy;
+use super::core::values::{Value, ValueKind};
+use super::hash_utils::{HashPolicy, NoHashing};
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::{FunctionInfo, Program};
 
@@ -23,6 +25,35 @@ pub struct RoleFunctions {
     pub rmw: Option<FunctionInfo>,
 }
 
+/// The functions runs call on each role and client, indexed by role id.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoleTable {
+    roles: Vec<RoleFunctions>,
+}
+
+impl RoleTable {
+    pub fn new(program: &Program) -> Self {
+        let len = program.roles.iter().map(|(r, _)| r.0 + 1).max().unwrap_or(0);
+        let mut roles = vec![RoleFunctions::default(); len];
+        for (id, name) in &program.roles {
+            let get = |suffix| program.get_func_by_name(&format!("{name}.{suffix}")).cloned();
+            roles[id.0] = RoleFunctions {
+                base_init: get("BASE_NODE_INIT"),
+                init: get("Init"),
+                recover_init: get("RecoverInit"),
+                write: get("Write"),
+                read: get("Read"),
+                rmw: get("RMW"),
+            };
+        }
+        Self { roles }
+    }
+
+    pub fn functions(&self, role: NameId) -> &RoleFunctions {
+        &self.roles[role.0]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Group {
     pub paths: Vec<String>,
@@ -33,9 +64,9 @@ pub struct Group {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Deployment {
-    pub spec: Option<spur_ast::types::DeployMetadata>,
-    pub root: Value<super::hash_utils::NoHashing>,
-    pub contexts: Vec<Value<super::hash_utils::NoHashing>>,
+    pub spec: DeployMetadata,
+    pub root: Value<NoHashing>,
+    pub contexts: Vec<Value<NoHashing>>,
     pub ordinals: Vec<usize>,
     pub paths: Vec<Option<String>>,
     pub hash: u64,
@@ -46,7 +77,10 @@ pub struct Deployment {
     pub crash_candidates: Vec<usize>,
     pub peer_indices: Vec<Vec<usize>>,
     pub client_role: NameId,
-    pub roles: Arc<Vec<RoleFunctions>>,
+    /// Destination candidates of Write, Read and RMW, in index order; `None`
+    /// for an operation that takes no destination or is not defined.
+    pub destinations: [Option<Vec<NodeId>>; 3],
+    pub roles: Arc<RoleTable>,
 }
 
 impl Deployment {
@@ -55,15 +89,22 @@ impl Deployment {
     }
 
     pub fn functions(&self, role: NameId) -> &RoleFunctions {
-        &self.roles[role.0]
+        self.roles.functions(role)
     }
 
-    pub fn peer_list<H: HashPolicy>(&self) -> Value<H> {
-        Value::list(self.nodes.iter().copied().map(Value::node).collect())
+    /// The Porcupine model the client's operations define.
+    pub fn model(&self) -> &'static str {
+        if self.functions(self.client_role).rmw.is_some() { "kv_rmw" } else { "kv" }
     }
 
-    pub fn init_args<H: HashPolicy>(&self, node: NodeId, peers: Value<H>) -> [Value<H>; 2] {
-        [Value::int(node.index as i64), peers]
+    /// The role parameter of the node at `index`.
+    pub fn context<H: HashPolicy>(&self, index: usize) -> Value<H> {
+        adopt(&self.contexts[index])
+    }
+
+    /// The deployment root, which is every client's parameter.
+    pub fn root_value<H: HashPolicy>(&self) -> Value<H> {
+        adopt(&self.root)
     }
 
     pub fn peers(&self, node: usize) -> &[usize] {
@@ -75,130 +116,67 @@ impl Deployment {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DeploymentCatalog {
-    roles: Arc<Vec<RoleFunctions>>,
-    server: Option<NameId>,
-    client: Option<NameId>,
-    cache: Arc<Mutex<HashMap<usize, Arc<Deployment>>>>,
-}
-
-impl PartialEq for DeploymentCatalog {
-    fn eq(&self, other: &Self) -> bool {
-        self.roles == other.roles && self.server == other.server && self.client == other.client
+/// Runs under `NoHashing` share the deployment's values; any other policy
+/// gets a structural copy.
+fn adopt<H: HashPolicy>(value: &Value<NoHashing>) -> Value<H> {
+    match (value as &dyn Any).downcast_ref::<Value<H>>() {
+        Some(shared) => shared.clone(),
+        None => convert(value),
     }
 }
 
-impl DeploymentCatalog {
-    pub fn new(program: &Program) -> Self {
-        let mut roles = vec![
-            RoleFunctions::default();
-            program
-                .roles
-                .iter()
-                .map(|(r, _)| r.0 + 1)
-                .max()
-                .unwrap_or(0)
-        ];
-        for (id, name) in &program.roles {
-            let get = |suffix| {
-                program
-                    .get_func_by_name(&format!("{name}.{suffix}"))
-                    .cloned()
-            };
-            roles[id.0] = RoleFunctions {
-                base_init: get("BASE_NODE_INIT"),
-                init: get("Init"),
-                recover_init: get("RecoverInit"),
-                write: get("Write"),
-                read: get("Read"),
-                rmw: get("RMW"),
-            };
-        }
-        Self {
-            roles: Arc::new(roles),
-            server: program
-                .roles
-                .iter()
-                .find(|(_, n)| n == "Node")
-                .map(|(r, _)| *r),
-            client: program
-                .roles
-                .iter()
-                .find(|(_, n)| n == "ClientInterface")
-                .map(|(r, _)| *r),
-            cache: Arc::default(),
-        }
+fn convert<H: HashPolicy>(value: &Value<NoHashing>) -> Value<H> {
+    let boxed = |v: &Arc<Value<NoHashing>>| Arc::new(convert(v));
+    match &value.kind {
+        ValueKind::Int(i) => Value::int(*i),
+        ValueKind::Bool(b) => Value::bool(*b),
+        ValueKind::String(s) => Value::string(s.clone()),
+        ValueKind::Unit => Value::unit(),
+        ValueKind::Node(n) => Value::node(*n),
+        ValueKind::List(xs) => Value::list(xs.iter().map(convert).collect()),
+        ValueKind::Tuple(xs) => Value::tuple(xs.iter().map(convert).collect()),
+        ValueKind::Option(v) => Value::option(v.as_ref().map(boxed)),
+        ValueKind::Variant(id, name, payload) => Value::variant(*id, name.clone(), payload.as_ref().map(boxed)),
+        ValueKind::Struct(shape, fields) => Value::struct_of(shape, fields.iter().map(convert).collect()),
+        ValueKind::Map(map) => Value::map(map.iter().map(|(k, v)| (convert(k), convert(v))).collect()),
+        _ => unreachable!("deployable values hold no node-owned resources"),
     }
+}
 
-    pub fn functions(&self, role: NameId) -> &RoleFunctions {
-        &self.roles[role.0]
-    }
-
-    pub fn get(&self, count: usize) -> Result<Arc<Deployment>, RuntimeError> {
-        let server = self
-            .server
-            .ok_or_else(|| RuntimeError::RoleNotFound("Node".into()))?;
-        let client_role = self
-            .client
-            .ok_or_else(|| RuntimeError::RoleNotFound("ClientInterface".into()))?;
-        let mut cache = self.cache.lock().unwrap();
-        Ok(cache
-            .entry(count)
-            .or_insert_with(|| {
-                let nodes: Arc<[NodeId]> = (0..count)
-                    .map(|index| NodeId {
-                        role: server,
-                        index,
-                    })
-                    .collect();
-                Arc::new(Deployment {
-                    spec: None, root: Value::unit(), contexts: vec![], ordinals: (0..count).collect(), paths: vec![None; count], hash: 0, canonical_params: serde_json::json!({}),
-                    groups: vec![Group {
-                        paths: vec!["nodes".into()],
-                        role: server,
-                        members: nodes.to_vec(),
-                        quorum: true,
-                    }],
-                    fanout_width: vec![count.saturating_sub(1) as u32; count],
-                    crash_candidates: (0..count).collect(),
-                    peer_indices: vec![(0..count).collect(); count],
-                    nodes,
-                    client_role,
-                    roles: self.roles.clone(),
-                })
-            })
-            .clone())
+#[cfg(test)]
+impl Deployment {
+    /// One quorum group of `count` nodes of one role, every client operation
+    /// addressed to it.
+    pub fn test_cluster(count: usize) -> Self {
+        use spur_ast::types::Type;
+        let role = NameId(0);
+        let nodes: Arc<[NodeId]> = (0..count).map(|index| NodeId { role, index }).collect();
+        Deployment {
+            spec: DeployMetadata {
+                id: NameId(2),
+                name: "Main".into(),
+                client: NameId(1),
+                parameter: None,
+                fields: vec![],
+                root: Type::Tuple(vec![]),
+            },
+            root: Value::unit(),
+            contexts: vec![Value::unit(); count],
+            ordinals: (0..count).collect(),
+            paths: (0..count).map(|i| Some(format!("nodes[{i}]"))).collect(),
+            hash: 0,
+            canonical_params: serde_json::json!({}),
+            groups: vec![Group { paths: vec!["nodes".into()], role, members: nodes.to_vec(), quorum: true }],
+            fanout_width: vec![count.saturating_sub(1) as u32; count],
+            crash_candidates: (0..count).collect(),
+            peer_indices: vec![(0..count).collect(); count],
+            client_role: NameId(1),
+            destinations: [Some(nodes.to_vec()), Some(nodes.to_vec()), Some(nodes.to_vec())],
+            nodes,
+            roles: Arc::default(),
+        }
     }
 }
 
 #[cfg(test)]
 mod test;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deployments_share_instances_and_resolve_role_functions() {
-        let program = crate::compiler::compile(
-            include_str!("../../tests/fixtures/canchor.spur"),
-            "canchor.spur",
-        )
-        .into_program()
-        .unwrap();
-        let a = program.deployments.get(3).unwrap();
-        let b = program.deployments.get(3).unwrap();
-        let c = program.deployments.get(5).unwrap();
-        assert!(Arc::ptr_eq(&a, &b));
-        assert!(!Arc::ptr_eq(&a, &c));
-        assert_eq!(
-            a.nodes.iter().map(|n| n.index).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert_eq!(a.groups[0].members.as_slice(), a.nodes.as_ref());
-        assert_eq!(a.fanout_width, vec![2; 3]);
-        assert!(a.functions(a.client_role).write.is_some());
-        assert!(a.functions(a.nodes[0].role).base_init.is_some());
-    }
-}

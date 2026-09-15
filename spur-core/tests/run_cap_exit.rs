@@ -19,7 +19,7 @@ const SPEC: &str = include_str!("fixtures/kv.spur");
 /// A workload with far more client operations than the seeded cap allows
 /// steps, so the run cannot complete before the cap ends it.
 const CONFIG: &str = r#"{
-  "num_servers": {"min": 3, "max": 3, "step": 1},
+  "params": {"n": {"min": 3, "max": 3, "step": 1}},
   "num_write_ops": {"min": 10, "max": 10, "step": 1},
   "num_read_ops": {"min": 10, "max": 10, "step": 1},
   "num_keys": {"min": 2, "max": 2, "step": 1},
@@ -121,7 +121,13 @@ fn check() {
     let program = compiler::compile(SPEC, "kv.spur")
         .into_program()
         .expect("spec compiles");
-    let config: ExplorerConfig = serde_json::from_str(CONFIG).expect("config parses");
+    let mut config: ExplorerConfig = serde_json::from_str(CONFIG).expect("config parses");
+    config
+        .bind(
+            &program,
+            &std::sync::Arc::new(std::sync::Mutex::new(spur_core::simulator::deploy::params::DeployCache::default())),
+        )
+        .expect("config binds");
     let run_config = config
         .expand_grid()
         .into_iter()
