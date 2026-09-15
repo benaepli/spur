@@ -63,6 +63,7 @@ pub enum Expr {
     Div(Box<Expr>, Box<Expr>),
     Mod(Box<Expr>, Box<Expr>),
     Min(Box<Expr>, Box<Expr>),
+    IndexOf(Box<Expr>, Box<Expr>),
     Tuple(Vec<Expr>),
     TupleAccess(Box<Expr>, usize),
     Unit,
@@ -128,6 +129,9 @@ pub struct FunctionInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Label {
+    Spawn(NameId, Expr, Lhs, Vertex, #[serde(skip)] Span),
+    Provide(Expr, Expr, Vertex, #[serde(skip)] Span),
+    ProvideAll(Expr, Expr, Vertex, #[serde(skip)] Span),
     Instr(Instr, Vertex /* next_vertex */),
     Pause(Vertex /* next_vertex */),
     MakeChannel(Lhs, Option<usize>, Vertex),
@@ -188,6 +192,8 @@ impl Cfg {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Program {
+    #[serde(skip)]
+    pub topology: spur_ast::types::TopologyMetadata,
     #[serde(skip)]
     pub deployments: crate::simulator::deploy::DeploymentCatalog,
     // The CFG is just a list of all vertices.

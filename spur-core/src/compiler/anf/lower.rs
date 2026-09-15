@@ -786,6 +786,7 @@ impl AnfLowerer {
             .map(|f| self.lower_func_def(f))
             .collect();
         ARoleDef {
+            param: AFuncParam { name: role.param.name, original_name: role.param.original_name, ty: role.param.ty, span: role.param.span },
             name: role.name,
             original_name: role.original_name,
             var_inits,

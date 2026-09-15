@@ -95,12 +95,12 @@ fn gen_level5(out: &mut String, i: usize) {
 }
 
 const BOILERPLATE: &str = r#"
-role Node {
-    fn Init(me: int) {}
+role Node(ctx: int) {
+    fn Init() {}
 }
 
-ClientInterface {
-    async fn Write(dest: Node, key: string, value: string) {}
-    async fn Read(dest: Node, key: string): string? { nil }
+client KV(sys: int) {
+    async fn Write(dest: Node, key: string, uid: int) {}
+    async fn Read(dest: Node, key: string): list<int> { [] }
 }
 "#;

@@ -188,6 +188,7 @@ pub struct LForInLoop {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LProgram {
+    pub topology: spur_ast::types::TopologyMetadata,
     pub top_level_defs: Vec<LTopLevelDef>,
     pub next_name_id: usize,
     pub id_to_name: HashMap<NameId, String>,
@@ -203,6 +204,8 @@ pub enum LTopLevelDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LRoleDef {
+    pub kind: spur_ast::types::RoleKind,
+    pub param: LFuncParam,
     pub name: NameId,
     pub original_name: String,
     pub var_inits: Vec<LVarInit>,

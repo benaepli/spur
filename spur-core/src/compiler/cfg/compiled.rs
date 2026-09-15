@@ -66,6 +66,7 @@ pub enum CExpr {
     Div(Opnd, Opnd),
     Mod(Opnd, Opnd),
     Min(Opnd, Opnd),
+    IndexOf(Opnd, Opnd),
     Tuple(Vec<Opnd>),
     TupleAccess(Opnd, usize),
     Unwrap(Opnd),
@@ -164,6 +165,9 @@ pub struct RecvOp {
 /// One vertex decoded. Vertex ids are the label's own targets.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
+    Spawn(Box<SpawnOp>),
+    Provide(Box<ProvideOp>),
+    ProvideAll(Box<ProvideOp>),
     AssignLocal { slot: u32, next: u32, rhs: Opnd },
     AssignNode { slot: u32, next: u32, rhs: Opnd },
     SyncCall(Box<SyncCallOp>),
@@ -616,6 +620,9 @@ impl Builder<'_> {
                 next: vertex(*next),
                 peer: opnd(peer),
             },
+            Label::Spawn(role, count, lhs, next, span) => Op::Spawn(Box::new(SpawnOp { role: *role, count: opnd(count), dest: dest(lhs), next: vertex(*next), span: *span })),
+            Label::Provide(handle, value, next, span) => Op::Provide(Box::new(ProvideOp { handle: opnd(handle), value: opnd(value), next: vertex(*next), span: *span })),
+            Label::ProvideAll(handle, value, next, span) => Op::ProvideAll(Box::new(ProvideOp { handle: opnd(handle), value: opnd(value), next: vertex(*next), span: *span })),
             Label::UniqueId(lhs, next) => Op::UniqueId {
                 dest: dest(lhs),
                 next: vertex(*next),
@@ -784,6 +791,7 @@ fn tree(expr: &Expr) -> CExpr {
         Expr::Times(a, b) => CExpr::Times(o(a), o(b)),
         Expr::Div(a, b) => CExpr::Div(o(a), o(b)),
         Expr::Mod(a, b) => CExpr::Mod(o(a), o(b)),
+        Expr::IndexOf(a, b) => CExpr::IndexOf(o(a), o(b)),
         Expr::Min(a, b) => CExpr::Min(o(a), o(b)),
         Expr::Tuple(es) => CExpr::Tuple(es.iter().map(o).collect()),
         Expr::TupleAccess(a, i) => CExpr::TupleAccess(o(a), *i),
@@ -801,4 +809,21 @@ fn tree(expr: &Expr) -> CExpr {
         Expr::SafeFind(a, b) => CExpr::SafeFind(o(a), o(b)),
         Expr::SafeTupleAccess(a, i) => CExpr::SafeTupleAccess(o(a), *i),
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpawnOp {
+    pub role: NameId,
+    pub count: Opnd,
+    pub dest: Dest,
+    pub next: u32,
+    pub span: crate::parser::Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvideOp {
+    pub handle: Opnd,
+    pub value: Opnd,
+    pub next: u32,
+    pub span: crate::parser::Span,
 }

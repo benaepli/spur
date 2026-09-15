@@ -56,6 +56,7 @@ fn tree_reads(e: &CExpr, out: &mut Vec<u32>) {
         | CExpr::Times(a, b)
         | CExpr::Div(a, b)
         | CExpr::Mod(a, b)
+        | CExpr::IndexOf(a, b)
         | CExpr::Min(a, b)
         | CExpr::Coalesce(a, b)
         | CExpr::SafeFind(a, b) => {
@@ -165,6 +166,8 @@ fn step(program: &Program, ops: &[Op], v: usize, failures: &mut Vec<String>) -> 
             vec![edge(*next, local(*dest))]
         }
         Op::SetTimer { dest, next, .. } => vec![edge(*next, local(*dest))],
+        Op::Spawn(s) => { opnd_reads(&s.count, &mut reads); vec![edge(s.next, local(s.dest))] }
+        Op::Provide(p) | Op::ProvideAll(p) => { opnd_reads(&p.handle, &mut reads); opnd_reads(&p.value, &mut reads); vec![edge(p.next, None)] }
         Op::UniqueId { dest, next } => vec![edge(*next, local(*dest))],
         Op::CondLocal { slot, then, els } => {
             reads.push(*slot);

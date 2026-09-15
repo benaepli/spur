@@ -669,6 +669,7 @@ pub enum ScheduleResult<H: HashPolicy> {
 
 #[derive(Debug, Clone)]
 pub struct State<H: HashPolicy> {
+    pub allocator: Option<Box<super::super::deploy::allocator::Allocator<H>>>,
     pub deployment: Option<std::sync::Arc<super::super::deploy::Deployment>>,
     pub deployed_count: usize,
     pub deployed_nodes: std::sync::Arc<[NodeId]>,
@@ -936,6 +937,7 @@ impl<H: HashPolicy> State<H> {
         let num_nodes = nodes.len();
         let deployed_nodes = role_node_counts.iter().flat_map(|(role, count)| std::iter::repeat_n(*role, *count)).enumerate().map(|(index, role)| NodeId { role, index }).collect();
         Self {
+            allocator: None,
             deployment: None,
             deployed_count: num_nodes,
             deployed_nodes,

@@ -869,7 +869,7 @@ fn lower_role(
     role: ARoleDef,
 ) -> (TRoleDef, NameId, Vec<(NameId, String, Type)>, TFuncDef) {
     // 1. Extract state struct fields, allocating a NameId for each field
-    let state_fields: Vec<(NameId, String, Type)> = role
+    let mut state_fields: Vec<(NameId, String, Type)> = role
         .var_inits
         .iter()
         .map(|vi| {
@@ -893,6 +893,14 @@ fn lower_role(
     let (s_id, _) = lowerer.fresh_name("s");
     lowerer.state_name_id = s_id;
     lowerer.state_type = Some(state_type.clone());
+
+    let self_type = Type::Role(role.name, role.original_name.clone());
+    for (id, name, ty) in [(crate::compiler::cfg::SELF_NAME, "self".to_string(), self_type), (role.param.name, role.param.original_name.clone(), role.param.ty.clone())] {
+        let (field, _) = lowerer.fresh_name(&name);
+        state_fields.push((field, name.clone(), ty.clone()));
+        lowerer.role_var_ids.insert(id);
+        lowerer.role_vars.push((id, field, name, ty));
+    }
 
     // 3. Generate init function
     let init_func = generate_init_func(lowerer, &role, state_struct_id, &state_type, &state_fields);
@@ -959,6 +967,9 @@ fn generate_init_func(
         }
     }
 
+    let context_fields = &state_fields[role.var_inits.len()..];
+    struct_fields.push((context_fields[0].0, TAtomic::Var(crate::compiler::cfg::SELF_NAME, "self".into())));
+    struct_fields.push((context_fields[1].0, TAtomic::Var(role.param.name, role.param.original_name.clone())));
     let struct_lit = TExpr {
         kind: TExprKind::StructLit(state_struct_id, struct_fields),
         ty: state_type.clone(),
@@ -983,7 +994,10 @@ fn generate_init_func(
         original_name: func_name,
         is_sync: true,
         is_traced: false,
-        params: vec![],
+        params: vec![
+            TFuncParam { name: crate::compiler::cfg::SELF_NAME, original_name: "self".into(), ty: Type::Role(role.name, role.original_name.clone()), span: role.span },
+            TFuncParam { name: role.param.name, original_name: role.param.original_name.clone(), ty: role.param.ty.clone(), span: role.param.span },
+        ],
         return_type: state_type.clone(),
         body: TBlock {
             statements: body_stmts,

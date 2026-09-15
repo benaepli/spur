@@ -433,6 +433,37 @@ pub fn report_type_errors(
                     .eprint((filename, Source::from(source)))?;
             }
 
+            TypeError::RoleParamNotDeployable { message, span }
+            | TypeError::AssignToRoleParam { message, span }
+            | TypeError::InitSignature { message, span }
+            | TypeError::SelfOutsideRole { message, span }
+            | TypeError::SpawnNotRole { message, span }
+            | TypeError::ProvideTargetNotRole { message, span }
+            | TypeError::ProvideValueType { message, span }
+            | TypeError::DeployNodeBound { message, span }
+            | TypeError::DeployParamNotStruct { message, span }
+            | TypeError::ParamFieldUntagged { message, span }
+            | TypeError::ParamFieldTwoTags { message, span }
+            | TypeError::ScaleType { message, span }
+            | TypeError::ChoiceType { message, span }
+            | TypeError::DeployNotFree { message, span }
+            | TypeError::DeployReturnType { message, span }
+            | TypeError::DeployClientMissing { message, span }
+            | TypeError::DeployClientUnknown { message, span }
+            | TypeError::ClientParamMismatch { message, span }
+            | TypeError::ClientOpMissing { message, span }
+            | TypeError::ClientOpSync { message, span }
+            | TypeError::ClientOpSignature { message, span }
+            | TypeError::TagPlacement { message, span }
+            | TypeError::QuorumType { message, span }
+            | TypeError::UnknownTag { message, span }
+            | TypeError::DuplicateTag { message, span } => {
+                Report::build(ReportKind::Error, filename, span.start)
+                    .with_message(message)
+                    .with_label(Label::new((filename, span.start..span.end)).with_message(message).with_color(Color::Red))
+                    .finish().eprint((filename, Source::from(source)))?;
+            }
+
             TypeError::RpcCallTargetNotRole { ty, span } => {
                 Report::build(ReportKind::Error, filename, span.start)
                     .with_message("invalid RPC call target")

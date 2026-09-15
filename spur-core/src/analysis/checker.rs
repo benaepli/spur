@@ -1,3 +1,4 @@
+mod topology;
 use crate::analysis::resolver::{
     BuiltinFn, NameId, PrepopulatedTypes, ResolvedAssignItem, ResolvedAssignment, ResolvedBlock,
     ResolvedCondExpr, ResolvedExpr, ResolvedExprKind, ResolvedForInLoop, ResolvedForLoop,
@@ -22,6 +23,57 @@ use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Clone)]
 pub enum TypeError {
+    #[error("RoleParamNotDeployable: {message}")]
+    RoleParamNotDeployable { message: String, span: Span },
+    #[error("AssignToRoleParam: {message}")]
+    AssignToRoleParam { message: String, span: Span },
+    #[error("InitSignature: {message}")]
+    InitSignature { message: String, span: Span },
+    #[error("SelfOutsideRole: {message}")]
+    SelfOutsideRole { message: String, span: Span },
+    #[error("SpawnNotRole: {message}")]
+    SpawnNotRole { message: String, span: Span },
+    #[error("ProvideTargetNotRole: {message}")]
+    ProvideTargetNotRole { message: String, span: Span },
+    #[error("ProvideValueType: {message}")]
+    ProvideValueType { message: String, span: Span },
+    #[error("DeployNodeBound: {message}")]
+    DeployNodeBound { message: String, span: Span },
+    #[error("DeployParamNotStruct: {message}")]
+    DeployParamNotStruct { message: String, span: Span },
+    #[error("ParamFieldUntagged: {message}")]
+    ParamFieldUntagged { message: String, span: Span },
+    #[error("ParamFieldTwoTags: {message}")]
+    ParamFieldTwoTags { message: String, span: Span },
+    #[error("ScaleType: {message}")]
+    ScaleType { message: String, span: Span },
+    #[error("ChoiceType: {message}")]
+    ChoiceType { message: String, span: Span },
+    #[error("DeployNotFree: {message}")]
+    DeployNotFree { message: String, span: Span },
+    #[error("DeployReturnType: {message}")]
+    DeployReturnType { message: String, span: Span },
+    #[error("DeployClientMissing: {message}")]
+    DeployClientMissing { message: String, span: Span },
+    #[error("DeployClientUnknown: {message}")]
+    DeployClientUnknown { message: String, span: Span },
+    #[error("ClientParamMismatch: {message}")]
+    ClientParamMismatch { message: String, span: Span },
+    #[error("ClientOpMissing: {message}")]
+    ClientOpMissing { message: String, span: Span },
+    #[error("ClientOpSync: {message}")]
+    ClientOpSync { message: String, span: Span },
+    #[error("ClientOpSignature: {message}")]
+    ClientOpSignature { message: String, span: Span },
+    #[error("TagPlacement: {message}")]
+    TagPlacement { message: String, span: Span },
+    #[error("QuorumType: {message}")]
+    QuorumType { message: String, span: Span },
+    #[error("UnknownTag: {message}")]
+    UnknownTag { message: String, span: Span },
+    #[error("DuplicateTag: {message}")]
+    DuplicateTag { message: String, span: Span },
+
     #[error("Type Mismatch: Expected `{expected}`, but found `{found}`")]
     Mismatch {
         expected: Type,
@@ -169,6 +221,8 @@ enum TypeDefinition {
 }
 
 pub struct TypeChecker {
+    role_params: HashMap<NameId, (spur_ast::types::RoleKind, Type)>,
+    current_role_param: Option<NameId>,
     scopes: Vec<HashMap<NameId, Type>>,
     type_defs: HashMap<NameId, TypeDefinition>,
     func_signatures: HashMap<NameId, FunctionSignature>,
@@ -235,6 +289,8 @@ impl TypeChecker {
         );
 
         Self {
+            role_params: HashMap::new(),
+            current_role_param: None,
             scopes: vec![HashMap::new()],
             type_defs: predefined,
             func_signatures: HashMap::new(),
@@ -277,7 +333,16 @@ impl TypeChecker {
 
     pub fn check_program(&mut self, program: ResolvedProgram) -> (TypedProgram, Vec<TypeError>) {
         self.collect_definitions(&program);
+        for def in &program.top_level_defs {
+            if let ResolvedTopLevelDef::Role(role) = def {
+                let ty = self.resolve_type(&role.param.type_def).unwrap_or(Type::Error);
+                self.role_params.insert(role.name, (role.kind, ty));
+            }
+        }
 
+        let tags = program.top_level_defs.iter().filter_map(|d| match d {
+            ResolvedTopLevelDef::Type(t) => match &t.def { ResolvedTypeDefStmtKind::Struct(fs) => Some(fs), _ => None }, _ => None
+        }).flatten().map(|f| (f.id, f.annotations.clone())).collect();
         let next_name_id = program.next_name_id;
         let id_to_name = program.id_to_name;
         let mut typed_top_levels = Vec::new();
@@ -336,9 +401,11 @@ impl TypeChecker {
 
         self.trivially_copyable = compute_trivially_copyable(&struct_defs, &enum_defs);
 
+        let topology = self.check_topology(&typed_top_levels, &struct_defs, &enum_defs, tags);
         let errors = std::mem::take(&mut self.errors);
         (
             TypedProgram {
+                topology,
                 top_level_defs: typed_top_levels,
                 next_name_id,
                 id_to_name,
@@ -448,6 +515,10 @@ impl TypeChecker {
     fn check_role_def(&mut self, role: ResolvedRoleDef) -> TypedRoleDef {
         self.enter_scope();
         self.current_func_is_sync = true;
+        let ty = self.role_params[&role.name].1.clone();
+        self.add_var(role.param.name, ty.clone());
+        self.current_role_param = Some(role.param.name);
+        let param = TypedFuncParam { name: role.param.name, original_name: role.param.original_name, ty, span: role.param.span };
 
         let mut typed_var_inits = Vec::new();
         for var_init in role.var_inits {
@@ -462,7 +533,10 @@ impl TypeChecker {
         }
 
         self.exit_scope();
+        self.current_role_param = None;
         TypedRoleDef {
+            kind: role.kind,
+            param,
             name: role.name,
             original_name: role.original_name,
             var_inits: typed_var_inits,
@@ -480,6 +554,7 @@ impl TypeChecker {
                     span: func.span,
                 });
                 return TypedFuncDef {
+                    annotations: func.annotations,
                     name: func.name,
                     original_name: func.original_name,
                     is_sync: false,
@@ -557,6 +632,7 @@ impl TypeChecker {
         self.current_func_is_sync = false;
         self.exit_scope();
         TypedFuncDef {
+            annotations: func.annotations,
             name: func.name,
             original_name: func.original_name,
             is_sync: sig.is_sync,
@@ -1153,6 +1229,9 @@ impl TypeChecker {
     ) -> TypedAssignItem {
         match item {
             ResolvedAssignItem::Existing(id, name) => {
+                if self.current_role_param == Some(id) {
+                    self.emit(TypeError::AssignToRoleParam { message: "role parameters are read-only".into(), span });
+                }
                 // Look up the existing variable's type and check it matches
                 let var_ty = self.get_var_type(id, span).unwrap_or(Type::Error);
                 if var_ty != Type::Error && *expected_ty != Type::Error {
@@ -1476,6 +1555,20 @@ impl TypeChecker {
     fn infer_expr(&mut self, expr: ResolvedExpr) -> TypedExpr {
         let span = expr.span;
         match expr.kind {
+            ResolvedExprKind::SelfHandle(role) => match role {
+                Some(id) => TypedExpr { kind: TypedExprKind::Var(crate::compiler::cfg::SELF_NAME, "self".into()), ty: Type::Role(id, self.role_defs[&id].clone()), span },
+                None => { self.emit(TypeError::SelfOutsideRole { message: "self requires a role or client".into(), span }); self.error_expr(span) }
+            },
+            ResolvedExprKind::Spawn(ty, count) => {
+                let ty = self.resolve_type(&ty).unwrap_or(Type::Error);
+                if let Type::Role(id, _) = &ty {
+                    if self.role_params.get(id).is_some_and(|(kind, _)| *kind == spur_ast::types::RoleKind::Role) {
+                        let count = self.check_expr(*count, &Type::Int);
+                        let result = Type::List(Box::new(ty.clone()));
+                        TypedExpr { kind: TypedExprKind::FuncCall(TypedFuncCall::Builtin(BuiltinFn::Spawn(*id), vec![count], result.clone())), ty: result, span }
+                    } else { self.emit(TypeError::SpawnNotRole { message: "clients cannot be spawned".into(), span }); self.error_expr(span) }
+                } else { self.emit(TypeError::SpawnNotRole { message: "spawn requires a role type".into(), span }); self.error_expr(span) }
+            },
             ResolvedExprKind::Var(name_id, name) => match self.get_var_type(name_id, span) {
                 Ok(ty) => TypedExpr {
                     kind: TypedExprKind::Var(name_id, name),
@@ -2660,6 +2753,9 @@ impl TypeChecker {
         args: Vec<ResolvedExpr>,
         span: Span,
     ) -> TypedExpr {
+        if matches!(builtin, BuiltinFn::Provide | BuiltinFn::ProvideAll | BuiltinFn::IndexOf) {
+            return self.check_topology_builtin(builtin, args, span);
+        }
         // Special case: role_to_string accepts any role type
         if builtin == BuiltinFn::RoleToString {
             if args.len() != 1 {

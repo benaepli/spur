@@ -381,6 +381,11 @@ pub fn ceval<H: HashPolicy>(
             }
             Ok(vec[i].clone())
         }
+        CExpr::IndexOf(xs, x) => {
+            let xs = coperand(l, n, xs, r, t)?;
+            let x = coperand(l, n, x, r, t)?;
+            Ok(match xs.as_list()?.iter().position(|v| v == &*x) { Some(i) => Value::option_some(Value::int(i as i64)), None => Value::option_none() })
+        }
         CExpr::Min(e1, e2) => {
             let v1 = coperand(l, n, e1, r, t)?.as_int()?;
             let v2 = coperand(l, n, e2, r, t)?.as_int()?;

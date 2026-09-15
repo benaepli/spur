@@ -480,6 +480,10 @@ fn fmt_builtin(b: BuiltinFn) -> &'static str {
         BuiltinFn::IntToString => "int_to_string",
         BuiltinFn::BoolToString => "bool_to_string",
         BuiltinFn::RoleToString => "role_to_string",
+        BuiltinFn::Spawn(_) => "spawn",
+        BuiltinFn::Provide => "provide",
+        BuiltinFn::ProvideAll => "provide_all",
+        BuiltinFn::IndexOf => "index_of",
         BuiltinFn::UniqueId => "unique_id",
     }
 }

@@ -183,6 +183,31 @@ fn type_error_span(e: &TypeError) -> spur_core::parser::Span {
         | NotATuple { span, .. }
         | UndefinedStructField { span, .. }
         | MissingStructField { span, .. }
+        | RoleParamNotDeployable { span, .. }
+        | AssignToRoleParam { span, .. }
+        | InitSignature { span, .. }
+        | SelfOutsideRole { span, .. }
+        | SpawnNotRole { span, .. }
+        | ProvideTargetNotRole { span, .. }
+        | ProvideValueType { span, .. }
+        | DeployNodeBound { span, .. }
+        | DeployParamNotStruct { span, .. }
+        | ParamFieldUntagged { span, .. }
+        | ParamFieldTwoTags { span, .. }
+        | ScaleType { span, .. }
+        | ChoiceType { span, .. }
+        | DeployNotFree { span, .. }
+        | DeployReturnType { span, .. }
+        | DeployClientMissing { span, .. }
+        | DeployClientUnknown { span, .. }
+        | ClientParamMismatch { span, .. }
+        | ClientOpMissing { span, .. }
+        | ClientOpSync { span, .. }
+        | ClientOpSignature { span, .. }
+        | TagPlacement { span, .. }
+        | QuorumType { span, .. }
+        | UnknownTag { span, .. }
+        | DuplicateTag { span, .. }
         | RpcCallTargetNotRole { span, .. }
         | FifoTargetNotRole { span, .. }
         | NotAList { span, .. }

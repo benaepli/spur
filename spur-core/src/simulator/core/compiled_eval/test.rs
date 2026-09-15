@@ -62,6 +62,7 @@ fn kind(e: &Expr) -> usize {
         Expr::VariantPayload(_) => 41,
         Expr::SafeFind(_, _) => 42,
         Expr::SafeTupleAccess(_, _) => 43,
+        Expr::IndexOf(_, _) => 44,
     }
 }
 

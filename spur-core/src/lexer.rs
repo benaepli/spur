@@ -82,7 +82,9 @@ pub enum TokenKind {
     // Keywords
     Enum,
     Match,
-    ClientInterface,
+    Client,
+    SelfHandle,
+    Spawn,
     Role,
     Fn,
     Var,
@@ -169,7 +171,9 @@ impl fmt::Display for TokenKind {
             TokenKind::FStringPart(s) => write!(f, "}} {} {{", s),
             TokenKind::FStringEnd(s) => write!(f, "}} {}\"", s),
             TokenKind::Integer(i) => write!(f, "{}", i),
-            TokenKind::ClientInterface => write!(f, "ClientInterface"),
+            TokenKind::Client => write!(f, "client"),
+            TokenKind::SelfHandle => write!(f, "self"),
+            TokenKind::Spawn => write!(f, "spawn"),
             TokenKind::Enum => write!(f, "enum"),
             TokenKind::Match => write!(f, "match"),
             TokenKind::Role => write!(f, "role"),
@@ -220,7 +224,9 @@ impl fmt::Display for TokenKind {
 static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "enum" => TokenKind::Enum,
     "match" => TokenKind::Match,
-    "ClientInterface" => TokenKind::ClientInterface,
+    "client" => TokenKind::Client,
+    "self" => TokenKind::SelfHandle,
+    "spawn" => TokenKind::Spawn,
     "role" => TokenKind::Role,
     "fn" => TokenKind::Fn,
     "var" => TokenKind::Var,
@@ -741,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_identifiers_and_numbers() {
-        let input = "myVar 123 _test ClientInterface";
+        let input = "myVar 123 _test client";
         let mut lexer = Lexer::new(input);
         let (tokens, errors) = lexer.collect_all();
 
@@ -750,7 +756,7 @@ mod tests {
         assert!(matches!(tokens[0].kind, TokenKind::Identifier(_)));
         assert_eq!(tokens[1].kind, TokenKind::Integer(123));
         assert!(matches!(tokens[2].kind, TokenKind::Identifier(_)));
-        assert_eq!(tokens[3].kind, TokenKind::ClientInterface);
+        assert_eq!(tokens[3].kind, TokenKind::Client);
     }
 
     #[test]

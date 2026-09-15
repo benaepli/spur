@@ -20,6 +20,7 @@ pub fn lower_program(typed: TypedProgram) -> LProgram {
         .collect();
 
     LProgram {
+        topology: typed.topology,
         top_level_defs,
         next_name_id: lowerer.next_name_id,
         id_to_name: typed.id_to_name,
@@ -65,6 +66,8 @@ impl Lowerer {
             .map(|f| self.lower_func_def(f))
             .collect();
         LRoleDef {
+            kind: role.kind,
+            param: LFuncParam { name: role.param.name, original_name: role.param.original_name, ty: role.param.ty, span: role.param.span },
             name: role.name,
             original_name: role.original_name,
             var_inits,

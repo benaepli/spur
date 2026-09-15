@@ -330,6 +330,7 @@ pub enum TypedPatternKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedProgram {
+    pub topology: TopologyMetadata,
     pub top_level_defs: Vec<TypedTopLevelDef>,
     pub next_name_id: usize,
     pub id_to_name: HashMap<NameId, String>,
@@ -347,6 +348,8 @@ pub enum TypedTopLevelDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedRoleDef {
+    pub kind: RoleKind,
+    pub param: TypedFuncParam,
     pub name: NameId,
     pub original_name: String,
     pub var_inits: Vec<TypedVarInit>,
@@ -356,6 +359,7 @@ pub struct TypedRoleDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedFuncDef {
+    pub annotations: Vec<Annotation>,
     pub name: NameId,
     pub original_name: String,
     pub is_sync: bool,
@@ -372,4 +376,52 @@ pub struct TypedFuncParam {
     pub original_name: String,
     pub ty: Type,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RoleKind { Role, Client }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub name: String,
+    pub args: Vec<(String, String)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamTag { Scale, Choice }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamField {
+    pub name: String,
+    pub ty: Type,
+    pub tag: ParamTag,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeployMetadata {
+    pub id: NameId,
+    pub name: String,
+    pub client: NameId,
+    pub parameter: Option<Type>,
+    pub fields: Vec<ParamField>,
+    pub root: Type,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleMetadata {
+    pub kind: RoleKind,
+    pub parameter: Type,
+    pub parameter_id: NameId,
+    pub destinations: HashMap<String, Option<NameId>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TopologyMetadata {
+    pub roles: HashMap<NameId, RoleMetadata>,
+    pub deploys: Vec<DeployMetadata>,
+    pub structs: HashMap<NameId, Vec<(NameId, String, Type)>>,
+    pub enums: HashMap<NameId, Vec<(NameId, String, Option<Type>)>>,
+    pub tags: HashMap<NameId, Vec<Annotation>>,
+    pub warnings: Vec<String>,
 }

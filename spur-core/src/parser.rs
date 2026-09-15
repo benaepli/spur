@@ -1,3 +1,4 @@
+pub use spur_ast::types::{Annotation, RoleKind};
 pub mod format;
 
 use crate::lexer::{Token, TokenKind};
@@ -40,6 +41,8 @@ pub enum TopLevelDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoleDef {
+    pub kind: RoleKind,
+    pub param: FuncParam,
     pub name: String,
     pub var_inits: Vec<VarInit>,
     pub func_defs: Vec<FuncDef>,
@@ -48,6 +51,7 @@ pub struct RoleDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDef {
+    pub annotations: Vec<Annotation>,
     pub name: String,
     pub is_sync: bool,
     pub is_traced: bool,
@@ -110,6 +114,7 @@ pub struct EnumVariant {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldDef {
+    pub annotations: Vec<Annotation>,
     pub name: String,
     pub type_def: TypeDef,
     pub span: Span,
@@ -247,6 +252,8 @@ impl Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
+    SelfHandle,
+    Spawn(TypeDef, Box<Expr>),
     // Variables and literals
     Var(String),
     IntLit(i64),
@@ -952,6 +959,10 @@ where
     };
 
     let builtins = choice((
+        just(TokenKind::SelfHandle).to(ExprKind::SelfHandle),
+        just(TokenKind::Spawn).ignore_then(type_def.clone().delimited_by(just(TokenKind::Less), just(TokenKind::Greater)))
+            .then(expr.clone().delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)))
+            .map(|(ty, count)| ExprKind::Spawn(ty, Box::new(count))),
         two_arg_builtin(TokenKind::Append, ExprKind::Append),
         two_arg_builtin(TokenKind::Prepend, ExprKind::Prepend),
         two_arg_builtin(TokenKind::Min, ExprKind::Min),
@@ -1291,14 +1302,19 @@ where
             type_def,
             span: e.span(),
         });
-    let func_params = func_param
+    let func_params = func_param.clone()
         .separated_by(just(TokenKind::Comma))
         .allow_trailing()
         .collect::<Vec<_>>();
 
-    let func_def = just(TokenKind::At)
-        .then(just(TokenKind::Identifier("trace".into())))
-        .or_not()
+    let qualified_name = ident.clone().separated_by(just(TokenKind::Dot)).at_least(1).collect::<Vec<_>>().map(|parts| parts.join("."));
+    let annotation_key = ident.clone().or(just(TokenKind::Client).to("client".to_string()));
+    let annotation = just(TokenKind::At).ignore_then(ident.clone()).then(
+        annotation_key.then_ignore(just(TokenKind::Equal)).then(qualified_name)
+            .separated_by(just(TokenKind::Comma)).allow_trailing().collect::<Vec<_>>()
+            .delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)).or_not()
+    ).map_with(|(name, args), e| Annotation { name, args: args.unwrap_or_default(), span: e.span() });
+    let func_def = annotation.clone().repeated().collect::<Vec<_>>()
         .then(just(TokenKind::Async).or_not())
         .then_ignore(just(TokenKind::Fn))
         .then(ident.clone())
@@ -1309,20 +1325,22 @@ where
                 .or_not(),
         )
         .then(block_p.clone())
-        .map_with(|(((((is_traced_opt, is_async_opt), name), params), return_type), body), e| FuncDef {
+        .map_with(|(((((annotations, is_async_opt), name), params), return_type), body), e| FuncDef {
                 name,
                 is_sync: is_async_opt.is_none(),
-                is_traced: is_traced_opt.is_some(),
+                is_traced: annotations.iter().any(|a| a.name == "trace"),
+                annotations,
                 params,
                 return_type,
                 body,
                 span: e.span(),
         });
 
-    let field_def = ident.clone()
+    let field_def = annotation.repeated().collect::<Vec<_>>().then(ident.clone())
         .then_ignore(just(TokenKind::Colon))
         .then(type_def.clone())
-        .map_with(|(name, type_def), e| FieldDef {
+        .map_with(|((annotations, name), type_def), e| FieldDef {
+            annotations,
             name,
             type_def,
             span: e.span(),
@@ -1378,27 +1396,12 @@ where
             .delimited_by(just(TokenKind::LeftBrace), just(TokenKind::RightBrace))
     };
 
-    let role_def = just(TokenKind::Role)
-        .ignore_then(ident.clone())
+    let role_def = choice((just(TokenKind::Role).to(RoleKind::Role), just(TokenKind::Client).to(RoleKind::Client)))
+        .then(ident.clone())
+        .then(func_param.delimited_by(just(TokenKind::LeftParen), just(TokenKind::RightParen)))
         .then(role_contents())
-        .map_with(|(name, (var_inits, func_defs)), e| {
-            TopLevelDef::Role(RoleDef {
-                name,
-                var_inits,
-                func_defs,
-                span: e.span(),
-            })
-        });
-
-    let client_def = just(TokenKind::ClientInterface)
-        .ignore_then(role_contents())
-        .map_with(|(var_inits, func_defs), e| {
-            TopLevelDef::Role(RoleDef {
-                name: "ClientInterface".to_string(),
-                var_inits,
-                func_defs,
-                span: e.span(),
-            })
+        .map_with(|(((kind, name), param), (var_inits, func_defs)), e| {
+            TopLevelDef::Role(RoleDef { kind, name, param, var_inits, func_defs, span: e.span() })
         });
 
     let free_func = func_def.clone().validate(|func, e, emitter| {
@@ -1410,7 +1413,6 @@ where
 
     choice((
         role_def,
-        client_def,
         type_def_stmt.map(TopLevelDef::Type),
         free_func,
     ))
@@ -1418,7 +1420,7 @@ where
         any_ref().ignored(),
         choice((
             just(TokenKind::Role).ignored(),
-            just(TokenKind::ClientInterface).ignored(),
+            just(TokenKind::Client).ignored(),
             just(TokenKind::Type).ignored(),
             just(TokenKind::Fn).ignored(),
             just(TokenKind::At).ignored(),
@@ -1546,7 +1548,7 @@ fn validate_expr(expr: &Expr, errors: &mut Vec<ValidationError>) {
             validate_expr(a, errors);
             validate_expr(b, errors);
         }
-        ExprKind::Not(a) | ExprKind::Negate(a) | ExprKind::Head(a) | ExprKind::Tail(a) |
+        ExprKind::Spawn(_, a) | ExprKind::Not(a) | ExprKind::Negate(a) | ExprKind::Head(a) | ExprKind::Tail(a) |
         ExprKind::Len(a) | ExprKind::TupleAccess(a, _) | ExprKind::SafeTupleAccess(a, _) | ExprKind::FieldAccess(a, _) |
         ExprKind::Unwrap(a) | ExprKind::SafeFieldAccess(a, _) | ExprKind::PersistData(a) |
         ExprKind::Recv(a) | ExprKind::Fifo(a) | ExprKind::Return(Some(a)) => {
@@ -1603,7 +1605,7 @@ fn validate_expr(expr: &Expr, errors: &mut Vec<ValidationError>) {
         ExprKind::IntLit(_) | ExprKind::StringLit(_) | ExprKind::BoolLit(_) | ExprKind::NilLit |
         ExprKind::VariantLit(_, _, None) | ExprKind::NamedDotAccess(_, _, None) |
         ExprKind::SetTimer(_) | ExprKind::MakeChannel | ExprKind::RetrieveData(_) |
-        ExprKind::DiscardData => {}
+        ExprKind::DiscardData | ExprKind::SelfHandle => {}
     }
 }
 
@@ -1652,7 +1654,7 @@ mod tests {
 
     #[test]
     fn test_variant_literals() {
-        let source = "role R { fn f() { x = E.V1; y = E.V2(42); } }";
+        let source = "role R(ctx: int) { fn f() { x = E.V1; y = E.V2(42); } }";
         let program = parse(source);
         // Navigate to the assignments
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
@@ -1685,7 +1687,7 @@ mod tests {
 
     #[test]
     fn test_match_expression() {
-        let source = "role R { fn f() { match x { E.V1 => { println(\"1\"); }, E.V2(val) => { println(\"2\"); } }; } }";
+        let source = "role R(ctx: int) { fn f() { match x { E.V1 => { println(\"1\"); }, E.V2(val) => { println(\"2\"); } }; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1730,7 +1732,7 @@ mod tests {
 
     #[test]
     fn test_infix_send() {
-        let source = "role R { async fn f() { val >- ch; } }";
+        let source = "role R(ctx: int) { async fn f() { val >- ch; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1758,7 +1760,7 @@ mod tests {
 
     #[test]
     fn test_infix_send_precedence() {
-        let source = "role R { async fn f() { x + 1 >- ch; } }";
+        let source = "role R(ctx: int) { async fn f() { x + 1 >- ch; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1786,7 +1788,7 @@ mod tests {
 
     #[test]
     fn test_with_struct_field() {
-        let source = "role R { fn f() { var x = record with { age: 31 }; } }";
+        let source = "role R(ctx: int) { fn f() { var x = record with { age: 31 }; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1808,7 +1810,7 @@ mod tests {
 
     #[test]
     fn test_with_multiple_fields() {
-        let source = "role R { fn f() { var x = record with { age: 31, active: true }; } }";
+        let source = "role R(ctx: int) { fn f() { var x = record with { age: 31, active: true }; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1837,7 +1839,7 @@ mod tests {
 
     #[test]
     fn test_with_index_key() {
-        let source = r#"role R { fn f() { var x = m with { ["k1"]: "v1" }; } }"#;
+        let source = r#"role R(ctx: int) { fn f() { var x = m with { ["k1"]: "v1" }; } }"#;
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1858,7 +1860,7 @@ mod tests {
 
     #[test]
     fn test_with_trailing_comma() {
-        let source = "role R { fn f() { var x = record with { age: 31, }; } }";
+        let source = "role R(ctx: int) { fn f() { var x = record with { age: 31, }; } }";
         let program = parse(source);
         if let TopLevelDef::Role(role) = &program.top_level_defs[0] {
             let func = &role.func_defs[0];
@@ -1872,7 +1874,7 @@ mod tests {
 
     #[test]
     fn test_for_loop_increment_validation() {
-        let source = "role R { fn f() { for var i = 0; i < 10; var i = i + 1 {} } }";
+        let source = "role R(ctx: int) { fn f() { for var i = 0; i < 10; var i = i + 1 {} } }";
         let program = parse(source);
         let errors = super::validate_parsed(&program);
         assert_eq!(errors.len(), 1);

@@ -28,6 +28,8 @@ pub enum ResolvedTopLevelDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedRoleDef {
+    pub kind: RoleKind,
+    pub param: ResolvedFuncParam,
     pub name: NameId,
     pub original_name: String,
     pub var_inits: Vec<ResolvedVarInit>,
@@ -37,6 +39,7 @@ pub struct ResolvedRoleDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedFuncDef {
+    pub annotations: Vec<Annotation>,
     pub name: NameId,
     pub original_name: String,
     pub is_sync: bool,
@@ -101,6 +104,7 @@ pub struct ResolvedEnumVariant {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedFieldDef {
+    pub annotations: Vec<Annotation>,
     pub id: NameId,
     pub name: String,
     pub type_def: ResolvedTypeDef,
@@ -219,6 +223,8 @@ pub struct ResolvedExpr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedExprKind {
+    SelfHandle(Option<NameId>),
+    Spawn(ResolvedTypeDef, Box<ResolvedExpr>),
     Var(NameId, String),
     IntLit(i64),
     StringLit(String),
@@ -308,6 +314,7 @@ pub struct Resolver {
 
     next_id: usize,
     current_role: Option<NameId>,
+    role_param_name: Option<String>,
 
     pre_populated_types: PrepopulatedTypes,
     id_to_name: HashMap<NameId, String>,
@@ -361,6 +368,7 @@ impl Resolver {
             global_func_scope: HashMap::new(),
             next_id,
             current_role: None,
+            role_param_name: None,
             pre_populated_types: PrepopulatedTypes {
                 int: int_type,
                 string: string_type,
@@ -411,6 +419,9 @@ impl Resolver {
 
     fn declare_var(&mut self, name: &str, span: Span) -> NameId {
         let id = self.new_name_id(name);
+        if self.role_param_name.as_deref() == Some(name) {
+            self.emit(ResolutionError::DuplicateName(name.to_string(), span));
+        }
         if let Some(err) =
             Self::declare_in_scope(self.var_scopes.last_mut().unwrap(), name, id, span)
         {
@@ -593,6 +604,13 @@ impl Resolver {
         self.current_role = Some(name_id);
 
         self.enter_scope();
+        let param = ResolvedFuncParam {
+            name: self.declare_var(&role.param.name, role.param.span),
+            original_name: role.param.name.clone(),
+            type_def: self.resolve_type_def(role.param.type_def),
+            span: role.param.span,
+        };
+        self.role_param_name = Some(role.param.name);
         let var_inits = role
             .var_inits
             .into_iter()
@@ -606,7 +624,10 @@ impl Resolver {
         self.exit_scope();
 
         self.current_role = prev_role;
+        self.role_param_name = None;
         Some(ResolvedRoleDef {
+            kind: role.kind,
+            param,
             name: name_id,
             original_name: role.name,
             var_inits,
@@ -635,6 +656,7 @@ impl Resolver {
         let body = self.resolve_block(func.body);
         self.exit_scope();
         Some(ResolvedFuncDef {
+            annotations: func.annotations,
             name: name_id,
             original_name: func.name,
             is_sync: func.is_sync,
@@ -720,6 +742,7 @@ impl Resolver {
     fn resolve_field_def(&mut self, field: FieldDef) -> ResolvedFieldDef {
         let id = self.new_name_id(&field.name);
         ResolvedFieldDef {
+            annotations: field.annotations,
             id,
             name: field.name,
             type_def: self.resolve_type_def(field.type_def),
@@ -958,6 +981,8 @@ impl Resolver {
     fn resolve_expr(&mut self, expr: Expr) -> ResolvedExpr {
         let span = expr.span;
         let kind = match expr.kind {
+            ExprKind::SelfHandle => ResolvedExprKind::SelfHandle(self.current_role),
+            ExprKind::Spawn(ty, count) => ResolvedExprKind::Spawn(self.resolve_type_def(ty), Box::new(self.resolve_expr(*count))),
             ExprKind::Var(name) => match self.lookup_var(&name, span) {
                 Ok(id) => ResolvedExprKind::Var(id, name),
                 Err(e) => {

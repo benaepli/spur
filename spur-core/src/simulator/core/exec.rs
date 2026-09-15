@@ -439,6 +439,21 @@ fn execute_common_label<H: HashPolicy, L: Logger, F: Feedback>(
             state.push_runnable(Runnable::Timer(timer));
             Ok(Some(StepOutcome::Continue(*next)))
         }
+        Label::Spawn(role, count, lhs, next, span) => {
+            let count = legacy_operand(local_env, node_env, count, &program.id_to_name)?.as_int()?;
+            let value = state.allocator.as_mut().ok_or(RuntimeError::AllocationOutsideDeploy)?.spawn(*role, count, *span)?;
+            store(lhs, value, local_env, node_env)?;
+            Ok(Some(StepOutcome::Continue(*next)))
+        }
+        Label::Provide(handle, value, next, span) | Label::ProvideAll(handle, value, next, span) => {
+            let handles = legacy_eval(local_env, node_env, handle, &program.id_to_name)?;
+            let value = legacy_eval(local_env, node_env, value, &program.id_to_name)?;
+            let allocator = state.allocator.as_mut().ok_or(RuntimeError::AllocationOutsideDeploy)?;
+            if matches!(label, Label::ProvideAll(..)) {
+                for h in handles.as_list()? { allocator.provide(h.as_node()?, value.clone(), *span)?; }
+            } else { allocator.provide(handles.as_node()?, value, *span)?; }
+            Ok(Some(StepOutcome::Continue(*next)))
+        }
         Label::UniqueId(lhs, next) => {
             let id = state.alloc_unique_id();
             store(lhs, Value::int(id as i64), local_env, node_env)?;
@@ -858,6 +873,9 @@ fn exec_legacy<H: HashPolicy, L: Logger, F: Feedback>(
             | Label::MakeChannel(_, _, _)
             | Label::SetTimer(_, _, _)
             | Label::MakeFifoLink(_, _, _)
+            | Label::Spawn(..)
+            | Label::Provide(..)
+            | Label::ProvideAll(..)
             | Label::UniqueId(_, _)
             | Label::Cond(_, _, _)
             | Label::Return(_)
@@ -1131,6 +1149,21 @@ fn run_common_op<H: HashPolicy, L: Logger, F: Feedback>(
             };
             state.push_runnable(Runnable::Timer(timer));
             Ok(Flow::Next(*next as usize))
+        }
+        Op::Spawn(spawn) => {
+            let count = coperand(local_env, node_env, &spawn.count, names, t)?.as_int()?;
+            let value = state.allocator.as_mut().ok_or(RuntimeError::AllocationOutsideDeploy)?.spawn(spawn.role, count, spawn.span)?;
+            store_dest(spawn.dest, value, local_env, node_env);
+            Ok(Flow::Next(spawn.next as usize))
+        }
+        Op::Provide(provide) | Op::ProvideAll(provide) => {
+            let handles = cvalue(local_env, node_env, &provide.handle, names, t)?;
+            let value = cvalue(local_env, node_env, &provide.value, names, t)?;
+            let allocator = state.allocator.as_mut().ok_or(RuntimeError::AllocationOutsideDeploy)?;
+            if matches!(op, Op::ProvideAll(_)) {
+                for h in handles.as_list()? { allocator.provide(h.as_node()?, value.clone(), provide.span)?; }
+            } else { allocator.provide(handles.as_node()?, value, provide.span)?; }
+            Ok(Flow::Next(provide.next as usize))
         }
         Op::UniqueId { dest, next } => {
             let id = state.alloc_unique_id();

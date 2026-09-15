@@ -137,9 +137,10 @@ impl Compiler {
     }
 
     /// Call when starting to compile a new role
-    fn begin_role(&mut self, var_inits: &[LVarInit]) {
+    fn begin_role(&mut self, param: NameId, var_inits: &[LVarInit]) {
         self.node_slots.clear();
-        self.next_node_slot = 1; // Slot 0 reserved for 'self'
+        self.node_slots.insert(param, 1);
+        self.next_node_slot = 2;
 
         for init in var_inits {
             self.node_slots.insert(init.name, self.next_node_slot);
@@ -273,7 +274,7 @@ impl Compiler {
             match def {
                 LTopLevelDef::Role(role) => {
                     // Set up node-level slot assignments for this role
-                    self.begin_role(&role.var_inits);
+                    self.begin_role(role.param.name, &role.var_inits);
 
                     // Compile role's var_inits into a special init function
                     let init_func_name = format!("{}.{}", role.original_name, "BASE_NODE_INIT");
@@ -296,6 +297,7 @@ impl Compiler {
         crate::simulator::util_stats::record_frame_layout(self.slots_before, self.slots_after);
 
         let mut program = Program {
+            topology: program.topology,
             deployments: Default::default(),
             cfg: Cfg { graph: self.cfg },
             rpc: self.rpc_map,
@@ -1422,6 +1424,21 @@ impl Compiler {
             BuiltinFn::RoleToString => {
                 let arg = &args[0];
                 self.compile_unary(arg, target, next_vertex, ctx, Expr::NodeToString)
+            }
+            BuiltinFn::IndexOf => self.compile_binary(&args[0], &args[1], target, next_vertex, ctx, Expr::IndexOf),
+            BuiltinFn::Spawn(role) => {
+                let count = self.alloc_temp_slot();
+                let span = self.current_span.unwrap_or_default();
+                let vertex = self.add_label(Label::Spawn(role, Expr::Var(count), target, next_vertex, span));
+                self.compile_expr_to_value(&args[0], Lhs::Var(count), vertex, ctx)
+            }
+            BuiltinFn::Provide | BuiltinFn::ProvideAll => {
+                let next = self.add_label(Label::Instr(Instr::Assign(target, Expr::Unit), next_vertex));
+                let (slots, exprs) = self.compile_temp_list(2);
+                let span = self.current_span.unwrap_or_default();
+                let label = if builtin == BuiltinFn::Provide { Label::Provide(exprs[0].clone(), exprs[1].clone(), next, span) } else { Label::ProvideAll(exprs[0].clone(), exprs[1].clone(), next, span) };
+                let vertex = self.add_label(label);
+                self.compile_expr_list_recursive(args.iter(), slots, vertex, ctx)
             }
             BuiltinFn::UniqueId => self.add_label(Label::UniqueId(target, next_vertex)),
         }

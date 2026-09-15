@@ -22,6 +22,7 @@ fn make_role_program(
 ) -> AProgram {
     AProgram {
         top_level_defs: vec![ATopLevelDef::Role(ARoleDef {
+            param: AFuncParam { name: id(99), original_name: "ctx".into(), ty: Type::Tuple(vec![]), span: dummy_span() },
             name: id(role_name_id),
             original_name: role_name.to_string(),
             var_inits,
@@ -85,6 +86,21 @@ fn expect_free_func(program: &TProgram, idx: usize) -> &TFuncDef {
         TTopLevelDef::FreeFunc(f) => f,
         other => panic!("expected FreeFunc at index {}, got {:?}", idx, other),
     }
+}
+
+// Role methods begin with one field load per role variable, including self
+// and the role parameter.
+fn body_after_prologue(f: &TFuncDef) -> &[TStatement] {
+    let loads = f
+        .body
+        .statements
+        .iter()
+        .take_while(|stmt| {
+            matches!(&stmt.kind, TStatementKind::LetAtom(la)
+                if matches!(&la.value.kind, TExprKind::FieldAccess(TAtomic::Var(_, n), _) if n == "s"))
+        })
+        .count();
+    &f.body.statements[loads..]
 }
 
 fn expect_let_atom(stmt: &TStatement) -> &TLetAtom {
@@ -175,7 +191,9 @@ fn test_role_state_extraction() {
     // Init function should be first (index 0), role second (index 1)
     let init_func = expect_free_func(&threaded, 0);
     assert!(init_func.original_name.contains("Node_init"));
-    assert_eq!(init_func.params.len(), 0);
+    assert_eq!(init_func.params.len(), 2);
+    assert_eq!(init_func.params[0].original_name, "self");
+    assert_eq!(init_func.params[1].original_name, "ctx");
 
     // The return type should be the state struct type
     match &init_func.return_type {
@@ -189,9 +207,11 @@ fn test_role_state_extraction() {
         _ => unreachable!(),
     };
     let fields = threaded.struct_defs.get(&state_struct_id).unwrap();
-    assert_eq!(fields.len(), 2);
+    assert_eq!(fields.len(), 4);
     assert_eq!(fields[0].1, "db");
     assert_eq!(fields[1].1, "count");
+    assert_eq!(fields[2].1, "self");
+    assert_eq!(fields[3].1, "ctx");
 
     // Role should have no var_inits (only func_defs)
     let role = expect_role(&threaded, 1);
@@ -374,14 +394,14 @@ fn test_role_method_call_threading() {
     // Plus the tail wrapping: LetAtom(__ret_tuple)
     // So we expect at least 4 statements before the tail binding
     assert!(
-        f.body.statements.len() >= 4,
+        body_after_prologue(f).len() >= 4,
         "expected >= 4 stmts, got {}:\n{:#?}",
-        f.body.statements.len(),
-        f.body.statements,
+        body_after_prologue(f).len(),
+        body_after_prologue(f),
     );
 
     // First statement should be LetAtom binding the tuple from the call
-    let tup_let = expect_let_atom(&f.body.statements[0]);
+    let tup_let = expect_let_atom(&body_after_prologue(f)[0]);
     match &tup_let.value.kind {
         TExprKind::FuncCall(TFuncCall::User(call)) => {
             assert_eq!(call.original_name, "modify");
@@ -419,9 +439,9 @@ fn test_return_tuple_wrapping() {
     let f = &role.func_defs[0];
 
     // Should have: LetAtom(__ret_tuple = (s, 42)), Return(__ret_tuple)
-    assert_eq!(f.body.statements.len(), 2);
+    assert_eq!(body_after_prologue(f).len(), 2);
 
-    let ret_let = expect_let_atom(&f.body.statements[0]);
+    let ret_let = expect_let_atom(&body_after_prologue(f)[0]);
     match &ret_let.value.kind {
         TExprKind::TupleLit(items) => {
             assert_eq!(items.len(), 2);
@@ -431,7 +451,7 @@ fn test_return_tuple_wrapping() {
         other => panic!("expected TupleLit, got {:?}", other),
     }
 
-    match &f.body.statements[1].kind {
+    match &body_after_prologue(f)[1].kind {
         TStatementKind::Return(atomic) => {
             assert_eq!(
                 *atomic,
@@ -488,7 +508,7 @@ fn test_send_state_injection() {
 
     // The Send LetAtom should be expanded with tuple unpacking
     // First stmt: LetAtom(__tup = Send(s, chan, val))
-    let tup_let = expect_let_atom(&f.body.statements[0]);
+    let tup_let = expect_let_atom(&body_after_prologue(f)[0]);
     match &tup_let.value.kind {
         TExprKind::Send(state, chan, val) => {
             assert!(matches!(state, TAtomic::Var(_, name) if name == "s"));
@@ -527,7 +547,7 @@ fn test_explicit_return_uses_declared_return_type() {
     let role = expect_role(&threaded, 1);
     let f = &role.func_defs[0];
 
-    let ret_let = expect_let_atom(&f.body.statements[0]);
+    let ret_let = expect_let_atom(&body_after_prologue(f)[0]);
     match &ret_let.ty {
         Type::Tuple(types) => {
             assert_eq!(types.len(), 2);
@@ -587,7 +607,7 @@ fn test_async_call_no_tuple_unpack() {
     let f = &role.func_defs[0];
 
     // First statement is the direct binding `var ch: chan<string> = Read(s, k);`.
-    let ch_let = expect_let_atom(&f.body.statements[0]);
+    let ch_let = expect_let_atom(&body_after_prologue(f)[0]);
     assert_eq!(ch_let.original_name, "ch");
     assert_eq!(ch_let.ty, chan_ty);
     match &ch_let.value.kind {
@@ -603,7 +623,7 @@ fn test_async_call_no_tuple_unpack() {
 
     // There must not be a tuple access or an `s = __tup.0` update generated
     // by this call — state handoff must be deferred to `<-`.
-    for stmt in &f.body.statements {
+    for stmt in body_after_prologue(f) {
         if let TStatementKind::LetAtom(la) = &stmt.kind
             && let TExprKind::TupleAccess(_, _) = &la.value.kind {
                 panic!(
@@ -656,7 +676,7 @@ fn test_sync_statement_call_threads_state() {
     let f = &role.func_defs[0];
 
     // stmt[0]: let __tup = modify(s, a);
-    let tup_let = expect_let_atom(&f.body.statements[0]);
+    let tup_let = expect_let_atom(&body_after_prologue(f)[0]);
     match &tup_let.value.kind {
         TExprKind::FuncCall(TFuncCall::User(tcall)) => {
             assert_eq!(tcall.original_name, "modify");
@@ -674,7 +694,7 @@ fn test_sync_statement_call_threads_state() {
     }
 
     // stmt[1]: let __s_new = __tup.0;
-    let s_new_let = expect_let_atom(&f.body.statements[1]);
+    let s_new_let = expect_let_atom(&body_after_prologue(f)[1]);
     match &s_new_let.value.kind {
         TExprKind::TupleAccess(TAtomic::Var(_, n), 0) => {
             assert_eq!(n, &tup_let.original_name);
@@ -683,11 +703,11 @@ fn test_sync_statement_call_threads_state() {
     }
 
     // stmt[2]: s = __s_new;
-    let assign = expect_assign(&f.body.statements[2]);
+    let assign = expect_assign(&body_after_prologue(f)[2]);
     assert_eq!(assign.target_name, "s");
 
     // No subsequent LetAtom should bind `__tup.1` — the result is discarded.
-    for stmt in &f.body.statements[3..] {
+    for stmt in &body_after_prologue(f)[3..] {
         if let TStatementKind::LetAtom(la) = &stmt.kind
             && let TExprKind::TupleAccess(_, 1) = &la.value.kind {
                 panic!("discard path should not bind __tup.1: {:?}", stmt);
