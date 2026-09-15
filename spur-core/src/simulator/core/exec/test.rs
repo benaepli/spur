@@ -1,13 +1,19 @@
 use super::*;
 use crate::analysis::resolver::NameId;
+use crate::compiler::cfg::compiled::check;
+use crate::compiler::cfg::compiled::{CompiledProgram, Rewrites};
 use crate::compiler::cfg::{Cfg, Expr, Instr, Label, Lhs, Program, VarSlot};
+use crate::simulator::core::partition::QueuedMessage;
 use crate::simulator::core::state::{
-    Continuation, LogEntry, Logger, NodeId, Record, SchedulePolicy, State,
+    Continuation, LogEntry, Logger, NodeId, Record, Runnable, SchedulePolicy, State, TraceEntry,
 };
 use crate::simulator::core::values::{Env, Value};
 use crate::simulator::coverage::{LocalCoverage, VertexMap};
 use crate::simulator::feedback::CfgFeedback;
-use crate::simulator::hash_utils::WithHashing;
+use crate::simulator::hash_utils::{NoHashing, WithHashing};
+use crate::simulator::util_stats::InterpreterTally;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use std::collections::HashMap;
@@ -120,6 +126,7 @@ struct TestLogger {
     entries: Vec<LogEntry>,
     text: TextBuffer,
     trace_text: TextBuffer,
+    traces: Vec<TraceEntry>,
 }
 
 impl TestLogger {
@@ -128,6 +135,7 @@ impl TestLogger {
             entries: Vec::new(),
             text: TextBuffer::default(),
             trace_text: TextBuffer::default(),
+            traces: Vec::new(),
         }
     }
 
@@ -147,6 +155,9 @@ impl Logger for TestLogger {
     fn log(&mut self, entry: LogEntry) {
         self.entries.push(entry);
     }
+    fn log_trace(&mut self, entry: TraceEntry) {
+        self.traces.push(entry);
+    }
 }
 
 fn make_record(pc: usize, local_slots: usize) -> Record<WithHashing> {
@@ -158,11 +169,19 @@ fn make_record_with_cont(
     local_slots: usize,
     continuation: Continuation<WithHashing>,
 ) -> Record<WithHashing> {
+    make_record_for(pc, local_slots, continuation)
+}
+
+fn make_record_for<H: HashPolicy>(
+    pc: usize,
+    local_slots: usize,
+    continuation: Continuation<H>,
+) -> Record<H> {
     let nid = NodeId {
         role: NameId(0),
         index: 0,
     };
-    let env = Env::<WithHashing>::with_slots(local_slots);
+    let env = Env::<H>::with_slots(local_slots);
     Record {
         pc,
         node: nid,
@@ -774,21 +793,11 @@ fn observe(program: &Program, start: usize, slots: usize) -> Observed {
         &mut SmallRng::seed_from_u64(0),
     );
     let events_after = util_stats::pending_evaluator_events();
-    let tally_after = util_stats::pending_interpreter_tally();
+    let t = tally_since(tally_before);
     let result = match result {
         Ok(Some(op)) => format!("value {:?}", op.value),
         Ok(None) => "yielded".to_string(),
         Err(e) => format!("error {e} / {e:?}"),
-    };
-    let t = crate::simulator::util_stats::InterpreterTally {
-        label_execs: tally_after.label_execs - tally_before.label_execs,
-        legacy_labels: tally_after.legacy_labels - tally_before.legacy_labels,
-        leaf_operands_inline: tally_after.leaf_operands_inline - tally_before.leaf_operands_inline,
-        tree_evals: tally_after.tree_evals - tally_before.tree_evals,
-        legacy_evals: tally_after.legacy_evals - tally_before.legacy_evals,
-        call_targets_indexed: tally_after.call_targets_indexed - tally_before.call_targets_indexed,
-        call_targets_fallback: tally_after.call_targets_fallback
-            - tally_before.call_targets_fallback,
     };
     Observed {
         result,
@@ -809,10 +818,12 @@ fn observe(program: &Program, start: usize, slots: usize) -> Observed {
     }
 }
 
-/// Runs `program` through the decoded loop and through the label loop and
-/// requires the same result, output, state and evaluator events.
-fn assert_loops_agree(program: Program, start: usize, slots: usize) -> (Observed, Observed) {
+/// Runs `program` decoded without rewrites through the decoded loop and
+/// through the label loop and requires the same result, output, state and
+/// evaluator events.
+fn assert_loops_agree(mut program: Program, start: usize, slots: usize) -> (Observed, Observed) {
     assert!(program.compiled.covers(program.cfg.graph.len()));
+    program.compiled = CompiledProgram::build_with(&program, Rewrites::Off);
     let mut undecoded = program.clone();
     undecoded.compiled = Default::default();
     let decoded = observe(&program, start, slots);
@@ -827,6 +838,215 @@ fn assert_loops_agree(program: Program, start: usize, slots: usize) -> (Observed
     assert_eq!(legacy.tally.label_execs, 0);
     assert_eq!(decoded.tally.label_execs, legacy.tally.legacy_labels);
     (decoded, legacy)
+}
+
+fn tally_since(before: InterpreterTally) -> InterpreterTally {
+    let a = util_stats::pending_interpreter_tally();
+    InterpreterTally {
+        label_execs: a.label_execs - before.label_execs,
+        legacy_labels: a.legacy_labels - before.legacy_labels,
+        leaf_operands_inline: a.leaf_operands_inline - before.leaf_operands_inline,
+        tree_evals: a.tree_evals - before.tree_evals,
+        legacy_evals: a.legacy_evals - before.legacy_evals,
+        call_targets_indexed: a.call_targets_indexed - before.call_targets_indexed,
+        call_targets_fallback: a.call_targets_fallback - before.call_targets_fallback,
+        stores_skipped: a.stores_skipped - before.stores_skipped,
+    }
+}
+
+/// What one execution left behind, with every queued or parked frame masked
+/// on the slots whose value a decode-time rewrite may change at its pc.
+struct RewriteObserved {
+    result: String,
+    logs: Vec<String>,
+    trace_text: String,
+    traces: Vec<String>,
+    state: String,
+    edges: Vec<((usize, usize), u64)>,
+    events: [u64; 3],
+    tally: InterpreterTally,
+}
+
+/// Replaces with Unit every slot of `record`'s frame whose value may differ
+/// at its pc, and `extra`, and clears the frame's signature and write count.
+fn mask_frame<H: HashPolicy>(
+    record: &mut Record<H>,
+    differing: &[Option<BTreeSet<u32>>],
+    extra: Option<u32>,
+) {
+    let set = differing
+        .get(record.pc)
+        .and_then(|d| d.as_ref())
+        .unwrap_or_else(|| panic!("a queued record rests at unreached vertex {}", record.pc));
+    let slots = record.env.slots.make_mut();
+    for s in set.iter().copied().chain(extra) {
+        if let Some(v) = slots.get_mut(s as usize) {
+            *v = Value::<H>::unit();
+        }
+    }
+    record.env.sig = 0;
+    record.env.writes = 0;
+}
+
+fn mask_runnable<H: HashPolicy>(r: &mut Runnable<H>, differing: &[Option<BTreeSet<u32>>]) {
+    if let Runnable::Record(record) = r {
+        mask_frame(record, differing, None);
+    }
+}
+
+/// Masks every frame the state holds. A blocked reader's destination slot is
+/// also masked, since the reader rests past the receive that writes it.
+fn mask_frames<H: HashPolicy>(state: &mut State<H>, differing: &[Option<BTreeSet<u32>>]) {
+    for q in &mut state.local_queues {
+        q.iter_mut().for_each(|r| mask_runnable(r, differing));
+    }
+    state.network_queue.iter_mut().for_each(|r| mask_runnable(r, differing));
+    state.timer_queue.iter_mut().for_each(|r| mask_runnable(r, differing));
+    state.purgatory.iter_mut().for_each(|(_, r)| mask_runnable(r, differing));
+    for (_, record) in state.crash_info.queued_messages.iter_mut() {
+        mask_frame(record, differing, None);
+    }
+    for m in state.partition_info.queued_messages.iter_mut() {
+        if let QueuedMessage::Record { record, .. } = m {
+            mask_frame(record, differing, None);
+        }
+    }
+    let ids: Vec<_> = state.channels.keys().copied().collect();
+    for id in ids {
+        let chan = state.channels.get_mut(&id).expect("a listed channel exists");
+        chan.waiting_readers = chan
+            .waiting_readers
+            .iter()
+            .map(|w| {
+                let (mut record, lhs) = (**w).clone();
+                let Lhs::Var(target) = &lhs;
+                let extra = match target {
+                    VarSlot::Local(s, _) => Some(*s),
+                    VarSlot::Node(_, _) => None,
+                };
+                mask_frame(&mut record, differing, extra);
+                Arc::new((record, lhs))
+            })
+            .collect();
+    }
+}
+
+fn observe_rewrites<H: HashPolicy>(
+    program: &Program,
+    start: usize,
+    slots: usize,
+    differing: &[Option<BTreeSet<u32>>],
+) -> RewriteObserved {
+    let mut state = State::<H>::new(&[(NameId(0), 1)], 2);
+    let mut logger = TestLogger::new();
+    let record = make_record_for::<H>(
+        start,
+        slots,
+        Continuation::ClientOp {
+            client_id: 0,
+            op_name: "test".to_string(),
+            unique_id: 0,
+        },
+    );
+    let mut coverage = LocalCoverage::new();
+    let events_before = util_stats::pending_evaluator_events();
+    let tally_before = util_stats::pending_interpreter_tally();
+    let result = exec::<H, TestLogger, CfgFeedback>(
+        &mut state,
+        &mut logger,
+        program,
+        record,
+        &VertexMap::new(),
+        &mut coverage,
+        &SchedulePolicy::Fixed,
+        &PurgatoryConfig::default(),
+        &mut SmallRng::seed_from_u64(0),
+    );
+    let events_after = util_stats::pending_evaluator_events();
+    let tally = tally_since(tally_before);
+    let result = match result {
+        Ok(Some(op)) => format!("value {:?}", op.value),
+        Ok(None) => "yielded".to_string(),
+        Err(e) => format!("error {e} / {e:?}"),
+    };
+    mask_frames(&mut state, differing);
+    let mut edges: Vec<_> = coverage.edges().iter().map(|(k, v)| (*k, *v)).collect();
+    edges.sort_unstable();
+    RewriteObserved {
+        result,
+        logs: logger
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("{:?} {} {}", e.node, e.step, logger.content(i)))
+            .collect(),
+        trace_text: logger.trace_text.str_from(0).to_string(),
+        traces: logger.traces.iter().map(|t| format!("{t:?}")).collect(),
+        state: format!("{state:?}"),
+        edges,
+        events: [
+            events_after[0] - events_before[0],
+            events_after[1] - events_before[1],
+            events_after[2] - events_before[2],
+        ],
+        tally,
+    }
+}
+
+/// Adds a function entry at `start` unless one is there, since execution
+/// may only start at an entry.
+fn with_entry(mut program: Program, start: usize, slots: usize) -> Program {
+    if !program.rpc.values().any(|f| f.entry == start) {
+        register(&mut program, "__start", function(start, 900, 0, slots as u32, false));
+    }
+    program
+}
+
+/// Runs `program` decoded with rewrites off and on, under both hash policies,
+/// and requires everything observable to match: result, logs, traces, edges,
+/// every state field outside frames, frames on every slot whose value no
+/// rewrite may change, and every interpreter count except the operand reads
+/// the rewrites remove. Returns the counts with rewrites on, without and
+/// with hashing.
+fn assert_rewrites_agree(program: &Program, start: usize, slots: usize) -> [InterpreterTally; 2] {
+    let program = with_entry(program.clone(), start, slots);
+    let mut off = program.clone();
+    off.compiled = CompiledProgram::build_with(&program, Rewrites::Off);
+    let mut on = program.clone();
+    on.compiled = CompiledProgram::build_with(&program, Rewrites::On);
+    let analysis = check::analyze(&on, &on.compiled.ops, &check::entries(&on));
+    assert!(analysis.failures.is_empty(), "{:?}", analysis.failures);
+    let d = &analysis.differing_in;
+    let pairs = [
+        (
+            observe_rewrites::<NoHashing>(&off, start, slots, d),
+            observe_rewrites::<NoHashing>(&on, start, slots, d),
+        ),
+        (
+            observe_rewrites::<WithHashing>(&off, start, slots, d),
+            observe_rewrites::<WithHashing>(&on, start, slots, d),
+        ),
+    ];
+    pairs.map(|(a, b)| {
+        assert_eq!(a.result, b.result);
+        assert_eq!(a.logs, b.logs);
+        assert_eq!(a.trace_text, b.trace_text);
+        assert_eq!(a.traces, b.traces);
+        assert_eq!(a.state, b.state);
+        assert_eq!(a.edges, b.edges);
+        assert_eq!(a.events[2], b.events[2]);
+        assert_eq!(a.events[0] + a.events[1], b.events[0] + b.events[1]);
+        let (x, y) = (a.tally, b.tally);
+        assert_eq!(x.label_execs, y.label_execs);
+        assert_eq!(x.legacy_labels, y.legacy_labels);
+        assert_eq!(x.tree_evals, y.tree_evals);
+        assert_eq!(x.legacy_evals, y.legacy_evals);
+        assert_eq!(x.call_targets_indexed, y.call_targets_indexed);
+        assert_eq!(x.call_targets_fallback, y.call_targets_fallback);
+        assert_eq!(x.stores_skipped, 0);
+        assert_eq!(x.leaf_operands_inline - y.leaf_operands_inline, y.stores_skipped);
+        y
+    })
 }
 
 fn function(entry: usize, name: usize, params: u32, slots: u32, is_sync: bool) -> FunctionInfo {
@@ -921,6 +1141,7 @@ fn decoded_loop_matches_label_loop_across_calls_loops_and_channels() {
     register(&mut program, "h", function(h_entry, 6, 1, 1, false));
     program.decode();
 
+    assert_rewrites_agree(&program, init, 8);
     let (decoded, _) = assert_loops_agree(program, init, 8);
     assert!(decoded.result.contains("Tuple([Value { kind: Int(9)"));
     assert!(decoded.result.contains("kind: Int(42)"));
@@ -947,6 +1168,8 @@ fn unresolved_and_async_callees_fail_alike_on_both_loops() {
     register(&mut program, "h", function(h_entry, 6, 0, 0, false));
     program.decode();
 
+    assert_rewrites_agree(&program, missing, 2);
+    assert_rewrites_agree(&program, to_async, 2);
     let (decoded, _) = assert_loops_agree(program.clone(), missing, 2);
     assert!(decoded.result.contains("function not found: missing"));
     assert_eq!(decoded.tally.call_targets_fallback, 1);
@@ -1029,4 +1252,89 @@ fn test_runtime_type_error() {
         crate::simulator::core::RuntimeError::TypeError { .. } => (),
         e => panic!("Expected TypeError, got {:?}", e),
     }
+}
+
+/// Stores no later read sees are skipped; a store read across a loop's back
+/// edge and the iterator reset a loop reads are kept; and every observable
+/// matches with rewrites off, including frames parked at a pause and at a
+/// blocked receive.
+#[test]
+fn unread_stores_are_skipped_and_everything_observable_matches() {
+    let mut builder = TestProgramBuilder::new();
+    let ret = builder.add(Label::Return(Expr::Var(slot(0))));
+    let head = builder.add(Label::Return(Expr::Unit));
+    let back = builder.add(Label::Continue(head));
+    let carry = builder.add(Label::Instr(
+        Instr::Copy(Lhs::Var(slot(0)), Expr::Var(slot(1))),
+        back,
+    ));
+    let print = builder.add(Label::Print(Expr::Var(slot(0)), carry));
+    builder.labels[head] = Label::ForLoopIn(
+        Lhs::Var(slot(1)),
+        Expr::List(vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)]),
+        slot(3),
+        print,
+        ret,
+    );
+    let iter_reset = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(slot(3)), Expr::Unit),
+        head,
+    ));
+    let binding_reset = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(slot(1)), Expr::Unit),
+        iter_reset,
+    ));
+    let show = builder.add(Label::Print(Expr::Var(slot(2)), binding_reset));
+    let second = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(slot(2)), Expr::Int(8)),
+        show,
+    ));
+    let pause = builder.add(Label::Pause(second));
+    let dead = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(slot(2)), Expr::Int(7)),
+        pause,
+    ));
+    let self_copy = builder.add(Label::Instr(
+        Instr::Copy(Lhs::Var(slot(0)), Expr::Var(slot(0))),
+        dead,
+    ));
+    let live = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(slot(0)), Expr::Int(5)),
+        self_copy,
+    ));
+    let overwritten = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(slot(0)), Expr::Unit),
+        live,
+    ));
+    let program = builder.build();
+    let on = CompiledProgram::build_with(&with_entry(program.clone(), overwritten, 4), Rewrites::On);
+    for v in [overwritten, self_copy, dead, binding_reset] {
+        assert!(matches!(on.ops[v], Op::StoreSkipped(_)), "vertex {v}: {:?}", on.ops[v]);
+    }
+    for v in [carry, iter_reset, second, live] {
+        assert!(matches!(on.ops[v], Op::AssignLocal { .. }), "vertex {v}: {:?}", on.ops[v]);
+    }
+    for tally in assert_rewrites_agree(&program, overwritten, 4) {
+        assert_eq!(tally.stores_skipped, 3);
+    }
+    for tally in assert_rewrites_agree(&program, second, 4) {
+        assert_eq!(tally.stores_skipped, 1);
+    }
+
+    let mut builder = TestProgramBuilder::new();
+    let ret = builder.add(Label::Return(Expr::Var(slot(1))));
+    let overwrite = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(slot(2)), Expr::Int(3)),
+        ret,
+    ));
+    let recv = builder.add(Label::Recv(Lhs::Var(slot(1)), Expr::Var(slot(0)), overwrite));
+    let dead = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(slot(2)), Expr::Int(1)),
+        recv,
+    ));
+    let make = builder.add(Label::MakeChannel(Lhs::Var(slot(0)), None, dead));
+    let program = builder.build();
+    let [plain, hashed] = assert_rewrites_agree(&program, make, 3);
+    assert_eq!(plain.stores_skipped, 1);
+    assert_eq!(hashed.stores_skipped, 1);
 }

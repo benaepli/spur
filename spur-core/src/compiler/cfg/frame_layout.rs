@@ -441,5 +441,72 @@ pub(super) fn compact_function_slots(graph: &mut [Label], first: Vertex, info: &
     info.debug_slot_names = names;
 }
 
+/// Local slot liveness over a whole graph, one bit per slot index below 128.
+/// Every successor edge stays inside one function, so a pass over the whole
+/// graph equals the union of passes over each function.
+pub(super) struct LocalLiveness {
+    /// Slots some path from a successor of the vertex reads before writing,
+    /// with no write of the vertex itself taken out.
+    live_out: Vec<u128>,
+}
+
+impl LocalLiveness {
+    /// Whether no path after `v` reads `slot` before writing it. A slot at or
+    /// above 128 is never reported dead.
+    pub(super) fn dead_after(&self, v: usize, slot: u32) -> bool {
+        slot < 128
+            && self
+                .live_out
+                .get(v)
+                .is_some_and(|out| out & (1u128 << slot) == 0)
+    }
+}
+
+/// Computes liveness for every vertex of `graph`. A read of a slot at or
+/// above 128 marks every slot live, and a write of one kills nothing.
+pub(super) fn local_liveness(graph: &[Label]) -> LocalLiveness {
+    let m = graph.len();
+    let mut reads = vec![0u128; m];
+    let mut kill_all = vec![0u128; m];
+    let mut kill_first = vec![0u128; m];
+    let mut succ: Vec<[Option<Vertex>; 2]> = Vec::with_capacity(m);
+    for (v, label) in graph.iter().enumerate() {
+        let mut label = label.clone();
+        visit_label(&mut label, &mut |access, idx| {
+            let bit = if *idx < 128 { 1u128 << *idx } else { 0 };
+            match access {
+                Access::Read => reads[v] |= if bit == 0 { u128::MAX } else { bit },
+                Access::Write => kill_all[v] |= bit,
+                Access::WriteFirstEdge => kill_first[v] |= bit,
+            }
+        });
+        succ.push(successors(&label));
+    }
+    let mut live_in = vec![0u128; m];
+    let mut live_out = vec![0u128; m];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for v in (0..m).rev() {
+            let mut out = 0u128;
+            let mut through = 0u128;
+            for (e, target) in succ[v].iter().enumerate() {
+                let Some(t) = *target else { continue };
+                let after = if t < m { live_in[t] } else { u128::MAX };
+                out |= after;
+                let kill = if e == 0 { kill_all[v] | kill_first[v] } else { kill_all[v] };
+                through |= after & !kill;
+            }
+            let inn = reads[v] | through;
+            if inn != live_in[v] || out != live_out[v] {
+                live_in[v] = inn;
+                live_out[v] = out;
+                changed = true;
+            }
+        }
+    }
+    LocalLiveness { live_out }
+}
+
 #[cfg(test)]
 mod test;

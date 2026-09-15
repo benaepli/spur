@@ -1416,6 +1416,7 @@ fn compiled_ops(m: &mut Marks) -> CompiledOpsStats {
     CompiledOpsStats {
         label_execs: m.int(),
         legacy_labels: m.int(),
+        stores_skipped: m.int(),
     }
 }
 
@@ -1423,10 +1424,12 @@ fn compiled_ops_leaves(prefix: &str, c: &CompiledOpsStats) -> Vec<(String, Value
     let CompiledOpsStats {
         label_execs,
         legacy_labels,
+        stores_skipped,
     } = c;
     vec![
         leaf(prefix, "label_execs", *label_execs),
         leaf(prefix, "legacy_labels", *legacy_labels),
+        leaf(prefix, "stores_skipped", *stores_skipped),
     ]
 }
 

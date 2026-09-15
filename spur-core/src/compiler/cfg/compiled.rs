@@ -10,6 +10,11 @@ use crate::analysis::type_id::TypeId;
 use crate::simulator::{StructShape, struct_shape};
 use ecow::EcoString;
 
+#[cfg(test)]
+pub(crate) mod check;
+#[cfg(test)]
+mod test;
+
 /// A child expression position. Slots and literals are read in place by the
 /// parent; only `Tree` enters the tree evaluator.
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +189,20 @@ pub enum Op {
     Recv(Box<RecvOp>),
     Pause(u32),
     SpinAwait { cond: Opnd, next: u32 },
+    /// A local store whose value no later read can see: a slot copied onto
+    /// itself, or a slot or literal stored where every path writes the slot
+    /// again before reading it. Moves to its successor like the store would.
+    StoreSkipped(u32),
+}
+
+/// Which decode-time rewrites a build applies. Every rewrite keeps vertex
+/// ids, transitions and every value a later read sees; only values no read
+/// can see, and when handles are dropped, may differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rewrites {
+    /// Each vertex decodes exactly as its label executes.
+    Off,
+    On,
 }
 
 /// The decoded form of a whole program.
@@ -199,9 +218,21 @@ pub struct CompiledProgram {
 }
 
 impl CompiledProgram {
-    /// Decodes every vertex of `program`. Reads the program's labels, call
-    /// maps and roles, which must not change afterwards.
+    /// Decodes every vertex of `program` with every rewrite applied. Reads
+    /// the program's labels, call maps and roles, which must not change
+    /// afterwards.
     pub fn build(program: &Program) -> Self {
+        Self::build_with(program, Rewrites::On)
+    }
+
+    /// Decodes every vertex of `program`, applying `rewrites`. Execution may
+    /// start only at a function entry of `program.rpc` or at a successor of
+    /// an executed vertex.
+    pub fn build_with(program: &Program, rewrites: Rewrites) -> Self {
+        let liveness = match rewrites {
+            Rewrites::Off => None,
+            Rewrites::On => Some(super::frame_layout::local_liveness(&program.cfg.graph)),
+        };
         let mut builder = Builder {
             program,
             call_functions: Vec::new(),
@@ -211,7 +242,16 @@ impl CompiledProgram {
             .cfg
             .graph
             .iter()
-            .map(|label| builder.op(label))
+            .enumerate()
+            .map(|(v, label)| match &liveness {
+                Some(liveness) if store_is_unread(label, v, liveness) => {
+                    let Label::Instr(_, next) = label else {
+                        unreachable!("only a store is skipped")
+                    };
+                    Op::StoreSkipped(vertex(*next))
+                }
+                _ => builder.op(label),
+            })
             .collect();
         CompiledProgram {
             ops,
@@ -246,6 +286,26 @@ fn dest(lhs: &Lhs) -> Dest {
     match lhs {
         Lhs::Var(VarSlot::Local(idx, _)) => Dest::Local(*idx),
         Lhs::Var(VarSlot::Node(idx, _)) => Dest::Node(*idx),
+    }
+}
+
+/// Whether `label` at vertex `v` stores into a local slot a value no later
+/// read can see: the slot's own value, or a slot or literal where the slot is
+/// not live afterwards. A store whose value comes from a subtree still runs,
+/// since evaluating the subtree can fail.
+fn store_is_unread(label: &Label, v: usize, liveness: &super::frame_layout::LocalLiveness) -> bool {
+    let Label::Instr(Instr::Assign(lhs, rhs) | Instr::Copy(lhs, rhs), _) = label else {
+        return false;
+    };
+    let Dest::Local(slot) = dest(lhs) else {
+        return false;
+    };
+    match rhs {
+        Expr::Var(VarSlot::Local(src, _)) if *src == slot => true,
+        Expr::Var(_) | Expr::Int(_) | Expr::Bool(_) | Expr::String(_) | Expr::Unit | Expr::Nil => {
+            liveness.dead_after(v, slot)
+        }
+        _ => false,
     }
 }
 

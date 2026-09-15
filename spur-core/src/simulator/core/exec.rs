@@ -968,6 +968,10 @@ fn run_common_op<H: HashPolicy, L: Logger, F: Feedback>(
             Ok(Flow::Next(if taken { *then } else { *els } as usize))
         }
         Op::Goto(target) => Ok(Flow::Next(*target as usize)),
+        Op::StoreSkipped(next) => {
+            t.stores_skipped += 1;
+            Ok(Flow::Next(*next as usize))
+        }
         Op::Return(rhs) => Ok(Flow::Return(cvalue(local_env, node_env, rhs, names, t)?)),
         Op::SyncCall(call) => {
             let func_info = callee(program, call.callee, &call.name, t)?;

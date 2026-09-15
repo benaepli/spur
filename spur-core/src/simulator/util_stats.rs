@@ -123,6 +123,7 @@ static RUN_BUFFERS_TRACE_VEC_GROWS: AtomicU64 = AtomicU64::new(0);
 static PRINT_CONTENT_PRESIZED: AtomicU64 = AtomicU64::new(0);
 static COMPILED_OPS_LABEL_EXECS: AtomicU64 = AtomicU64::new(0);
 static COMPILED_OPS_LEGACY_LABELS: AtomicU64 = AtomicU64::new(0);
+static COMPILED_OPS_STORES_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static COMPILED_EXPR_LEAF_OPERANDS_INLINE: AtomicU64 = AtomicU64::new(0);
 static COMPILED_EXPR_TREE_EVALS: AtomicU64 = AtomicU64::new(0);
 static COMPILED_EXPR_LEGACY_EVALS: AtomicU64 = AtomicU64::new(0);
@@ -941,6 +942,7 @@ pub fn set_enabled(on: bool) {
             &PRINT_CONTENT_PRESIZED,
             &COMPILED_OPS_LABEL_EXECS,
             &COMPILED_OPS_LEGACY_LABELS,
+            &COMPILED_OPS_STORES_SKIPPED,
             &COMPILED_EXPR_LEAF_OPERANDS_INLINE,
             &COMPILED_EXPR_TREE_EVALS,
             &COMPILED_EXPR_LEGACY_EVALS,
@@ -5900,11 +5902,14 @@ impl RunBufferStats {
 }
 
 /// Labels run by the decoded operation loop, and labels run one by one from
-/// the graph because a program carried no decoded form.
+/// the graph because a program carried no decoded form. `stores_skipped`
+/// counts executed vertices whose local store was decoded away because no
+/// later read can see the value.
 #[derive(Serialize, Debug)]
 pub struct CompiledOpsStats {
     pub label_execs: u64,
     pub legacy_labels: u64,
+    pub stores_skipped: u64,
 }
 
 impl CompiledOpsStats {
@@ -5912,6 +5917,7 @@ impl CompiledOpsStats {
         Self {
             label_execs: COMPILED_OPS_LABEL_EXECS.load(Ordering::Relaxed),
             legacy_labels: COMPILED_OPS_LEGACY_LABELS.load(Ordering::Relaxed),
+            stores_skipped: COMPILED_OPS_STORES_SKIPPED.load(Ordering::Relaxed),
         }
     }
 }
@@ -6463,6 +6469,7 @@ pub struct InterpreterTally {
     pub legacy_evals: u64,
     pub call_targets_indexed: u64,
     pub call_targets_fallback: u64,
+    pub stores_skipped: u64,
 }
 
 impl InterpreterTally {
@@ -6475,6 +6482,7 @@ impl InterpreterTally {
             legacy_evals: 0,
             call_targets_indexed: 0,
             call_targets_fallback: 0,
+            stores_skipped: 0,
         }
     }
 
@@ -6487,6 +6495,7 @@ impl InterpreterTally {
             legacy_evals: self.legacy_evals + o.legacy_evals,
             call_targets_indexed: self.call_targets_indexed + o.call_targets_indexed,
             call_targets_fallback: self.call_targets_fallback + o.call_targets_fallback,
+            stores_skipped: self.stores_skipped + o.stores_skipped,
         }
     }
 
@@ -6614,6 +6623,7 @@ pub fn flush_frame_stats() {
     for (v, total) in [
         (interp.label_execs, &COMPILED_OPS_LABEL_EXECS),
         (interp.legacy_labels, &COMPILED_OPS_LEGACY_LABELS),
+        (interp.stores_skipped, &COMPILED_OPS_STORES_SKIPPED),
         (interp.leaf_operands_inline, &COMPILED_EXPR_LEAF_OPERANDS_INLINE),
         (interp.tree_evals, &COMPILED_EXPR_TREE_EVALS),
         (interp.legacy_evals, &COMPILED_EXPR_LEGACY_EVALS),

@@ -1567,6 +1567,11 @@ impl<H: HashPolicy> State<H> {
     }
 
     /// Compute state signature by aggregating component signatures.
+    ///
+    /// Frames keep values that no later read sees, and decode-time rewrites
+    /// change which of those values remain, so under an eager hash policy
+    /// the signature of a queued record's frame is defined only for programs
+    /// decoded with `Rewrites::Off`.
     pub fn signature(&self) -> u64 {
         let mut h: u64 = 0;
 
