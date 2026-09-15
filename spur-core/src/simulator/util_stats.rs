@@ -465,6 +465,7 @@ static SCHED_ELIGIBILITY_COUNTED_STEPS: AtomicU64 = AtomicU64::new(0);
 static SCHED_ELIGIBILITY_WALKED_STEPS: AtomicU64 = AtomicU64::new(0);
 static SCHED_ELIGIBILITY_WALKED_ELEMENTS: AtomicU64 = AtomicU64::new(0);
 static SCHED_ELIGIBILITY_GENERAL_STEPS: AtomicU64 = AtomicU64::new(0);
+static SCHED_CRASH_SCANS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static RWP_EVALUATED: AtomicU64 = AtomicU64::new(0);
 static RWP_PRESENT: AtomicU64 = AtomicU64::new(0);
 static RWP_CONTESTED: AtomicU64 = AtomicU64::new(0);
@@ -890,6 +891,7 @@ pub fn set_enabled(on: bool) {
             &SCHED_ELIGIBILITY_WALKED_STEPS,
             &SCHED_ELIGIBILITY_WALKED_ELEMENTS,
             &SCHED_ELIGIBILITY_GENERAL_STEPS,
+            &SCHED_CRASH_SCANS_SKIPPED,
             &STATS_LOCAL_FOLDS,
             &STATS_LOCAL_FOLDED_INCREMENTS,
             &HW_BUSY_NS,
@@ -1503,6 +1505,16 @@ pub fn record_eligibility_pass(walked: bool, general: bool, elements: u64) {
             1,
         );
     }
+}
+
+/// One scheduling step found no node with a pending crash and skipped the
+/// per-node crash scans.
+#[inline]
+pub fn record_crash_scans_skipped() {
+    if !enabled() {
+        return;
+    }
+    bump(|b| &b.sched_crash_scans_skipped, &SCHED_CRASH_SCANS_SKIPPED, 1);
 }
 
 /// One within-queue selection was seen by the multiplier-authority probe.
@@ -5036,6 +5048,9 @@ impl RecoveryPlaceboStats {
 /// `eligibility_general_steps` counts the walked steps that filtered every
 /// queue because something other than a planned crash could be rejected.
 /// Counted plus walked is the number of steps that sized their queues.
+/// `crash_scans_skipped` counts the steps that skipped the per-node crash
+/// scans because no node had a pending crash; with the crash-eligible steps
+/// it makes up the same number of steps.
 #[derive(Serialize, Debug)]
 pub struct SchedStats {
     pub eligible_known: u64,
@@ -5045,6 +5060,7 @@ pub struct SchedStats {
     pub eligibility_walked_steps: u64,
     pub eligibility_walked_elements: u64,
     pub eligibility_general_steps: u64,
+    pub crash_scans_skipped: u64,
 }
 
 impl SchedStats {
@@ -5058,6 +5074,7 @@ impl SchedStats {
             eligibility_walked_elements: SCHED_ELIGIBILITY_WALKED_ELEMENTS
                 .load(Ordering::Relaxed),
             eligibility_general_steps: SCHED_ELIGIBILITY_GENERAL_STEPS.load(Ordering::Relaxed),
+            crash_scans_skipped: SCHED_CRASH_SCANS_SKIPPED.load(Ordering::Relaxed),
         }
     }
 }
@@ -6671,6 +6688,7 @@ struct RunCounters {
     sched_eligibility_walked_steps: Cell<u64>,
     sched_eligibility_walked_elements: Cell<u64>,
     sched_eligibility_general_steps: Cell<u64>,
+    sched_crash_scans_skipped: Cell<u64>,
     ca_steps_with_crash_eligible: Cell<u64>,
     ca_offered: Cell<u64>,
     timer_steer_evaluated: Cell<u64>,
@@ -6741,6 +6759,7 @@ impl RunCounters {
             sched_eligibility_walked_steps: Cell::new(0),
             sched_eligibility_walked_elements: Cell::new(0),
             sched_eligibility_general_steps: Cell::new(0),
+            sched_crash_scans_skipped: Cell::new(0),
             ca_steps_with_crash_eligible: Cell::new(0),
             ca_offered: Cell::new(0),
             timer_steer_evaluated: Cell::new(0),
@@ -6810,6 +6829,7 @@ impl RunCounters {
             (&self.sched_eligibility_walked_steps, &SCHED_ELIGIBILITY_WALKED_STEPS),
             (&self.sched_eligibility_walked_elements, &SCHED_ELIGIBILITY_WALKED_ELEMENTS),
             (&self.sched_eligibility_general_steps, &SCHED_ELIGIBILITY_GENERAL_STEPS),
+            (&self.sched_crash_scans_skipped, &SCHED_CRASH_SCANS_SKIPPED),
             (&self.ca_steps_with_crash_eligible, &CA_STEPS_WITH_CRASH_ELIGIBLE),
             (&self.ca_offered, &CA_OFFERED),
             (&self.timer_steer_evaluated, &TIMER_STEER_EVALUATED),

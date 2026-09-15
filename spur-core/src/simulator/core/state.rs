@@ -713,6 +713,12 @@ pub struct State<H: HashPolicy> {
     /// `nodes`. Kept exact by the queue hooks below and excluded from
     /// `signature()`, so it cannot change deduplication.
     pub send_ledger: Vec<SendLedger>,
+    /// How many nodes have a nonzero `crash_pending` in `send_ledger`. Moved
+    /// only where one node's count crosses between 0 and 1: raised in the
+    /// crash arm of `push_runnable`, lowered in `release_pending_crash`, which
+    /// `take_local` and the scheduler's `crash_node` call for each crash they
+    /// remove from a local queue.
+    nodes_with_pending_crash: u32,
     /// Per-node step a queued crash is held until, indexed like `nodes`;
     /// zero means no hold. Scheduling bookkeeping like `send_ledger`,
     /// excluded from `signature()` so it cannot change deduplication.
@@ -950,6 +956,7 @@ impl<H: HashPolicy> State<H> {
             timer_stats: TimerRunStats::default(),
             timer_inert_streaks: Vec::new(),
             send_ledger: vec![SendLedger::default(); num_nodes],
+            nodes_with_pending_crash: 0,
             crash_hold_until: vec![0; num_nodes],
             crash_phase: crash_phase::RunAnchor::with_nodes(num_nodes),
             crash_hold_drawn: false,
@@ -1142,6 +1149,9 @@ impl<H: HashPolicy> State<H> {
                 let idx = node_id.index;
                 if let Some(l) = self.send_ledger.get_mut(idx) {
                     l.crash_pending += 1;
+                    if l.crash_pending == 1 {
+                        self.nodes_with_pending_crash += 1;
+                    }
                 }
                 self.local_queues[idx].push(runnable);
             }
@@ -1174,12 +1184,28 @@ impl<H: HashPolicy> State<H> {
     /// the ledger exact.
     pub fn take_local(&mut self, node: usize, idx: usize) -> Runnable<H> {
         let r = self.local_queues[node].remove(idx);
-        if let Runnable::Crash { node_id, .. } = &r
-            && let Some(l) = self.send_ledger.get_mut(node_id.index)
-        {
-            l.crash_pending = l.crash_pending.saturating_sub(1);
+        if let Runnable::Crash { node_id, .. } = &r {
+            self.release_pending_crash(node_id.index);
         }
         r
+    }
+
+    /// Counts one crash of `node` as removed from its local queue.
+    pub fn release_pending_crash(&mut self, node: usize) {
+        if let Some(l) = self.send_ledger.get_mut(node)
+            && l.crash_pending > 0
+        {
+            l.crash_pending -= 1;
+            if l.crash_pending == 0 {
+                self.nodes_with_pending_crash = self.nodes_with_pending_crash.saturating_sub(1);
+            }
+        }
+    }
+
+    /// How many nodes have at least one planned crash queued.
+    #[inline]
+    pub fn nodes_with_pending_crash(&self) -> u32 {
+        self.nodes_with_pending_crash
     }
 
     /// The origin of a remote message, or `None` for anything else.
@@ -1850,6 +1876,11 @@ mod ledger_tests {
     fn assert_exact(state: &State<NoHashing>, when: &str) {
         let (ledgers, stale, requests) = recount(state);
         assert_eq!(state.send_ledger, ledgers, "ledger drifted {when}");
+        assert_eq!(
+            state.nodes_with_pending_crash,
+            ledgers.iter().filter(|l| l.crash_pending > 0).count() as u32,
+            "pending crash node count drifted {when}"
+        );
         assert_eq!(state.net_stale_records, stale, "stale count drifted {when}");
         assert_eq!(state.net_requests, requests, "request count drifted {when}");
     }

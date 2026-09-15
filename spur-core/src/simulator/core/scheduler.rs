@@ -1268,9 +1268,22 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // offered again at the next step, which keeps the number of crashes a run
     // takes the same and moves only when they land. Nodes past the width of the
     // mask are never withheld.
-    let crash_hold_mask = crash_hold_mask(state, topology.num_servers.max(0) as usize, rng);
+    //
+    // With no pending crash on any node, the hold and defer loops, the
+    // crash-anchor probe and the crash census would pass over every node
+    // without drawing or counting anything, so they are skipped; the release
+    // trigger still expires on its step.
+    let crash_pending = state.nodes_with_pending_crash() > 0;
+    let crash_hold_mask = if crash_pending {
+        crash_hold_mask(state, topology.num_servers.max(0) as usize, rng)
+    } else {
+        util_stats::record_crash_scans_skipped();
+        let step_now = state.crash_info.current_step;
+        expire_release_trigger(state, step_now);
+        0
+    };
 
-    let crash_defer_mask: u64 = if partial_fanout_crash_bias > 0.0 {
+    let crash_defer_mask: u64 = if crash_pending && partial_fanout_crash_bias > 0.0 {
         let mut mask = 0u64;
         for (n, ledger) in state.send_ledger.iter().enumerate().take(u64::BITS as usize) {
             if ledger.crash_pending == 0 || ledger.in_flight == 1 {
@@ -1303,7 +1316,7 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // node whose own message is still in flight, and does the step take it?
     // A crash is never withheld by a reservation or a link order, so a
     // pending crash is a schedulable one.
-    if util_stats::enabled() {
+    if crash_pending && util_stats::enabled() {
         let mut crash_eligible = false;
         let mut anchored = false;
         for ledger in &state.send_ledger {
@@ -1319,10 +1332,11 @@ pub fn schedule_runnable<H: HashPolicy, L: Logger, Q: QueueSelector, F: Feedback
     // undelivered message of its own. Read before the pick, while the crash
     // this step may take is still counted among the candidates.
     let crash_candidate_with_inflight = util_stats::crash_census_enabled().then(|| {
-        state
-            .send_ledger
-            .iter()
-            .any(|l| l.crash_pending > 0 && l.in_flight > 0)
+        crash_pending
+            && state
+                .send_ledger
+                .iter()
+                .any(|l| l.crash_pending > 0 && l.in_flight > 0)
     });
 
     // Observation-only steer-authority audit: what the scoring function ranks
@@ -2228,10 +2242,8 @@ fn crash_node<H: HashPolicy>(state: &mut State<H>, program: &Program, node_id: N
     // 1. Process local queue for crashed node: save external records, drop the rest
     let local = std::mem::take(&mut state.local_queues[node_id.index]);
     for task in local {
-        if let Runnable::Crash { .. } = &task
-            && let Some(l) = state.send_ledger.get_mut(node_id.index)
-        {
-            l.crash_pending = l.crash_pending.saturating_sub(1);
+        if let Runnable::Crash { .. } = &task {
+            state.release_pending_crash(node_id.index);
         }
         if let Runnable::Record(record) = task
             && record.origin_node != record.node {
@@ -4420,5 +4432,61 @@ mod tests {
             "general {general:?} masked {masked_walks} victim {victim_walks} holds {victim_holds} \
              pending {pending_not_withheld} counted {counted}"
         );
+    }
+
+    /// The count of nodes with a pending crash equals a scan of every node's
+    /// ledger after every crash queued, every local runnable taken and every
+    /// node crashed, and each ledger count equals the crashes on its node's
+    /// local queue.
+    #[test]
+    fn nodes_with_pending_crash_match_a_scan_after_every_transition() {
+        const NODES: usize = 4;
+        let mut rng = StdRng::seed_from_u64(29);
+        let program = Program::default();
+        let scan = |state: &State<NoHashing>| {
+            state.send_ledger.iter().filter(|l| l.crash_pending > 0).count() as u32
+        };
+        let mut rises = 0;
+        let mut falls = 0;
+        for run in 0..300 {
+            let mut state = State::<NoHashing>::new(&[(ROLE, NODES)], 1);
+            for step in 0..80 {
+                let n = below(&mut rng, NODES as u64) as usize;
+                let before = scan(&state);
+                match below(&mut rng, 6) {
+                    0 | 1 => state.push_runnable(Runnable::Crash {
+                        node_id: node(n),
+                        priority: 0.5,
+                    }),
+                    2 => state.push_runnable(Runnable::Recover {
+                        node_id: node(n),
+                        priority: 0.5,
+                    }),
+                    3 | 4 => {
+                        let len = state.local_queues[n].len() as u64;
+                        if len > 0 {
+                            state.take_local(n, below(&mut rng, len) as usize);
+                        }
+                    }
+                    _ => {
+                        state.crash_info.currently_crashed.remove(&node(n));
+                        crash_node(&mut state, &program, node(n));
+                    }
+                }
+                let after = scan(&state);
+                rises += u32::from(after > before);
+                falls += u32::from(after < before);
+                assert_eq!(state.nodes_with_pending_crash(), after, "run {run} step {step}");
+                for (m, q) in state.local_queues.iter().enumerate() {
+                    let queued = q.iter().filter(|r| matches!(r, Runnable::Crash { .. })).count();
+                    assert_eq!(
+                        state.send_ledger[m].crash_pending as usize,
+                        queued,
+                        "run {run} step {step} node {m}"
+                    );
+                }
+            }
+        }
+        assert!(rises > 0 && falls > 0, "rises {rises} falls {falls}");
     }
 }

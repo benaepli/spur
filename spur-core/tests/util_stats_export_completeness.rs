@@ -1243,6 +1243,7 @@ fn sched(m: &mut Marks) -> SchedStats {
         eligibility_walked_steps: m.int(),
         eligibility_walked_elements: m.int(),
         eligibility_general_steps: m.int(),
+        crash_scans_skipped: m.int(),
     }
 }
 
@@ -1255,6 +1256,7 @@ fn sched_leaves(prefix: &str, s: &SchedStats) -> Vec<(String, Value)> {
         eligibility_walked_steps,
         eligibility_walked_elements,
         eligibility_general_steps,
+        crash_scans_skipped,
     } = s;
     vec![
         leaf(prefix, "eligible_known", *eligible_known),
@@ -1264,6 +1266,7 @@ fn sched_leaves(prefix: &str, s: &SchedStats) -> Vec<(String, Value)> {
         leaf(prefix, "eligibility_walked_steps", *eligibility_walked_steps),
         leaf(prefix, "eligibility_walked_elements", *eligibility_walked_elements),
         leaf(prefix, "eligibility_general_steps", *eligibility_general_steps),
+        leaf(prefix, "crash_scans_skipped", *crash_scans_skipped),
     ]
 }
 
