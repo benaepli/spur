@@ -172,7 +172,7 @@ fn visit_label(label: &mut Label, f: &mut impl FnMut(Access, &mut u32)) {
 /// The label's successors, the first being the one `WriteFirstEdge` applies
 /// to. A spin-await that re-runs itself writes nothing, so its self edge
 /// changes no liveness and is left out.
-fn successors(label: &Label) -> [Option<Vertex>; 2] {
+pub(super) fn successors(label: &Label) -> [Option<Vertex>; 2] {
     match label {
         Label::Instr(_, n)
         | Label::Pause(n)

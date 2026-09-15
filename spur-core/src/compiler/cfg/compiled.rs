@@ -193,6 +193,35 @@ pub enum Op {
     /// itself, or a slot or literal stored where every path writes the slot
     /// again before reading it. Moves to its successor like the store would.
     StoreSkipped(u32),
+    /// A local store whose string value is written by the print its chain
+    /// ends in, and whose slot no path reads after that print. Moves to its
+    /// successor like the store would.
+    StoreFolded(u32),
+    /// A print of a local slot whose string the stores before it build,
+    /// written piece by piece. Checks each slot piece in order, raising the
+    /// error the first failing store would, then writes the same text the
+    /// print would. `trees_folded` counts the expression trees of the folded
+    /// stores.
+    PrintParts { parts: Box<[PrintPart]>, trees_folded: u32, next: u32 },
+}
+
+/// A slot read by a piece of a folded print.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PieceSource {
+    Local(u32),
+    Node(u32),
+}
+
+/// One piece of a folded print, in text order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrintPart {
+    Lit(EcoString),
+    /// A slot that must hold a string. A failed check reports the slot's own
+    /// type when `own_type`, and "string" otherwise, as the concatenation it
+    /// stands for does.
+    Str { src: PieceSource, own_type: bool },
+    /// A slot that must hold an integer, written in decimal.
+    Int(PieceSource),
 }
 
 /// Which decode-time rewrites a build applies. Every rewrite keeps vertex
@@ -238,7 +267,7 @@ impl CompiledProgram {
             call_functions: Vec::new(),
             callee_index: std::collections::HashMap::new(),
         };
-        let ops = program
+        let mut ops: Vec<Op> = program
             .cfg
             .graph
             .iter()
@@ -253,6 +282,9 @@ impl CompiledProgram {
                 _ => builder.op(label),
             })
             .collect();
+        if let Some(liveness) = &liveness {
+            fold_print_chains(program, &mut ops, liveness);
+        }
         CompiledProgram {
             ops,
             call_functions: builder.call_functions,
@@ -306,6 +338,222 @@ fn store_is_unread(label: &Label, v: usize, liveness: &super::frame_layout::Loca
             liveness.dead_after(v, slot)
         }
         _ => false,
+    }
+}
+
+/// The local slot a store label writes.
+fn local_store_slot(label: &Label) -> Option<u32> {
+    match label {
+        Label::Instr(Instr::Assign(lhs, _) | Instr::Copy(lhs, _), _) => match dest(lhs) {
+            Dest::Local(slot) => Some(slot),
+            Dest::Node(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// Per vertex, the number of ways execution can arrive: one per graph edge,
+/// including a spin-await running itself again, and one per function entry;
+/// with the source of the last edge seen.
+fn predecessors(program: &Program) -> (Vec<u32>, Vec<Option<usize>>) {
+    let graph = &program.cfg.graph;
+    let n = graph.len();
+    let mut count = vec![0u32; n];
+    let mut edge_from = vec![None; n];
+    for (v, label) in graph.iter().enumerate() {
+        let rerun = matches!(label, Label::SpinAwait(..)).then_some(v);
+        for t in super::frame_layout::successors(label).into_iter().flatten().chain(rerun) {
+            if t < n {
+                count[t] += 1;
+                edge_from[t] = Some(v);
+            }
+        }
+    }
+    for info in program.rpc.values() {
+        if info.entry < n {
+            count[info.entry] += 1;
+        }
+    }
+    (count, edge_from)
+}
+
+/// The most pieces a folded print may hold. A chain that concatenates a
+/// string with itself doubles its pieces per store.
+const MAX_PRINT_PARTS: usize = 256;
+
+/// A value a chain of stores computes, as far as decoding can tell.
+#[derive(Clone)]
+enum Sym {
+    /// The value of a slot as it was before the chain.
+    Copy(PieceSource),
+    /// A string: its pieces in text order, each slot piece with the index of
+    /// its check among the checks the stores make, in evaluation order.
+    Text(Vec<(PrintPart, Option<u32>)>),
+}
+
+#[derive(Default)]
+struct ChainFold {
+    env: std::collections::HashMap<u32, Sym>,
+    checks: u32,
+    trees: u32,
+}
+
+impl ChainFold {
+    fn check(&mut self) -> u32 {
+        self.checks += 1;
+        self.checks - 1
+    }
+
+    /// The value of `o`, evaluating trees operand by operand, left before
+    /// right, and each check after its operands, as the tree evaluator does.
+    /// `None` when the value is not a string built from literals, slots and
+    /// integer slots by concatenation.
+    fn eval(&mut self, o: &Opnd) -> Option<Sym> {
+        match o {
+            Opnd::Local(i) => Some(
+                self.env
+                    .get(i)
+                    .cloned()
+                    .unwrap_or(Sym::Copy(PieceSource::Local(*i))),
+            ),
+            Opnd::Node(i) => Some(Sym::Copy(PieceSource::Node(*i))),
+            Opnd::Str(s) => Some(Sym::Text(vec![(PrintPart::Lit(s.clone()), None)])),
+            Opnd::Tree(e) => {
+                self.trees += 1;
+                match &**e {
+                    CExpr::IntToString(a) => match self.eval(a)? {
+                        Sym::Copy(src) => Some(Sym::Text(vec![(PrintPart::Int(src), Some(self.check()))])),
+                        Sym::Text(_) => None,
+                    },
+                    CExpr::Plus(a, b) => {
+                        let a = self.eval(a)?;
+                        let b = self.eval(b)?;
+                        let out = match (a, b) {
+                            (Sym::Copy(_), Sym::Copy(_)) => return None,
+                            (Sym::Copy(src), Sym::Text(rest)) => {
+                                let mut out = vec![(PrintPart::Str { src, own_type: true }, Some(self.check()))];
+                                out.extend(rest);
+                                out
+                            }
+                            (Sym::Text(mut out), Sym::Copy(src)) => {
+                                out.push((PrintPart::Str { src, own_type: false }, Some(self.check())));
+                                out
+                            }
+                            (Sym::Text(mut out), Sym::Text(rest)) => {
+                                out.extend(rest);
+                                out
+                            }
+                        };
+                        (out.len() <= MAX_PRINT_PARTS).then_some(Sym::Text(out))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Folds the stores `suffix` into the print of local slot `target` at `p`,
+/// returning the pieces and the trees folded. Refused unless every store is
+/// a concatenation of literals, slots and integer slots; every folded slot
+/// and the target are dead after the print; the target is such a string
+/// and some store holds a tree; every check the stores make appears once, in
+/// evaluation order, as the pieces are ordered; and no label of the suffix
+/// writes a slot a piece reads.
+fn fold_suffix(
+    program: &Program,
+    ops: &[Op],
+    suffix: &[usize],
+    p: usize,
+    target: u32,
+    liveness: &super::frame_layout::LocalLiveness,
+) -> Option<(Vec<PrintPart>, u32)> {
+    let mut fold = ChainFold::default();
+    let mut written = Vec::new();
+    for &u in suffix {
+        match &ops[u] {
+            Op::AssignLocal { slot, rhs, .. } => {
+                if !liveness.dead_after(p, *slot) {
+                    return None;
+                }
+                let sym = fold.eval(rhs)?;
+                fold.env.insert(*slot, sym);
+                written.push(*slot);
+            }
+            Op::StoreSkipped(_) => written.extend(local_store_slot(&program.cfg.graph[u])),
+            _ => return None,
+        }
+    }
+    if !liveness.dead_after(p, target) || fold.trees == 0 {
+        return None;
+    }
+    let Some(Sym::Text(pieces)) = fold.env.remove(&target) else {
+        return None;
+    };
+    let mut next_check = 0;
+    for (part, check) in &pieces {
+        if let Some(k) = check {
+            if *k != next_check {
+                return None;
+            }
+            next_check += 1;
+        }
+        if let PrintPart::Str { src: PieceSource::Local(s), .. } | PrintPart::Int(PieceSource::Local(s)) = part {
+            if written.contains(s) {
+                return None;
+            }
+        }
+    }
+    if next_check != fold.checks {
+        return None;
+    }
+    Some((pieces.into_iter().map(|(part, _)| part).collect(), fold.trees))
+}
+
+/// Rewrites each print of a local slot whose string a chain of stores builds
+/// into a folded print, and the chain's stores into folded stores. The chain
+/// is the longest run of stores ending at the print in which every vertex
+/// after the first, the print included, is reached only from the vertex
+/// before it, so entering anywhere past the first store is impossible.
+fn fold_print_chains(program: &Program, ops: &mut [Op], liveness: &super::frame_layout::LocalLiveness) {
+    let (preds, edge_from) = predecessors(program);
+    for p in 0..ops.len() {
+        let Op::Print { value: Opnd::Local(target), next } = &ops[p] else {
+            continue;
+        };
+        let (target, next) = (*target, *next);
+        let mut chain = Vec::new();
+        let mut cur = p;
+        while preds[cur] == 1 {
+            let Some(u) = edge_from[cur] else { break };
+            if !matches!(ops[u], Op::AssignLocal { .. } | Op::StoreSkipped(_)) {
+                break;
+            }
+            chain.push(u);
+            cur = u;
+        }
+        chain.reverse();
+        for start in 0..chain.len() {
+            if !matches!(ops[chain[start]], Op::AssignLocal { .. }) {
+                continue;
+            }
+            let suffix = &chain[start..];
+            let Some((parts, trees_folded)) = fold_suffix(program, ops, suffix, p, target, liveness) else {
+                continue;
+            };
+            for &u in suffix {
+                if let Op::AssignLocal { next, .. } = ops[u] {
+                    ops[u] = Op::StoreFolded(next);
+                }
+            }
+            ops[p] = Op::PrintParts {
+                parts: parts.into_boxed_slice(),
+                trees_folded,
+                next,
+            };
+            break;
+        }
     }
 }
 

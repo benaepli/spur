@@ -1,6 +1,7 @@
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::compiled::{
-    AsyncOp, Dest, ForLoopInOp, Op, TraceDispatchOp, TraceEnterOp, TraceExitOp,
+    AsyncOp, Dest, ForLoopInOp, Op, PieceSource, PrintPart, TraceDispatchOp, TraceEnterOp,
+    TraceExitOp,
 };
 use crate::compiler::cfg::{Expr, FunctionInfo, Instr, Label, Program, VarSlot};
 use crate::simulator::core::compiled_eval::{borrowed, coperand, cvalue};
@@ -12,7 +13,7 @@ use crate::simulator::core::state::{
     ClientOpResult, Continuation, LogEntry, Logger, NodeId, PurgatoryConfig, Record,
     Runnable, RunnableCategory, SchedulePolicy, State, Timer, TraceEntry, TraceKind,
 };
-use crate::simulator::core::values::{ChannelId, Env, Value, ValueKind, ValueSeq};
+use crate::simulator::core::values::{ChannelId, Decimal, Env, Value, ValueKind, ValueSeq};
 use ecow::EcoVec;
 use rand::Rng;
 use crate::simulator::rng::{Stream, StreamRng};
@@ -87,6 +88,70 @@ fn print_into<H: HashPolicy>(val: &Value<H>, out: &mut TextBuffer) -> usize {
     }
     let _ = val.write_to(out);
     out.len()
+}
+
+#[inline(always)]
+fn piece<'a, H: HashPolicy>(local_env: &'a Env<H>, node_env: &'a Env<H>, src: PieceSource) -> &'a Value<H> {
+    match src {
+        PieceSource::Local(idx) => local_env.get(idx),
+        PieceSource::Node(idx) => node_env.get(idx),
+    }
+}
+
+/// The length of the decimal text of `n`.
+fn decimal_len(n: i64) -> usize {
+    n.unsigned_abs().checked_ilog10().map_or(1, |d| d as usize + 1) + usize::from(n < 0)
+}
+
+/// Appends the printed text of the string the pieces concatenate to `out`
+/// and returns where it ends. Every slot piece is checked, in order, before
+/// anything is written, so a failed check leaves `out` unchanged.
+#[inline(never)]
+fn print_parts<H: HashPolicy>(
+    parts: &[PrintPart],
+    local_env: &Env<H>,
+    node_env: &Env<H>,
+    out: &mut TextBuffer,
+) -> Result<usize, RuntimeError> {
+    let mut len = 0;
+    for part in parts {
+        len += match part {
+            PrintPart::Lit(s) => s.len(),
+            PrintPart::Str { src, own_type } => {
+                let v = piece(local_env, node_env, *src);
+                match &v.kind {
+                    ValueKind::String(s) => s.len(),
+                    _ => {
+                        return Err(RuntimeError::TypeError {
+                            expected: "int or string",
+                            got: if *own_type { v.type_name() } else { "string" },
+                        });
+                    }
+                }
+            }
+            PrintPart::Int(src) => decimal_len(piece(local_env, node_env, *src).as_int()?),
+        };
+    }
+    util_stats::record_print_presized();
+    out.reserve(len + 2);
+    out.push_str("\"");
+    for part in parts {
+        match part {
+            PrintPart::Lit(s) => out.push_str(s),
+            PrintPart::Str { src, .. } => {
+                if let ValueKind::String(s) = &piece(local_env, node_env, *src).kind {
+                    out.push_str(s);
+                }
+            }
+            PrintPart::Int(src) => {
+                if let ValueKind::Int(n) = piece(local_env, node_env, *src).kind {
+                    out.push_str(Decimal::of_i64(n).as_str());
+                }
+            }
+        }
+    }
+    out.push_str("\"");
+    Ok(out.len())
 }
 
 pub fn exec_sync_on_node<H: HashPolicy, L: Logger, F: Feedback>(
@@ -970,6 +1035,25 @@ fn run_common_op<H: HashPolicy, L: Logger, F: Feedback>(
         Op::Goto(target) => Ok(Flow::Next(*target as usize)),
         Op::StoreSkipped(next) => {
             t.stores_skipped += 1;
+            Ok(Flow::Next(*next as usize))
+        }
+        Op::StoreFolded(next) => {
+            t.stores_folded += 1;
+            Ok(Flow::Next(*next as usize))
+        }
+        Op::PrintParts {
+            parts,
+            trees_folded,
+            next,
+        } => {
+            let content_end = print_parts(parts, local_env, node_env, logger.log_text())?;
+            t.prints_fused += 1;
+            t.print_trees_folded += u64::from(*trees_folded);
+            logger.log(LogEntry {
+                node: node_id,
+                content_end,
+                step: state.crash_info.current_step,
+            });
             Ok(Flow::Next(*next as usize))
         }
         Op::Return(rhs) => Ok(Flow::Return(cvalue(local_env, node_env, rhs, names, t)?)),

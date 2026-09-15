@@ -37,7 +37,12 @@ fn on_big_stack(f: impl FnOnce() + Send + 'static) {
 
 /// Whether `rewritten` may stand in for `plain` at one vertex.
 fn rewrite_allowed(plain: &Op, rewritten: &Op) -> bool {
-    plain == rewritten || matches!((plain, rewritten), (Op::AssignLocal { .. }, Op::StoreSkipped(_)))
+    plain == rewritten
+        || match (plain, rewritten) {
+            (Op::AssignLocal { next, .. }, Op::StoreSkipped(to) | Op::StoreFolded(to)) => next == to,
+            (Op::Print { value: Opnd::Local(_), next }, Op::PrintParts { next: to, .. }) => next == to,
+            _ => false,
+        }
 }
 
 #[test]
@@ -48,7 +53,7 @@ fn no_rewritten_value_is_read_in_any_spec() {
         files.sort();
         assert!(!files.is_empty());
         let mut failures = Vec::new();
-        let (mut compiled, mut skipped_stores) = (0, 0);
+        let (mut compiled, mut skipped_stores, mut folded_prints) = (0, 0, 0);
         for file in &files {
             let name = file.display().to_string();
             let Some(program) = compile_spec(file) else {
@@ -61,6 +66,7 @@ fn no_rewritten_value_is_read_in_any_spec() {
             for (v, (p, r)) in plain.ops.iter().zip(&program.compiled.ops).enumerate() {
                 assert!(rewrite_allowed(p, r), "{name} vertex {v}: {p:?} decoded as {r:?}");
                 skipped_stores += usize::from(matches!(r, Op::StoreSkipped(_)));
+                folded_prints += usize::from(matches!(r, Op::PrintParts { .. }));
             }
             let analysis = analyze(&program, &program.compiled.ops, &entries(&program));
             failures.extend(analysis.failures.iter().map(|f| format!("{name} {f}")));
@@ -68,6 +74,7 @@ fn no_rewritten_value_is_read_in_any_spec() {
         }
         assert!(compiled > 0, "no spec compiled");
         assert!(skipped_stores > 0, "no store was skipped in any spec");
+        assert!(folded_prints > 0, "no print was folded in any spec");
         assert!(failures.is_empty(), "rewritten values read:\n{}", failures.join("\n"));
     });
 }

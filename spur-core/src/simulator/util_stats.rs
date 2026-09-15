@@ -124,6 +124,9 @@ static PRINT_CONTENT_PRESIZED: AtomicU64 = AtomicU64::new(0);
 static COMPILED_OPS_LABEL_EXECS: AtomicU64 = AtomicU64::new(0);
 static COMPILED_OPS_LEGACY_LABELS: AtomicU64 = AtomicU64::new(0);
 static COMPILED_OPS_STORES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static COMPILED_OPS_STORES_FOLDED: AtomicU64 = AtomicU64::new(0);
+static COMPILED_OPS_PRINTS_FUSED: AtomicU64 = AtomicU64::new(0);
+static COMPILED_OPS_PRINT_TREES_FOLDED: AtomicU64 = AtomicU64::new(0);
 static COMPILED_EXPR_LEAF_OPERANDS_INLINE: AtomicU64 = AtomicU64::new(0);
 static COMPILED_EXPR_TREE_EVALS: AtomicU64 = AtomicU64::new(0);
 static COMPILED_EXPR_LEGACY_EVALS: AtomicU64 = AtomicU64::new(0);
@@ -943,6 +946,9 @@ pub fn set_enabled(on: bool) {
             &COMPILED_OPS_LABEL_EXECS,
             &COMPILED_OPS_LEGACY_LABELS,
             &COMPILED_OPS_STORES_SKIPPED,
+            &COMPILED_OPS_STORES_FOLDED,
+            &COMPILED_OPS_PRINTS_FUSED,
+            &COMPILED_OPS_PRINT_TREES_FOLDED,
             &COMPILED_EXPR_LEAF_OPERANDS_INLINE,
             &COMPILED_EXPR_TREE_EVALS,
             &COMPILED_EXPR_LEGACY_EVALS,
@@ -5904,12 +5910,18 @@ impl RunBufferStats {
 /// Labels run by the decoded operation loop, and labels run one by one from
 /// the graph because a program carried no decoded form. `stores_skipped`
 /// counts executed vertices whose local store was decoded away because no
-/// later read can see the value.
+/// later read can see the value. `stores_folded` counts executed vertices
+/// whose store a folded print writes into its text instead, `prints_fused`
+/// the folded prints written, and `print_trees_folded` the expression trees
+/// those prints did not evaluate.
 #[derive(Serialize, Debug)]
 pub struct CompiledOpsStats {
     pub label_execs: u64,
     pub legacy_labels: u64,
     pub stores_skipped: u64,
+    pub stores_folded: u64,
+    pub prints_fused: u64,
+    pub print_trees_folded: u64,
 }
 
 impl CompiledOpsStats {
@@ -5918,6 +5930,9 @@ impl CompiledOpsStats {
             label_execs: COMPILED_OPS_LABEL_EXECS.load(Ordering::Relaxed),
             legacy_labels: COMPILED_OPS_LEGACY_LABELS.load(Ordering::Relaxed),
             stores_skipped: COMPILED_OPS_STORES_SKIPPED.load(Ordering::Relaxed),
+            stores_folded: COMPILED_OPS_STORES_FOLDED.load(Ordering::Relaxed),
+            prints_fused: COMPILED_OPS_PRINTS_FUSED.load(Ordering::Relaxed),
+            print_trees_folded: COMPILED_OPS_PRINT_TREES_FOLDED.load(Ordering::Relaxed),
         }
     }
 }
@@ -6470,6 +6485,9 @@ pub struct InterpreterTally {
     pub call_targets_indexed: u64,
     pub call_targets_fallback: u64,
     pub stores_skipped: u64,
+    pub stores_folded: u64,
+    pub prints_fused: u64,
+    pub print_trees_folded: u64,
 }
 
 impl InterpreterTally {
@@ -6483,6 +6501,9 @@ impl InterpreterTally {
             call_targets_indexed: 0,
             call_targets_fallback: 0,
             stores_skipped: 0,
+            stores_folded: 0,
+            prints_fused: 0,
+            print_trees_folded: 0,
         }
     }
 
@@ -6496,6 +6517,9 @@ impl InterpreterTally {
             call_targets_indexed: self.call_targets_indexed + o.call_targets_indexed,
             call_targets_fallback: self.call_targets_fallback + o.call_targets_fallback,
             stores_skipped: self.stores_skipped + o.stores_skipped,
+            stores_folded: self.stores_folded + o.stores_folded,
+            prints_fused: self.prints_fused + o.prints_fused,
+            print_trees_folded: self.print_trees_folded + o.print_trees_folded,
         }
     }
 
@@ -6624,6 +6648,9 @@ pub fn flush_frame_stats() {
         (interp.label_execs, &COMPILED_OPS_LABEL_EXECS),
         (interp.legacy_labels, &COMPILED_OPS_LEGACY_LABELS),
         (interp.stores_skipped, &COMPILED_OPS_STORES_SKIPPED),
+        (interp.stores_folded, &COMPILED_OPS_STORES_FOLDED),
+        (interp.prints_fused, &COMPILED_OPS_PRINTS_FUSED),
+        (interp.print_trees_folded, &COMPILED_OPS_PRINT_TREES_FOLDED),
         (interp.leaf_operands_inline, &COMPILED_EXPR_LEAF_OPERANDS_INLINE),
         (interp.tree_evals, &COMPILED_EXPR_TREE_EVALS),
         (interp.legacy_evals, &COMPILED_EXPR_LEGACY_EVALS),

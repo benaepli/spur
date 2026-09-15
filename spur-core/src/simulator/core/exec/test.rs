@@ -1,7 +1,7 @@
 use super::*;
 use crate::analysis::resolver::NameId;
 use crate::compiler::cfg::compiled::check;
-use crate::compiler::cfg::compiled::{CompiledProgram, Rewrites};
+use crate::compiler::cfg::compiled::{CExpr, CompiledProgram, Opnd, Rewrites};
 use crate::compiler::cfg::{Cfg, Expr, Instr, Label, Lhs, Program, VarSlot};
 use crate::simulator::core::partition::QueuedMessage;
 use crate::simulator::core::state::{
@@ -851,6 +851,9 @@ fn tally_since(before: InterpreterTally) -> InterpreterTally {
         call_targets_indexed: a.call_targets_indexed - before.call_targets_indexed,
         call_targets_fallback: a.call_targets_fallback - before.call_targets_fallback,
         stores_skipped: a.stores_skipped - before.stores_skipped,
+        stores_folded: a.stores_folded - before.stores_folded,
+        prints_fused: a.prints_fused - before.prints_fused,
+        print_trees_folded: a.print_trees_folded - before.print_trees_folded,
     }
 }
 
@@ -1006,9 +1009,43 @@ fn with_entry(mut program: Program, start: usize, slots: usize) -> Program {
 /// and requires everything observable to match: result, logs, traces, edges,
 /// every state field outside frames, frames on every slot whose value no
 /// rewrite may change, and every interpreter count except the operand reads
-/// the rewrites remove. Returns the counts with rewrites on, without and
-/// with hashing.
+/// and trees the rewrites remove. Returns the counts with rewrites on,
+/// without and with hashing.
 fn assert_rewrites_agree(program: &Program, start: usize, slots: usize) -> [InterpreterTally; 2] {
+    assert_rewrites_agree_failing(program, start, slots, None)
+}
+
+/// Operand reads a decoded store or print makes: leaf operands and borrowed
+/// slot reads.
+fn operand_reads(o: &Opnd, top: bool) -> (u64, u64) {
+    match o {
+        Opnd::Tree(e) => match &**e {
+            CExpr::Plus(a, b) => {
+                let (x, y) = (operand_reads(a, false), operand_reads(b, false));
+                (x.0 + y.0, x.1 + y.1)
+            }
+            CExpr::IntToString(a) => operand_reads(a, false),
+            other => panic!("a folded store holds only concatenations: {other:?}"),
+        },
+        Opnd::Local(_) | Opnd::Node(_) if !top => (1, 1),
+        _ => (1, 0),
+    }
+}
+
+fn edge_count(edges: &[((usize, usize), u64)], from: usize) -> u64 {
+    edges.iter().filter(|((f, _), _)| *f == from).map(|(_, c)| c).sum()
+}
+
+/// As `assert_rewrites_agree`. With `failing`, the run fails with rewrites
+/// off at that folded store, and with rewrites on runs on from it to its
+/// folded print, which fails with the same error: the decoded form's label
+/// executions and edges exceed by exactly those transitions.
+fn assert_rewrites_agree_failing(
+    program: &Program,
+    start: usize,
+    slots: usize,
+    failing: Option<usize>,
+) -> [InterpreterTally; 2] {
     let program = with_entry(program.clone(), start, slots);
     let mut off = program.clone();
     off.compiled = CompiledProgram::build_with(&program, Rewrites::Off);
@@ -1027,26 +1064,399 @@ fn assert_rewrites_agree(program: &Program, start: usize, slots: usize) -> [Inte
             observe_rewrites::<WithHashing>(&on, start, slots, d),
         ),
     ];
+    let mut past_failure = Vec::new();
+    if let Some(f) = failing {
+        let mut v = f;
+        while let Op::StoreFolded(next) | Op::StoreSkipped(next) = on.compiled.ops[v] {
+            past_failure.push((v, next as usize));
+            v = next as usize;
+        }
+        assert!(matches!(on.compiled.ops[f], Op::StoreFolded(_)), "vertex {f} is not folded");
+        assert!(matches!(on.compiled.ops[v], Op::PrintParts { .. }), "vertex {f} reaches no folded print");
+    }
     pairs.map(|(a, b)| {
         assert_eq!(a.result, b.result);
         assert_eq!(a.logs, b.logs);
         assert_eq!(a.trace_text, b.trace_text);
         assert_eq!(a.traces, b.traces);
         assert_eq!(a.state, b.state);
-        assert_eq!(a.edges, b.edges);
+        let mut edges: HashMap<(usize, usize), u64> = a.edges.iter().copied().collect();
+        for e in &past_failure {
+            *edges.entry(*e).or_insert(0) += 1;
+        }
+        let mut edges: Vec<_> = edges.into_iter().collect();
+        edges.sort_unstable();
+        assert_eq!(edges, b.edges);
         assert_eq!(a.events[2], b.events[2]);
-        assert_eq!(a.events[0] + a.events[1], b.events[0] + b.events[1]);
         let (x, y) = (a.tally, b.tally);
-        assert_eq!(x.label_execs, y.label_execs);
+        assert_eq!(y.label_execs - x.label_execs, past_failure.len() as u64);
         assert_eq!(x.legacy_labels, y.legacy_labels);
-        assert_eq!(x.tree_evals, y.tree_evals);
         assert_eq!(x.legacy_evals, y.legacy_evals);
         assert_eq!(x.call_targets_indexed, y.call_targets_indexed);
         assert_eq!(x.call_targets_fallback, y.call_targets_fallback);
-        assert_eq!(x.stores_skipped, 0);
-        assert_eq!(x.leaf_operands_inline - y.leaf_operands_inline, y.stores_skipped);
+        assert_eq!([x.stores_skipped, x.stores_folded, x.prints_fused, x.print_trees_folded], [0; 4]);
+        let (mut stores_folded, mut prints_fused, mut trees_folded) = (0, 0, 0);
+        let (mut leaves_folded, mut borrows_folded) = (0, 0);
+        for (v, (plain, rewritten)) in off.compiled.ops.iter().zip(&on.compiled.ops).enumerate() {
+            let runs = edge_count(&b.edges, v);
+            match (plain, rewritten) {
+                (Op::AssignLocal { rhs, .. }, Op::StoreFolded(_)) => {
+                    stores_folded += runs;
+                    let (leaves, borrows) = operand_reads(rhs, true);
+                    leaves_folded += runs * leaves;
+                    borrows_folded += runs * borrows;
+                }
+                (Op::Print { .. }, Op::PrintParts { trees_folded: trees, .. }) => {
+                    prints_fused += runs;
+                    trees_folded += runs * u64::from(*trees);
+                    leaves_folded += runs;
+                    borrows_folded += runs;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(y.stores_folded, stores_folded);
+        assert_eq!(y.prints_fused, prints_fused);
+        assert_eq!(y.print_trees_folded, trees_folded);
+        if failing.is_none() {
+            assert_eq!(x.tree_evals - y.tree_evals, y.print_trees_folded);
+            assert_eq!(
+                x.leaf_operands_inline - y.leaf_operands_inline,
+                y.stores_skipped + leaves_folded
+            );
+            assert_eq!(
+                a.events[0] + a.events[1] - (b.events[0] + b.events[1]),
+                borrows_folded
+            );
+        }
         y
     })
+}
+
+fn var(idx: u32) -> Expr {
+    Expr::Var(slot(idx))
+}
+
+fn text(s: &str) -> Expr {
+    Expr::String(s.into())
+}
+
+fn plus(a: Expr, b: Expr) -> Expr {
+    Expr::Plus(Box::new(a), Box::new(b))
+}
+
+fn decimal(a: Expr) -> Expr {
+    Expr::IntToString(Box::new(a))
+}
+
+/// A program that stores `setup` into local slots and `node_setup` into node
+/// slots, stores into node slot 1 so no setup store joins the chain, runs
+/// the local stores of `chain`, prints local slot `target` and returns.
+struct ChainProgram {
+    program: Program,
+    start: usize,
+    stores: Vec<usize>,
+    print: usize,
+    ret: usize,
+}
+
+fn chain_program(
+    setup: &[(u32, Expr)],
+    node_setup: &[(u32, Expr)],
+    chain: &[(u32, Expr)],
+    target: u32,
+) -> ChainProgram {
+    let mut builder = TestProgramBuilder::new();
+    let ret = builder.add(Label::Return(Expr::Unit));
+    let print = builder.add(Label::Print(var(target), ret));
+    let mut next = print;
+    let mut stores = Vec::new();
+    for (s, e) in chain.iter().rev() {
+        next = builder.add(Label::Instr(Instr::Assign(Lhs::Var(slot(*s)), e.clone()), next));
+        stores.push(next);
+    }
+    stores.reverse();
+    next = builder.add(Label::Instr(
+        Instr::Assign(Lhs::Var(node_slot(1)), Expr::Int(0)),
+        next,
+    ));
+    for (s, e) in node_setup.iter().rev() {
+        next = builder.add(Label::Instr(Instr::Assign(Lhs::Var(node_slot(*s)), e.clone()), next));
+    }
+    for (s, e) in setup.iter().rev() {
+        next = builder.add(Label::Instr(Instr::Assign(Lhs::Var(slot(*s)), e.clone()), next));
+    }
+    ChainProgram {
+        program: builder.build(),
+        start: next,
+        stores,
+        print,
+        ret,
+    }
+}
+
+fn decoded_on(program: &Program, start: usize, slots: usize) -> Program {
+    let mut on = with_entry(program.clone(), start, slots);
+    on.compiled = CompiledProgram::build_with(&on, Rewrites::On);
+    on
+}
+
+const CHAIN_SLOTS: usize = 100;
+
+/// A folded print writes the bytes the print writes for integers at both
+/// ends of their range, more than eight decimal pieces, a node slot, and
+/// empty, non-ASCII, quote and backslash strings in literals and slots.
+#[test]
+fn folded_prints_write_the_bytes_the_print_writes() {
+    let texts = ["", "h\u{e9}llo \u{2603}", "\"", "\\"];
+    let ints = [0, -1, i64::MIN, i64::MAX];
+    let mut setup: Vec<(u32, Expr)> = ints.iter().enumerate().map(|(i, n)| (i as u32, Expr::Int(*n))).collect();
+    setup.extend(texts.iter().enumerate().map(|(i, s)| (4 + i as u32, text(s))));
+    let node_setup = [(0, text("n\u{f6}de"))];
+
+    let mut chain = vec![(20, plus(var(4), text("(")))];
+    let mut expected = String::from("(");
+    let mut acc = 20;
+    let mut fresh = 21;
+    let mut push = |chain: &mut Vec<(u32, Expr)>, e: Expr| {
+        chain.push((fresh, e));
+        fresh += 1;
+        fresh - 1
+    };
+    for k in 0..10 {
+        let i = k % ints.len();
+        let tmp = push(&mut chain, decimal(var(i as u32)));
+        acc = push(&mut chain, plus(var(acc), var(tmp)));
+        expected.push_str(&ints[i].to_string());
+        let (lit, slot_text) = (texts[k % texts.len()], texts[(k + 1) % texts.len()]);
+        acc = push(&mut chain, plus(var(acc), text(lit)));
+        acc = push(&mut chain, plus(var(acc), var(4 + ((k + 1) % texts.len()) as u32)));
+        expected.push_str(lit);
+        expected.push_str(slot_text);
+    }
+    acc = push(&mut chain, plus(text("<"), var(acc)));
+    acc = push(&mut chain, plus(var(acc), Expr::Var(node_slot(0))));
+    acc = push(&mut chain, plus(var(acc), plus(text("["), text("]"))));
+    let expected = format!("\"<{expected}n\u{f6}de[]\"");
+
+    let c = chain_program(&setup, &node_setup, &chain, acc);
+    let on = decoded_on(&c.program, c.start, CHAIN_SLOTS);
+    let Op::PrintParts { parts, trees_folded, .. } = &on.compiled.ops[c.print] else {
+        panic!("the print is not folded: {:?}", on.compiled.ops[c.print]);
+    };
+    assert_eq!(parts.iter().filter(|p| matches!(p, PrintPart::Int(_))).count(), 10);
+    assert_eq!(*trees_folded as usize, chain.len() + 1);
+    for v in &c.stores {
+        assert!(matches!(on.compiled.ops[*v], Op::StoreFolded(_)), "vertex {v}: {:?}", on.compiled.ops[*v]);
+    }
+    for tally in assert_rewrites_agree(&c.program, c.start, CHAIN_SLOTS) {
+        assert_eq!(tally.prints_fused, 1);
+        assert_eq!(tally.stores_folded, chain.len() as u64);
+    }
+    let observed = observe_rewrites::<NoHashing>(&on, c.start, CHAIN_SLOTS, &check::analyze(&on, &on.compiled.ops, &check::entries(&on)).differing_in);
+    assert_eq!(observed.logs.len(), 1);
+    assert!(observed.logs[0].ends_with(&format!(" {expected}")), "{} vs {expected}", observed.logs[0]);
+}
+
+/// A folded print fails with the error, text and all, the first failing
+/// store in evaluation order raises, and a chain whose checks come in a
+/// different order than its pieces is not folded.
+#[test]
+fn folded_prints_fail_like_the_first_failing_store() {
+    let cases: Vec<(&str, Vec<(u32, Expr)>, Vec<(u32, Expr)>, Vec<(u32, Expr)>, usize, &str)> = vec![
+        (
+            "decimal of a string",
+            vec![(0, text("seven"))],
+            vec![],
+            vec![(10, plus(text("a"), decimal(var(0)))), (11, plus(var(10), text("!")))],
+            0,
+            "expected: \"int\", got: \"string\"",
+        ),
+        (
+            "literal plus an integer",
+            vec![(0, Expr::Int(5))],
+            vec![],
+            vec![(10, plus(text("a"), var(0))), (11, plus(var(10), text("b")))],
+            0,
+            "expected: \"int or string\", got: \"string\"",
+        ),
+        (
+            "integer plus a literal",
+            vec![(0, Expr::Int(5))],
+            vec![],
+            vec![(10, plus(var(0), text("a"))), (11, plus(var(10), text("b")))],
+            0,
+            "expected: \"int or string\", got: \"int\"",
+        ),
+        (
+            "two failing stores",
+            vec![(0, Expr::Int(5)), (1, Expr::Bool(true))],
+            vec![],
+            vec![(10, plus(var(0), text("a"))), (11, plus(var(10), decimal(var(1)))), (12, plus(var(11), text("c")))],
+            0,
+            "expected: \"int or string\", got: \"int\"",
+        ),
+        (
+            "a decimal check before a concatenation check",
+            vec![(0, Expr::Int(5)), (1, Expr::Bool(true))],
+            vec![],
+            vec![(10, plus(text("a"), decimal(var(1)))), (11, plus(var(10), var(0)))],
+            0,
+            "expected: \"int\", got: \"bool\"",
+        ),
+        (
+            "failure at a later store",
+            vec![(0, text("seven"))],
+            vec![],
+            vec![
+                (10, plus(text("a"), text("b"))),
+                (11, plus(var(10), decimal(var(0)))),
+                (12, plus(var(11), text("!"))),
+            ],
+            1,
+            "expected: \"int\", got: \"string\"",
+        ),
+        (
+            "node slot piece",
+            vec![],
+            vec![(0, Expr::Int(3))],
+            vec![(10, plus(text("n="), Expr::Var(node_slot(0)))), (11, plus(var(10), text(".")))],
+            0,
+            "expected: \"int or string\", got: \"string\"",
+        ),
+        (
+            "right-nested chain across stores",
+            vec![(0, Expr::Unit)],
+            vec![],
+            vec![(10, plus(text("a"), var(0))), (11, plus(text("b"), var(10)))],
+            0,
+            "expected: \"int or string\", got: \"string\"",
+        ),
+    ];
+    for (name, setup, node_setup, chain, failing, error) in cases {
+        let target = chain.last().expect("a chain has a store").0;
+        let c = chain_program(&setup, &node_setup, &chain, target);
+        let on = decoded_on(&c.program, c.start, CHAIN_SLOTS);
+        assert!(matches!(on.compiled.ops[c.print], Op::PrintParts { .. }), "{name}: {:?}", on.compiled.ops[c.print]);
+        let observed = observe_rewrites::<WithHashing>(&on, c.start, CHAIN_SLOTS, &check::analyze(&on, &on.compiled.ops, &check::entries(&on)).differing_in);
+        assert!(observed.result.contains(error), "{name}: {}", observed.result);
+        for tally in assert_rewrites_agree_failing(&c.program, c.start, CHAIN_SLOTS, Some(c.stores[failing])) {
+            assert_eq!(tally.prints_fused, 0, "{name}");
+            assert_eq!(tally.stores_folded, chain.len() as u64, "{name}");
+        }
+    }
+
+    let right_nested = [(10, plus(var(0), plus(text("a"), var(1)))), (11, plus(var(10), text("!")))];
+    for setup in [
+        [(0, Expr::Int(5)), (1, Expr::Bool(true))],
+        [(0, text("x")), (1, text("y"))],
+    ] {
+        let c = chain_program(&setup, &[], &right_nested, 11);
+        let on = decoded_on(&c.program, c.start, CHAIN_SLOTS);
+        assert!(matches!(on.compiled.ops[c.stores[0]], Op::AssignLocal { .. }));
+        assert!(matches!(on.compiled.ops[c.print], Op::PrintParts { .. }));
+        assert_rewrites_agree(&c.program, c.start, CHAIN_SLOTS);
+    }
+    let c = chain_program(
+        &[(0, Expr::Int(5)), (1, Expr::Bool(true))],
+        &[],
+        &right_nested[..1],
+        10,
+    );
+    let on = decoded_on(&c.program, c.start, CHAIN_SLOTS);
+    assert!(matches!(on.compiled.ops[c.print], Op::Print { .. }));
+    let [plain, _] = assert_rewrites_agree(&c.program, c.start, CHAIN_SLOTS);
+    assert_eq!(plain.prints_fused, 0);
+}
+
+/// A chain vertex past the first that is also a function entry ends the
+/// chain there, and a run entered at it fails and prints alike.
+#[test]
+fn a_chain_is_cut_at_a_second_way_in() {
+    let c = chain_program(
+        &[(0, Expr::Int(5))],
+        &[],
+        &[(10, plus(text("a"), decimal(var(0)))), (11, plus(var(10), text("b")))],
+        11,
+    );
+    let on = decoded_on(&c.program, c.stores[1], CHAIN_SLOTS);
+    assert!(matches!(on.compiled.ops[c.stores[0]], Op::AssignLocal { .. }));
+    assert!(matches!(on.compiled.ops[c.stores[1]], Op::StoreFolded(_)));
+    let mut program = c.program.clone();
+    register(&mut program, "middle", function(c.stores[1], 901, 0, CHAIN_SLOTS as u32, false));
+    program.decode();
+    assert_rewrites_agree_failing(&program, c.stores[1], CHAIN_SLOTS, Some(c.stores[1]));
+    let [plain, hashed] = assert_rewrites_agree(&program, c.start, CHAIN_SLOTS);
+    assert_eq!([plain.prints_fused, hashed.prints_fused], [1, 1]);
+}
+
+/// The checker rejects a folded slot read after the print, a piece slot
+/// written inside the chain, a second way into a chain vertex past the
+/// first, and permuted pieces.
+#[test]
+fn the_checker_rejects_broken_folded_prints() {
+    let c = chain_program(
+        &[(0, Expr::Int(7)), (1, text("z"))],
+        &[],
+        &[
+            (10, decimal(var(0))),
+            (11, plus(text("a"), var(10))),
+            (12, plus(var(11), var(1))),
+            (13, plus(text("q"), text("r"))),
+        ],
+        12,
+    );
+    let on = decoded_on(&c.program, c.start, CHAIN_SLOTS);
+    let entries = check::entries(&on);
+    assert!(check::analyze(&on, &on.compiled.ops, &entries).failures.is_empty());
+    let Op::PrintParts { parts, trees_folded, next } = on.compiled.ops[c.print].clone() else {
+        panic!("the print is not folded: {:?}", on.compiled.ops[c.print]);
+    };
+    assert_eq!(trees_folded, 4);
+    assert_eq!(parts.len(), 3);
+    let rejected = |program: &Program, ops: &[Op], entries: &[usize], expected: &str| {
+        let failures = check::analyze(program, ops, entries).failures;
+        assert!(failures.iter().any(|f| f.contains(expected)), "expected {expected:?} in {failures:?}");
+    };
+
+    let mut ops = on.compiled.ops.clone();
+    ops[c.ret] = Op::Return(Opnd::Local(10));
+    rejected(&on, &ops, &entries, &format!("vertex {}: reads slot 10,", c.ret));
+
+    let mut program = on.clone();
+    program.cfg.graph[c.stores[3]] = Label::Instr(
+        Instr::Assign(Lhs::Var(slot(1)), plus(text("q"), text("r"))),
+        c.print,
+    );
+    rejected(&program, &on.compiled.ops, &entries, &format!("vertex {}: piece slot 1 is written", c.print));
+
+    let mut program = on.clone();
+    register(&mut program, "middle", function(c.stores[1], 901, 0, CHAIN_SLOTS as u32, false));
+    let middle_entries = check::entries(&program);
+    rejected(
+        &program,
+        &on.compiled.ops,
+        &middle_entries,
+        &format!("vertex {}: folded store in no folded print's chain", c.stores[0]),
+    );
+
+    let mut program = on.clone();
+    program.cfg.graph.push(Label::Continue(c.stores[2]));
+    let mut ops = on.compiled.ops.clone();
+    ops.push(Op::Goto(c.stores[2] as u32));
+    for v in &c.stores[..2] {
+        rejected(&program, &ops, &entries, &format!("vertex {v}: folded store in no folded print's chain"));
+    }
+
+    let mut swapped = parts.to_vec();
+    swapped.swap(1, 2);
+    let mut ops = on.compiled.ops.clone();
+    ops[c.print] = Op::PrintParts {
+        parts: swapped.into_boxed_slice(),
+        trees_folded,
+        next,
+    };
+    rejected(&on, &ops, &entries, &format!("vertex {}: folded print pieces", c.print));
 }
 
 fn function(entry: usize, name: usize, params: u32, slots: u32, is_sync: bool) -> FunctionInfo {

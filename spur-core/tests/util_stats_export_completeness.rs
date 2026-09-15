@@ -1417,6 +1417,9 @@ fn compiled_ops(m: &mut Marks) -> CompiledOpsStats {
         label_execs: m.int(),
         legacy_labels: m.int(),
         stores_skipped: m.int(),
+        stores_folded: m.int(),
+        prints_fused: m.int(),
+        print_trees_folded: m.int(),
     }
 }
 
@@ -1425,11 +1428,17 @@ fn compiled_ops_leaves(prefix: &str, c: &CompiledOpsStats) -> Vec<(String, Value
         label_execs,
         legacy_labels,
         stores_skipped,
+        stores_folded,
+        prints_fused,
+        print_trees_folded,
     } = c;
     vec![
         leaf(prefix, "label_execs", *label_execs),
         leaf(prefix, "legacy_labels", *legacy_labels),
         leaf(prefix, "stores_skipped", *stores_skipped),
+        leaf(prefix, "stores_folded", *stores_folded),
+        leaf(prefix, "prints_fused", *prints_fused),
+        leaf(prefix, "print_trees_folded", *print_trees_folded),
     ]
 }
 
