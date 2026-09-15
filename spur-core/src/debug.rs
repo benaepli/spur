@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use arrow::array::{Array, AsArray};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,68 @@ impl SimulatorDebugger {
         Ok(Self {
             parquet_dir: path.to_path_buf(),
         })
+    }
+
+    /// Labels of the run's deployed nodes by global index, as `Role[ordinal]`
+    /// followed by the node's path when it has one. Empty when the output has
+    /// no deployment tables.
+    pub fn node_labels(&self, run_id: i64) -> Result<HashMap<i64, String>> {
+        let Some(deployment_id) = self.deployment_of(run_id)? else {
+            return Ok(HashMap::new());
+        };
+        let mut labels = HashMap::new();
+        for batch in read_all_batches(&self.parquet_dir.join("deployment_nodes"))? {
+            let ids = batch.column_by_name("deployment_id").unwrap().as_primitive::<arrow::datatypes::Int32Type>();
+            let indices = batch.column_by_name("node_index").unwrap().as_primitive::<arrow::datatypes::Int32Type>();
+            let roles = batch.column_by_name("role").unwrap().as_string::<i32>();
+            let ordinals = batch.column_by_name("ordinal").unwrap().as_primitive::<arrow::datatypes::Int32Type>();
+            let paths = batch.column_by_name("path").unwrap().as_string::<i32>();
+            for i in 0..batch.num_rows() {
+                if ids.value(i) != deployment_id {
+                    continue;
+                }
+                let mut label = format!("{}[{}]", roles.value(i), ordinals.value(i));
+                if paths.is_valid(i) {
+                    label = format!("{label} {}", paths.value(i));
+                }
+                labels.insert(indices.value(i) as i64, label);
+            }
+        }
+        Ok(labels)
+    }
+
+    /// The global index of the node at `path` in the run's deployment.
+    pub fn node_at_path(&self, run_id: i64, path: &str) -> Result<i64> {
+        let deployment_id = self
+            .deployment_of(run_id)?
+            .ok_or_else(|| anyhow!("run {run_id} has no deployment in this output"))?;
+        for batch in read_all_batches(&self.parquet_dir.join("deployment_nodes"))? {
+            let ids = batch.column_by_name("deployment_id").unwrap().as_primitive::<arrow::datatypes::Int32Type>();
+            let indices = batch.column_by_name("node_index").unwrap().as_primitive::<arrow::datatypes::Int32Type>();
+            let paths = batch.column_by_name("path").unwrap().as_string::<i32>();
+            for i in 0..batch.num_rows() {
+                if ids.value(i) == deployment_id && paths.is_valid(i) && paths.value(i) == path {
+                    return Ok(indices.value(i) as i64);
+                }
+            }
+        }
+        Err(anyhow!("no node at path `{path}` in the deployment of run {run_id}"))
+    }
+
+    fn deployment_of(&self, run_id: i64) -> Result<Option<i32>> {
+        for batch in read_all_batches(&self.parquet_dir.join("runs"))? {
+            let Some(deployments) = batch.column_by_name("deployment_id") else {
+                return Ok(None);
+            };
+            let deployments = deployments.as_primitive::<arrow::datatypes::Int32Type>();
+            let runs = batch.column_by_name("run_id").unwrap().as_primitive::<arrow::datatypes::Int64Type>();
+            for i in 0..batch.num_rows() {
+                if runs.value(i) == run_id && deployments.value(i) >= 0 {
+                    return Ok(Some(deployments.value(i)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Fetches all logs for a specific node, ordered by simulation step.

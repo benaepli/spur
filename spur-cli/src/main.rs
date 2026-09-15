@@ -182,6 +182,9 @@ pub enum DebugSubcommands {
         /// Node ID
         #[arg(long)]
         node_id: Option<i64>,
+        /// Node path in the run's deployment, e.g. `nodes[2]`
+        #[arg(long, conflicts_with = "node_id")]
+        node: Option<String>,
     },
     /// Show a combined timeline of executions, logs, and traces
     Combined {
@@ -203,6 +206,9 @@ pub enum DebugSubcommands {
         /// Node ID
         #[arg(long)]
         node_id: Option<i64>,
+        /// Node path in the run's deployment, e.g. `nodes[2]`
+        #[arg(long, conflicts_with = "node_id")]
+        node: Option<String>,
     },
 }
 
@@ -258,12 +264,14 @@ fn main() {
                 db,
                 run_id,
                 node_id,
-            } => run_debug_logs(db, run_id, node_id),
+                node,
+            } => run_debug_logs(db, run_id, node_id, node),
             DebugSubcommands::Traces {
                 db,
                 run_id,
                 node_id,
-            } => run_debug_traces(db, run_id, node_id),
+                node,
+            } => run_debug_traces(db, run_id, node_id, node),
             DebugSubcommands::Combined { db, run_id } => run_debug_combined(db, run_id),
         },
     };
@@ -800,9 +808,34 @@ fn run_run_plan(
     Ok(())
 }
 
-fn run_debug_logs(db_path: PathBuf, run_id: i64, node_id: Option<i64>) -> Result<()> {
+/// The label of node `id`. Every deployed node has a label, so an index past
+/// them is a client; without labels every node reads `Node id`.
+fn node_label(labels: &std::collections::HashMap<i64, String>, id: i64) -> String {
+    match labels.get(&id) {
+        Some(label) => label.clone(),
+        None if !labels.is_empty() && id >= labels.len() as i64 => format!("Client {id}"),
+        None => format!("Node {id}"),
+    }
+}
+
+/// The node an `--node-id` or `--node` argument names.
+fn selected_node(
+    debugger: &SimulatorDebugger,
+    run_id: i64,
+    node_id: Option<i64>,
+    node: Option<String>,
+) -> Result<Option<i64>> {
+    match node {
+        Some(path) => debugger.node_at_path(run_id, &path).map(Some),
+        None => Ok(node_id),
+    }
+}
+
+fn run_debug_logs(db_path: PathBuf, run_id: i64, node_id: Option<i64>, node: Option<String>) -> Result<()> {
     let debugger = SimulatorDebugger::new(&db_path)
         .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+    let node_id = selected_node(&debugger, run_id, node_id, node)?;
+    let labels = debugger.node_labels(run_id).unwrap_or_default();
 
     if let Some(node_id) = node_id {
         let logs = debugger
@@ -814,7 +847,7 @@ fn run_debug_logs(db_path: PathBuf, run_id: i64, node_id: Option<i64>) -> Result
             return Ok(());
         }
 
-        println!("Logs for Run {}, Node {}:", run_id, node_id);
+        println!("Logs for Run {}, {}:", run_id, node_label(&labels, node_id));
         println!("{:-<40}", "");
         for (step, content) in logs {
             println!("[Step {:4}] {}", step, content);
@@ -834,9 +867,9 @@ fn run_debug_logs(db_path: PathBuf, run_id: i64, node_id: Option<i64>) -> Result
         println!("{:-<60}", "");
         for (step, node_id, content) in logs {
             let node_str = node_id
-                .map(|id| id.to_string())
+                .map(|id| node_label(&labels, id))
                 .unwrap_or_else(|| "SYS".to_string());
-            println!("[Step {:4}] [Node {:>3}] {}", step, node_str, content);
+            println!("[Step {:4}] [{}] {}", step, node_str, content);
         }
         println!("{:-<60}", "");
     }
@@ -851,6 +884,7 @@ fn run_debug_combined(db_path: PathBuf, run_id: i64) -> Result<()> {
     let events = debugger
         .get_combined_timeline(run_id)
         .map_err(|e| anyhow::anyhow!("Failed to fetch combined timeline: {}", e))?;
+    let labels = debugger.node_labels(run_id).unwrap_or_default();
 
     if events.is_empty() {
         println!("No events found for run {}.", run_id);
@@ -866,7 +900,7 @@ fn run_debug_combined(db_path: PathBuf, run_id: i64) -> Result<()> {
                 _ => "  System  ".to_string(),
             },
             _ => match event.node_id {
-                Some(id) => format!("Node   {:>3}", id),
+                Some(id) => node_label(&labels, id),
                 None => "  System  ".to_string(),
             },
         };
@@ -880,9 +914,11 @@ fn run_debug_combined(db_path: PathBuf, run_id: i64) -> Result<()> {
     Ok(())
 }
 
-fn run_debug_traces(db_path: PathBuf, run_id: i64, node_id: Option<i64>) -> Result<()> {
+fn run_debug_traces(db_path: PathBuf, run_id: i64, node_id: Option<i64>, node: Option<String>) -> Result<()> {
     let debugger = SimulatorDebugger::new(&db_path)
         .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+    let node_id = selected_node(&debugger, run_id, node_id, node)?;
+    let labels = debugger.node_labels(run_id).unwrap_or_default();
 
     let traces = debugger
         .get_traces(run_id, node_id)
@@ -910,9 +946,9 @@ fn run_debug_traces(db_path: PathBuf, run_id: i64, node_id: Option<i64>) -> Resu
             None => "".to_string(),
         };
         println!(
-            "[Step {:4}] [Node {:>3}] [tid={:<3}] {:<8} {:<24} args={:<20} sched={}{}",
+            "[Step {:4}] [{}] [tid={:<3}] {:<8} {:<24} args={:<20} sched={}{}",
             t.step,
-            t.node_id,
+            node_label(&labels, t.node_id),
             t.trace_id,
             t.trace_kind,
             t.function_name,
