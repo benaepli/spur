@@ -124,16 +124,26 @@ fn draw_destination(candidates: &Option<Vec<NodeId>>, rng: &mut impl Rng) -> Opt
         .map(|nodes| nodes[draw_position(nodes.len(), rng)])
 }
 
-/// The members of the group a group-shaped partition applies to. A shape
-/// that prefers quorum groups uses them when any exist. A single candidate
-/// takes no draw.
-fn choose_group(deployment: &Deployment, prefer_quorum: bool, rng: &mut impl Rng) -> Option<Vec<NodeId>> {
-    let non_empty = || deployment.groups.iter().filter(|g| !g.members.is_empty());
-    let quorum: Vec<_> = non_empty().filter(|g| g.quorum).collect();
+/// Whether `members` can form a ring: at least four, none repeated.
+pub(crate) fn ring_eligible(members: &[NodeId]) -> bool {
+    members.len() >= 4 && members.iter().collect::<HashSet<_>>().len() == members.len()
+}
+
+/// The members of the group a group-shaped partition applies to, among the
+/// groups `eligible` accepts. A shape that prefers quorum groups uses the
+/// eligible ones when any exist. A single candidate takes no draw.
+fn choose_group(
+    deployment: &Deployment,
+    prefer_quorum: bool,
+    eligible: fn(&[NodeId]) -> bool,
+    rng: &mut impl Rng,
+) -> Option<Vec<NodeId>> {
+    let accepted = || deployment.groups.iter().filter(|g| eligible(&g.members));
+    let quorum: Vec<_> = accepted().filter(|g| g.quorum).collect();
     let candidates: Vec<_> = if prefer_quorum && !quorum.is_empty() {
         quorum
     } else {
-        non_empty().collect()
+        accepted().collect()
     };
     match candidates.len() {
         0 => None,
@@ -155,7 +165,7 @@ fn random_partition(deployment: &Deployment, rng: &mut impl Rng) -> Option<Parti
                 return Some(PartitionAction::IsolateOne(node));
             }
             1 => {
-                let Some(group) = choose_group(deployment, false, rng) else { continue };
+                let Some(group) = choose_group(deployment, false, |m| !m.is_empty(), rng) else { continue };
                 let n = group.len();
                 let mut side_a: Vec<usize> = (0..n).filter(|_| rng.random_bool(0.5)).collect();
                 if side_a.is_empty() {
@@ -166,11 +176,11 @@ fn random_partition(deployment: &Deployment, rng: &mut impl Rng) -> Option<Parti
                 return Some(PartitionAction::Halves { group, side_a });
             }
             2 => {
-                let Some(group) = choose_group(deployment, true, rng) else { continue };
+                let Some(group) = choose_group(deployment, true, ring_eligible, rng) else { continue };
                 return Some(PartitionAction::MajoritiesRing { group });
             }
             _ => {
-                let Some(group) = choose_group(deployment, true, rng) else { continue };
+                let Some(group) = choose_group(deployment, true, |m| !m.is_empty(), rng) else { continue };
                 let bridge = draw_position(group.len(), rng);
                 return Some(PartitionAction::Bridge { group, bridge });
             }
@@ -534,6 +544,33 @@ mod tests {
             assert!(!petgraph::algo::is_cyclic_directed(&exempt), "seed {seed}");
         }
         assert!(dropped_somewhere > 0, "no seed had an edge into a recover to drop");
+    }
+
+    #[test]
+    fn generated_rings_use_only_groups_of_four_distinct_members() {
+        let mut deployment = Deployment::test_cluster(8);
+        let nodes = deployment.nodes.to_vec();
+        deployment.groups = vec![
+            crate::simulator::deploy::Group { paths: vec!["small".into()], role: nodes[0].role, members: nodes[..3].to_vec(), quorum: true },
+            crate::simulator::deploy::Group { paths: vec!["large".into()], role: nodes[0].role, members: nodes[3..].to_vec(), quorum: false },
+        ];
+        let small = Deployment::test_cluster(3);
+        let mut rings = 0;
+        for seed in 0..400u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            if let Some(PartitionAction::MajoritiesRing { group }) = random_partition(&deployment, &mut rng) {
+                assert_eq!(group, nodes[3..].to_vec(), "seed {seed}: the only eligible group");
+                rings += 1;
+            }
+            let mut rng = SmallRng::seed_from_u64(seed);
+            assert!(
+                !matches!(random_partition(&small, &mut rng), Some(PartitionAction::MajoritiesRing { .. })),
+                "seed {seed}: a three-node group is never a ring"
+            );
+        }
+        assert!(rings > 0, "some seed drew a ring");
+        assert!(ring_eligible(&nodes[..4]) && !ring_eligible(&nodes[..3]));
+        assert!(!ring_eligible(&[nodes[0], nodes[1], nodes[2], nodes[0]]));
     }
 
     #[test]

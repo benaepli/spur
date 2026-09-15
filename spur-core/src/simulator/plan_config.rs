@@ -232,6 +232,12 @@ impl Resolver<'_> {
                     }
                     PartitionSpec::MajoritiesRing { group } => {
                         let group = self.group(group)?;
+                        if !crate::simulator::path::generator::ring_eligible(&group) {
+                            return Err(PlanConfigError::InvalidEvent {
+                                event_id: self.event_id.to_string(),
+                                reason: "a majorities_ring group needs at least four distinct members".into(),
+                            });
+                        }
                         let json = json!({"type": "majorities_ring", "group": indices(&group)});
                         (PartitionAction::MajoritiesRing { group }, json)
                     }
@@ -387,5 +393,48 @@ impl PlanFileConfig {
             "dependencies": self.dependencies,
         });
         Ok(ResolvedPlan { deployment: Arc::new(deployment), graph, json })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPEC: &str = r#"
+type Sys { one: list<Node>; three: list<Node>; four: list<Node>; repeated: list<Node>; empty: list<Node>; };
+
+role Node(sys: int) {
+    fn Init() {}
+}
+
+client KV(sys: Sys) {
+    async fn Write(dest: Node, key: string, uid: int) {}
+    async fn Read(dest: Node, key: string): list<int> { [] }
+}
+
+@deploy(client = KV)
+fn Main(): Sys? {
+    var n = spawn<Node>(4);
+    provide_all(n, 0);
+    Sys { one: [n[0]], three: [n[0], n[1], n[2]], four: n, repeated: [n[0], n[1], n[2], n[0]], empty: [] }
+}
+"#;
+
+    fn resolve(group: &str) -> Result<ResolvedPlan, PlanConfigError> {
+        let program = crate::compiler::compile(SPEC, "rings.spur").into_program().expect("the ring spec compiles");
+        let text = format!(
+            r#"{{"num_runs": 1, "max_iterations": 10, "events": {{"p": {{"partition": {{"type": "majorities_ring", "group": "{group}"}}}}, "h": "heal"}}, "dependencies": [["p", "h"]]}}"#
+        );
+        let plan: PlanFileConfig = serde_json::from_str(&text).expect("the plan parses");
+        plan.resolve(&program)
+    }
+
+    #[test]
+    fn ring_events_need_four_distinct_members() {
+        let resolved = resolve("four").expect("four distinct members form a ring");
+        assert_eq!(resolved.json["events"]["p"]["partition"]["group"], json!([0, 1, 2, 3]));
+        for bad in ["empty", "one", "three", "repeated"] {
+            assert!(resolve(bad).is_err(), "{bad} is not a valid ring");
+        }
     }
 }

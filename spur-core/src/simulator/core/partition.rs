@@ -17,8 +17,10 @@ pub enum PartitionType {
         side_a: OrdSet<NodeId>,
         side_b: OrdSet<NodeId>,
     },
-    /// Overlapping majorities in a ring — each node can reach floor(n/2)+1
-    /// nearest neighbors (including itself). No global quorum exists.
+    /// Overlapping majorities on a ring of group members: two members are
+    /// linked when their ring distance is at most the smallest radius that
+    /// gives every member a direct majority, counting itself. A valid ring has
+    /// at least four distinct members.
     MajoritiesRing { ring: Vec<NodeId> },
     /// A group split in two halves that reach each other only through the
     /// bridge. The bridge and both sides together are the group.
@@ -99,10 +101,10 @@ impl PartitionType {
                     return true;
                 };
                 let n = ring.len();
-                // Distance is taken over ring positions: min(|i-j|, n-|i-j|).
-                let reach = n / 2;
+                // With q = n/2 + 1, the radius is ceil((q - 1) / 2).
+                let radius = n / 4 + (n % 4) / 2;
                 let d = i.abs_diff(j);
-                d.min(n - d) <= reach
+                d.min(n - d) <= radius
             }
             PartitionType::Bridge {
                 bridge,
@@ -471,6 +473,36 @@ mod tests {
         assert!(state.partition_info.queued_messages.is_empty());
         assert!(state.partition_info.active.is_none());
         assert_eq!(state.network_queue.len(), 6, "the heal releases every held message");
+    }
+
+    #[test]
+    fn ring_adjacency_gives_each_member_a_direct_majority_and_blocks_the_rest() {
+        let blocked_from_zero: [(usize, &[usize]); 5] =
+            [(4, &[2]), (5, &[2, 3]), (6, &[3]), (7, &[3, 4]), (8, &[3, 4, 5])];
+        for (n, blocked) in blocked_from_zero {
+            let ring: Vec<NodeId> = (0..n).map(|i| node(0, 3 * i + 1)).collect();
+            let p = PartitionAction::MajoritiesRing { group: ring.clone() }.to_partition_type();
+            let linked = |i: usize, j: usize| p.can_communicate(ring[i % n], ring[j % n]);
+            for j in 0..n {
+                assert_eq!(linked(0, j), !blocked.contains(&j), "n = {n}, 0 -> {j}");
+            }
+            let quorum = n / 2 + 1;
+            let mut any_blocked = false;
+            for i in 0..n {
+                assert!(linked(i, i), "n = {n}, self {i}");
+                let neighborhood = (0..n).filter(|&j| linked(i, j)).count();
+                assert!(neighborhood >= quorum, "n = {n}: {i} reaches {neighborhood} of quorum {quorum}");
+                for j in 0..n {
+                    assert_eq!(linked(i, j), linked(j, i), "n = {n}, symmetry {i} {j}");
+                    for k in 0..n {
+                        assert_eq!(linked(i, j), linked(i + k, j + k), "n = {n}, rotation {k}");
+                    }
+                    assert_eq!(linked(i, j), linked(n - i, n - j), "n = {n}, reflection");
+                    any_blocked |= !linked(i, j);
+                }
+            }
+            assert!(any_blocked, "n = {n} blocks some member pair");
+        }
     }
 
     #[test]
