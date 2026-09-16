@@ -1466,6 +1466,15 @@ fn run_campaign_impl(
     let run_counter = AtomicI64::new(0);
 
     let deploy_space = arm_configs.first().and_then(|c| c.deploy_space.clone());
+    // The tables are written before the first run so a session cut short still
+    // identifies its deployments, and again at the end for the aliases.
+    if let Some(space) = deploy_space.as_deref() {
+        crate::simulator::explorer::write_deployment_tables(
+            output_path,
+            program,
+            &crate::simulator::explorer::cached_deployments(space),
+        );
+    }
     let mut arms: Vec<BuiltArm> = block
         .arms
         .iter()
