@@ -11,11 +11,18 @@ top_level_def ::=
   | type_def_stmt
   | func_def
 
-role_def ::= 'role' ID '{' var_inits func_defs '}'
-client_def ::= 'ClientInterface' '{' var_inits func_defs '}'
+(* A role and a client each declare exactly one parameter. *)
+role_def ::= 'role' ID role_param '{' var_inits func_defs '}'
+client_def ::= 'client' ID role_param '{' var_inits func_defs '}'
+role_param ::= '(' ID ':' type_def ')'
 
 func_defs ::= ( func_def )*
-func_def ::= ( '@trace' )? ( 'async' )? 'fn' ID '(' func_params? ')' ( ':' type_def )? block
+func_def ::= annotation* ( 'async' )? 'fn' ID '(' func_params? ')' ( ':' type_def )? block
+
+annotation ::= '@' ID ( '(' annotation_args? ')' )?
+annotation_args ::= annotation_arg ( ',' annotation_arg )* ','?
+annotation_arg ::= ID '=' qualified_name
+qualified_name ::= ID ( '.' ID )*
 
 func_call ::= ID '(' args? ')'
 args ::= expr ( ',' expr )* ','?
@@ -31,7 +38,7 @@ type_def_list ::= type_def ( ',' type_def )* ','?
 type_def_stmt ::= 'type' ID ( struct_body | enum_def | type_alias ) ';'?
 struct_body ::= '{' field_defs? '}'
 field_defs ::= field_def ( ';' field_def )* ';'?
-field_def ::= ID ':' type_def
+field_def ::= annotation* ID ':' type_def
 
 enum_def ::= 'enum' '{' enum_variants '}'
 enum_variant ::= ID ( '(' type_def ')' )?
@@ -135,6 +142,8 @@ primary_base ::=
   | 'recv' '(' expr ')'
   | 'set_timer' '(' string_literal? ')'
   | 'fifo' '(' expr ')'
+  | 'self'
+  | 'spawn' '<' type_def '>' '(' expr ')'
   | ID
   | '(' expr ')'
 
@@ -182,6 +191,176 @@ field_init ::= ID ':' expr
 list_ops ::= ( 'head' | 'tail' | 'len' ) '(' expr ')'
 ```
 
+## Roles and Clients
+
+A program declares server roles with `role` and the operations a workload issues
+with `client`. Each declaration takes exactly one parameter, the node's context.
+The parameter is read-only and is in scope in the block's variable initializers
+and in every one of its functions.
+
+```
+type Cluster {
+    @quorum nodes: list<Node>;
+};
+
+role Node(cluster: Cluster) {
+    var me: int = index_of(cluster.nodes, self)!;
+    var replicas: list<Node> = cluster.nodes;
+
+    fn Init() { ... }
+    async fn RecoverInit() { ... }
+
+    @trace
+    async fn AppendEntries(...) { ... }
+}
+```
+
+- `self` is a keyword. In `role R` it has type `R` and in `client C` it has type
+  `C`: it is a handle to the node the code runs on. Outside a role or a client
+  it is an error.
+- A node's integer identity is an ordinary role variable. The convention is
+  `var me: int = index_of(cluster.nodes, self)!;`.
+- `Init` and `RecoverInit` take no parameters and return unit. Both are
+  optional, and either may be `async`.
+- Variable initializers run before `Init` at startup and again on recovery
+  before `RecoverInit`. They may read the parameter and `self`.
+- Assigning to the parameter is an error. `ctx.f := v` builds a new value and
+  does not rebind `ctx`.
+- The parameter type must be deployable (see Deployments). A role that needs no
+  context declares `role Witness(unused: ())`.
+
+A role parameter is supplied by a deploy function. A client's parameter is the
+deployment root, so it always sees the whole deployment.
+
+### Client operations
+
+```
+client KVClient(sys: Cluster) {
+    async fn Write(dest: Node, key: string, uid: int) { ... }
+    async fn Read(dest: Node, key: string): list<int> { ... }
+    async fn RMW(dest: Node, key: string, uid: int): list<int> { ... }
+}
+```
+
+- `Write` and `Read` are required, `RMW` is optional. All three are `async` and
+  must have these parameter and return types.
+- `dest` is optional per operation. When present it is the first parameter and
+  its type is a role, never a client. Different operations may name different
+  roles. An operation without `dest` routes itself from the client parameter.
+- Other functions in a client are helpers. The simulator calls only these three.
+- The linearizability model follows from the client: `kv_rmw` when `RMW` is
+  declared, `kv` otherwise.
+
+## Deployments
+
+A deploy function builds the nodes of a run and the value each of them receives
+as its parameter. It is a free function marked `@deploy(client = C)`, where `C`
+names the client that issues operations against it.
+
+```
+type ClusterParams {
+    @scale n: int;
+};
+
+fn cluster(n: int): Cluster {
+    var nodes: list<Node> = spawn<Node>(n);
+    var c: Cluster = Cluster { nodes: nodes };
+    provide_all(nodes, c);
+    c
+}
+
+@deploy(client = KVClient)
+fn Main(p: ClusterParams): Cluster? {
+    if (p.n < 1) {
+        return nil;
+    }
+    cluster(p.n)
+}
+```
+
+### Allocation builtins
+
+| Builtin | Type | Meaning |
+| --- | --- | --- |
+| `spawn<R>(k)` | `int -> list<R>`, `R` a role | Allocates `k` fresh handles of role `R`. No node runs yet. |
+| `provide(h, v)` | `(R, P) -> ()`, `P` the parameter type of `R` | Binds `v` as the parameter of node `h`. |
+| `provide_all(hs, v)` | `(list<R>, P) -> ()` | `provide(h, v)` for each `h`, in list order. |
+| `index_of(xs, x)` | `(list<T>, T) -> int?` | Position of the first element equal to `x`, or `nil`. |
+
+`spawn` names a role, never a client: clients are created by the simulator, not
+by a deploy. Every spawned handle must be provided exactly once by the time the
+deploy returns; a missing or repeated `provide` stops the session.
+
+These three allocation builtins do something only while a deploy function runs,
+so an ordinary function that calls them is a library builder for deploys.
+Calling one from role or client code raises a runtime error. `index_of` is an
+ordinary builtin and may be called anywhere.
+
+`spawn` calls take global node indices in call order: the first call gets
+`0..k`, the next continues from there. That index is the node's identity in
+every output table and in every payload. Nodes of one role are also numbered by
+an ordinal within the role, used in reports and debug output as `Role[ordinal]`.
+
+### `@deploy`
+
+- The function is free and is not allowed to do anything that needs a running
+  node: no `self`, no role variable, no RPC, no channel operation, no timer, no
+  `fifo`, no `unique_id`, no persistence builtin. The restriction follows calls,
+  so it also covers every function a deploy calls.
+- It takes one parameter of struct type, or no parameter at all.
+- It returns `T?`, where `T` is a deployable type that is not itself optional.
+  Returning `nil` rejects the parameter tuple: the explorer skips it rather than
+  treating it as an error. A deploy may coerce its parameters instead, for
+  example rounding a replica count up to odd.
+- `client = C` is required and names a `client` declaration whose parameter type
+  is exactly `T`.
+- A program may declare several deploys. Their names are distinct, and a config
+  or the `--deploy` flag selects one.
+- A deploy function may also be called as an ordinary function.
+
+### Parameter structs
+
+A deploy's parameter is a struct whose every field carries exactly one of
+`@scale` or `@choice`. The explorer varies those fields; nothing else about a
+deployment varies.
+
+| Tag | Field type | Config supplies |
+| --- | --- | --- |
+| `@scale` | `int` | `{ "min", "max", "step" }`; the explorer visits small values first |
+| `@choice` | `int`, `bool`, `string`, or an enum whose variants carry no payload | a JSON array of values |
+
+### `@quorum`
+
+`@quorum` marks a field of type `list<R>` as a group from which a majority is
+drawn. Generated `majorities_ring` and `bridge` partitions prefer quorum groups.
+It has no other effect.
+
+### Deployable types
+
+A type is deployable when it is built only from `int`, `string`, `bool`, `()`,
+tuples, `list<T>`, `map<K, V>`, `T?`, structs and enums of deployable types, and
+role handle types. Channels, FIFO links and client handle types are not
+deployable, because a deployment exists before any node runs. Role parameter
+types, deploy parameter structs and deploy root types must all be deployable.
+Handles are plain values, so roles may refer to each other's types.
+
+### Groups and paths
+
+The simulator walks the returned root value, guided by its static type, and
+records:
+
+- a canonical path for every handle, such as `nodes[2]` or
+  `shards["east"].nodes[0]`, written from the root; `$` names the root itself
+- every value of type `list<R>` as a group, deduplicated by role and member
+  sequence, with the first path canonical and later ones aliases; a group is a
+  quorum group when any of its occurrences sits under a `@quorum` field
+
+Walk order is struct fields in declaration order, list and tuple elements by
+index, and map entries in ascending key order. `nil` contributes nothing, and
+enum payloads are walked but are not addressable by a path. A spawned handle
+that the root does not reach still runs and can still crash, but it has no path,
+so configs cannot name it.
+
 ## Typing
 
 Spur is a strongly and statically typed language.
@@ -193,6 +372,7 @@ The type system is composed of:
 - Collections: `list<T>`, `map<K, V>`
 - Concurrency: `chan<T>`
 - Optional types: `T?`, which can be either `nil` or a value of type `T`
+- Role handles: `R` for a role or client `R`, the type of `self` and of every value `spawn<R>` returns
 - Refinement types: `T { x | expr }`, where `x` binds a value of type `T` and `expr` must be of type `bool`
 
 ### Refinements
@@ -466,6 +646,8 @@ Right now, this includes:
 
 - `println: string -> ()`
 - `int_to_string: int -> string`
+- `index_of: (list<T>, T) -> int?`
+- `spawn<R>: int -> list<R>`, `provide: (R, P) -> ()`, `provide_all: (list<R>, P) -> ()` (deploy functions only)
 
 ## Syntactic Notes
 
