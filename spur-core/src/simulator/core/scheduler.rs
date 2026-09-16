@@ -2367,15 +2367,20 @@ fn reinit_node<H: HashPolicy, L: Logger, F: Feedback>(
 ) -> Result<(), RuntimeError> {
     use crate::compiler::cfg::{SELF_SLOT, VarSlot};
 
-    let init_fn = deployment.functions(node_id.role).base_init.as_ref()
+    let functions = deployment.functions(node_id.role);
+    let init_fn = functions.base_init.as_ref()
         .ok_or_else(|| RuntimeError::MissingRequiredFunction("Node.BASE_NODE_INIT".to_string()))?;
+    let ctx = deployment.context::<H>(node_id.index);
 
     if let VarSlot::Node(self_idx, _) = SELF_SLOT {
         state.nodes[node_id.index].set(self_idx, Value::<H>::node(node_id));
     }
-    state.set_context(node_id.index, deployment.context::<H>(node_id.index));
+    if functions.param_in_env {
+        state.set_context(node_id.index, ctx.clone());
+    }
 
-    let mut env = build_frame::<H>(init_fn, &[]);
+    let args = crate::simulator::explorer::context_args(init_fn, &ctx);
+    let mut env = build_frame::<H>(init_fn, &args);
 
     exec_sync_on_node::<H, L, F>(
         state,
@@ -2423,7 +2428,10 @@ fn recover_node<H: HashPolicy, L: Logger, F: Feedback>(
         return Ok(());
     };
 
-    let initial_args: EcoVec<Value<H>> = EcoVec::new();
+    let ctx = deployment.context::<H>(node_id.index);
+    let initial_args: EcoVec<Value<H>> = crate::simulator::explorer::context_args(recover_fn, &ctx)
+        .into_iter()
+        .collect();
     let env = build_frame(recover_fn, &initial_args);
 
     let record = Record {

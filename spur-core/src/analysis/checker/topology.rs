@@ -64,7 +64,13 @@ impl TypeChecker {
         let mut meta = TopologyMetadata { structs: structs.clone(), enums: enums.clone(), tags, ..Default::default() };
         let role_defs: Vec<_> = tops.iter().filter_map(|d| match d { TypedTopLevelDef::Role(r) => Some(r), _ => None }).collect();
         for role in &role_defs {
-            meta.roles.insert(role.name, RoleMetadata { kind: role.kind, parameter: role.param.ty.clone(), parameter_id: role.param.name, destinations: HashMap::new() });
+            // A client's parameter always occupies a node slot; a role's does
+            // only when a function other than Init and RecoverInit reads it.
+            let param_in_env = role.kind == RoleKind::Client
+                || role.func_defs.iter().any(|f| {
+                    !["Init", "RecoverInit"].contains(&f.original_name.as_str()) && reads(&f.body, role.param.name)
+                });
+            meta.roles.insert(role.name, RoleMetadata { kind: role.kind, parameter: role.param.ty.clone(), parameter_id: role.param.name, param_in_env, destinations: HashMap::new() });
         }
         let mut functions = Vec::new();
         let mut node_vars = HashSet::from([crate::compiler::cfg::SELF_NAME]);
@@ -124,7 +130,7 @@ impl TypeChecker {
         let mut effects = HashMap::new();
         for f in &functions {
             let mut effect = Effect::default();
-            visit_block(&f.body, &node_vars, &mut effect);
+            visit_block(&f.body, &node_vars, None, &mut effect);
             effects.insert(f.name, effect);
         }
         loop {
@@ -211,49 +217,57 @@ fn reachable_structs(ty: &Type, meta: &TopologyMetadata, seen: &mut HashSet<Name
 }
 
 #[derive(Default)]
-struct Effect { node_bound: bool, calls: HashSet<NameId> }
+struct Effect { node_bound: bool, reads_target: bool, calls: HashSet<NameId> }
 
-fn visit_block(block: &TypedBlock, vars: &HashSet<NameId>, effect: &mut Effect) {
-    for s in &block.statements { visit_statement(s, vars, effect); }
-    if let Some(t) = &block.tail_expr { visit_expr(t, vars, effect); }
+/// Whether `block` reads `target`.
+fn reads(block: &TypedBlock, target: NameId) -> bool {
+    let mut effect = Effect::default();
+    visit_block(block, &HashSet::new(), Some(target), &mut effect);
+    effect.reads_target
 }
-fn visit_statement(stmt: &TypedStatement, vars: &HashSet<NameId>, effect: &mut Effect) {
+
+fn visit_block(block: &TypedBlock, vars: &HashSet<NameId>, probe: Option<NameId>, effect: &mut Effect) {
+    for s in &block.statements { visit_statement(s, vars, probe, effect); }
+    if let Some(t) = &block.tail_expr { visit_expr(t, vars, probe, effect); }
+}
+fn visit_statement(stmt: &TypedStatement, vars: &HashSet<NameId>, probe: Option<NameId>, effect: &mut Effect) {
     match &stmt.kind {
-        TypedStatementKind::Assignment(a) => visit_expr(&a.value, vars, effect),
-        TypedStatementKind::Expr(e) => visit_expr(e, vars, effect),
+        TypedStatementKind::Assignment(a) => visit_expr(&a.value, vars, probe, effect),
+        TypedStatementKind::Expr(e) => visit_expr(e, vars, probe, effect),
         TypedStatementKind::ForLoop(l) => {
-            if let Some(a) = &l.init { visit_expr(&a.value, vars, effect); }
-            if let Some(c) = &l.condition { visit_expr(c, vars, effect); }
-            if let Some(a) = &l.increment { visit_expr(&a.value, vars, effect); }
-            for s in &l.body { visit_statement(s, vars, effect); }
+            if let Some(a) = &l.init { visit_expr(&a.value, vars, probe, effect); }
+            if let Some(c) = &l.condition { visit_expr(c, vars, probe, effect); }
+            if let Some(a) = &l.increment { visit_expr(&a.value, vars, probe, effect); }
+            for s in &l.body { visit_statement(s, vars, probe, effect); }
         }
-        TypedStatementKind::ForInLoop(l) => { visit_expr(&l.iterable, vars, effect); for s in &l.body { visit_statement(s, vars, effect); } }
+        TypedStatementKind::ForInLoop(l) => { visit_expr(&l.iterable, vars, probe, effect); for s in &l.body { visit_statement(s, vars, probe, effect); } }
         TypedStatementKind::Error => {}
     }
 }
-fn visit_expr(expr: &TypedExpr, vars: &HashSet<NameId>, effect: &mut Effect) {
+fn visit_expr(expr: &TypedExpr, vars: &HashSet<NameId>, probe: Option<NameId>, effect: &mut Effect) {
     use TypedExprKind::*;
+    if matches!(&expr.kind, Var(id, _) if Some(*id) == probe) { effect.reads_target = true; }
     if matches!(&expr.kind, Var(id, _) if vars.contains(id)) || matches!(&expr.kind, MakeChannel | Send(..) | Recv(..) | SetTimer(..) | Fifo(..) | PersistData(..) | RetrieveData(..) | DiscardData | RpcCall(..)) { effect.node_bound = true; }
     match &expr.kind {
         FuncCall(TypedFuncCall::User(call)) | RpcCall(_, call) => {
             effect.calls.insert(call.name);
-            for a in &call.args { visit_expr(a, vars, effect); }
-            if let RpcCall(target, _) = &expr.kind { visit_expr(target, vars, effect); }
+            for a in &call.args { visit_expr(a, vars, probe, effect); }
+            if let RpcCall(target, _) = &expr.kind { visit_expr(target, vars, probe, effect); }
         }
-        FuncCall(TypedFuncCall::Builtin(b, args, _)) => { if *b == BuiltinFn::UniqueId { effect.node_bound = true; } for a in args { visit_expr(a, vars, effect); } }
-        BinOp(_, a, b) | Append(a, b) | Prepend(a, b) | Min(a, b) | Exists(a, b) | Erase(a, b) | Send(a, b) | Index(a, b) | SafeIndex(a, b) => { visit_expr(a, vars, effect); visit_expr(b, vars, effect); }
-        Store(a, b, c) | Slice(a, b, c) => { visit_expr(a, vars, effect); visit_expr(b, vars, effect); visit_expr(c, vars, effect); }
-        Not(a) | Negate(a) | Head(a) | Tail(a) | Len(a) | UnwrapOptional(a) | Recv(a) | Fifo(a) | TupleAccess(a, _) | FieldAccess(a, _, _) | SafeFieldAccess(a, _, _) | SafeTupleAccess(a, _) | WrapInOptional(a) | PersistData(a) | Return(a) => visit_expr(a, vars, effect),
-        MapLit(pairs) => { for (a, b) in pairs { visit_expr(a, vars, effect); visit_expr(b, vars, effect); } }
-        ListLit(xs) | TupleLit(xs) => { for x in xs { visit_expr(x, vars, effect); } }
-        StructLit(_, fields) => { for (_, _, v) in fields { visit_expr(v, vars, effect); } }
-        Match(e, arms) => { visit_expr(e, vars, effect); for arm in arms { visit_block(&arm.body, vars, effect); } }
+        FuncCall(TypedFuncCall::Builtin(b, args, _)) => { if *b == BuiltinFn::UniqueId { effect.node_bound = true; } for a in args { visit_expr(a, vars, probe, effect); } }
+        BinOp(_, a, b) | Append(a, b) | Prepend(a, b) | Min(a, b) | Exists(a, b) | Erase(a, b) | Send(a, b) | Index(a, b) | SafeIndex(a, b) => { visit_expr(a, vars, probe, effect); visit_expr(b, vars, probe, effect); }
+        Store(a, b, c) | Slice(a, b, c) => { visit_expr(a, vars, probe, effect); visit_expr(b, vars, probe, effect); visit_expr(c, vars, probe, effect); }
+        Not(a) | Negate(a) | Head(a) | Tail(a) | Len(a) | UnwrapOptional(a) | Recv(a) | Fifo(a) | TupleAccess(a, _) | FieldAccess(a, _, _) | SafeFieldAccess(a, _, _) | SafeTupleAccess(a, _) | WrapInOptional(a) | PersistData(a) | Return(a) => visit_expr(a, vars, probe, effect),
+        MapLit(pairs) => { for (a, b) in pairs { visit_expr(a, vars, probe, effect); visit_expr(b, vars, probe, effect); } }
+        ListLit(xs) | TupleLit(xs) => { for x in xs { visit_expr(x, vars, probe, effect); } }
+        StructLit(_, fields) => { for (_, _, v) in fields { visit_expr(v, vars, probe, effect); } }
+        Match(e, arms) => { visit_expr(e, vars, probe, effect); for arm in arms { visit_block(&arm.body, vars, probe, effect); } }
         Conditional(c) => {
-            for b in std::iter::once(&c.if_branch).chain(&c.elseif_branches) { visit_expr(&b.condition, vars, effect); visit_block(&b.body, vars, effect); }
-            if let Some(b) = &c.else_branch { visit_block(b, vars, effect); }
+            for b in std::iter::once(&c.if_branch).chain(&c.elseif_branches) { visit_expr(&b.condition, vars, probe, effect); visit_block(&b.body, vars, probe, effect); }
+            if let Some(b) = &c.else_branch { visit_block(b, vars, probe, effect); }
         }
-        Block(b) => visit_block(b, vars, effect),
-        VariantLit(_, _, _, Some(p)) => visit_expr(p, vars, effect),
+        Block(b) => visit_block(b, vars, probe, effect),
+        VariantLit(_, _, _, Some(p)) => visit_expr(p, vars, probe, effect),
         _ => {}
     }
 }

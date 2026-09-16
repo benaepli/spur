@@ -17,6 +17,9 @@ use crate::compiler::cfg::{FunctionInfo, Program};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RoleFunctions {
+    /// Whether the role parameter occupies a node slot; when it does not, the
+    /// initializers, Init and RecoverInit take it as an argument.
+    pub param_in_env: bool,
     pub base_init: Option<FunctionInfo>,
     pub init: Option<FunctionInfo>,
     pub recover_init: Option<FunctionInfo>,
@@ -38,6 +41,7 @@ impl RoleTable {
         for (id, name) in &program.roles {
             let get = |suffix| program.get_func_by_name(&format!("{name}.{suffix}")).cloned();
             roles[id.0] = RoleFunctions {
+                param_in_env: program.topology.roles.get(id).is_none_or(|r| r.param_in_env),
                 base_init: get("BASE_NODE_INIT"),
                 init: get("Init"),
                 recover_init: get("RecoverInit"),

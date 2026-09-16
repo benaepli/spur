@@ -886,6 +886,15 @@ impl SingleRunConfig {
     }
 }
 
+/// The arguments a start or recovery function takes: the role parameter when
+/// it declares one, nothing otherwise.
+pub(crate) fn context_args<H: crate::simulator::hash_utils::HashPolicy>(
+    function: &crate::compiler::cfg::FunctionInfo,
+    ctx: &crate::simulator::core::values::Value<H>,
+) -> Vec<crate::simulator::core::values::Value<H>> {
+    if function.param_count == 1 { vec![ctx.clone()] } else { vec![] }
+}
+
 fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feedback>(
     program: &Program,
     logger: &mut L,
@@ -903,10 +912,16 @@ fn initialize_state<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: F
     );
 
     for &node_id in deployment.nodes.iter() {
-        // Variable initializers read the role parameter.
-        state.set_context(node_id.index, deployment.context::<H>(node_id.index));
-        if let Some(init_fn) = &deployment.functions(node_id.role).base_init {
-            let mut env = build_frame::<H>(init_fn, &[]);
+        // Variable initializers read the role parameter, from its node slot or
+        // as an argument.
+        let functions = deployment.functions(node_id.role);
+        let ctx = deployment.context::<H>(node_id.index);
+        if functions.param_in_env {
+            state.set_context(node_id.index, ctx.clone());
+        }
+        if let Some(init_fn) = &functions.base_init {
+            let args = context_args(init_fn, &ctx);
+            let mut env = build_frame::<H>(init_fn, &args);
             exec_sync_on_node::<H, _, F>(
                 &mut state,
                 logger,
@@ -940,7 +955,8 @@ fn init_topology<H: crate::simulator::hash_utils::HashPolicy, L: Logger, F: Feed
 ) -> Result<(), RuntimeError> {
     for &node_id in deployment.nodes.iter() {
         let Some(init_fn) = &deployment.functions(node_id.role).init else { continue; };
-        let mut env = build_frame::<H>(init_fn, &[]);
+        let args = context_args(init_fn, &deployment.context::<H>(node_id.index));
+        let mut env = build_frame::<H>(init_fn, &args);
 
         exec_sync_on_node::<H, _, F>(
             state,

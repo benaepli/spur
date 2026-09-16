@@ -304,3 +304,49 @@ fn contexts_are_shared_under_no_hashing_and_copied_under_hashing() {
     assert!(d.functions(d.nodes[2].role).init.is_some());
     assert_eq!(d.model(), "kv");
 }
+
+const HANDLER_READS_SPEC: &str = r#"
+type Cluster { @quorum nodes: list<Node>; };
+
+role Node(c: Cluster) {
+    var me: int = index_of(c.nodes, self)!;
+    fn Init() {}
+    async fn Size(): int { len(c.nodes) }
+}
+
+client KV(sys: Cluster) {
+    async fn Write(dest: Node, key: string, uid: int) {}
+    async fn Read(dest: Node, key: string): list<int> { [] }
+}
+
+@deploy(client = KV)
+fn Main(): Cluster? {
+    var nodes = spawn<Node>(2);
+    var c = Cluster { nodes: nodes };
+    provide_all(nodes, c);
+    c
+}
+"#;
+
+#[test]
+fn the_role_parameter_takes_a_node_slot_only_when_a_handler_reads_it() {
+    let role = |program: &Program, name: &str| {
+        program.roles.iter().find(|(_, n)| n == name).expect("the role exists").0
+    };
+    let initializers_only = program();
+    let node = role(&initializers_only, "Node");
+    let functions = initializers_only.role_table.functions(node);
+    assert!(!functions.param_in_env, "no function beyond the initializers reads it");
+    assert_eq!(functions.base_init.as_ref().unwrap().param_count, 1, "the initializers take it as an argument");
+    assert!(
+        initializers_only.role_table.functions(role(&initializers_only, "KV")).param_in_env,
+        "a client keeps its parameter in the node env"
+    );
+
+    let handler_reads = crate::compiler::compile(HANDLER_READS_SPEC, "handler_reads.spur")
+        .into_program()
+        .expect("the handler spec compiles");
+    let functions = handler_reads.role_table.functions(role(&handler_reads, "Node"));
+    assert!(functions.param_in_env, "a handler reads the parameter");
+    assert_eq!(functions.base_init.as_ref().unwrap().param_count, 0);
+}
