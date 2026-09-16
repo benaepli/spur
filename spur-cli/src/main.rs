@@ -128,6 +128,20 @@ enum Commands {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Resolve a plan's paths against its deployment
+    ResolvePlan {
+        /// Input specification file (.spur)
+        spec: PathBuf,
+        /// Plan configuration JSON file
+        #[arg(short = 'p', long)]
+        plan: PathBuf,
+        /// The `@deploy` function to use, overriding the plan's `deploy`
+        #[arg(long)]
+        deploy: Option<String>,
+        /// Where to write the resolved plan
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Debug simulation results
     Debug(DebugArgs),
 }
@@ -259,6 +273,12 @@ fn main() {
             log_backend,
             yes,
         } => run_run_plan(spec, plan, deploy, output_dir, log_backend.into(), yes),
+        Commands::ResolvePlan {
+            spec,
+            plan,
+            deploy,
+            output,
+        } => run_resolve_plan(spec, plan, deploy, output),
         Commands::Debug(args) => match args.command {
             DebugSubcommands::Logs {
                 db,
@@ -959,6 +979,33 @@ fn run_debug_traces(db_path: PathBuf, run_id: i64, node_id: Option<i64>, node: O
     }
     println!("{:-<120}", "");
 
+    Ok(())
+}
+
+/// Writes the plan with every path replaced by the global node index it
+/// resolves to, the form the trace tools match plan events against.
+fn run_resolve_plan(
+    spec_path: PathBuf,
+    plan_path: PathBuf,
+    deploy: Option<String>,
+    output: PathBuf,
+) -> Result<()> {
+    let source = fs::read_to_string(&spec_path)
+        .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
+    let program = compiler::compile(&source, spec_path.to_string_lossy().as_ref())
+        .into_program()
+        .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
+    let text = fs::read_to_string(&plan_path)
+        .with_context(|| format!("Failed to read plan file: {}", plan_path.display()))?;
+    let mut config: spur_core::simulator::plan_config::PlanFileConfig = serde_json::from_str(&text)?;
+    if deploy.is_some() {
+        config.deploy = deploy;
+    }
+    let resolved = config
+        .resolve(&program)
+        .map_err(|e| anyhow::anyhow!("Failed to resolve the plan: {}", e))?;
+    fs::write(&output, serde_json::to_string_pretty(&resolved.json)? + "\n")?;
+    println!("Resolved plan written to {}", output.display());
     Ok(())
 }
 
