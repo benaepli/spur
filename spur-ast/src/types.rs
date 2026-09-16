@@ -413,6 +413,10 @@ pub struct RoleMetadata {
     pub kind: RoleKind,
     pub parameter: Type,
     pub parameter_id: NameId,
+    /// Whether the parameter occupies a node slot. It does when a function
+    /// other than Init and RecoverInit reads it; otherwise those functions
+    /// and the variable initializers take it as an argument.
+    pub param_in_env: bool,
     pub destinations: HashMap<String, Option<NameId>>,
 }
 

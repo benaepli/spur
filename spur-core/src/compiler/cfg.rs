@@ -59,6 +59,10 @@ pub struct Compiler {
     node_slots: HashMap<NameId, u32>,
     next_node_slot: u32,
 
+    /// The role parameter passed to the initializers, Init and RecoverInit
+    /// as an argument; `None` while it occupies a node slot or outside a role.
+    role_param: Option<(NameId, String)>,
+
     /// Debug names for current function's slots
     current_slot_names: Vec<String>,
 
@@ -107,6 +111,7 @@ impl Compiler {
             next_local_slot: 0,
             node_slots: HashMap::new(),
             next_node_slot: 1, // Slot 0 reserved for 'self'
+            role_param: None,
             current_slot_names: Vec::new(),
             current_local_defaults: Vec::new(),
             max_node_slots: 1,
@@ -137,10 +142,14 @@ impl Compiler {
     }
 
     /// Call when starting to compile a new role
-    fn begin_role(&mut self, param: NameId, var_inits: &[LVarInit]) {
+    fn begin_role(&mut self, param: NameId, param_in_env: bool, var_inits: &[LVarInit]) {
         self.node_slots.clear();
-        self.node_slots.insert(param, CTX_SLOT);
-        self.next_node_slot = CTX_SLOT + 1;
+        self.next_node_slot = if param_in_env {
+            self.node_slots.insert(param, CTX_SLOT);
+            CTX_SLOT + 1
+        } else {
+            CTX_SLOT
+        };
 
         for init in var_inits {
             self.node_slots.insert(init.name, self.next_node_slot);
@@ -248,6 +257,7 @@ impl Compiler {
         self.id_to_name = program.id_to_name;
         // Store type_ids for use during compilation
         self.type_ids = type_ids;
+        let roles_meta = program.topology.roles.clone();
 
         // Build func_sync_map and compile all top-level definitions
         for def in &program.top_level_defs {
@@ -274,7 +284,10 @@ impl Compiler {
             match def {
                 LTopLevelDef::Role(role) => {
                     // Set up node-level slot assignments for this role
-                    self.begin_role(role.param.name, &role.var_inits);
+                    let param_in_env = roles_meta.get(&role.name).is_none_or(|r| r.param_in_env);
+                    self.role_param = (!param_in_env)
+                        .then(|| (role.param.name, role.param.original_name.clone()));
+                    self.begin_role(role.param.name, param_in_env, &role.var_inits);
 
                     // Compile role's var_inits into a special init function
                     let init_func_name = format!("{}.{}", role.original_name, "BASE_NODE_INIT");
@@ -288,6 +301,7 @@ impl Compiler {
                     }
                 }
                 LTopLevelDef::FreeFunc(func) => {
+                    self.role_param = None;
                     let func_info = self.compile_func_def(func);
                     self.rpc_map.insert(func_info.name, func_info);
                 }
@@ -320,8 +334,11 @@ impl Compiler {
         qualified_name: String,
     ) -> FunctionInfo {
         let first_vertex = self.cfg.len();
-        // Begin a new function with no parameters
-        self.begin_function(&[]);
+        // The initializers read the role parameter, as an argument when it has
+        // no node slot.
+        let params: Vec<(NameId, String)> = self.role_param.clone().into_iter().collect();
+        let param_count = params.len() as u32;
+        self.begin_function(&params);
 
         // Allocate a temp slot for the return value
         let return_slot = self.alloc_temp_slot();
@@ -352,7 +369,7 @@ impl Compiler {
         let info = FunctionInfo {
             entry,
             name: func_name_id,
-            param_count: 0,
+            param_count,
             local_slot_count: self.next_local_slot,
             local_defaults: self.current_local_defaults.clone(),
             is_sync: true,
@@ -364,10 +381,15 @@ impl Compiler {
     fn compile_func_def(&mut self, func: LFuncDef) -> FunctionInfo {
         let first_vertex = self.cfg.len();
         // Collect parameter info: (NameId, display_name)
-        let params: Vec<(NameId, String)> = func
-            .params
-            .iter()
-            .map(|p| (p.name, p.original_name.clone()))
+        // Init and RecoverInit take the role parameter as a leading argument
+        // when it has no node slot; it is not part of the traced payload.
+        let synthetic = matches!(func.original_name.as_str(), "Init" | "RecoverInit")
+            .then(|| self.role_param.clone())
+            .flatten();
+        let traced_from = synthetic.is_some() as u32;
+        let params: Vec<(NameId, String)> = synthetic
+            .into_iter()
+            .chain(func.params.iter().map(|p| (p.name, p.original_name.clone())))
             .collect();
         let param_count = params.len() as u32;
         let is_traced = func.is_traced;
@@ -426,7 +448,7 @@ impl Compiler {
         // If traced, insert TraceEnter after the return-slot init and before the body.
         let after_init = if is_traced {
             let tid_slot = trace_id_slot.unwrap();
-            let param_exprs: Vec<Expr> = (0..param_count)
+            let param_exprs: Vec<Expr> = (traced_from..param_count)
                 .map(|i| {
                     let name_id = params[i as usize].0;
                     Expr::Var(VarSlot::Local(i, name_id))
