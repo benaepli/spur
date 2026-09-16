@@ -1323,6 +1323,9 @@ fn run_explorer_impl<F: Feedback>(
 ) -> Result<ExploreSummary, Box<dyn Error>> {
     let weights = config.feedback.weights;
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
+    // The tables are written before the first run so a session cut short
+    // still identifies its deployments, and again at the end for the aliases.
+    write_deployment_tables(output_path, program, &cached_deployments(config.deploy_space()));
 
     let configs: Arc<Vec<SingleRunConfig>> = Arc::new(config.expand_grid());
     let budgeted = config.wall_budget_sec > 0.0;
@@ -1625,6 +1628,9 @@ fn run_plan_impl<F: Feedback>(
         std::path::Path::new(output_path).join("plan_resolved.json"),
         serde_json::to_string_pretty(&resolved_json)?,
     )?;
+    // The tables are written before the first run so a session cut short
+    // still identifies its deployments, and again at the end for the aliases.
+    write_deployment_tables(output_path, program, &[(deployment.clone(), vec![])]);
     let global_state = Arc::new(GlobalState::<F>::new());
 
     let runs: Vec<i64> = (1..=config.num_runs as i64).collect();
@@ -1732,6 +1738,9 @@ fn run_explorer_genetic_impl<F: Feedback>(
 ) -> Result<ExploreSummary, Box<dyn Error>> {
     let weights = config.feedback.weights;
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
+    // The tables are written before the first run so a session cut short
+    // still identifies its deployments, and again at the end for the aliases.
+    write_deployment_tables(output_path, program, &cached_deployments(config.deploy_space()));
     let global_state = Arc::new(GlobalState::<F>::new());
     let run_counter = Arc::new(AtomicI64::new(0));
     let mut ctrl_rng = SmallRng::seed_from_u64(derive_seed(config.session_seed, 0, GENETIC_SALT));
@@ -2218,6 +2227,9 @@ fn run_explorer_aos_impl<F: Feedback>(
         .deploy_space
         .clone()
         .expect("an explorer config is bound to its program before use");
+    // The tables are written before the first run so a session cut short
+    // still identifies its deployments, and again at the end for the aliases.
+    write_deployment_tables(output_path, program, &cached_deployments(&deploy_space));
     let mut aos = AosExplorer::<F>::new(config, batch_size, weights, session_seed);
 
     let attribution = RunAttribution::mode("aos");
@@ -2870,6 +2882,9 @@ fn run_explorer_continuous_impl<F: Feedback>(
 ) -> Result<ExploreSummary, Box<dyn Error>> {
     let weights = config.envelope.feedback.weights;
     let writer: Arc<dyn HistoryWriter> = Arc::from(create_writer(backend, output_path)?);
+    // The tables are written before the first run so a session cut short
+    // still identifies its deployments, and again at the end for the aliases.
+    write_deployment_tables(output_path, program, &cached_deployments(config.envelope.deploy_space()));
     let run_counter = AtomicI64::new(0);
     let session_seed = config.envelope.session_seed;
 
